@@ -111,7 +111,12 @@ object/control-pointer pair and increments a reference count; `0x66137b0` sets
 that pair from an input supplied elsewhere. Thus this observation does not
 identify the implementation behind the signing-related virtual call. Bounded
 searches did not establish the setter's caller or dynamic type; indirect calls,
-other encodings and other modules remain possible.
+other encodings and other modules remain possible. A complete inventory of this
+ELF's 885 defined default/protected dynamic exports contains no symbol whose
+value equals `0x6613200` or `0x66137b0` (REA evidence
+`ev_6829f3d51f172faae17c5de300ab034d8496bae4e5913bea953c39d2f68b7722`).
+This does not rule out local/hidden symbols, indirect calls, bindings or code in
+other modules.
 These are bounded static observations, not runtime or peer-compatibility
 evidence. Field meanings, upstream collection construction and signature
 behavior remain unverified.
@@ -421,12 +426,18 @@ remain to be recovered and independently verified.
   reference login ticket result, caller-supplied signer and raw-frame verifier.
   It verifies through that caller policy before decoding, then checks the
   reference envelope account, command and local sequence before classification.
+  It accepts a caller-provided ticket object and cannot prove that its ticket
+  bytes originated from the stated UIN; the caller must maintain that association.
   SSO header version and registration build version remain distinct. It closes
   the claimed socket and does not retry, mark the account online, authenticate
   the server or establish compatibility with the selected QQ build. Callback
   byte snapshots are wiped best-effort after completion or cancellation; the
-  callback may retain copies or continue its own side effects. These behaviors
-  have synthetic loopback coverage only.
+  callback may retain copies or continue its own side effects. A synthetic
+  two-socket test passes the login result directly to registration after the
+  login socket closes, and exercises success and raw-verifier rejection. Its
+  fabricated peer, keys and verification policy do not prove server identity or
+  wire compatibility. Chain-level timeout and no-replay behavior remain outside
+  that test; separate component tests cover selected timeout cases.
 - `src/direct/sso-register.ts` encodes the reference PC registration and SSO
   heartbeat bodies, and classifies a registration response using its command,
   SSO return code and exact `register success` message. Account and sequence
