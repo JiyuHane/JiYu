@@ -168,9 +168,9 @@ function inspectRegister(frame: Uint8Array, signedBody: Uint8Array): boolean {
 }
 
 describe('synthetic WT to SSO reference handoff', () => {
-    it.each([true, false])(
-        'uses a fresh registration socket; raw policy accepts=%s',
-        async (accept) => {
+    it.each(['accept', 'reject', 'abort', 'timeout'] as const)(
+        'uses a fresh registration socket; synthetic verifier=%s',
+        async (mode) => {
             let failed = false;
 
             const fail = () => {
@@ -267,6 +267,10 @@ describe('synthetic WT to SSO reference handoff', () => {
             }
 
             sensitive.push(...Object.values(loginResult.tickets));
+            const ticketSnapshots = Object.values(loginResult.tickets).map((ticket) =>
+                Uint8Array.from(ticket),
+            );
+            sensitive.push(...ticketSnapshots);
             expect(
                 loginResult.uin === '123' &&
                     loginResult.tickets.d2.length === 1 &&
@@ -299,9 +303,48 @@ describe('synthetic WT to SSO reference handoff', () => {
             let verifyRequest = new Uint8Array();
             let verifyResponse = new Uint8Array();
             let policyValid = false;
+            let verifierEntered = false;
+            let entered!: () => void;
+            let release!: (value: boolean) => void;
+            const enteredGate = new Promise<void>((resolve) => {
+                entered = resolve;
+            });
+            const verifierGate = new Promise<boolean>((resolve) => {
+                release = resolve;
+            });
+            const controller = new AbortController();
             const decode = vi.spyOn(service, 'decodeServiceResponse');
             const write = vi.spyOn(socketB, 'write');
-            const result = await referenceRegister({
+            const verify = vi.fn(
+                (input: {
+                    uin: string;
+                    sequence: number;
+                    command: string;
+                    requestFrame: Uint8Array;
+                    responseFrame: Uint8Array;
+                }) => {
+                    verifyRequest = input.requestFrame;
+                    verifyResponse = input.responseFrame;
+                    policyValid =
+                        input.uin === '123' &&
+                        input.sequence === sequence &&
+                        input.command === SSO_INFO_SYNC_COMMAND &&
+                        decode.mock.calls.length === 0 &&
+                        input.requestFrame.some((byte) => byte !== 0) &&
+                        input.responseFrame.some((byte) => byte !== 0);
+                    verifierEntered = true;
+                    entered();
+
+                    if (mode === 'abort' || mode === 'timeout') {
+                        return verifierGate;
+                    }
+
+                    input.responseFrame.fill(0);
+                    return mode === 'accept' && policyValid;
+                },
+            );
+            let settlements = 0;
+            const pending = referenceRegister({
                 socket: socketB,
                 login: loginResult,
                 profile: { subAppId: 42, guid: Uint8Array.of(0xab, 0xcd), version: 'header-v' },
@@ -314,48 +357,102 @@ describe('synthetic WT to SSO reference handoff', () => {
                     random: 4,
                 },
                 sequence,
-                timeoutMs: 1500,
+                timeoutMs: 2000,
+                signal: controller.signal,
                 buildReserved: (input) => {
                     signerInput = input.body;
                     signedBody = Uint8Array.from(input.body);
                     sensitive.push(signedBody);
                     return input.body;
                 },
-                verifyRaw: (input) => {
-                    verifyRequest = input.requestFrame;
-                    verifyResponse = input.responseFrame;
-                    policyValid =
-                        input.uin === '123' &&
-                        input.sequence === sequence &&
-                        input.command === SSO_INFO_SYNC_COMMAND &&
-                        decode.mock.calls.length === 0;
-                    input.responseFrame.fill(0);
-                    return accept && policyValid;
-                },
+                verifyRaw: verify,
+            }).then((result) => {
+                settlements++;
+                return result;
             });
-            expect(
-                accept
-                    ? result.kind === 'response' &&
-                          result.value === 'success' &&
-                          result.writeState === 'written'
-                    : result.kind === 'failure' &&
-                          result.code === 'raw-rejected' &&
-                          result.writeState === 'unknown',
-            ).toBe(true);
-            expect(
-                registerCount === 1 &&
-                    registerValid &&
-                    policyValid &&
-                    !failed &&
-                    write.mock.calls.length === 1 &&
-                    socketB.closed,
-            ).toBe(true);
-            expect(decode.mock.calls.length === (accept ? 1 : 0)).toBe(true);
-            expect(
-                [signerInput, verifyRequest, verifyResponse].every(
-                    (v) => v.length > 0 && v.every((byte) => byte === 0),
-                ),
-            ).toBe(true);
+
+            try {
+                if (mode === 'abort' || mode === 'timeout') {
+                    await Promise.race([enteredGate, pending]);
+                    expect(verifierEntered).toBe(true);
+                    expect(registerCount === 1 && registerValid && policyValid).toBe(true);
+                    expect(write.mock.calls.length === 1 && decode.mock.calls.length === 0).toBe(
+                        true,
+                    );
+
+                    if (mode === 'abort') {
+                        controller.abort();
+                    }
+                }
+
+                const result = await pending;
+                expect(
+                    mode === 'accept'
+                        ? result.kind === 'response' &&
+                              result.value === 'success' &&
+                              result.writeState === 'written'
+                        : result.kind === 'failure' &&
+                              result.code ===
+                                  (mode === 'abort'
+                                      ? 'raw-cancelled'
+                                      : mode === 'timeout'
+                                        ? 'raw-timeout'
+                                        : 'raw-rejected') &&
+                              result.writeState === 'unknown',
+                ).toBe(true);
+                expect(
+                    registerCount === 1 &&
+                        registerValid &&
+                        policyValid &&
+                        !failed &&
+                        write.mock.calls.length === 1 &&
+                        socketB.closed,
+                ).toBe(true);
+                expect(decode.mock.calls.length === (mode === 'accept' ? 1 : 0)).toBe(true);
+                expect(verify).toHaveBeenCalledOnce();
+                expect(
+                    [signerInput, verifyRequest, verifyResponse].every(
+                        (v) => v.length > 0 && v.every((byte) => byte === 0),
+                    ),
+                ).toBe(true);
+                expect(
+                    Object.values(loginResult.tickets).every(
+                        (ticket, index) =>
+                            ticket.length === ticketSnapshots[index].length &&
+                            ticket.every((byte, offset) => byte === ticketSnapshots[index][offset]),
+                    ),
+                ).toBe(true);
+
+                // Releasing a callback does not cancel its own external side effects.
+                release(true);
+                await new Promise<void>((resolve) => setImmediate(resolve));
+                await new Promise<void>((resolve) => setImmediate(resolve));
+                expect(
+                    settlements === 1 &&
+                        registerCount === 1 &&
+                        write.mock.calls.length === 1 &&
+                        verify.mock.calls.length === 1 &&
+                        decode.mock.calls.length === (mode === 'accept' ? 1 : 0) &&
+                        !failed &&
+                        socketB.closed,
+                ).toBe(true);
+                expect(
+                    [signerInput, verifyRequest, verifyResponse].every((v) =>
+                        v.every((byte) => byte === 0),
+                    ),
+                ).toBe(true);
+                expect(
+                    Object.values(loginResult.tickets).every(
+                        (ticket, index) =>
+                            ticket.length === ticketSnapshots[index].length &&
+                            ticket.every((byte, offset) => byte === ticketSnapshots[index][offset]),
+                    ),
+                ).toBe(true);
+            } finally {
+                release(true);
+                controller.abort();
+                await pending;
+            }
         },
         10000,
     );

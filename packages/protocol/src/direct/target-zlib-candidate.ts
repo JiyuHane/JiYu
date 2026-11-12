@@ -30,6 +30,8 @@ const clearBytes = Uint8Array.prototype.fill;
 export function inflateTargetZlibCandidate(input: Uint8Array, maxOutputBytes: number): Uint8Array {
     let snapshot: Uint8Array | undefined;
     let decoded: Buffer | undefined;
+    let output: Uint8Array | undefined;
+    let transferred = false;
 
     try {
         if (
@@ -98,13 +100,22 @@ export function inflateTargetZlibCandidate(input: Uint8Array, maxOutputBytes: nu
             throw new RangeError('invalid output or trailing input');
         }
 
-        const output = new Uint8Array(decoded.byteLength);
+        output = new Uint8Array(decoded.byteLength);
         copyBytes.call(output, decoded);
+        transferred = true;
         return output;
     } catch {
         // A fixed message avoids exposing content or Node's input-dependent errors.
         throw new Error('target zlib candidate decoding failed');
     } finally {
+        try {
+            if (output && !transferred) {
+                clearBytes.call(output, 0);
+            }
+        } catch {
+            // Best effort only; preserve the operation's fixed error.
+        }
+
         try {
             if (snapshot) {
                 clearBytes.call(snapshot, 0);

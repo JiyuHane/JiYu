@@ -116,7 +116,22 @@ ELF's 885 defined default/protected dynamic exports contains no symbol whose
 value equals `0x6613200` or `0x66137b0` (REA evidence
 `ev_6829f3d51f172faae17c5de300ab034d8496bae4e5913bea953c39d2f68b7722`).
 This does not rule out local/hidden symbols, indirect calls, bindings or code in
-other modules.
+other modules. In separate bounded instruction windows, the exported
+`notifyRefreshSign` and `clearSign` both obtain a receiver from global
+`0x9178fa8` and call its virtual slot `+0x28`; neither inspected window directly
+calls `0x6613200` or `0x66137b0`. Their relationship to the object returned by
+`0x6613810` is still unknown, as are the dispatch targets and signing algorithm.
+The two constructed objects have separate virtual-table address points at
+`0x902c6c8` and `0x902c7c8`; ELF relative relocations put `0x6713850` and
+`0x6713c00` in their respective `+0x30` slots. Local instruction windows make
+these slots candidate execution methods, not observed runtime calls. Both load
+a receiver from global `0x9177e20`; their inspected callees did not establish a
+connection to the signer setter. The dispatch receiver's `+0x28` and the
+constructed objects' `+0x30` slots belong to different objects. The inspected
+candidate paths both access the second receiver's `+0x30` and call `0x6725fb0`;
+the clear path's subsequent pointer/count changes and releases are consistent
+with deleting a node from an associated structure. This does not establish the
+structure's business meaning or a link to the signing-manager setter.
 These are bounded static observations, not runtime or peer-compatibility
 evidence. Field meanings, upstream collection construction and signature
 behavior remain unverified.
@@ -283,13 +298,23 @@ remain to be recovered and independently verified.
   inflate candidate with caller-selected output limit and a 16 MiB local cap on
   input and output. It rejects trailing data using Node's consumed-byte count.
   It neither follows the target's retry policy nor establishes the target's
-  runtime zlib binding, accepted format or trailing-byte semantics, and it is
-  not automatically wired into a response parser. A synthetic integration test
-  explicitly composes the prefix probe, business wrapper and candidate inflate;
+  runtime zlib binding, accepted format or trailing-byte semantics. The explicit
+  transform described below can invoke it only when requested. A synthetic
+  integration test separately composes the prefix probe, business wrapper and candidate inflate;
   that test also composes the basic prefix for a synthetic zero-selector case.
   It assumes no conditional four-byte skip, whose target applicability depends
   on a separate string-collection lookup; it does not infer a compression flag,
   prove full native header/reserve decoding, or authenticate a peer.
+- `src/direct/target-response-transform.ts` composes the strict head and business
+  wrapper parsers for an already caller-accepted view. The caller explicitly
+  chooses a final skip of zero or four bytes and a compression policy; a set
+  low flag bit triggers the zlib candidate only when explicitly selected. The
+  returned offsets leave outer trailing bytes to the caller. As local resource
+  policies, the entire input view—including those trailing bytes—and the chosen
+  output budget are each capped at 16 MiB; the budget also applies to unchanged
+  bodies. This is stricter than separately bounded fields and is not a target
+  limit. The transform does not authenticate, establish the lookup decision,
+  prove native decompression behavior or verify QQ interoperability.
 - `src/direct/target-service-business.ts` frames a nonempty raw request body as
   `BE32(body length + 4) || body` for the observed main-request path. The
   standalone helper's empty-body behavior differs from the main entry; this
@@ -434,10 +459,12 @@ remain to be recovered and independently verified.
   byte snapshots are wiped best-effort after completion or cancellation; the
   callback may retain copies or continue its own side effects. A synthetic
   two-socket test passes the login result directly to registration after the
-  login socket closes, and exercises success and raw-verifier rejection. Its
-  fabricated peer, keys and verification policy do not prove server identity or
-  wire compatibility. Chain-level timeout and no-replay behavior remain outside
-  that test; separate component tests cover selected timeout cases.
+  login socket closes, and exercises success, raw-verifier rejection, and
+  abort/timeout while the verifier is pending. In those synthetic failure cases,
+  the test observes no additional write or decode after releasing the verifier;
+  it does not establish arbitrary late-callback behavior or cancel effects
+  performed by the callback itself. Its fabricated peer and verification policy
+  do not prove server identity or wire compatibility.
 - `src/direct/sso-register.ts` encodes the reference PC registration and SSO
   heartbeat bodies, and classifies a registration response using its command,
   SSO return code and exact `register success` message. Account and sequence

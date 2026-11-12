@@ -1,6 +1,6 @@
 import { runInNewContext } from 'node:vm';
 import { deflateRawSync, deflateSync, gzipSync } from 'node:zlib';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
     inflateTargetZlibCandidate,
     MAX_TARGET_ZLIB_CANDIDATE_BYTES,
@@ -9,6 +9,39 @@ import {
 const failure = 'target zlib candidate decoding failed';
 
 describe('local bounded zlib candidate', () => {
+    it('clears an allocated output when the final copy fails', () => {
+        const NativeBytes = Uint8Array;
+        const input = NativeBytes.from(deflateSync(NativeBytes.of(97, 98, 99)));
+        const before = NativeBytes.from(input);
+        let allocated: Uint8Array | undefined;
+        let thrown: unknown;
+        const injected = new Proxy(NativeBytes, {
+            construct(target, args, newTarget) {
+                if (args.length === 1 && args[0] === 3) {
+                    allocated = new NativeBytes(1);
+                    allocated[0] = 0xa5;
+                    return allocated;
+                }
+
+                return Reflect.construct(target, args, newTarget);
+            },
+        });
+
+        vi.stubGlobal('Uint8Array', injected);
+
+        try {
+            inflateTargetZlibCandidate(input, 3);
+        } catch (error) {
+            thrown = error;
+        } finally {
+            vi.unstubAllGlobals();
+        }
+
+        expect(thrown).toEqual(new Error(failure));
+        expect(allocated).toEqual(NativeBytes.of(0));
+        expect(input).toEqual(before);
+    });
+
     it('decodes a known static zlib vector and independent binary output', () => {
         const vector = Uint8Array.of(
             0x78,

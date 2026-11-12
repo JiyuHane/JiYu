@@ -1,5 +1,5 @@
 import { runInNewContext } from 'node:vm';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
     decodeTargetServiceBusinessResponse,
     MAX_TARGET_SERVICE_BUSINESS_RESPONSE_BYTES,
@@ -8,6 +8,44 @@ import {
 const failure = 'target service business response decoding failed';
 
 describe('target-static raw service business response wrapper', () => {
+    it('clears an allocated body when constructing the source view fails', () => {
+        const NativeBytes = Uint8Array;
+        const input = NativeBytes.of(0, 0, 0, 7, 97, 98, 99);
+        const before = NativeBytes.from(input);
+        let allocated: Uint8Array | undefined;
+        let thrown: unknown;
+        const injected = new Proxy(NativeBytes, {
+            construct(target, args, newTarget) {
+                if (args[0] === input.buffer) {
+                    throw new Error('injected source failure');
+                }
+
+                const result = Reflect.construct(target, args, newTarget) as Uint8Array;
+
+                if (args[0] === 3) {
+                    allocated = result;
+                    allocated.fill(0xa5);
+                }
+
+                return result;
+            },
+        });
+
+        vi.stubGlobal('Uint8Array', injected);
+
+        try {
+            decodeTargetServiceBusinessResponse(input);
+        } catch (error) {
+            thrown = error;
+        } finally {
+            vi.unstubAllGlobals();
+        }
+
+        expect(thrown).toEqual(new Error(failure));
+        expect(allocated).toEqual(NativeBytes.of(0, 0, 0));
+        expect(input).toEqual(before);
+    });
+
     it('accepts an empty inclusive wrapper', () => {
         const input = Uint8Array.of(0, 0, 0, 4);
         const result = decodeTargetServiceBusinessResponse(input);

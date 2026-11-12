@@ -17,6 +17,7 @@ const sharedBufferLength = Object.getOwnPropertyDescriptor(
 )!.get!;
 const typedArrayValues = Uint8Array.prototype.values;
 const copyBytes = Uint8Array.prototype.set;
+const clearBytes = Uint8Array.prototype.fill;
 
 /**
  * Read only the raw inclusive-length business wrapper, not a complete response.
@@ -29,6 +30,9 @@ export function decodeTargetServiceBusinessResponse(
     input: Uint8Array,
     offset = 0,
 ): { body: Uint8Array; nextOffset: number } {
+    let body: Uint8Array | undefined;
+    let transferred = false;
+
     try {
         if (
             isProxy(input) ||
@@ -75,12 +79,22 @@ export function decodeTargetServiceBusinessResponse(
             throw new RangeError('invalid length');
         }
 
-        const body = new Uint8Array(length - 4);
+        body = new Uint8Array(length - 4);
         const source = new Uint8Array(buffer, byteOffset + offset + 4, length - 4);
         copyBytes.call(body, source);
-        return { body, nextOffset: offset + length };
+        const result = { body, nextOffset: offset + length };
+        transferred = true;
+        return result;
     } catch {
         // Do not expose input-dependent exceptions or caller-controlled objects.
         throw new Error('target service business response decoding failed');
+    } finally {
+        try {
+            if (body && !transferred) {
+                clearBytes.call(body, 0);
+            }
+        } catch {
+            // Best effort only; preserve the fixed error.
+        }
     }
 }
