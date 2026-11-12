@@ -1,7 +1,8 @@
 import { Hono } from 'hono';
 import type { HttpBindings } from '@hono/node-server';
 import type { UpdateService } from '../update/service';
-import { readUpdateSource, saveUpdateSource, testUpdateSources } from '../update/sources';
+import { readUpdateSource, saveUpdateSource } from '../update/sources';
+import { UPDATE_UNAVAILABLE } from '../update/jiyu-update-policy';
 import {
     normalizeUpdateSourceConfig,
     type UpdateSourceConfig,
@@ -31,22 +32,16 @@ export function updateRoutes(service: UpdateService, restart: () => void) {
             return c.json({
                 config,
                 saved: true,
-                applied: true,
-                online: true,
+                applied: false,
+                online: false,
                 errors: [],
-                message: '更新来源已保存',
+                message: '更新来源已保存；Jiyu 更新暂不可用，配置尚未生效',
             });
         } catch (error) {
             return c.json({ message: error instanceof Error ? error.message : String(error) }, 500);
         }
     });
-    app.post('/sources/test', async (c) => {
-        try {
-            return c.json({ results: await testUpdateSources(await c.req.json()) });
-        } catch (error) {
-            return c.json({ message: error instanceof Error ? error.message : String(error) }, 400);
-        }
-    });
+    app.post('/sources/test', (c) => c.json({ message: UPDATE_UNAVAILABLE }, 503));
     app.post('/download', async (c) => {
         let body: unknown;
 

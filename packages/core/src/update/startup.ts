@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import path from 'node:path';
-import { applyPendingUpdate } from './files';
+import { assertNoLegacyUpdate } from './jiyu-update-policy';
 
 export const RESTART_EXIT_CODE = 75;
 
@@ -32,11 +32,7 @@ export async function runApplication(root: string): Promise<void> {
 
     try {
         do {
-            const version = await applyPendingUpdate(root);
-
-            if (version) {
-                console.info(`[Update] 已更新至 v${version}`);
-            }
+            await assertNoLegacyUpdate(root);
 
             if (stopping) {
                 break;

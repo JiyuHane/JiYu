@@ -24,6 +24,7 @@ import { initWebUI } from './webui/server';
 import { bindSystemFaceCatalog } from './sys-face-catalog';
 import { logRuntimeIntegrity } from './runtime-integrity-log';
 import { RESTART_EXIT_CODE, runApplication } from './update/startup';
+import { assertNoLegacyUpdate } from './update/jiyu-update-policy';
 
 const log = createLogger('App');
 const updateRoot =
@@ -255,8 +256,15 @@ if (isMessageStoreMigrationWorkerData(workerData)) {
 } else if (updateRoot && !process.env.SNOWLUMA_UPDATE_ROOT) {
     void runApplication(updateRoot);
 } else {
-    installProcessGuards();
-    main().catch(async (error) => {
+    void (async () => {
+        // A packaged process may be launched with the supervisor environment already set.
+        if (updateRoot) {
+            await assertNoLegacyUpdate(updateRoot);
+        }
+
+        installProcessGuards();
+        await main();
+    })().catch(async (error) => {
         log.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
         await closeLogger();
         process.exit(1);

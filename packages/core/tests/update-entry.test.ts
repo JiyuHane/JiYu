@@ -37,6 +37,14 @@ beforeAll(async () => {
     const fixture = path.join(compiled, 'fixture.ts').replaceAll('\\', '/');
     await writeFile(fixture, '');
 
+    await build({
+        ...config,
+        configFile: false,
+        logLevel: 'silent',
+        plugins: [],
+        build: { ...config.build, outDir: path.join(compiled, 'actual') },
+    });
+
     for (const version of ['1.0.0', '2.0.0']) {
         let loadedFixture = false;
         await build({
@@ -67,6 +75,10 @@ beforeAll(async () => {
                         if (process.env.UPDATE_TEST_MODE === 'restart' && version === '1.0.0') {
                             const staging = await updateDirectory(root);
                             fs.cpSync(path.join(root, 'candidate'), path.join(staging, 'pending'), {recursive:true});
+                            fs.writeFileSync(path.join(root, 'old-pid'), String(process.pid));
+                            process.exit(RESTART_EXIT_CODE);
+                        }
+                        if (process.env.UPDATE_TEST_MODE === 'plain-restart' && !fs.existsSync(path.join(root, 'old-pid'))) {
                             fs.writeFileSync(path.join(root, 'old-pid'), String(process.pid));
                             process.exit(RESTART_EXIT_CODE);
                         }
@@ -125,13 +137,17 @@ afterEach(async () => {
     await rm(staging, { recursive: true, force: true });
 });
 
-function run(mode = '', args: string[] = []) {
+function run(mode = '', args: string[] = [], direct = false) {
     return new Promise<{ code: number | null; output: string }>((resolve, reject) => {
         const child = spawn(process.execPath, [path.join(root, 'index.mjs'), ...args], {
             cwd: os.tmpdir(),
             stdio: 'pipe',
             windowsHide: true,
-            env: { ...process.env, UPDATE_TEST_MODE: mode },
+            env: {
+                ...process.env,
+                UPDATE_TEST_MODE: mode,
+                ...(direct ? { SNOWLUMA_UPDATE_ROOT: 'untrusted-external-root' } : {}),
+            },
         });
         let output = '';
         child.stdout.on('data', (data: Buffer) => {
@@ -165,28 +181,46 @@ describe('packaged startup', () => {
         });
     });
 
-    it('waits for the old process to exit, applies the release, then executes the new code', async () => {
-        await candidate(path.join(root, 'candidate'));
-        const result = await run('restart', ['kept']);
+    it('restarts the existing application when no update is pending', async () => {
+        const result = await run('plain-restart', ['kept']);
         expect(result.code, result.output).toBe(0);
-        expect(result.output).toContain('已更新至 v2.0.0');
-        expect(JSON.parse(result.output.trim().split('\n').at(-1)!)).toMatchObject({
-            version: '2.0.0',
+        expect(JSON.parse(result.output)).toMatchObject({
+            version: '1.0.0',
             args: ['kept'],
             oldAlive: false,
         });
-        expect(JSON.parse(await readFile(path.join(root, 'release.json'), 'utf8')).version).toBe(
-            '2.0.0',
-        );
-        expect(await exists(staging)).toBe(false);
     });
 
-    it('applies an already staged update on ordinary startup', async () => {
+    it('stops instead of applying a release staged during restart', async () => {
+        await candidate(path.join(root, 'candidate'));
+        const result = await run('restart', ['kept']);
+        expect(result.code, result.output).toBe(1);
+        expect(result.output).toContain('可能已部分应用');
+        expect(result.output).not.toContain('"version":"2.0.0"');
+        expect(JSON.parse(await readFile(path.join(root, 'release.json'), 'utf8')).version).toBe(
+            '1.0.0',
+        );
+        expect(await exists(path.join(staging, 'pending/payload/index.mjs'))).toBe(true);
+    });
+
+    it('stops before executing either payload on ordinary startup', async () => {
         await candidate(path.join(staging, 'pending'));
         const result = await run();
-        expect(result.code, result.output).toBe(0);
-        expect(result.output).toContain('"version":"2.0.0"');
+        expect(result.code, result.output).toBe(1);
+        expect(result.output).toContain('旧更新待处理');
+        expect(result.output).not.toContain('"version":"2.0.0"');
         expect(result.output).not.toContain('"version":"1.0.0"');
+        expect(await exists(path.join(staging, 'pending/payload/index.mjs'))).toBe(true);
+    });
+
+    it('guards the real packaged entry even with an inherited supervisor environment', async () => {
+        await cp(path.join(compiled, 'actual/index.mjs'), path.join(root, 'index.mjs'));
+        await candidate(path.join(staging, 'pending'));
+        const result = await run('', [], true);
+        expect(result.code, result.output).toBe(1);
+        expect(result.output).toContain('可能已部分应用');
+        expect(await exists(path.join(staging, 'pending/payload/index.mjs'))).toBe(true);
+        expect(await exists(path.join(root, 'config'))).toBe(false);
     });
 
     it('propagates an application failure without restarting it', async () => {

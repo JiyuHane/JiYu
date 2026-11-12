@@ -59,7 +59,8 @@ describe('update source routes', () => {
         expect(await response.json()).toMatchObject({
             config: normalized,
             saved: true,
-            applied: true,
+            applied: false,
+            online: false,
             errors: [],
         });
         expect(readRuntimeConfig()).toMatchObject({
@@ -77,9 +78,8 @@ describe('update source routes', () => {
             vi.stubGlobal('fetch', fetchMock);
             const app = await routes();
 
-            for (const endpoint of ['/sources', '/sources/test']) {
-                expect((await app.request(endpoint, { method: 'POST', body })).status).toBe(400);
-            }
+            expect((await app.request('/sources', { method: 'POST', body })).status).toBe(400);
+            expect((await app.request('/sources/test', { method: 'POST', body })).status).toBe(503);
 
             expect(fetchMock).not.toHaveBeenCalled();
             expect(fs.existsSync('config/runtime.json')).toBe(false);

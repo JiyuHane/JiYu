@@ -101,8 +101,7 @@ import {
     sniffImageMime,
     writeBackgroundImage,
 } from './ui-config';
-import { getUpdateInfo } from '../update/check';
-import { createUpdateService } from '../update/service';
+import { getJiyuUpdateInfo, createJiyuUpdateService } from '../update/jiyu-update-policy';
 import { updateRoutes } from './update-routes';
 import { buildFullTraceDownload } from './log-export';
 import { loadNotificationsConfig, saveNotificationsConfig } from '../notifications/config';
@@ -1291,10 +1290,7 @@ export async function initWebUI(
         return c.json({ status: 'running' });
     });
 
-    const updater = await createUpdateService(
-        listener.restart ? listener.updateRoot : undefined,
-        APP_VERSION,
-    );
+    const updater = await createJiyuUpdateService(APP_VERSION);
     app.route(
         '/api/update',
         updateRoutes(updater, () => listener.restart?.()),
@@ -1302,7 +1298,7 @@ export async function initWebUI(
 
     app.get('/api/update/check', async (c) => {
         const force = c.req.query('force') === 'true' || c.req.query('force') === '1';
-        return c.json(await getUpdateInfo(force));
+        return c.json(await getJiyuUpdateInfo(force));
     });
 
     let lastCpuTimes: { idle: number; total: number }[] | null = null;

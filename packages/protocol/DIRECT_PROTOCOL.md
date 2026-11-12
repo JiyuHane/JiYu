@@ -91,6 +91,15 @@ The child container comes from the request object's pointer at `+0x98`, not
 from the head context: its string offsets `+0x30`, `+0x00`, and `+0x18` feed
 child fields 1, 2, and 3 respectively, when nonempty. This permutation is a
 memory-layout observation, not evidence of signature or other business meaning.
+The same `req + 0x98` container is also read by the bounded path beginning at
+`0x666a830`; its constructor, population source and any relationship to signing
+remain unknown. A caller at `0x66678b0` invokes a virtual slot compatible with the
+observed V12 head encoder, but static inspection did not establish its runtime
+receiver type or complete calling chain. A separately bounded wrapper path
+at `0x6664434` passes a stack request to `0x66672f0`; immediately before that,
+`0x6664411` calls `0x6665a90` with a destination at request `+0x98` and a
+stack-sourced input. The helper's actual writes and that input's origin are
+not yet established.
 These are bounded static observations, not runtime or peer-compatibility
 evidence. Field meanings, upstream collection construction and signature
 behavior remain unverified.
@@ -171,7 +180,14 @@ selector 1 or 2 and never selects or falls back between keys. Selector 0
 requires the key value to be absent or `undefined`. It returns only an
 unauthenticated plaintext candidate, requires the caller to verify the original
 frame independently, and enforces its own nonempty and size policies. This is
-not an exact implementation of the native two-candidate retry behavior.
+not an exact implementation of the native two-candidate retry behavior. The
+current strict raw transport independently requires an inclusive length in the
+first frame word; target-static `DecodeBasic` did not establish that check, so
+this transport constraint must not be mistaken for a target validation rule.
+A synthetic loopback test exercises the transport callbacks with basic parsing,
+a single caller-supplied TEA key, strict head parsing, business framing and
+explicit candidate inflation. Its verifier compares a fabricated fixture and
+is not peer authentication; it does not establish QQ interoperability.
 
 A bounded x86-64 disassembly also shows a `lea` at module-relative address
 `0x34f8b6e` referring to `wtlogin_ecdh_session.cc`, near references to
