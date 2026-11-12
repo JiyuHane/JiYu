@@ -87,6 +87,10 @@ field 13 by presence without a nonempty check, `0x8b47741–0x8b47768` and
 sets field 21 to 32 when both flags hold, `0x666a465–0x666a484` forwards field
 26 when its presence flag is set without testing its value, and
 `0x666a660–0x666a6bb` checks the three child strings before creating field 24.
+The child container comes from the request object's pointer at `+0x98`, not
+from the head context: its string offsets `+0x30`, `+0x00`, and `+0x18` feed
+child fields 1, 2, and 3 respectively, when nonempty. This permutation is a
+memory-layout observation, not evidence of signature or other business meaning.
 These are bounded static observations, not runtime or peer-compatibility
 evidence. Field meanings, upstream collection construction and signature
 behavior remain unverified.
@@ -102,10 +106,14 @@ Upstream body semantics and full native overflow/allocation behavior remain
 unknown.
 
 On the response side, bounded inspection of `0x6668330` shows an initial call
-to `DecodeBasic` at `0x6668a50`, followed by a check that the consumed basic
-length is smaller than the received buffer. A nonzero byte in the decoded basic
-structure selects `0x666c5a0` on the remaining bytes and requires nonempty
-output; the zero branch keeps the remainder. The resulting span is passed to
+to `DecodeBasic` at `0x6668a50`. In that input span it reads two BE32 words
+at offsets 0 and 4, one byte each at 8 and 9, and a byte string beginning with
+an inclusive BE32 length at 10. Lengths below 4 fail; 4 represents an empty
+string. On success its consumed length is `10 + string length`, which the caller
+requires to be smaller than the input span. The first word is not compared with
+the input length on this path, and the string's semantics are not established.
+The byte at offset 8 selects `0x666c5a0` when nonzero, operating on the remaining
+bytes and requiring nonempty output; the zero branch keeps the remainder. The resulting span is passed to
 `DecodeRspHead` at `0x6668b50`, and its consumed length is checked against the
 span before additional processing and a call to `0x6668d00`. The helper
 `0x6669a10` reads an inclusive BE32 business length: values below four fail,
@@ -119,12 +127,51 @@ wrapping is a reasonable inference, but the actual runtime binding, version,
 supported input formats, dictionary and trailing-byte behavior remain unknown.
 No absolute output limit was established on this path. The preceding length
 helper also adjusts allocation before checking the read result; these static
-observations are not a resource-safety guarantee. A later diagnostic uses a decoded BE32 head field
-as `seq_id`, but its binding to a particular request is unproven. The decrypt
-selector value 2 references the same fixed data location as the outbound branch,
-without proving the outbound classifier and response selector always correspond.
-This establishes local decoding stages, not server authentication or response
-compatibility.
+observations are not a resource-safety guarantee. In `DecodeRspHead`, the
+declared inclusive head length is checked against the whole incoming span and
+the reader then resets its position to byte 4. The next BE32, at bytes 4–7, is used by a later
+`seq_id` diagnostic; the following BE32 is at bytes 8–11. The reader is not
+restricted to the declared head boundary while decoding the remaining fields,
+so a short declared head can overlap bytes subsequently treated as business
+body. A final BE32 read's success is also ignored before returning success.
+These are static observations of the selected implementation, not validation
+rules to copy into a new parser. In particular, the sequence's binding to a
+particular request remains unproven. The next three fields are inclusive-BE32
+length-delimited byte strings, followed by a BE32 word stored at `+0x58`, then
+an inclusive-BE32 byte vector. On the inspected path, the low bit controlling
+optional decompression comes directly from that word. A final BE32 read into
+`+0x78` is attempted without checking its return value; the decoder leaves its
+prior destination value unchanged if fewer than four bytes remain. These byte
+strings and the final word retain unknown business semantics.
+
+For the V12 path, `DecodeRspHead` reads a length-delimited byte vector into its
+output; the inclusive four-byte length is not included in the vector. The V12
+virtual slot `+0x28` resolves to `0x6669900`, which forwards that vector to
+`0x666ad40`. An empty vector returns success without updating the initialized
+output; a nonempty vector is passed to a `CPBMessageOpti` parser, and failure
+stops packet decoding. On success, the caller compares an extracted head string
+against a local collection. Only if that lookup succeeds and at least five bytes
+remain after the declared head does it skip four bytes before decoding the
+business wrapper. The skipped bytes are not checked on this branch. The
+collection's origin, complete reserve wire types and business meaning are not
+established; the conditional offset must not be inferred from synthetic headers.
+
+The decrypt caller bypasses `0x666c5a0` for selector 0. Inside that function,
+selector 1 takes a primary 16-byte candidate from one context object's `+0x78`
+and, only after the first decryption fails, may try a second object's `+0x78`;
+an absent primary immediately fails. Selector 2 references the same fixed data
+location as the outbound class-2 branch. Other values fail in the callee. The
+selected decrypt routine checks a minimum 16-byte, eight-byte-aligned input and
+seven trailing zero bytes. These observations neither identify the objects or
+key lifecycle nor prove that outbound classifier and response selector always
+correspond. QQ-TEA framing checks are not server authentication, and static
+inspection does not establish runtime response compatibility. The local
+`target-service-decrypt-candidate.ts` accepts one explicitly supplied key for
+selector 1 or 2 and never selects or falls back between keys. Selector 0
+requires the key value to be absent or `undefined`. It returns only an
+unauthenticated plaintext candidate, requires the caller to verify the original
+frame independently, and enforces its own nonempty and size policies. This is
+not an exact implementation of the native two-candidate retry behavior.
 
 A bounded x86-64 disassembly also shows a `lea` at module-relative address
 `0x34f8b6e` referring to `wtlogin_ecdh_session.cc`, near references to
@@ -173,6 +220,25 @@ remain to be recovered and independently verified.
   is unverified. Head and reserve encoders best-effort clear their own temporary
   snapshots after success or failure; their returned buffers and caller input
   remain intact. This does not guarantee erasure of JS or Proton internal copies.
+- `src/direct/target-service-response-basic.ts` reads only the observed basic
+  prefix and length-delimited opaque bytes, retaining both words as unsigned
+  values and byte 9 without assigning it business meaning. The parser accepts
+  an exact-end basic segment; a packet caller still needs to enforce the
+  observed requirement for remaining bytes. Its 16 MiB cap applies to the
+  basic segment only, not the rest of the input. It neither treats the first
+  word as a frame length nor decrypts or authenticates the remainder.
+- `src/direct/target-sso12-response-head.ts` locally parses the three observed
+  length-delimited byte fields, the flags word and the reserve vector strictly
+  inside the declared head. The remaining bytes are preserved as an opaque tail;
+  no final word, business meaning, authentication or automatic decompression is
+  inferred. Unlike the observed native reader, this local parser rejects fields
+  that cross the declared head boundary. Its allocation cap is a local policy.
+- `src/direct/target-sso12-response-prefix.ts` probes only the first three
+  big-endian words of a candidate response head and returns the remaining
+  declared head bytes as an opaque copy. It locally requires at least 12 bytes
+  within the declared head, stricter than the observed native `L >= 5` behavior;
+  acceptance proves neither the rest of the head nor request binding or peer
+  identity. Its 16 MiB cap and input checks are local policies.
 - `src/direct/target-service-business-response.ts` parses one inclusive-length
   response business wrapper at a caller-selected offset and returns an independent
   body copy and next offset. A length of four is valid and produces an empty
@@ -180,6 +246,17 @@ remain to be recovered and independently verified.
   body allocation. It does not interpret the head flag, decompress the body,
   verify peer identity or bind the response to a request. Its 16 MiB cap and
   rejected shared buffers are local policies, not observed target limits.
+- `src/direct/target-zlib-candidate.ts` offers an explicit local zlib-wrapped
+  inflate candidate with caller-selected output limit and a 16 MiB local cap on
+  input and output. It rejects trailing data using Node's consumed-byte count.
+  It neither follows the target's retry policy nor establishes the target's
+  runtime zlib binding, accepted format or trailing-byte semantics, and it is
+  not automatically wired into a response parser. A synthetic integration test
+  explicitly composes the prefix probe, business wrapper and candidate inflate;
+  that test also composes the basic prefix for a synthetic zero-selector case.
+  It assumes no conditional four-byte skip, whose target applicability depends
+  on a separate string-collection lookup; it does not infer a compression flag,
+  prove full native header/reserve decoding, or authenticate a peer.
 - `src/direct/target-service-business.ts` frames a nonempty raw request body as
   `BE32(body length + 4) || body` for the observed main-request path. The
   standalone helper's empty-body behavior differs from the main entry; this
@@ -342,12 +419,26 @@ remain to be recovered and independently verified.
   `transactRaw()` offers a separate single-flight path that gives a bounded
   candidate wire frame to caller callbacks before the library decodes it. The
   returned sequence is the local allocation, not proof of a response match; the
-  caller must verify all semantics and peer trust. Callback context is caller-owned,
+  caller must verify all semantics and peer trust. The selected target's response
+  selector 1 and 2 key paths have separate static evidence but are not wired to
+  this reference transport; no key identity or selector/class equivalence should
+  be inferred. Callback context is caller-owned,
   and callback byte copies are best-effort wiped after use; a callback must make
-  its own copy of any bytes it needs to retain. `writeState: unknown` means a
-  write was attempted, not that the peer received or rejected it. Extra observed
-  data during this strict transaction closes the connection; external code must not
-  pause the owned socket or alter its reading mode. These checks cannot establish
+  its own copy of any bytes it needs to retain. Cleanup uses a captured typed-array
+  intrinsic and handles detached callback buffers independently, so replacing an
+  instance's `fill` method or transferring its backing does not prevent transaction
+  settlement. It does not erase transferred or other externally held copies.
+  Deadlines and abort handling run
+  on the JavaScript event loop: a synchronous callback can block them, and an
+  asynchronous callback can continue its own external side effects after the
+  transaction has timed out. Callers must stage effects until successful return
+  and implement any stronger cancellation independently. `writeState: unknown`
+  means a write was attempted, not that the peer received or rejected it. Extra observed
+  data during this strict transaction closes the connection. Request-frame input
+  rejects shared backing buffers and proxy-bearing prototype chains before copying;
+  prototype traversal is locally bounded to 256 levels and keeps the previous
+  local-realm view restriction. External code must not pause the owned socket or
+  alter its reading mode. These checks cannot establish
   when bytes still in the operating-system buffer arrived. The client cannot verify
   that an opaque body was built for the same account and device profile; an
   eventual login orchestrator must enforce that relationship. This reference-only

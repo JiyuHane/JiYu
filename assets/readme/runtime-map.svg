@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="440" viewBox="0 0 1200 440" role="img" aria-labelledby="map-title map-desc">
-  <title id="map-title">SnowLuma 运行链路</title>
+  <title id="map-title">霁羽运行链路</title>
   <desc id="map-desc">QQ 进程接入后，数据经过协议桥接、OneBot 标准化，再分发到 WebSocket、HTTP、WebUI、SDK 与 MCP。</desc>
 
   <defs>
@@ -30,7 +30,7 @@
 
   <g transform="translate(54 42)">
     <text class="mono" x="0" y="0" fill="#6e819b" font-size="13" letter-spacing="2">RUNTIME MAP · FROM SESSION TO CONSUMER</text>
-    <text class="sans" x="0" y="45" fill="#14223a" font-size="34" font-weight="720">一条事件如何穿过 SnowLuma</text>
+    <text class="sans" x="0" y="45" fill="#14223a" font-size="34" font-weight="720">一条事件如何穿过霁羽</text>
     <text class="sans" x="0" y="75" fill="#63758e" font-size="16">每层只承担一种职责，多个 QQ 账号各自拥有独立、可追踪的会话链路。</text>
   </g>
 

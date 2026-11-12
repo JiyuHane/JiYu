@@ -1,5 +1,6 @@
 import type { Socket } from 'node:net';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { types as utilTypes } from 'node:util';
 import type { SendPacketResult } from '@snowluma/common/packet-sender';
 import {
     decodeServiceResponse,
@@ -107,6 +108,48 @@ const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
 const byteLengthGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get!;
 const byteOffsetGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get!;
 const bufferGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
+const tagGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, Symbol.toStringTag)!.get!;
+const sharedByteLengthGetter = Object.getOwnPropertyDescriptor(
+    SharedArrayBuffer.prototype,
+    'byteLength',
+)!.get!;
+const isArrayBufferView = ArrayBuffer.isView;
+const typedArrayValues = Uint8Array.prototype.values;
+const fillBytes = Uint8Array.prototype.fill;
+const getPrototype = Object.getPrototypeOf;
+const isProxy = utilTypes.isProxy;
+const uint8Prototype = Uint8Array.prototype;
+
+function hasLocalUint8Prototype(value: object): boolean {
+    let current: object | null = value;
+
+    // Bound traversal and reject proxy prototypes before accessing their traps.
+    for (let depth = 0; depth < 256 && current !== null; depth++) {
+        if (isProxy(current)) {
+            return false;
+        }
+
+        if (current === uint8Prototype) {
+            return true;
+        }
+
+        current = getPrototype(current) as object | null;
+    }
+
+    return false;
+}
+
+function wipeRawBuffer(buffer: Uint8Array | undefined): void {
+    if (!buffer) {
+        return;
+    }
+
+    try {
+        fillBytes.call(buffer, 0);
+    } catch {
+        // A callback can detach its copy; continue cleaning the remaining buffers.
+    }
+}
 
 type Pending = {
     sequence: number;
@@ -541,7 +584,7 @@ export class Sso12PacketClient {
                                     verify(first, context, identity),
                                 );
                             } finally {
-                                first.fill(0);
+                                wipeRawBuffer(first);
 
                                 if (pending.callbackCopy === first) {
                                     pending.callbackCopy = undefined;
@@ -570,7 +613,7 @@ export class Sso12PacketClient {
                                     consume(second, context, identity),
                                 );
                             } finally {
-                                second.fill(0);
+                                wipeRawBuffer(second);
 
                                 if (pending.callbackCopy === second) {
                                     pending.callbackCopy = undefined;
@@ -594,7 +637,7 @@ export class Sso12PacketClient {
 
                             this.rawPending = undefined;
                             clearTimeout(pending.timer);
-                            candidate.fill(0);
+                            wipeRawBuffer(candidate);
                             pending.candidate = undefined;
                             resolve({ kind: 'response', sequence, value, writeState: 'written' });
                         } catch {
@@ -616,9 +659,9 @@ export class Sso12PacketClient {
                     this.rawPending = undefined;
                     clearTimeout(pending.timer);
                     this.removeRawAbort(pending);
-                    pending.candidate?.fill(0);
-                    pending.callbackCopy?.fill(0);
-                    pending.requestFrame?.fill(0);
+                    wipeRawBuffer(pending.candidate);
+                    wipeRawBuffer(pending.callbackCopy);
+                    wipeRawBuffer(pending.requestFrame);
                     resolve({
                         kind: 'failure',
                         code,
@@ -731,15 +774,33 @@ export class Sso12PacketClient {
                         return;
                     }
 
-                    if (!(frameInput instanceof Uint8Array)) {
+                    if (
+                        !isArrayBufferView(frameInput) ||
+                        tagGetter.call(frameInput) !== 'Uint8Array' ||
+                        !hasLocalUint8Prototype(frameInput)
+                    ) {
                         throw new Error('invalid');
                     }
 
+                    // The intrinsic detects detached and out-of-bounds resizable views.
+                    typedArrayValues.call(frameInput);
                     const size = byteLengthGetter.call(frameInput) as number;
                     const offset = byteOffsetGetter.call(frameInput) as number;
-                    const buffer = bufferGetter.call(frameInput) as ArrayBuffer;
+                    const buffer = bufferGetter.call(frameInput) as ArrayBuffer | SharedArrayBuffer;
+                    let shared = true;
 
-                    if (size < 14 || size > this.maxWrite || size > MAX_SERVICE_FRAME_BYTES) {
+                    try {
+                        sharedByteLengthGetter.call(buffer);
+                    } catch {
+                        shared = false;
+                    }
+
+                    if (
+                        shared ||
+                        size < 14 ||
+                        size > this.maxWrite ||
+                        size > MAX_SERVICE_FRAME_BYTES
+                    ) {
                         throw new Error('invalid');
                     }
 
@@ -785,7 +846,7 @@ export class Sso12PacketClient {
 
                     try {
                         this.socket.write(frame, (error?: Error | null) => {
-                            frame.fill(0);
+                            wipeRawBuffer(frame);
 
                             if (pending.requestFrame === frame) {
                                 pending.requestFrame = undefined;

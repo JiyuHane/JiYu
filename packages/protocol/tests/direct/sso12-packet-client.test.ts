@@ -1,5 +1,6 @@
 import { createServer, createConnection, type Server, type Socket } from 'node:net';
 import { once } from 'node:events';
+import { runInNewContext } from 'node:vm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
     Sso12PacketClient,
@@ -325,6 +326,26 @@ describe('strict raw-before-decode reference transaction', () => {
         verifyCandidate: async (value: Uint8Array) => Buffer.from(value).equals(candidate),
         consumeCandidate: async (_value: Uint8Array, context: { id: number }) => context.id,
     });
+    type Mutation = 'detach' | 'getter' | 'throw' | 'non-function';
+    const mutate = (data: Uint8Array, mutation: Mutation): void => {
+        if (mutation === 'detach') {
+            structuredClone(data.buffer, { transfer: [data.buffer] });
+        } else if (mutation === 'getter') {
+            Object.defineProperty(data, 'fill', {
+                get: () => {
+                    throw new Error('getter');
+                },
+            });
+        } else if (mutation === 'throw') {
+            Object.defineProperty(data, 'fill', {
+                value: () => {
+                    throw new Error('fill');
+                },
+            });
+        } else {
+            Object.defineProperty(data, 'fill', { value: 1 });
+        }
+    };
     it('reassembles bytewise, presents raw bytes before any decode, and isolates both callback copies', async () => {
         const classifier = vi.fn(() => 'response' as const);
         const { client } = await setup(
@@ -360,6 +381,160 @@ describe('strict raw-before-decode reference transaction', () => {
             value: 'consumed',
         });
         expect(classifier).not.toHaveBeenCalled();
+    });
+    it.each(
+        (['verify', 'consume'] as const).flatMap((phase) =>
+            (['detach', 'getter', 'throw', 'non-function'] as const).map(
+                (mutation) => [phase, mutation] as const,
+            ),
+        ),
+    )('settles after %s callback copy mutation: %s', async (phase, mutation) => {
+        const { client } = await setup((peer) => peer.write(candidate));
+        const returned = { owned: Uint8Array.of(5, 6) };
+        let verifyCopy!: Uint8Array;
+        let consumeCopy!: Uint8Array;
+        const consume = vi.fn((data: Uint8Array) => {
+            consumeCopy = data;
+            expect(Buffer.from(data)).toEqual(candidate);
+
+            if (phase === 'consume') {
+                mutate(data, mutation);
+            }
+
+            return returned;
+        });
+        const pending = client.transactRaw({
+            ...opts(),
+            verifyCandidate: (data) => {
+                verifyCopy = data;
+                expect(Buffer.from(data)).toEqual(candidate);
+
+                if (phase === 'verify') {
+                    mutate(data, mutation);
+                }
+
+                return true;
+            },
+            consumeCandidate: consume,
+        });
+        const result = await Promise.race([
+            pending,
+            new Promise<'unsettled'>((resolve) => setTimeout(() => resolve('unsettled'), 500)),
+        ]);
+        expect(result).toEqual({
+            kind: 'response',
+            sequence: 1,
+            value: returned,
+            writeState: 'written',
+        });
+        expect(consume).toHaveBeenCalledTimes(1);
+        expect([...returned.owned]).toEqual([5, 6]);
+        for (const [copy, copyPhase] of [
+            [verifyCopy, 'verify'],
+            [consumeCopy, 'consume'],
+        ] as const) {
+            if (mutation === 'detach' && phase === copyPhase) {
+                expect(copy.byteLength).toBe(0);
+            } else {
+                expect([...copy]).toEqual(Array(candidate.length).fill(0));
+            }
+        }
+    });
+    it.each(
+        (['verify', 'consume'] as const).flatMap((phase) =>
+            (['detach', 'getter', 'throw', 'non-function'] as const).flatMap((mutation) =>
+                (['error', 'abort'] as const).map((outcome) => [phase, mutation, outcome] as const),
+            ),
+        ),
+    )('cleans all staging on %s %s with %s', async (phase, mutation, outcome) => {
+        const controller = new AbortController();
+        const { client, socket } = await setup((peer) => peer.write(candidate));
+        const originalWrite = socket.write.bind(socket);
+        let finishWrite!: (error?: Error | null) => void;
+        let requestCopy!: Uint8Array;
+        vi.spyOn(socket, 'write').mockImplementation(((
+            frame: Uint8Array,
+            callback: typeof finishWrite,
+        ) => {
+            requestCopy = frame;
+            finishWrite = callback;
+            return originalWrite(frame);
+        }) as typeof socket.write);
+        let originalCandidate!: Uint8Array;
+        let callbackCopy!: Uint8Array;
+        let enter!: () => void;
+        let release!: () => void;
+        const entered = new Promise<void>((resolve) => {
+            enter = resolve;
+        });
+        const gate = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        const context = { id: 3, owned: Uint8Array.of(7, 8) };
+        const handle = async (data: Uint8Array): Promise<void> => {
+            expect(Buffer.from(data)).toEqual(candidate);
+            callbackCopy = data;
+            originalCandidate = (client as unknown as { rawPending: { candidate: Uint8Array } })
+                .rawPending.candidate;
+            mutate(data, mutation);
+            enter();
+
+            if (outcome === 'error') {
+                throw new Error('callback error');
+            }
+
+            await gate;
+        };
+        const pending = client.transactRaw({
+            ...opts(),
+            buildRequest: () => ({ frame: Buffer.from(wire), context }),
+            signal: controller.signal,
+            verifyCandidate: async (data) => {
+                if (phase === 'verify') {
+                    await handle(data);
+                }
+
+                return true;
+            },
+            consumeCandidate: async (data, receivedContext) => {
+                expect(receivedContext).toBe(context);
+                if (phase === 'consume') {
+                    await handle(data);
+                }
+
+                return receivedContext;
+            },
+        });
+        await entered;
+        expect(Buffer.from(originalCandidate)).toEqual(candidate);
+        expect(Buffer.from(requestCopy)).toEqual(wire);
+        if (outcome === 'abort') {
+            controller.abort();
+        }
+        expect(
+            await Promise.race([
+                pending,
+                new Promise<'unsettled'>((resolve) => setTimeout(() => resolve('unsettled'), 500)),
+            ]),
+        ).toEqual({
+            kind: 'failure',
+            code: outcome === 'abort' ? 'raw-cancelled' : 'raw-callback-failed',
+            writeState: 'unknown',
+        });
+        expect([...originalCandidate]).toEqual(Array(candidate.length).fill(0));
+        expect([...requestCopy]).toEqual(Array(wire.length).fill(0));
+        if (mutation === 'detach') {
+            expect(callbackCopy.byteLength).toBe(0);
+        } else {
+            expect([...callbackCopy]).toEqual(Array(candidate.length).fill(0));
+        }
+        expect([...context.owned]).toEqual([7, 8]);
+        release();
+        finishWrite();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect((await client.whenClosed).code).toBe(
+            outcome === 'abort' ? 'raw-cancelled' : 'raw-callback-failed',
+        );
     });
     it('rejects a paused socket before starting the raw transaction', async () => {
         const { client, socket } = await setup(() => {});
@@ -639,6 +814,161 @@ describe('strict raw-before-decode reference transaction', () => {
             binding: { sequence: 0, command: 'next' },
         });
     });
+    it.each(['same-realm', 'cross-realm', 'buffer'] as const)(
+        'rejects %s SharedArrayBuffer-backed request before write or verification',
+        async (realm) => {
+            const storage =
+                realm === 'cross-realm'
+                    ? (runInNewContext(
+                          `new SharedArrayBuffer(${wire.length})`,
+                      ) as SharedArrayBuffer)
+                    : new SharedArrayBuffer(wire.length);
+            const shared = realm === 'buffer' ? Buffer.from(storage) : new Uint8Array(storage);
+            shared.set(wire);
+            const received = vi.fn();
+            const { client, socket, peer } = await setup(received);
+            const writes = vi.spyOn(socket, 'write');
+            const verify = vi.fn(() => true);
+            const result = await client.transactRaw({
+                ...opts(),
+                timeoutMs: 250,
+                buildRequest: () => ({ frame: shared, context: { id: 1 } }),
+                verifyCandidate: verify,
+            });
+            expect(result).toEqual({
+                kind: 'failure',
+                code: 'raw-build-failed',
+                writeState: 'not-written',
+            });
+            expect(await client.whenClosed).toEqual({
+                kind: 'handler-error',
+                code: 'raw-build-failed',
+            });
+            expect(writes).not.toHaveBeenCalled();
+            expect(received).not.toHaveBeenCalled();
+            expect(verify).not.toHaveBeenCalled();
+            expect(peer.destroyed || socket.destroyed).toBe(true);
+            expect(Buffer.from(shared)).toEqual(wire);
+        },
+    );
+    it.each([
+        'proxy',
+        'revoked',
+        'detached',
+        'out-of-bounds',
+        'cross-realm-view',
+        'other-view',
+    ] as const)('rejects %s request before write without invoking proxy traps', async (kind) => {
+        const trap = vi.fn(() => {
+            throw new Error('proxy trap');
+        });
+        let input: Uint8Array;
+        if (kind === 'proxy' || kind === 'revoked') {
+            const wrapped = Proxy.revocable(Uint8Array.from(wire), {
+                getPrototypeOf: trap,
+                get: trap,
+            });
+            input = wrapped.proxy;
+            if (kind === 'revoked') {
+                wrapped.revoke();
+            }
+        } else if (kind === 'detached') {
+            input = Uint8Array.from(wire);
+            structuredClone(input.buffer, { transfer: [input.buffer] });
+        } else if (kind === 'out-of-bounds') {
+            const storage = new ArrayBuffer(wire.length, { maxByteLength: wire.length * 2 });
+            input = new Uint8Array(storage, 0, wire.length);
+            input.set(wire);
+            storage.resize(4);
+        } else if (kind === 'cross-realm-view') {
+            input = runInNewContext('new Uint8Array(18)') as Uint8Array;
+        } else {
+            input = new Uint16Array(18) as unknown as Uint8Array;
+        }
+        const { client, socket } = await setup(() => {});
+        const writes = vi.spyOn(socket, 'write');
+        const verify = vi.fn(() => true);
+        expect(
+            await client.transactRaw({
+                ...opts(),
+                timeoutMs: 250,
+                buildRequest: () => ({ frame: input, context: { id: 1 } }),
+                verifyCandidate: verify,
+            }),
+        ).toEqual({ kind: 'failure', code: 'raw-build-failed', writeState: 'not-written' });
+        expect(await client.whenClosed).toEqual({
+            kind: 'handler-error',
+            code: 'raw-build-failed',
+        });
+        expect(writes).not.toHaveBeenCalled();
+        expect(verify).not.toHaveBeenCalled();
+        expect(trap).not.toHaveBeenCalled();
+    });
+    it.each(['live', 'revoked', 'deep'] as const)(
+        'rejects a real view with %s unsafe prototype chain before writing',
+        async (kind) => {
+            const frame = Uint8Array.from(wire);
+            const trap = vi.fn(() => {
+                throw new Error('prototype trap');
+            });
+            if (kind === 'deep') {
+                let prototype: object = Uint8Array.prototype;
+                for (let depth = 0; depth < 300; depth++) {
+                    prototype = Object.create(prototype) as object;
+                }
+                Object.setPrototypeOf(frame, prototype);
+            } else {
+                const wrapped = Proxy.revocable(Object.create(Uint8Array.prototype) as object, {
+                    getPrototypeOf: trap,
+                });
+                Object.setPrototypeOf(frame, wrapped.proxy);
+                if (kind === 'revoked') {
+                    wrapped.revoke();
+                }
+            }
+            const { client, socket } = await setup(() => {});
+            const writes = vi.spyOn(socket, 'write');
+            const verify = vi.fn(() => true);
+            expect(
+                await client.transactRaw({
+                    ...opts(),
+                    timeoutMs: 250,
+                    buildRequest: () => ({ frame, context: { id: 1 } }),
+                    verifyCandidate: verify,
+                }),
+            ).toEqual({ kind: 'failure', code: 'raw-build-failed', writeState: 'not-written' });
+            expect(await client.whenClosed).toEqual({
+                kind: 'handler-error',
+                code: 'raw-build-failed',
+            });
+            expect(writes).not.toHaveBeenCalled();
+            expect(verify).not.toHaveBeenCalled();
+            expect(trap).not.toHaveBeenCalled();
+        },
+    );
+    it.each(['buffer', 'uint8array', 'subclass'] as const)(
+        'accepts ordinary %s request frames and preserves caller bytes',
+        async (kind) => {
+            class ByteSubclass extends Uint8Array {}
+            const frame =
+                kind === 'buffer'
+                    ? Buffer.from(wire)
+                    : kind === 'subclass'
+                      ? ByteSubclass.from(wire)
+                      : Uint8Array.from(wire);
+            const { client } = await setup((peer, bytes) => {
+                expect(Buffer.from(bytes)).toEqual(wire);
+                peer.write(candidate);
+            });
+            expect(
+                await client.transactRaw({
+                    ...opts(),
+                    buildRequest: () => ({ frame, context: { id: 4 } }),
+                }),
+            ).toMatchObject({ kind: 'response', value: 4, writeState: 'written' });
+            expect(Buffer.from(frame)).toEqual(wire);
+        },
+    );
     it('copies exact request bytes before reading a mutating context getter', async () => {
         const original = Buffer.from(wire);
         const { client } = await setup((peer, frame) => {

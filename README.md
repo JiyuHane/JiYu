@@ -2,17 +2,16 @@
 
 **雪霁捎信，连接不止。**
 
-霁羽是基于 SnowLuma 源码继续开发的 QQ 客户端 TypeScript 互操作运行时。<br>
+霁羽是独立维护的 QQ 互操作项目，使用 TypeScript 构建。<br>
 OneBot v11 · WebUI · SDK · MCP
 
-「霁」是风雪后的晴光，「羽」是继续传递消息的信使。霁羽为独立维护的接力项目，并非 SnowLuma 官方后继项目；感谢原项目作者与贡献者。
+「霁」是风雪后的晴光，「羽」是继续传递消息的信使。霁羽致力于让消息接入、协议研究和工具开发拥有清晰、可维护的边界。
 
 将 QQ 原生会话转换为 [OneBot v11](https://github.com/botuniverse/onebot-11) 动作与事件，通过 WebSocket、HTTP、WebUI、SDK 和 MCP 提供统一入口。
 
 多账号会话、消息与媒体、连接配置和实时日志，在一个运行时中管理。
 
-**[项目仓库](https://github.com/shizukugo/Jiyu)** · **[快速开始](#快速开始)** · **[独立协议研发进展](packages/protocol/DIRECT_PROTOCOL.md)**<br>
-[原项目部署指南](https://snowluma.github.io/zh/docs/guide/deploy) · [原项目动作参考](https://snowluma.github.io/zh/docs/api)
+**[项目仓库](https://github.com/shizukugo/Jiyu)** · **[快速开始](#快速开始)** · **[独立协议研发进展](packages/protocol/DIRECT_PROTOCOL.md)**
 
 目前运行时仍通过 QQ 客户端接入；不依赖客户端或 Hook 的独立协议正在研发。现有离线组件已覆盖部分协议封包和扫码数据处理，但独立登录及运行时接入尚未完成。
 
@@ -21,9 +20,9 @@ OneBot v11 · WebUI · SDK · MCP
 <br clear="both" />
 
 > [!CAUTION]
-> SnowLuma 是独立的第三方项目，与腾讯 / QQ 无隶属或授权关系。项目仅供学习与技术研究，请遵守《QQ 用户协议》及适用法律；软件按“现状”提供，使用风险自负。详见 [`EULA.md`](EULA.md)。
+> **霁羽（Jiyu）是独立的第三方项目，与腾讯 / QQ 无隶属或授权关系。**项目仅供学习与技术研究，请遵守《QQ 用户协议》及适用法律；软件按“现状”提供，使用风险自负。详见 [`EULA.md`](EULA.md)。
 >
-> **Disclaimer:** SnowLuma is independent of Tencent / QQ and is provided for study and research only, “as is” and without warranty.
+> **Disclaimer:** Jiyu is an independent third-party project, unaffiliated with Tencent / QQ. It is provided for study and research only, “as is” and without warranty.
 
 ## 核心能力
 
@@ -37,7 +36,7 @@ OneBot v11 · WebUI · SDK · MCP
 
 ## 运行链路
 
-下图沿用原项目的运行链路示意；图中的 SnowLuma 指本项目所继承的现有架构。
+下图展示当前运行时从 QQ 会话到应用接入的处理链路。
 
 <p align="center">
   <img src="./assets/readme/runtime-map.svg" width="100%" alt="QQ 会话经过协议桥接与 OneBot 标准化后连接到 WebSocket、HTTP、WebUI、SDK 和 MCP" />
@@ -65,7 +64,7 @@ OneBot v11 · WebUI · SDK · MCP
 
 3. 打开 [`http://localhost:5099`](http://localhost:5099)，使用启动日志中的初始密码登录 WebUI，按引导接入 QQ 进程并配置 OneBot 连接。
 
-霁羽的发行包尚未发布；历史上游链接仅供参考。
+霁羽的发行包尚未发布。每次分支推送会触发独立 Docker 镜像构建和基础检查；目前仅构建 `linux/amd64` 镜像，不发布至镜像仓库。镜像不包含 QQ 或图形环境，实际接入仍依赖相应的进程和运行环境。
 
 账号识别由登录数据库的文件变化、进程和登录事件或手动操作触发，不做周期探测。未载入的 QQ 进程也不会持续调用 Windows Restart Manager；需要重查时可点击 WebUI 进程行的刷新/重连。
 
@@ -73,8 +72,8 @@ OneBot v11 · WebUI · SDK · MCP
 
 | 入口 | 文档 |
 | --- | --- |
-| WebSocket / HTTP | [原项目 OneBot 动作参考](https://snowluma.github.io/zh/docs/api) |
-| 部署（Docker / Windows） | [原项目部署指南](https://snowluma.github.io/zh/docs/guide/deploy) |
+| WebSocket / HTTP | [OneBot 动作参考](https://snowluma.github.io/zh/docs/api) |
+| 部署（Docker / Windows） | [部署指南](https://snowluma.github.io/zh/docs/guide/deploy) |
 | TypeScript SDK | [`packages/sdk/README.md`](packages/sdk/README.md) |
 | MCP | [`packages/mcp/README.md`](packages/mcp/README.md) |
 
@@ -90,7 +89,7 @@ pnpm typecheck
 pnpm test
 ```
 
-现阶段源码中的包名、配置项和命令仍沿用 `@snowluma/*` 与 `SNOWLUMA_*`；更名不会改变这些兼容接口。贡献流程见 [`CONTRIBUTING.md`](CONTRIBUTING.md)，开发方向见 [`RoadMap.md`](RoadMap.md)。
+现阶段源码中的包名、配置项和命令仍沿用 `@snowluma/*` 与 `SNOWLUMA_*`；项目更名不会改变这些兼容接口。开发方向见 [`RoadMap.md`](RoadMap.md)，问题与建议请提交到 [Jiyu Issues](https://github.com/shizukugo/Jiyu/issues)。
 
 ## 使用边界与许可
 
@@ -103,17 +102,13 @@ pnpm test
 
 SnowLuma is source-available for study and non-commercial self-hosting, but it is not OSI open source. Commercial use and public distribution of modified or derivative versions require prior written permission.
 
-## 社区与鸣谢
+## 参考与鸣谢
 
-霁羽以 SnowLuma 为基础，感谢原项目的作者与贡献者。项目问题可在 [Jiyu Issues](https://github.com/shizukugo/Jiyu/issues) 反馈。
+霁羽独立维护，不代表 SnowLuma 官方项目。项目参考了 SnowLuma 的架构与实现；当前仓库还保留部分源自 SnowLuma 的代码和资源，其署名与原有许可声明仍然适用。感谢相关作者与贡献者。
 
-以下为历史上游社区入口，可用性以实际情况为准：
+项目也参考了 [LagrangeV2](https://github.com/LagrangeDev/LagrangeV2) 的协议定义与 [NapCatQQ](https://github.com/NapNeko/NapCatQQ) 的实现思路。问题和建议请提交至 [Jiyu Issues](https://github.com/shizukugo/Jiyu/issues)。
 
-- [原项目问题页](https://github.com/SnowLuma/SnowLuma/issues)
-- [原项目 QQ 群](https://qm.qq.com/q/g3UMLpWALe)
-- [原项目 Telegram](https://t.me/napcatqq)
-
-项目参考了 [LagrangeV2](https://github.com/LagrangeDev/LagrangeV2) 的协议定义与 [NapCatQQ](https://github.com/NapNeko/NapCatQQ) 的实现思路。
+原项目声明：SnowLuma 是独立的第三方项目，与腾讯 / QQ 无隶属或授权关系。项目仅供学习与技术研究，请遵守《QQ 用户协议》及适用法律；软件按“现状”提供，使用风险自负。详见 [`EULA.md`](EULA.md)。
 
 <p align="center">
   <a href="https://github.com/SnowLuma/SnowLuma/graphs/contributors"><img src="https://contrib.rocks/image?repo=SnowLuma/SnowLuma" alt="SnowLuma 贡献者" /></a>

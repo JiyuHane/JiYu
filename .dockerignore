@@ -1,0 +1,14 @@
+.git
+**/node_modules
+**/dist
+/config
+/data
+**/data
+/logs
+**/coverage
+.env
+.env.*
+!.env.example
+.vscode
+.idea
+.claude
