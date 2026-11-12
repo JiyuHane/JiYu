@@ -1,7 +1,9 @@
-# SnowLuma WebUI
+# Jiyu WebUI / 霁羽控制台
 
-SnowLuma's browser console is a Vite + React application for managing runtime
-status, OneBot configuration, logs, storage, and server settings.
+Jiyu's browser console is a Vite + React application for managing runtime
+status, OneBot configuration, logs, storage, and server settings. It inherits
+parts of SnowLuma; see the [project notice](../../JIYU_NOTICE.md) for attribution
+and licensing context.
 
 ## Default appearance
 
@@ -20,11 +22,10 @@ Keep the server defaults in `packages/core/src/webui/ui-config.ts`, the frontend
 defaults and preset in `src/contexts/ThemeContext.tsx`, and the pre-mount tokens
 in `src/index.css` aligned when changing the default accent.
 
-The browser favicon, home-screen icon and in-app logo share the mascot avatar
-in [`assets/brand/mascot-avatar.png`](../../assets/brand/mascot-avatar.png).
-Its exported sizes live in `public/`: `logo.png` (512 px), `favicon.png` (64 px),
-and `apple-touch-icon.png` (180 px). Export from the master without redrawing
-individual sizes.
+The browser favicon, home-screen icon and in-app logo use the Jiyu icon at
+[`public/jiyu-icon.png`](public/jiyu-icon.png), based on the project's
+[`assets/readme/jiyu-icon.png`](../../assets/readme/jiyu-icon.png). The original
+SnowLuma brand assets and their applicable attribution remain in the repository.
 
 ## Host appearance integration
 
@@ -109,9 +110,11 @@ account does not delay other accounts.
 
 ## Local development
 
-Packaged installations offer download and restart controls in Settings → About.
-Downloads are verified and staged; files are applied before the application starts.
-Restart confirmation uses the shared modal, and download results use action feedback.
+Settings → About retains the update controls and status presentation. Jiyu's
+current update policy disables online update checks and installation; saved
+update-source settings are not applied. A detected legacy pending update blocks
+startup instead of being applied automatically. See the
+[project overview](../../README.md#更新说明) for the current behavior.
 
 On Windows, the native API logs the process token and EXE integrity label once
 at startup. A Low (or lower) token triggers a WebUI warning; file labels and

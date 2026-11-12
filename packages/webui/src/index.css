@@ -228,6 +228,48 @@
     box-shadow: var(--shadow-card);
   }
 
+  /* Frosted feather details are decoration, not a second theme writer. They
+     follow the existing tokens, so custom palettes and sidebar-only accents
+     retain ownership of their own surfaces. Host overlays stay untouched. */
+  html:not([data-webui-target]) .jiyu-brand-row {
+    position: relative;
+  }
+  html:not([data-webui-target]) .jiyu-brand-row::after {
+    content: '';
+    position: absolute;
+    inset: auto 1rem 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, color-mix(in oklab, var(--sidebar-primary) 30%, var(--sidebar-border)), transparent);
+    pointer-events: none;
+  }
+  html:not([data-webui-target]) .jiyu-brand-avatar,
+  html:not([data-webui-target]) .jiyu-login-avatar {
+    box-shadow: 0 3px 12px -4px color-mix(in oklab, var(--sidebar-primary) 38%, transparent);
+  }
+  html:not([data-webui-target]) .jiyu-wordmark {
+    letter-spacing: 0.08em;
+  }
+  /* The OLED setting promises a black canvas, including before sign-in. */
+  html.dark[data-dark-intensity="black"] .jiyu-login-glow {
+    display: none;
+  }
+  html:not([data-webui-target]) .jiyu-topbar {
+    border-bottom: 1px solid color-mix(in oklab, var(--border) 80%, transparent);
+  }
+  html:not([data-webui-target]) .ui-card {
+    box-shadow: var(--shadow-card), inset 0 1px color-mix(in oklab, var(--card-foreground) 5%, transparent);
+  }
+  html:not([data-webui-target]) .ui-nav-item:focus-visible {
+    outline: 2px solid var(--sidebar-ring);
+    outline-offset: -2px;
+  }
+  html:not([data-webui-target]) .ui-button[data-variant="default"] {
+    box-shadow: 0 2px 8px -3px color-mix(in oklab, var(--primary) 42%, transparent);
+  }
+  html:not([data-webui-target]) [data-ui-control]:hover:not(:disabled):not(:focus-visible) {
+    border-color: color-mix(in oklab, var(--ring) 36%, var(--border));
+  }
+
   /* Skeleton Swap reserves a fixed box by default. Data panels that can grow
      after the swap keep the original timing/motion but release that box once
      real content is present, so the component never becomes an inner scroller. */

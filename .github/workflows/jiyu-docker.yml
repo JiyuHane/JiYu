@@ -21,5 +21,5 @@ jobs:
       - name: Check Node and release files without starting the app
         run: |
           docker run --rm --entrypoint node jiyu:ci check-node-version.cjs
-          docker run --rm --entrypoint sh jiyu:ci -c 'test -f index.mjs && test -f release.json && test -f client/index.html && test -f native/sqlite/prebuilds/linux-x64/@appthreat+sqlite3.glibc.node'
+          docker run --rm --entrypoint sh jiyu:ci -c 'test -f index.mjs && test -f release.json && test -f client/index.html && test -f LICENSE && test -f EULA.md && test -f PRIVACY.md && test -f JIYU_NOTICE.md && test -f native/sqlite/prebuilds/linux-x64/@appthreat+sqlite3.glibc.node'
           docker run --rm --entrypoint node jiyu:ci -e 'const m = { exports: {} }; process.dlopen(m, "/app/native/sqlite/prebuilds/linux-x64/@appthreat+sqlite3.glibc.node"); if (m.exports.NATIVE_INTERFACE_VERSION !== 1) process.exit(1)'

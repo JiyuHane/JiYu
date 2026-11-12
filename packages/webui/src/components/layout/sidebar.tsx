@@ -144,10 +144,10 @@ export function Sidebar({ collapsed = false, onItemClick }: SidebarProps) {
             {/* Brand — logo sits in a fixed 48px column centred in the collapsed
           rail; the wordmark to its right is clipped (never unmounted) when the
           rail narrows. */}
-            <div className="flex h-16 shrink-0 items-center px-2">
+            <div className="jiyu-brand-row flex h-16 shrink-0 items-center px-2">
                 <div className="grid w-12 shrink-0 place-items-center">
-                    <div className="relative flex size-9 items-center justify-center overflow-hidden rounded-xl bg-primary/10 ring-1 ring-primary/20">
-                        <img src="/logo.png" alt="SnowLuma" className="size-full object-cover" />
+                    <div className="jiyu-brand-avatar relative flex size-9 items-center justify-center overflow-hidden rounded-xl bg-sidebar-primary/10 ring-1 ring-sidebar-primary/20">
+                        <img src="/jiyu-icon.png" alt="霁羽" className="size-full object-cover" />
                     </div>
                 </div>
                 <div
@@ -157,7 +157,10 @@ export function Sidebar({ collapsed = false, onItemClick }: SidebarProps) {
                     )}
                 >
                     <div className="flex items-baseline gap-1.5 whitespace-nowrap">
-                        <span className="text-sm font-bold tracking-tight">{APP_NAME}</span>
+                        <span className="jiyu-wordmark text-sm font-bold">霁羽</span>
+                        <span className="text-xs font-medium tracking-tight text-muted-foreground">
+                            {APP_NAME}
+                        </span>
                         <span className="text-micro font-medium text-muted-foreground tabular-nums">
                             v{APP_VERSION}
                         </span>
@@ -247,7 +250,7 @@ export function Sidebar({ collapsed = false, onItemClick }: SidebarProps) {
                                             {!collapsed && (
                                                 <motion.span
                                                     layoutId="sidebar-active-bar"
-                                                    className="ui-nav-highlight absolute left-0 top-1/2 h-5 w-0.5 -translate-y-1/2 rounded-full bg-primary"
+                                                    className="ui-nav-highlight absolute left-0 top-1/2 h-5 w-0.5 -translate-y-1/2 rounded-full bg-sidebar-primary"
                                                     transition={{
                                                         type: 'spring',
                                                         stiffness: 380,
@@ -259,7 +262,10 @@ export function Sidebar({ collapsed = false, onItemClick }: SidebarProps) {
                                     )}
                                     <span className="relative z-10 grid w-12 shrink-0 place-items-center">
                                         <Icon
-                                            className={cn('size-4', isActive && 'text-primary')}
+                                            className={cn(
+                                                'size-4',
+                                                isActive && 'text-sidebar-primary',
+                                            )}
                                         />
                                     </span>
                                     <span

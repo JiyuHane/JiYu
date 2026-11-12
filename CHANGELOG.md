@@ -1,5 +1,17 @@
 # 更新记录
 
+## 未发布 / Unreleased
+
+- 更新霁羽项目 README、项目声明和仓库链接，加入项目形象图标。
+- 新增基于 VitePress 的文档站，并更新 WebUI 的霁羽品牌与视觉主题。
+- 添加独立协议实验组件、目标原始事务适配与相关离线测试；真实 QQ 登录和互通等能力仍在研发中。
+- 隔离历史在线更新入口，并添加 Docker 构建工作流。
+
+## 以下为继承的 SnowLuma 历史 / Inherited SnowLuma history
+
+以下版本记录与比较链接保留自 SnowLuma，并非霁羽的发行记录。
+The version entries and comparison links below are inherited from SnowLuma, not Jiyu releases.
+
 ## 2.0.0
 
 ### 升级

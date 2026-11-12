@@ -66,6 +66,16 @@ describe('parseAgreementMeta', () => {
         expect(meta.effectiveDate).toBe('2026-06-19');
     });
 
+    it('keeps the shipped agreement tab titles distinct', () => {
+        const { docs } = loadAgreements();
+        const eula = docs.find((doc) => doc.id === 'eula');
+        const privacy = docs.find((doc) => doc.id === 'privacy');
+
+        expect(eula?.title.split('/')[0]).toContain('原许可');
+        expect(privacy?.title.split('/')[0]).toContain('原隐私');
+        expect(eula?.title.split('/')[0]).not.toBe(privacy?.title.split('/')[0]);
+    });
+
     it('degrades gracefully on empty text', () => {
         expect(parseAgreementMeta('')).toEqual({
             title: '',

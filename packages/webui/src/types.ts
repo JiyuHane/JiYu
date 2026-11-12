@@ -1,4 +1,4 @@
-export const APP_NAME = 'SnowLuma';
+export const APP_NAME = 'Jiyu';
 // Injected at build time by Vite from the monorepo root package.json.
 export { APP_VERSION } from '@snowluma/common/version';
 import type { UpdateSourceConfig } from '@snowluma/common/update-source';

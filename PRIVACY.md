@@ -1,3 +1,11 @@
+# 霁羽项目与原隐私说明 / Jiyu project and original privacy notice
+
+霁羽（Jiyu）是独立维护的项目，仓库为 <https://github.com/JiyuHane/Jiyu>，继承了部分 SnowLuma 软件及其原始声明。下文是 SnowLuma 随附的原始隐私说明及其声明，并非霁羽已核验并生效的隐私承诺。原 [`LICENSE`](LICENSE) 及其中的事先书面授权要求仍须遵守；专有组件的权利另行区分。有关当前数据处理的有限信息及待核实事项，请见 [JIYU_NOTICE.md](JIYU_NOTICE.md)（[在线查看](https://github.com/JiyuHane/Jiyu/blob/dev/JIYU_NOTICE.md)）。
+
+Jiyu is an independently maintained project at <https://github.com/JiyuHane/Jiyu>, inheriting parts of the SnowLuma software and its original notices. The text below is SnowLuma's accompanying original privacy notice and statements, not a verified, effective privacy commitment by Jiyu. The original [`LICENSE`](LICENSE), including its prior written authorization requirements, remains relevant; proprietary component rights are separate. For limited current data-handling information and items awaiting verification, see [JIYU_NOTICE.md](JIYU_NOTICE.md) ([online](https://github.com/JiyuHane/Jiyu/blob/dev/JIYU_NOTICE.md)).
+
+---
+
 # SnowLuma 隐私与数据处理说明 / Privacy & Data Handling Notice
 
 - **生效日期 / Effective date:** 2026-06-19

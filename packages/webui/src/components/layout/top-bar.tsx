@@ -56,7 +56,7 @@ export function TopBar({
     return (
         <header
             data-ui-surface="chrome"
-            className="z-30 flex min-h-16 shrink-0 items-center gap-[4px] bg-background px-[max(10px,env(safe-area-inset-left))] pr-[max(1rem,env(safe-area-inset-right))] pt-[env(safe-area-inset-top)] md:gap-2 md:px-4"
+            className="jiyu-topbar z-30 flex min-h-16 shrink-0 items-center gap-[4px] bg-background px-[max(10px,env(safe-area-inset-left))] pr-[max(1rem,env(safe-area-inset-right))] pt-[env(safe-area-inset-top)] md:gap-2 md:px-4"
         >
             {/* Mobile-only menu trigger. On desktop there's no collapse button — the
           sidebar auto-expands on hover/focus, and its boundary with the content

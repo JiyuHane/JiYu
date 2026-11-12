@@ -39,6 +39,9 @@ const runtimeDistFiles = [
     targetPlatform === 'win32' ? 'launcher.bat' : 'launcher.sh',
 ];
 const agreementFiles = ['EULA.md', 'PRIVACY.md'];
+// Distributed alongside the agreements, but not additional consent items.
+const noticeFiles = ['LICENSE', 'JIYU_NOTICE.md'];
+const releaseDocuments = [...agreementFiles, ...noticeFiles];
 
 // Native binaries shipped for the selected target:
 //   * `snowluma-*.{dll,node,so}`           – NTQQ hook (Windows + Linux).
@@ -76,15 +79,14 @@ if (missingNatives.length > 0) {
     );
 }
 
-// Legal docs are served by the WebUI consent gate; a missing one would silently
-// disable consent in the shipped build, so fail the build instead (mirrors the
-// native-binary guard above).
-const missingAgreements = agreementFiles.filter((f) => !fs.existsSync(path.resolve(repoRoot, f)));
+// Agreements and their linked project notice and license must all ship together.
+// Missing agreements would also silently disable the WebUI consent gate.
+const missingDocuments = releaseDocuments.filter((f) => !fs.existsSync(path.resolve(repoRoot, f)));
 
-if (missingAgreements.length > 0) {
+if (missingDocuments.length > 0) {
     throw new Error(
-        `Missing legal documents required by the WebUI consent gate:\n` +
-            missingAgreements.map((f) => `  - ${path.resolve(repoRoot, f)}`).join('\n'),
+        `Missing release documents:\n` +
+            missingDocuments.map((f) => `  - ${path.resolve(repoRoot, f)}`).join('\n'),
     );
 }
 
@@ -109,7 +111,7 @@ const BaseConfigPlugin: PluginOption[] = [
                     ...new Set([
                         ...Object.keys(bundle).map((file) => file.split('/')[0]),
                         ...runtimeDistFiles,
-                        ...agreementFiles,
+                        ...releaseDocuments,
                         'native',
                         'client',
                         'package.json',
@@ -155,9 +157,8 @@ const BaseConfigPlugin: PluginOption[] = [
                 dest: path.join(distDir, 'native', 'ffmpeg'),
                 flatten: true,
             },
-            // Legal docs served verbatim by the WebUI consent gate. Copied next to
-            // the bundle so consent.ts's path probe finds them in a packaged deploy.
-            ...agreementFiles.map((file) => ({
+            // Keep linked documents together; only agreements feed the consent gate.
+            ...releaseDocuments.map((file) => ({
                 src: toPosix(path.resolve(repoRoot, file)),
                 dest: distDir,
                 flatten: true,

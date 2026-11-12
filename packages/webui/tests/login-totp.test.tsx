@@ -23,6 +23,10 @@ describe('LoginPage 2FA step', () => {
         );
         expect(markup).toContain('输入访问令牌');
         expect(markup).toContain('进入控制台');
+        expect(markup).toContain('霁羽');
+        expect(markup).toContain('/jiyu-icon.png');
+        expect(markup).toContain('Jiyu');
+        expect(markup).toContain('SnowLuma');
         expect(markup).toContain('max-w-md');
         expect(markup).not.toContain('max-w-2xl');
         expect(markup).not.toContain('character 1 of 6');

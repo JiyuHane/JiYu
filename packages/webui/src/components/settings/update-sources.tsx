@@ -7,7 +7,12 @@ import { DropdownSelect } from '@/components/ui/dropdown-select';
 import { SkeletonSwap } from '@/components/interior/skeleton-swap';
 import { useActionFeedback } from '@/contexts/ActionFeedbackContext';
 import { useApi } from '@/lib/api';
-import type { UpdateSourceConfig, UpdateSourceProbe } from '@/types';
+import type { UpdateSourceConfig, UpdateSourceProbe, UpdateSourceSaveResult } from '@/types';
+
+export function updateSourceSaveNotice(result: UpdateSourceSaveResult): string {
+    const fallback = result.applied ? '更新来源已保存并生效' : '更新来源已保存，但尚未生效';
+    return [result.message || fallback, ...result.errors].filter(Boolean).join('；');
+}
 
 export function UpdateSources() {
     const api = useApi();
@@ -17,6 +22,7 @@ export function UpdateSources() {
     const [mirrors, setMirrors] = useState('');
     const [results, setResults] = useState<UpdateSourceProbe[]>([]);
     const [error, setError] = useState<string | null>(null);
+    const [notice, setNotice] = useState<string | null>(null);
     const [busy, setBusy] = useState(false);
     const [ready, setReady] = useState(false);
     const [reload, setReload] = useState(0);
@@ -52,6 +58,7 @@ export function UpdateSources() {
     const act = async (testing: boolean) => {
         setBusy(true);
         setError(null);
+        setNotice(null);
 
         try {
             await runAction(
@@ -59,8 +66,8 @@ export function UpdateSources() {
                     title: testing ? '正在检测更新来源' : '正在保存更新来源',
                     successTitle: testing ? '来源检测完成' : '更新来源已保存',
                     successDetail: testing
-                        ? '检测从 SnowLuma 所在服务器发起'
-                        : '下次检查和下载时生效',
+                        ? '检测从服务所在服务器发起'
+                        : '已保存，请查看下方生效状态',
                     errorTitle: testing ? '来源检测失败' : '保存失败',
                 },
                 async () => {
@@ -77,10 +84,11 @@ export function UpdateSources() {
                     } else {
                         const saved = await api.update.saveSources(next);
 
-                        if (!saved.saved || !saved.applied) {
+                        if (!saved.saved) {
                             throw new Error(saved.errors.join('；') || saved.message);
                         }
 
+                        setNotice(updateSourceSaveNotice(saved));
                         setConfig(saved.config);
                         setMirrors(saved.config.mirrors.join('\n'));
                         setResults([]);
@@ -100,6 +108,11 @@ export function UpdateSources() {
             {error && (
                 <p role="alert" className="break-words text-xs text-destructive">
                     {error}
+                </p>
+            )}
+            {notice && (
+                <p role="status" className="break-words text-xs text-muted-foreground">
+                    {notice}
                 </p>
             )}
             <SkeletonSwap ready={ready} reserve={100} lines={3} label="更新来源">
@@ -122,9 +135,8 @@ export function UpdateSources() {
                             }}
                         />
                         <p className="text-xs text-muted-foreground">
-                            自动模式先尝试
-                            GitHub，失败后按列表顺序切换。镜像用于文件下载，版本查询也会尝试 GitHub
-                            发布页面。
+                            启用在线更新后，自动模式将先尝试
+                            GitHub，再按列表顺序切换镜像。当前更新来源配置仅保存，尚未生效。
                         </p>
                         {config.mode === 'mirror' && (
                             <div className="flex flex-col gap-1.5">
@@ -245,7 +257,7 @@ export function UpdateSources() {
                                     仅保留可用镜像
                                 </Button>
                                 <p className="text-xs text-muted-foreground">
-                                    选用或筛选后，点击「保存来源」生效。
+                                    选用或筛选后可保存配置；当前在线更新尚未启用，配置暂不生效。
                                 </p>
                             </div>
                         )}

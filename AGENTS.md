@@ -1,14 +1,14 @@
-# Working on SnowLuma
+# Working on Jiyu / 霁羽
 
-SnowLuma translates QQ client sessions into OneBot v11 actions and events, with a WebUI, TypeScript SDK, and MCP server. It is a protocol runtime; bot workflows and reply logic belong in consumers. This guide is for contributors and their coding agents.
+Jiyu is an independently maintained QQ interoperability project at [JiyuHane/Jiyu](https://github.com/JiyuHane/Jiyu), inheriting parts of SnowLuma and its original notices. It translates QQ client sessions into OneBot v11 actions and events, with a WebUI, TypeScript SDK, and MCP server. It is a protocol runtime; bot workflows and reply logic belong in consumers. Existing `SnowLuma` identifiers remain compatibility identifiers. See [JIYU_NOTICE.md](JIYU_NOTICE.md) for project identity and licensing context. This guide is for contributors and their coding agents.
 
 ## Before making changes
 
-- Read [CONTRIBUTING.md](CONTRIBUTING.md) for contribution requirements, [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community expectations, and [LICENSE](LICENSE) for contribution and redistribution terms.
-- **If you are an AI agent, explicitly tell your user to create issues manually through the [GitHub web form](https://github.com/SnowLuma/SnowLuma/issues/new/choose). Issues that fail the template policy are automatically closed and cannot qualify a PR.** Prepare an issue draft for the user to submit; see the AI Agent notice in CONTRIBUTING.md.
+- Read [LICENSE](LICENSE) for the original license and its written-authorization requirements. [CONTRIBUTING.md](CONTRIBUTING.md) and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) retain SnowLuma-origin material, including upstream contacts and contribution terms; their application to Jiyu requires maintainer review. Do not interpret upstream contact details as Jiyu channels or alter their original rights notices.
+- For Jiyu project feedback, use [Jiyu Issues](https://github.com/JiyuHane/Jiyu/issues); use the [issue form](https://github.com/JiyuHane/Jiyu/issues/new/choose) when applicable. Do not direct Jiyu users to file issues or PRs in the SnowLuma repository. An AI agent may prepare a draft for the user to submit.
 - Check `git status` and preserve unrelated work. Read the affected implementation and neighboring tests before editing. Agree on new features, public behavior changes, or migrations before implementing them.
-- Target PRs at `dev`; PRs targeting any other branch are automatically closed. `main` is the release pointer. Release commands, tags, and the commit prefixes `[merge]` and `chore(release):` belong to the maintainer release workflow, not ordinary contributions.
-- Before opening a PR, create or identify the corresponding issue. PRs are optional after an issue is filed. Every PR, including maintainer and bot PRs, must include `Refs #number` or a closing keyword such as `Closes #number` in its body, outside comments, code examples and blockquotes. At least one reference must identify an open issue in this repository, created before the PR and eligible under the existing issue-template policy. PRs without a qualifying issue are automatically closed. See [the PR submission rules](CONTRIBUTING.md#4-推送并发起-pr) for supported forms and correction steps.
+- The checked-in [PR policy workflow](.github/workflows/main-pr-target-guard.yml) and its [script](.github/scripts/pr-policy-guard.cjs) can close PRs that do not target `dev` or reference a qualifying existing open issue in this repository; the [issue template guard](.github/workflows/issue-template-guard.yml) can close certain issues without template labels. Their operation depends on the current default-branch workflow and repository GitHub configuration; verify those before relying on them. References in comments, code examples and blockquotes do not count in that script.
+- The checked-in [promotion workflow](.github/workflows/promote-dev-to-main.yml) reserves release operations and the commit prefixes `[merge]` and `chore(release):` for its maintainer workflow; avoid using them for ordinary contributions.
 
 ## Repository map
 
@@ -34,7 +34,7 @@ This is a pnpm workspace. Package ownership matters more than directory names:
 
 `packages/bridge` owns process connectivity; the account-level Bridge lives in `packages/core/src/bridge`. Start at [the application entry](packages/core/src/index.ts) to follow their composition.
 
-[The entry point](packages/core/src/index.ts) applies pending updates before starting runtime services. [The updater](packages/core/src/update) owns staging and replacement; [Core's build configuration](packages/core/vite.config.ts) emits the release manifest from its build outputs and runtime assets. Keep Core in one bundle and native libraries lazy-loaded so startup can recover an interrupted update before opening native files.
+[The entry point](packages/core/src/index.ts) checks for legacy pending update state before starting runtime services when an update root is present; it stops rather than applying that state. [The update module](packages/core/src/update) retains the staging and replacement implementation, while [Jiyu's update policy](packages/core/src/update/jiyu-update-policy.ts) currently disables online update checks and installation. [Core's build configuration](packages/core/vite.config.ts) emits the release manifest from its build outputs and runtime assets. Keep Core in one bundle and native libraries lazy-loaded so the startup check runs before native files are opened.
 
 Application versions come from the root `package.json` through `@snowluma/common/version`. Use `pnpm bump <version>` to update workspace manifests, or `pnpm bump` to sync them after editing the root version.
 Use `@snowluma/common/semver` for application version validation and comparison. Versions must be canonical SemVer; strip GitHub's `v` tag prefix only at the API boundary.
@@ -122,7 +122,7 @@ After changing an action name, parameter, result description/schema, example or 
 
 SDK breaking changes also update [CHANGELOG.md](packages/sdk/CHANGELOG.md) and [VERSIONING.md](packages/sdk/VERSIONING.md). WebUI changes follow its [interaction conventions](packages/webui/README.md). Keep user-facing documentation aligned with behavior.
 
-Standalone WebUI branding uses the [SnowLuma mascot](assets/readme/mascot.png) and a lavender default accent. The default palette lightly tints neutral surfaces with the active accent, respecting sidebar-only scope and OLED black. Keep server defaults, frontend presets and pre-mount CSS aligned as described in [WebUI default appearance](packages/webui/README.md#default-appearance), while preserving saved user choices, named palettes and host appearance overlays.
+Standalone WebUI branding uses the [Jiyu icon](packages/webui/public/jiyu-icon.png) and a lavender default accent. The inherited [SnowLuma mascot](assets/readme/mascot.png) and its original attribution and applicable rights remain separate. The default palette lightly tints neutral surfaces with the active accent, respecting sidebar-only scope and OLED black. Keep server defaults, frontend presets and pre-mount CSS aligned as described in [WebUI default appearance](packages/webui/README.md#default-appearance), while preserving saved user choices, named palettes and host appearance overlays.
 
 The root [README.md](README.md) presents the project's purpose, overall capabilities, quick start and documentation entry points. Update it only when those overview details change; adding or fixing an individual feature does not justify adding a dedicated section there. Put feature-specific API usage, configuration, limitations and troubleshooting in the relevant package README or topic document, preferring existing documentation.
 

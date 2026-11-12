@@ -318,12 +318,15 @@ export function LoginPage({
 function LoginBrand({ subtitle }: { subtitle: string }) {
     return (
         <div className="flex flex-col items-center gap-3 text-center">
-            <div className="flex size-14 items-center justify-center rounded-2xl bg-primary/10 shadow-sm ring-1 ring-primary/20">
-                <img src="/logo.png" alt="SnowLuma" className="size-10 rounded-xl object-cover" />
+            <div className="jiyu-login-avatar flex size-14 items-center justify-center rounded-2xl bg-primary/10 shadow-sm ring-1 ring-primary/20">
+                <img src="/jiyu-icon.png" alt="霁羽" className="size-10 rounded-xl object-cover" />
             </div>
             <div>
                 <div className="flex items-center justify-center gap-2">
-                    <span className="text-2xl font-semibold tracking-tight">{APP_NAME}</span>
+                    <span className="jiyu-wordmark text-2xl font-semibold">霁羽</span>
+                    <span className="text-sm font-medium tracking-tight text-muted-foreground">
+                        {APP_NAME}
+                    </span>
                     <span className="rounded-full bg-primary/10 px-1.5 py-0.5 font-mono text-micro text-primary tabular-nums">
                         v{APP_VERSION}
                     </span>
@@ -365,7 +368,7 @@ function LoginShell({
 
             <div
                 data-ui-decoration=""
-                className="pointer-events-none absolute inset-0"
+                className="jiyu-login-glow pointer-events-none absolute inset-0"
                 style={{
                     background:
                         'radial-gradient(75% 55% at 50% 0%, color-mix(in oklab, var(--primary) 20%, transparent) 0%, transparent 68%)',

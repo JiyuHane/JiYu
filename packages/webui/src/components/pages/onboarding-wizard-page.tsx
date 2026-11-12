@@ -165,7 +165,7 @@ export function OnboardingWizardPage({
             <main className="relative z-10 mx-auto flex min-h-0 w-full max-w-5xl flex-1 flex-col px-4 pb-[max(1rem,env(safe-area-inset-bottom))] pt-14 sm:px-6 sm:pb-5 sm:pt-4">
                 <header className="mx-auto mb-2 w-full max-w-2xl shrink-0 text-center">
                     <p className="text-xs font-semibold tracking-wide text-primary">
-                        SnowLuma WebUI
+                        霁羽 · Jiyu WebUI
                     </p>
                     <h1 className="mt-1 text-balance text-2xl font-semibold tracking-tight sm:text-3xl">
                         完成首次使用设置

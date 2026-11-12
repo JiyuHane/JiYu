@@ -98,6 +98,7 @@ pnpm test
 
 | 内容 | 入口 |
 | --- | --- |
+| 霁羽文档站 | [文档首页](packages/docs/index.md) · [本地构建说明](packages/docs/guide/development.md) |
 | OneBot v11 | [OneBot v11 规范](https://github.com/botuniverse/onebot-11) |
 | WebUI | [WebUI 文档](packages/webui/README.md) |
 | TypeScript SDK | [SDK 文档](packages/sdk/README.md) |
@@ -116,6 +117,8 @@ pnpm test
 <a href="https://github.com/JiyuHane/Jiyu/graphs/contributors"><img src="https://contrib.rocks/image?repo=JiyuHane/Jiyu" alt="Jiyu 仓库贡献者" /></a>
 
 ## 来源与许可
+
+项目身份、许可来源与已知数据处理说明见 [霁羽项目说明](JIYU_NOTICE.md)。
 
 霁羽独立维护，与 SnowLuma 官方项目无隶属关系。本仓库参考了 SnowLuma 的架构与实现，也保留了部分源自 SnowLuma 的代码和资源；相关著作权、署名与原有许可声明继续适用。项目还参考了 [LagrangeV2](https://github.com/LagrangeDev/LagrangeV2) 的协议定义和 [NapCatQQ](https://github.com/NapNeko/NapCatQQ) 的实现思路。
 

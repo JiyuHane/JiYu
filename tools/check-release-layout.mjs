@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const root = path.resolve(process.argv[2] ?? 'dist');
 const entryPoint = path.join(root, 'index.mjs');
 
@@ -19,6 +21,24 @@ if (release.version !== runtimePackage.version) {
 const actualEntries = fs.readdirSync(root).filter(name => !['node', 'node.exe'].includes(name));
 if (JSON.stringify([...release.entries].sort()) !== JSON.stringify(actualEntries.sort())) {
   throw new Error('release file manifest does not match the packaged files');
+}
+
+for (const file of ['LICENSE', 'JIYU_NOTICE.md']) {
+  const packaged = path.join(root, file);
+  if (!fs.statSync(packaged, { throwIfNoEntry: false })?.isFile()) {
+    throw new Error(`release is missing required document: ${file}`);
+  }
+  if (!fs.readFileSync(packaged).equals(fs.readFileSync(path.join(repoRoot, file)))) {
+    throw new Error(`release document differs from source: ${file}`);
+  }
+}
+for (const file of ['EULA.md', 'PRIVACY.md']) {
+  const text = fs.readFileSync(path.join(root, file), 'utf8');
+  for (const linked of ['JIYU_NOTICE.md', 'LICENSE']) {
+    if (!text.includes(`](${linked})`) && !text.includes(`](./${linked})`)) {
+      throw new Error(`${file} is missing its relative ${linked} link`);
+    }
+  }
 }
 
 const sqliteRoot = path.join(root, 'native', 'sqlite');

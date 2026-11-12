@@ -94,8 +94,10 @@ import { settingsRoute, type SettingsTab } from '@/router';
 import { NotificationsPanel } from '@/components/settings/notifications-panel';
 import { GlobalConfigPanel } from '@/components/settings/global-config-panel';
 import { SystemPanel } from '@/components/settings/system-panel';
+import { JIYU_REPO_URL, UpdateAvailability } from '@/components/settings/update-availability';
 import { UpdateInstaller } from '@/components/settings/update-installer';
 import { UpdateSources } from '@/components/settings/update-sources';
+
 import { StoragePanel } from '@/components/settings/storage-panel';
 import { DeveloperCrashProbe, developerCrashReducer } from '@/components/settings/developer-tools';
 
@@ -106,7 +108,7 @@ interface TabDef {
 }
 
 // Three domains, rendered as macOS System-Settings-style sidebar sections:
-// the dashboard itself (控制台), the all-accounts SnowLuma protocol runtime,
+// the dashboard itself (控制台), the all-accounts protocol runtime,
 // and the host/deployment (平台). Section headers show on the desktop rail
 // only; the mobile strip stays a flat wrap.
 const TAB_GROUPS: { title: string; tabs: TabDef[] }[] = [
@@ -119,7 +121,7 @@ const TAB_GROUPS: { title: string; tabs: TabDef[] }[] = [
         ],
     },
     {
-        title: 'SnowLuma',
+        title: '霁羽',
         tabs: [
             { key: 'globalConfig', label: '全局配置', icon: SlidersHorizontal },
             { key: 'storage', label: '存储管理', icon: HardDrive },
@@ -1915,7 +1917,7 @@ function DeveloperPanel() {
 
 // ─────────────── 关于 ───────────────
 
-const REPO_URL = 'https://github.com/SnowLuma/SnowLuma';
+const REPO_URL = JIYU_REPO_URL;
 
 function UpdateGroup() {
     const { updateInfo, refreshUpdate, resources } = useAppState();
@@ -2016,6 +2018,7 @@ function UpdateGroup() {
 
     return (
         <Group title="软件更新" icon={Sparkles}>
+            <UpdateAvailability />
             <SettingRow label="当前版本" layout="inline">
                 <code className="rounded-md border bg-muted/40 px-2 py-0.5 font-mono text-xs tabular-nums">
                     v{APP_VERSION}
@@ -2080,13 +2083,15 @@ function AboutPanel() {
                                 className="absolute inset-0 -z-10 scale-125 rounded-full bg-primary/20 blur-2xl"
                             />
                             <img
-                                src="/logo.png"
-                                alt="SnowLuma"
+                                src="/jiyu-icon.png"
+                                alt="霁羽"
                                 className="size-20 rounded-2xl object-cover drop-shadow-sm"
                             />
                         </div>
                         <div className="flex items-center gap-2">
-                            <span className="text-2xl font-semibold tracking-tight">SnowLuma</span>
+                            <span className="text-2xl font-semibold tracking-tight">
+                                霁羽 · Jiyu
+                            </span>
                             <span className="rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 font-mono text-meta text-primary tabular-nums">
                                 v{APP_VERSION}
                             </span>
@@ -2099,6 +2104,10 @@ function AboutPanel() {
                         以轻量注入驱动 QQ NT，对外提供标准 OneBot v11
                         接口，让机器人一次部署、长期稳定运行。
                     </p>
+                    <p className="max-w-md text-xs leading-relaxed text-muted-foreground">
+                        基于 SnowLuma 构建。SnowLuma 原始代码及资源 © 2026
+                        SnowLumaDevs，许可与署名依随附文件保留。
+                    </p>
                 </CardContent>
             </Card>
 
@@ -2110,9 +2119,9 @@ function AboutPanel() {
                 <CardContent className="flex flex-col items-center gap-4 px-6 py-7 text-center">
                     <Star className="size-7 fill-primary/15 text-primary" />
                     <div className="flex flex-col items-center gap-1">
-                        <p className="text-sm font-medium">喜欢 SnowLuma？给个 Star 支持一下</p>
+                        <p className="text-sm font-medium">喜欢霁羽？给个 Star 支持一下</p>
                         <p className="max-w-xs text-xs leading-relaxed text-muted-foreground">
-                            开源不易，你的 ⭐ 是我们持续维护的最大动力。
+                            你的 ⭐ 是我们持续维护的动力。
                         </p>
                     </div>
                     <Button asChild className="w-full max-w-xs">
@@ -2122,7 +2131,10 @@ function AboutPanel() {
                     </Button>
                     <div className="flex flex-wrap items-center justify-center gap-x-5 gap-y-2 pt-1 text-[12px]">
                         <AboutLink href={REPO_URL} icon={Github}>
-                            仓库
+                            霁羽项目
+                        </AboutLink>
+                        <AboutLink href="https://github.com/SnowLuma/SnowLuma" icon={Github}>
+                            上游 SnowLuma 项目
                         </AboutLink>
                         <AboutLink href={`${REPO_URL}/releases`} icon={Tag}>
                             发行版

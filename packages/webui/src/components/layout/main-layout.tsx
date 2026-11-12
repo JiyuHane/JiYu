@@ -102,7 +102,7 @@ export function MainLayout({ status, onLogout, notice, children }: MainLayoutPro
                 screen-reader-only. */}
                         <SheetTitle className="sr-only">导航菜单</SheetTitle>
                         <SheetDescription className="sr-only">
-                            切换 SnowLuma 控制台的页面。
+                            切换霁羽控制台的页面。
                         </SheetDescription>
                         <Sidebar onItemClick={() => setMobileOpen(false)} />
                     </SheetContent>

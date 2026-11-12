@@ -1,3 +1,11 @@
+# 霁羽项目与原许可说明 / Jiyu project and original EULA note
+
+霁羽（Jiyu）是独立维护的项目，仓库为 <https://github.com/JiyuHane/Jiyu>，继承了部分 SnowLuma 软件及其原始声明。下文是 SnowLuma 随附的原始 EULA 及其声明，并非霁羽作出的新授权声明。原 [`LICENSE`](LICENSE) 及其中的事先书面授权要求仍须遵守；专有组件的权利另行区分。详见 [JIYU_NOTICE.md](JIYU_NOTICE.md)（[在线查看](https://github.com/JiyuHane/Jiyu/blob/dev/JIYU_NOTICE.md)）。
+
+Jiyu is an independently maintained project at <https://github.com/JiyuHane/Jiyu>, inheriting parts of the SnowLuma software and its original notices. The text below is SnowLuma's accompanying original EULA and statements, not a new grant by Jiyu. The original [`LICENSE`](LICENSE), including its prior written authorization requirements, remains relevant; proprietary component rights are separate. See [JIYU_NOTICE.md](JIYU_NOTICE.md) ([online](https://github.com/JiyuHane/Jiyu/blob/dev/JIYU_NOTICE.md)).
+
+---
+
 # SnowLuma 最终用户许可协议（EULA）/ End-User License Agreement
 
 - **生效日期 / Effective date:** 2026-07-21

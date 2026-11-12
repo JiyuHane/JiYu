@@ -52,6 +52,8 @@ const runtimeEntries = new Set([
     'check-node-version.cjs',
     'EULA.md',
     'PRIVACY.md',
+    'LICENSE',
+    'JIYU_NOTICE.md',
 ]);
 
 export function isRuntimeEntry(name: string): boolean {
