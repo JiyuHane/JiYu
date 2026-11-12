@@ -138,11 +138,22 @@ Earlier in the same bounded path, `0x6724ce0` searches an associated structure,
 compares three node fields, and returns zero when all three compare equal. The
 examined continuation of `0x67252d0` cleans up temporaries and returns a saved
 boolean; no direct call to the signing-manager setter was seen in those windows.
+Another inspected function, `0x6725690`, searches a string-indexed structure via
+`0x6725fb0`, then a second tree using an integer and may return a node's `+0x28`
+address. Its relation to the outbound request's `+0x98` container is unknown.
 This does not establish the structure's business meaning, callback execution,
 or a link to the signing-manager setter.
 These are bounded static observations, not runtime or peer-compatibility
 evidence. Field meanings, upstream collection construction and signature
 behavior remain unverified.
+
+The packaged application declares an entry inside `application.asar`. The two
+selected launcher entries in that archive were not valid UTF-8 in the static
+analysis, so their code was not recovered. Separate plaintext launcher files
+outside the archive contain calls to `major.node.load(...)`; they must not be
+substituted for the archive entries. No path from those plaintext files to
+`wrapper.node` or the signing-manager setter has been established. This is a
+bounded static result, not proof that no such path exists.
 
 The same outbound path builds the business buffer by a direct call at
 `0x666794d` to `0x6667fa0`, not another virtual-table slot. That helper reads
@@ -191,8 +202,12 @@ length-delimited byte strings, followed by a BE32 word stored at `+0x58`, then
 an inclusive-BE32 byte vector. On the inspected path, the low bit controlling
 optional decompression comes directly from that word. A final BE32 read into
 `+0x78` is attempted without checking its return value; the decoder leaves its
-prior destination value unchanged if fewer than four bytes remain. These byte
-strings and the final word retain unknown business semantics.
+prior destination value unchanged if fewer than four bytes remain. A bounded
+recheck follows `0x6668cd2–0x6668cdd` into `0x6668ec0` and `0x8b64950`: the
+reader checks the remaining length of the original span, writes the big-endian
+word only when four bytes remain, and then advances. The caller later starts
+business processing at the declared head end, independently of this final read.
+These byte strings and the final word retain unknown business semantics.
 
 For the V12 path, `DecodeRspHead` reads a length-delimited byte vector into its
 output; the inclusive four-byte length is not included in the vector. The V12
@@ -290,6 +305,14 @@ remain to be recovered and independently verified.
   no final word, business meaning, authentication or automatic decompression is
   inferred. Unlike the observed native reader, this local parser rejects fields
   that cross the declared head boundary. Its allocation cap is a local policy.
+- `src/direct/target-sso12-response-final.ts` models the final BE32 read for the
+  subset accepted by that strict head parser. Given the complete plaintext span
+  and a caller-supplied prior value, it reads from immediately after the reserve,
+  including across the declared head boundary, or preserves the prior value if
+  fewer than four bytes remain. It does not alter the declared head end or opaque
+  tail. The whole-view 16 MiB cap is local; a successful read does not establish
+  the outer caller's length condition, complete packet success, authentication
+  or QQ interoperability.
 - `src/direct/target-sso12-response-prefix.ts` probes only the first three
   big-endian words of a candidate response head and returns the remaining
   declared head bytes as an opaque copy. It locally requires at least 12 bytes
