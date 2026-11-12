@@ -8,7 +8,7 @@
 
 项目提供 WebUI、多账号管理、HTTP / WebSocket 适配，以及供开发者使用的 SDK 和 MCP 工具。与此同时，霁羽正在研究不依赖 QQ 客户端或 Hook 的独立协议实现。
 
-[快速开始](#快速开始) · [独立协议进展](#独立协议进展) · [开发与文档](#开发与文档) · [问题反馈](https://github.com/shizukugo/Jiyu/issues)
+[快速开始](#快速开始) · [独立协议进展](#独立协议进展) · [开发与文档](#开发与文档) · [问题反馈](https://github.com/JiyuHane/Jiyu/issues)
 
 <br clear="both" />
 
@@ -43,7 +43,7 @@
 ### 从源码构建
 
 ```bash
-git clone https://github.com/shizukugo/Jiyu.git
+git clone https://github.com/JiyuHane/Jiyu.git
 cd Jiyu
 pnpm install --frozen-lockfile
 pnpm run build:all
@@ -107,13 +107,13 @@ pnpm test
 
 仓库内部的包名、配置项和命令目前仍使用 `@snowluma/*` 与 `SNOWLUMA_*`；这些是现有兼容接口，并不表示霁羽已发布自己的同名软件包。部分包文档仍可能保留原项目的更新或发布说明，请以本 README 和当前实现为准。
 
-遇到问题或有改进建议，可以在 [Jiyu Issues](https://github.com/shizukugo/Jiyu/issues) 反馈。
+遇到问题或有改进建议，可以在 [Jiyu Issues](https://github.com/JiyuHane/Jiyu/issues) 反馈。
 
 ## 霁羽的贡献者
 
 以下展示的是 **Jiyu 仓库**的 GitHub 提交贡献者统计；其他形式的贡献未必包含在内。
 
-<a href="https://github.com/shizukugo/Jiyu/graphs/contributors"><img src="https://contrib.rocks/image?repo=shizukugo/Jiyu" alt="Jiyu 仓库贡献者" /></a>
+<a href="https://github.com/JiyuHane/Jiyu/graphs/contributors"><img src="https://contrib.rocks/image?repo=JiyuHane/Jiyu" alt="Jiyu 仓库贡献者" /></a>
 
 ## 来源与许可
 
