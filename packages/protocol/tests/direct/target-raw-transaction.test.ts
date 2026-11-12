@@ -3,7 +3,13 @@ import { createConnection, createServer, type Server, type Socket } from 'node:n
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { qqTeaDecrypt, qqTeaEncrypt } from '../../src/direct/qq-tea';
 import { ServiceFrameDecoder } from '../../src/direct/service-stream';
-import { Sso12PacketClient, type Sso12RawOptions } from '../../src/direct/sso12-packet-client';
+import {
+    createSso12RawClient,
+    type Sso12RawClient,
+    type Sso12RawTransport,
+    type Sso12RawOptions,
+    type Sso12RawResult,
+} from '../../src/direct/sso12-packet-client';
 import type { CandidateWithLookup } from '../../src/direct/target-response-candidate';
 import { encodeTargetSso12Reserve } from '../../src/direct/target-sso12-reserve';
 import {
@@ -13,7 +19,7 @@ import {
 
 const sockets: Socket[] = [];
 const servers: Server[] = [];
-const clients: Sso12PacketClient[] = [];
+const clients: Sso12RawClient[] = [];
 const errors: Error[] = [];
 const key = Uint8Array.from({ length: 16 }, (_, i) => i);
 const field2 = Uint8Array.of(0xff, 0, 0x80);
@@ -113,22 +119,9 @@ async function setup(answer: Buffer) {
             errors.push(error as Error);
         }
     });
-    const classify = vi.fn(() => 'response' as const);
-    const verifyUin = vi.fn(() => true);
-    const client = new Sso12PacketClient({
-        socket,
-        uin: '123456',
-        encryption: { type: 'zero' },
-        subAppId: 42,
-        guid: Uint8Array.of(1),
-        version: 'fixture',
-        a2: new Uint8Array(),
-        buildReserved: async () => new Uint8Array(),
-        classifyIncoming: classify,
-        verifyResponseUin: verifyUin,
-    });
+    const client = createSso12RawClient({ socket, uin: '123456' });
     clients.push(client);
-    return { client, peer, classify, verifyUin, getRequest: () => request };
+    return { client, peer, getRequest: () => request };
 }
 
 afterEach(async () => {
@@ -152,6 +145,18 @@ afterEach(async () => {
 });
 
 describe('experimental target raw transaction on synthetic loopback', () => {
+    it('accepts a structurally typed generic raw transport without a reference client', async () => {
+        const transport: Sso12RawTransport = {
+            async transactRaw<C, T>(_options: Sso12RawOptions<C, T>): Promise<Sso12RawResult<T>> {
+                return { kind: 'failure', code: 'fixture', writeState: 'not-written' };
+            },
+        };
+        expect(await transactTargetRawOnce(transport, options())).toEqual({
+            kind: 'failure',
+            code: 'fixture',
+            writeState: 'not-written',
+        });
+    });
     it.each([true, false])('uses private snapshots and publishes hit=%s', async (hit) => {
         const answer = response(hit);
         const fixture = await setup(answer);
@@ -201,8 +206,6 @@ describe('experimental target raw transaction on synthetic loopback', () => {
         expect(input.head.a2).toEqual(beforeHead);
         expect(exposedRequest!.every((x) => x === 0)).toBe(true);
         expect(exposedResponse!.every((x) => x === 0)).toBe(true);
-        expect(fixture.classify).not.toHaveBeenCalled();
-        expect(fixture.verifyUin).not.toHaveBeenCalled();
         const arrays = [
             result.value.basic.opaque,
             result.value.head.field1,
@@ -348,7 +351,7 @@ describe('experimental target raw transaction on synthetic loopback', () => {
             transactRaw: () => {
                 throw new Error('private key');
             },
-        } as unknown as Sso12PacketClient;
+        } as unknown as Sso12RawTransport;
         expect(await transactTargetRawOnce(thrown, options())).toEqual({
             kind: 'failure',
             code: 'target-transaction-failed',
@@ -361,7 +364,7 @@ describe('experimental target raw transaction on synthetic loopback', () => {
                 sequence: 1,
                 writeState: 'written',
             }),
-        } as unknown as Sso12PacketClient;
+        } as unknown as Sso12RawTransport;
         expect(await transactTargetRawOnce(wrong, options())).toEqual({
             kind: 'failure',
             code: 'target-transaction-failed',
@@ -376,7 +379,7 @@ describe('experimental target raw transaction on synthetic loopback', () => {
                 retained = raw;
                 return { kind: 'response', value: undefined, sequence: 1, writeState: 'written' };
             },
-        } as unknown as Sso12PacketClient;
+        } as unknown as Sso12RawTransport;
         expect(await transactTargetRawOnce(fake, options())).toEqual({
             kind: 'failure',
             code: 'target-transaction-failed',
@@ -406,7 +409,7 @@ describe('experimental target raw transaction on synthetic loopback', () => {
                 );
                 return { kind: 'failure', code: 'raw-extra-data', writeState: 'unknown' };
             },
-        } as unknown as Sso12PacketClient;
+        } as unknown as Sso12RawTransport;
         expect(await transactTargetRawOnce(fake, options())).toEqual({
             kind: 'failure',
             code: 'raw-extra-data',
@@ -433,7 +436,7 @@ describe('experimental target raw transaction on synthetic loopback', () => {
 
     it('returns cancelled or expired preflight before calling raw', async () => {
         const raw = vi.fn();
-        const fake = { transactRaw: raw } as unknown as Sso12PacketClient;
+        const fake = { transactRaw: raw } as unknown as Sso12RawTransport;
         const controller = new AbortController();
         controller.abort();
         const input = options();
@@ -466,7 +469,7 @@ describe('experimental target raw transaction on synthetic loopback', () => {
         const hostile = vi.fn(function () {
             return callerBytes;
         });
-        const fake = { transactRaw: vi.fn() } as unknown as Sso12PacketClient;
+        const fake = { transactRaw: vi.fn() } as unknown as Sso12RawTransport;
         vi.stubGlobal('Uint8Array', hostile);
         let result;
 

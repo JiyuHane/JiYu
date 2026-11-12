@@ -10,7 +10,7 @@ import {
     composeTargetResponseCandidateWithLookup,
     type CandidateWithLookup,
 } from './target-response-candidate';
-import type { Sso12PacketClient, Sso12RawResult } from './sso12-packet-client';
+import type { Sso12RawTransport, Sso12RawResult } from './sso12-packet-client';
 
 export interface TargetRawTransactionOptions {
     head: TargetSso12Head;
@@ -169,7 +169,7 @@ function clearCandidate(value: CandidateWithLookup | undefined): void {
  * bound; lookup additionally counts the decoded field2 against its own 16 MiB cap.
  */
 export async function transactTargetRawOnce(
-    client: Sso12PacketClient,
+    client: Sso12RawTransport,
     options: TargetRawTransactionOptions,
 ): Promise<Sso12RawResult<CandidateWithLookup>> {
     const started = performance.now();

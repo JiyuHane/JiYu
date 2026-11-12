@@ -303,10 +303,15 @@ shows the primary decoder receives a pointer from receiver `+0x18`; receiver
 byte `+4` can bypass it, and a fallback calls the same decoder with an embedded
 address at receiver `+7`. The candidate constructor at `0x34f8af0` passes the
 `+0x18` output to mode-dependent routines. One mode reaches `0x34f7740`, where
-`0x2c7` is passed to an unresolved function near a secp192k1 diagnostic. The
-curve, input provenance and key derivation remain unproved; the diagnostic is
-only a clue. The disassembler automatically displayed an annotation that may
-contain a hardcoded public-key string; its value was not retained in this record.
+`0x2c7` is passed to an unresolved function near a secp192k1 diagnostic. A
+separate table initializer, if its intervening calls return without modifying
+the table, writes ID `0x2c7` and a `NIST P-192` label to the first table entry;
+the downstream lookup compares this ID. This observed label conflicts with the
+nearby diagnostic and is not proof of the mathematical parameters, actual
+runtime selection or the login path. Function identity, input provenance and
+key derivation remain unproved. The disassembler automatically displayed an
+annotation that may contain a hardcoded public-key string; its value was not
+retained in this record.
 The fixed public reference's server point and verification key were not found as
 contiguous raw byte sequences in this one ELF; encoded constants, other modules,
 and different implementations remain possible. No QQ client was executed or
@@ -447,12 +452,15 @@ remain to be recovered and independently verified.
   and local sequence assignment do not establish server authentication or
   target request/response binding.
 - `src/direct/target-raw-transaction.ts` offers one experimental transaction
-  on a caller-supplied connected `Sso12PacketClient`. That existing client's
-  constructor still requires reference-shaped profile options even though this
-  raw path does not use its reference packet encoders or classifier. The adapter
-  snapshots caller inputs, encodes the target-static head, business and outer
-  frame, uses the raw client's locally allocated sequence, and invokes the
-  caller's raw verifier before
+  on a caller-supplied connected raw transport. `createSso12RawClient` constructs
+  the shared raw engine without reference profile, key, signer or classifier
+  options; its UIN is a caller-supplied 1–20-digit local identity label, not a
+  verified account binding. The existing reference-mode `Sso12PacketClient`
+  remains accepted. In raw-only mode, bytes
+  arriving outside an active raw transaction close the connection rather than
+  entering the reference decoder. The adapter snapshots caller inputs, encodes
+  the target-static head, business and outer frame, uses the raw client's locally
+  allocated sequence, and invokes the caller's raw verifier before
   decoding the response. The response selector, key and lookup collection are
   explicit caller inputs; the lookup path currently accepts only empty reserve.
   The verifier receives copies and must supply the trust policy. A result is

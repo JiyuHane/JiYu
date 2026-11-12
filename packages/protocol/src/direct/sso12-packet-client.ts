@@ -34,6 +34,15 @@ export interface Sso12PacketClientOptions {
     maxWriteBufferBytes?: number;
 }
 
+/** UIN is a caller-supplied local identifier, not an authenticated account. */
+export interface Sso12RawClientOptions {
+    socket: Socket;
+    uin: string;
+    initialSequence?: number;
+    defaultTimeoutMs?: number;
+    maxWriteBufferBytes?: number;
+}
+
 export type Sso12CloseReason = Readonly<{
     kind: 'local' | 'remote' | 'transport-error' | 'protocol-error' | 'handler-error';
     code: string;
@@ -87,6 +96,59 @@ export interface Sso12RawOptions<C, T> {
     ) => T | Promise<T>;
     timeoutMs?: number;
     signal?: AbortSignal;
+}
+
+export interface Sso12RawTransport {
+    transactRaw<C, T>(options: Sso12RawOptions<C, T>): Promise<Sso12RawResult<T>>;
+}
+
+export interface Sso12RawClient extends Sso12RawTransport {
+    readonly whenClosed: Promise<Sso12CloseReason>;
+    close(): void;
+}
+
+const rawConfigurations = new WeakSet<object>();
+
+/** Accept only plain records with whitelisted own data properties; never evaluate getters. */
+export function createSso12RawClient(options: Sso12RawClientOptions): Sso12RawClient {
+    if (typeof options !== 'object' || options === null || utilTypes.isProxy(options)) {
+        throw new Error('invalid protocol-12 transport configuration');
+    }
+
+    const prototype = Object.getPrototypeOf(options);
+
+    if (prototype !== Object.prototype && prototype !== null) {
+        throw new Error('invalid protocol-12 transport configuration');
+    }
+
+    const descriptors = Object.getOwnPropertyDescriptors(options);
+    const allowed = new Set([
+        'socket',
+        'uin',
+        'initialSequence',
+        'defaultTimeoutMs',
+        'maxWriteBufferBytes',
+    ]);
+
+    for (const name of Reflect.ownKeys(descriptors)) {
+        if (
+            typeof name !== 'string' ||
+            !allowed.has(name) ||
+            !Object.hasOwn(descriptors[name], 'value')
+        ) {
+            throw new Error('invalid protocol-12 transport configuration');
+        }
+    }
+
+    const config: Sso12RawClientOptions = {
+        socket: descriptors.socket?.value as Socket,
+        uin: descriptors.uin?.value as string,
+        initialSequence: descriptors.initialSequence?.value as number | undefined,
+        defaultTimeoutMs: descriptors.defaultTimeoutMs?.value as number | undefined,
+        maxWriteBufferBytes: descriptors.maxWriteBufferBytes?.value as number | undefined,
+    };
+    rawConfigurations.add(config);
+    return new Sso12PacketClient(config as Sso12PacketClientOptions);
 }
 
 type RawPending = {
@@ -180,14 +242,17 @@ export class Sso12PacketClient {
     private readonly socket: Socket;
     private readonly releaseSocket: () => void;
     private readonly uin: string;
-    private readonly encryption: { type: 'zero' } | { type: 'd2'; key: Uint8Array; d2: Uint8Array };
-    private readonly subAppId: number;
-    private readonly guid: Uint8Array;
-    private readonly version: string;
-    private readonly a2: Uint8Array;
-    private readonly buildReserved: Sso12PacketClientOptions['buildReserved'];
-    private readonly classify: Sso12PacketClientOptions['classifyIncoming'];
-    private readonly verifyUin: NonNullable<Sso12PacketClientOptions['verifyResponseUin']>;
+    private readonly rawOnly: boolean;
+    // Present only in reference mode; guarded before reference-only operations.
+    private readonly encryption!:
+        { type: 'zero' } | { type: 'd2'; key: Uint8Array; d2: Uint8Array };
+    private readonly subAppId!: number;
+    private readonly guid!: Uint8Array;
+    private readonly version!: string;
+    private readonly a2!: Uint8Array;
+    private readonly buildReserved!: Sso12PacketClientOptions['buildReserved'];
+    private readonly classify!: Sso12PacketClientOptions['classifyIncoming'];
+    private readonly verifyUin!: NonNullable<Sso12PacketClientOptions['verifyResponseUin']>;
     private readonly timeout: number;
     private readonly maxWrite: number;
     private readonly decoder = new ServiceFrameDecoder();
@@ -203,37 +268,58 @@ export class Sso12PacketClient {
     });
 
     constructor(options: Sso12PacketClientOptions) {
-        const { socket, uin, encryption, subAppId, guid, version, a2 } = options;
+        // Only the factory can tag its private snapshot; legacy inputs are untouched.
+        const rawOnly = rawConfigurations.has(options);
+        const reference = options;
+        const referenceValues = !rawOnly
+            ? (() => {
+                  const { socket, uin, encryption, subAppId, guid, version, a2 } = reference;
+                  return { socket, uin, encryption, subAppId, guid, version, a2 };
+              })()
+            : undefined;
+        const socket = referenceValues ? referenceValues.socket : options.socket;
+        const uin = referenceValues ? referenceValues.uin : options.uin;
         const timeout = options.defaultTimeoutMs ?? 15000;
         const maxWrite = options.maxWriteBufferBytes ?? MAX_SERVICE_FRAME_BYTES;
         const sequence = options.initialSequence ?? 1;
 
+        const referenceInvalid = (): boolean => {
+            if (rawOnly || !referenceValues) {
+                return false;
+            }
+
+            const { encryption, subAppId, guid, version, a2 } = referenceValues;
+            return (
+                !encryption ||
+                (encryption.type !== 'zero' && encryption.type !== 'd2') ||
+                (encryption.type === 'd2' &&
+                    (!(encryption.key instanceof Uint8Array) ||
+                        encryption.key.length !== 16 ||
+                        !(encryption.d2 instanceof Uint8Array) ||
+                        encryption.d2.length === 0 ||
+                        encryption.d2.length > MAX_SERVICE_FRAME_BYTES)) ||
+                !Number.isInteger(subAppId) ||
+                subAppId < 0 ||
+                subAppId > 0x7fffffff ||
+                !(guid instanceof Uint8Array) ||
+                guid.length === 0 ||
+                guid.length > 0xffff ||
+                !(a2 instanceof Uint8Array) ||
+                a2.length > MAX_SERVICE_FRAME_BYTES ||
+                typeof version !== 'string' ||
+                version.length === 0 ||
+                Buffer.byteLength(version) > 0xfffd ||
+                typeof reference.buildReserved !== 'function' ||
+                typeof reference.classifyIncoming !== 'function' ||
+                (reference.verifyResponseUin !== undefined &&
+                    typeof reference.verifyResponseUin !== 'function')
+            );
+        };
+
         if (
             typeof uin !== 'string' ||
             !/^[0-9]{1,20}$/.test(uin) ||
-            !encryption ||
-            (encryption.type !== 'zero' && encryption.type !== 'd2') ||
-            (encryption.type === 'd2' &&
-                (!(encryption.key instanceof Uint8Array) ||
-                    encryption.key.length !== 16 ||
-                    !(encryption.d2 instanceof Uint8Array) ||
-                    encryption.d2.length === 0 ||
-                    encryption.d2.length > MAX_SERVICE_FRAME_BYTES)) ||
-            !Number.isInteger(subAppId) ||
-            subAppId < 0 ||
-            subAppId > 0x7fffffff ||
-            !(guid instanceof Uint8Array) ||
-            guid.length === 0 ||
-            guid.length > 0xffff ||
-            !(a2 instanceof Uint8Array) ||
-            a2.length > MAX_SERVICE_FRAME_BYTES ||
-            typeof version !== 'string' ||
-            version.length === 0 ||
-            Buffer.byteLength(version) > 0xfffd ||
-            typeof options.buildReserved !== 'function' ||
-            typeof options.classifyIncoming !== 'function' ||
-            (options.verifyResponseUin !== undefined &&
-                typeof options.verifyResponseUin !== 'function') ||
+            referenceInvalid() ||
             !Number.isInteger(sequence) ||
             sequence < 0 ||
             sequence > 0xffffffff ||
@@ -259,21 +345,28 @@ export class Sso12PacketClient {
 
         this.socket = socket;
         this.uin = uin;
-        this.encryption =
-            encryption.type === 'zero'
-                ? { type: 'zero' }
-                : {
-                      type: 'd2',
-                      key: Uint8Array.from(encryption.key),
-                      d2: Uint8Array.from(encryption.d2),
-                  };
-        this.subAppId = subAppId;
-        this.guid = Uint8Array.from(guid);
-        this.version = version;
-        this.a2 = Uint8Array.from(a2);
-        this.buildReserved = options.buildReserved;
-        this.classify = options.classifyIncoming;
-        this.verifyUin = options.verifyResponseUin ?? ((expected, actual) => expected === actual);
+        this.rawOnly = rawOnly;
+
+        if (!rawOnly && referenceValues) {
+            const { encryption, subAppId, guid, version, a2 } = referenceValues;
+            this.encryption =
+                encryption.type === 'zero'
+                    ? { type: 'zero' }
+                    : {
+                          type: 'd2',
+                          key: Uint8Array.from(encryption.key),
+                          d2: Uint8Array.from(encryption.d2),
+                      };
+            this.subAppId = subAppId;
+            this.guid = Uint8Array.from(guid);
+            this.version = version;
+            this.a2 = Uint8Array.from(a2);
+            this.buildReserved = reference.buildReserved;
+            this.classify = reference.classifyIncoming;
+            this.verifyUin =
+                reference.verifyResponseUin ?? ((expected, actual) => expected === actual);
+        }
+
         this.timeout = timeout;
         this.maxWrite = maxWrite;
         this.nextSequence = sequence;
@@ -302,6 +395,10 @@ export class Sso12PacketClient {
     getProfile(): Sso12Profile {
         if (this.closed || this.socket.destroyed) {
             throw new Error('connection closed');
+        }
+
+        if (this.rawOnly) {
+            throw new Error('reference-profile-unavailable');
         }
 
         return Object.freeze({
@@ -356,6 +453,11 @@ export class Sso12PacketClient {
         if (this.rawPending && rawCallback.getStore() === this.rawPending) {
             this.shutdown('handler-error', 'callback-reentry', 'raw callback reentry');
             return Promise.resolve(wrap(failure('raw callback reentry'), null));
+        }
+
+        // An unrelated concurrent reference call fails without disturbing a raw exchange.
+        if (this.rawOnly) {
+            return Promise.resolve(wrap(failure('reference-mode-unavailable'), null));
         }
 
         if (this.pending || this.rawPending) {
@@ -1010,6 +1112,14 @@ export class Sso12PacketClient {
                 return;
             }
 
+            if (this.rawOnly) {
+                if (chunk.length !== 0) {
+                    this.shutdown('protocol-error', 'raw-unexpected-data', 'unexpected raw data');
+                }
+
+                return;
+            }
+
             // Bound each returned frame list even when a peer coalesces many tiny frames.
             for (let offset = 0; offset < chunk.length && !this.closed; offset += 65536) {
                 for (const frame of this.decoder.push(chunk.subarray(offset, offset + 65536))) {
@@ -1205,13 +1315,16 @@ export class Sso12PacketClient {
         this.rawPending?.fail(code);
         this.decoder.discard();
 
-        if (this.encryption.type === 'd2') {
-            this.encryption.key.fill(0);
-            this.encryption.d2.fill(0);
+        if (!this.rawOnly) {
+            if (this.encryption.type === 'd2') {
+                this.encryption.key.fill(0);
+                this.encryption.d2.fill(0);
+            }
+
+            this.a2.fill(0);
+            this.guid.fill(0);
         }
 
-        this.a2.fill(0);
-        this.guid.fill(0);
         this.socket.destroy();
     }
 }
