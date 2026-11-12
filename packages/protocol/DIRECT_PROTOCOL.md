@@ -160,9 +160,10 @@ span before additional processing and a call to `0x6668d00`. The helper
 `0x6669a10` reads an inclusive BE32 business length: values below four fail,
 four yields an empty body, and larger values describe the following bytes. A
 low bit of a decoded head field selects `UncompressBuffer` at `0x666c890`.
-That function passes the body to the imported `uncompress` symbol, with at most
-four attempts whose output capacities are computed in 32-bit arithmetic as
-10, 20, 40 and 80 times the input length. Return code `-5` triggers a retry;
+That function passes the body to the imported `uncompress` symbol through
+call `0x666ca30`, PLT `0x8e10650` and the static relocation slot `0x915fa78`.
+It makes at most four attempts whose output capacities are computed in 32-bit
+arithmetic as 10, 20, 40 and 80 times the input length. Return code `-5` triggers a retry;
 other nonzero codes fail. The ELF declares a dependency on `libz.so.1`, so zlib
 wrapping is a reasonable inference, but the actual runtime binding, version,
 supported input formats, dictionary and trailing-byte behavior remain unknown.
@@ -315,6 +316,15 @@ remain to be recovered and independently verified.
   bodies. This is stricter than separately bounded fields and is not a target
   limit. The transform does not authenticate, establish the lookup decision,
   prove native decompression behavior or verify QQ interoperability.
+- `src/direct/target-response-candidate.ts` composes the basic prefix, a single
+  explicit-key decryption candidate and that bounded transform. The caller must
+  independently verify and isolate the same frame bytes supplied to it; this
+  composition does not establish authentication or request binding. Selector 0
+  takes no key; selectors 1 and 2 each require one caller-provided key and do not
+  fall back. The first basic word is preserved rather than treated as a frame
+  length. Basic offsets refer to the supplied frame view; head and business
+  offsets refer to the plaintext candidate, not the encrypted wire. Opaque basic
+  data, head tail and post-business trailing bytes remain separate outputs.
 - `src/direct/target-service-business.ts` frames a nonempty raw request body as
   `BE32(body length + 4) || body` for the observed main-request path. The
   standalone helper's empty-body behavior differs from the main entry; this

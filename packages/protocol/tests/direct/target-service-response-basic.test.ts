@@ -1,5 +1,5 @@
 import { runInNewContext } from 'node:vm';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
     decodeTargetServiceResponseBasic,
     MAX_TARGET_SERVICE_RESPONSE_BASIC_BYTES,
@@ -8,6 +8,85 @@ import {
 const failure = 'target service response basic decoding failed';
 
 describe('target-static service response basic', () => {
+    it('clears an allocated opaque copy when constructing the source view fails', () => {
+        const NativeBytes = Uint8Array;
+        const input = NativeBytes.of(0, 0, 0, 1, 0, 0, 0, 2, 3, 4, 0, 0, 0, 7, 10, 11, 12);
+        const before = NativeBytes.from(input);
+        let allocated: Uint8Array | undefined;
+        let thrown: unknown;
+        const injected = new Proxy(NativeBytes, {
+            construct(target, args, newTarget) {
+                if (args[0] === input.buffer) {
+                    throw new Error('injected source failure');
+                }
+
+                const result = Reflect.construct(target, args, newTarget) as Uint8Array;
+
+                if (args.length === 1 && args[0] === 3) {
+                    allocated = result;
+                    allocated.fill(0xa5);
+                    Object.defineProperty(allocated, 'fill', {
+                        value: () => {
+                            throw new Error('shadow fill');
+                        },
+                    });
+                }
+
+                return result;
+            },
+        });
+
+        vi.stubGlobal('Uint8Array', injected);
+
+        try {
+            decodeTargetServiceResponseBasic(input);
+        } catch (error) {
+            thrown = error;
+        } finally {
+            vi.unstubAllGlobals();
+        }
+
+        expect(thrown).toEqual(new Error(failure));
+        expect(input).toEqual(before);
+        expect(allocated).toBeInstanceOf(NativeBytes);
+        expect(allocated!.buffer).not.toBe(input.buffer);
+        expect(allocated).toEqual(NativeBytes.of(0, 0, 0));
+    });
+
+    it('clears an allocated opaque copy when copying fails', () => {
+        const NativeBytes = Uint8Array;
+        const input = NativeBytes.of(0, 0, 0, 1, 0, 0, 0, 2, 3, 4, 0, 0, 0, 7, 10, 11, 12);
+        const before = NativeBytes.from(input);
+        let allocated: Uint8Array | undefined;
+        let thrown: unknown;
+        const injected = new Proxy(NativeBytes, {
+            construct(target, args, newTarget) {
+                if (args.length === 1 && args[0] === 3) {
+                    allocated = NativeBytes.of(0xa5, 0xa5);
+                    return allocated;
+                }
+
+                return Reflect.construct(target, args, newTarget);
+            },
+        });
+
+        vi.stubGlobal('Uint8Array', injected);
+
+        try {
+            decodeTargetServiceResponseBasic(input);
+        } catch (error) {
+            thrown = error;
+        } finally {
+            vi.unstubAllGlobals();
+        }
+
+        expect(thrown).toEqual(new Error(failure));
+        expect(input).toEqual(before);
+        expect(allocated).toBeInstanceOf(NativeBytes);
+        expect(allocated!.buffer).not.toBe(input.buffer);
+        expect(allocated).toEqual(NativeBytes.of(0, 0));
+    });
+
     it('reads unsigned words and both bytes without treating word0 as total length', () => {
         const input = Uint8Array.of(
             0xff,
@@ -73,6 +152,7 @@ describe('target-static service response basic', () => {
             nextOffset: 17,
         });
         expect(backing).toEqual(before);
+        expect(result.opaque.buffer).not.toBe(backing.buffer);
         backing[16] = 0x11;
         expect(result.opaque[0]).toBe(0xaa);
         result.opaque[1] = 0x22;

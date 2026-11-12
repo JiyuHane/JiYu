@@ -17,6 +17,7 @@ const sharedBufferLength = Object.getOwnPropertyDescriptor(
 )!.get!;
 const typedArrayValues = Uint8Array.prototype.values;
 const copyBytes = Uint8Array.prototype.set;
+const clearBytes = Uint8Array.prototype.fill;
 
 /**
  * Parse only the statically observed basic fields, with local bounds. Exact-end
@@ -37,6 +38,9 @@ export function decodeTargetServiceResponseBasic(
     opaque: Uint8Array;
     nextOffset: number;
 } {
+    let opaque: Uint8Array | undefined;
+    let transferred = false;
+
     try {
         if (
             isProxy(input) ||
@@ -88,11 +92,21 @@ export function decodeTargetServiceResponseBasic(
             throw new RangeError('invalid basic length');
         }
 
-        const opaque = new Uint8Array(length - 4);
+        opaque = new Uint8Array(length - 4);
         const source = new Uint8Array(buffer, byteOffset + offset + 14, length - 4);
         copyBytes.call(opaque, source);
-        return { word0, word4, selector, flag9, opaque, nextOffset: offset + total };
+        const result = { word0, word4, selector, flag9, opaque, nextOffset: offset + total };
+        transferred = true;
+        return result;
     } catch {
         throw new Error('target service response basic decoding failed');
+    } finally {
+        try {
+            if (opaque && !transferred) {
+                clearBytes.call(opaque, 0);
+            }
+        } catch {
+            // Best effort only; preserve the fixed error.
+        }
     }
 }
