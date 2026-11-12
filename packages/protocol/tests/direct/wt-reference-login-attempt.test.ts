@@ -74,6 +74,11 @@ function parse(frame: Uint8Array) {
 
     read();
     const command = read().toString();
+    read();
+    read();
+    read();
+    pos += sso.readUInt16BE(pos);
+    const reserved = Buffer.from(read());
     const oicq = Buffer.from(sso.subarray(sso.readUInt32BE(0) + 4));
     const point = Buffer.from(oicq.subarray(48, 73));
     const shared = peer.deriveTeaKey(point);
@@ -82,6 +87,7 @@ function parse(frame: Uint8Array) {
         account,
         seq: sso.readUInt32BE(4),
         command,
+        reserved,
         oicq,
         point,
         shared,
@@ -111,7 +117,7 @@ function reply(req: Request, business: Uint8Array) {
     wt[0] = 2;
     wt.writeUInt16BE(wt.length, 1);
     wt.writeUInt16BE(req.kind === 0x810 ? 0x810 : 0x812, 5);
-    wt.writeUInt32BE(req.kind === 0x810 ? 123 : 0, 9);
+    wt.writeUInt32BE(req.kind === 0x810 ? Number(req.account) : 0, 9);
     wt.set(cipher, 16);
     wt[wt.length - 1] = 3;
     const sso = Buffer.concat([
@@ -308,6 +314,7 @@ describe('reference one-socket attempt (synthetic only)', () => {
         expect(attempt.getState()).toBe('confirmed-held');
         expect(await attempt.login(loginFields)).toEqual({
             status: 'tickets',
+            uin: '123',
             tickets: {
                 d2: Uint8Array.of(9),
                 d2Key: new Uint8Array(16).fill(10),
@@ -333,6 +340,56 @@ describe('reference one-socket attempt (synthetic only)', () => {
         expect(evidences.map((e) => e.transportUin)).toEqual(['999', '999', '999', '999', '999']);
         expect(evidences.map((e) => e.requestUin)).toEqual(['999', '999', '999', '999', '123']);
         await expect(attempt.login(loginFields)).rejects.toThrow();
+    });
+    it('keeps confirmed accounts isolated across concurrent and sequential attempts', async () => {
+        const makeAttempt = async (uin: bigint) => {
+            let ownedSocket!: Socket;
+            const { attempt } = await setup(
+                (socket, request) => {
+                    const business =
+                        request.kind === 0x31
+                            ? fetchBody()
+                            : request.kind === 0x810
+                              ? loginReply()
+                              : pollBody(0, uin);
+                    socket.write(reply(request, business));
+                },
+                {
+                    verifyContext: ({ operation, requestUin, responseUin, businessUin }) =>
+                        requestUin === responseUin &&
+                        (operation !== 'poll' || businessUin === uin) &&
+                        (operation !== 'login' || requestUin === uin.toString()),
+                },
+                (options) => {
+                    ownedSocket = options.socket;
+                },
+            );
+            return { attempt, socket: ownedSocket };
+        };
+
+        const first = await makeAttempt(123n);
+        const second = await makeAttempt(456n);
+        await Promise.all([first.attempt.fetch(fetchFields), second.attempt.fetch(fetchFields)]);
+        expect(await Promise.all([first.attempt.poll(), second.attempt.poll()])).toEqual([
+            { status: 'confirmed' },
+            { status: 'confirmed' },
+        ]);
+        const [secondResult, firstResult] = await Promise.all([
+            second.attempt.login(loginFields),
+            first.attempt.login(loginFields),
+        ]);
+        expect(firstResult).toMatchObject({ status: 'tickets', uin: '123' });
+        expect(secondResult).toMatchObject({ status: 'tickets', uin: '456' });
+        expect(first.socket.destroyed).toBe(true);
+        expect(second.socket.destroyed).toBe(true);
+        const third = await makeAttempt(789n);
+        await third.attempt.fetch(fetchFields);
+        await third.attempt.poll();
+        expect(await third.attempt.login(loginFields)).toMatchObject({
+            status: 'tickets',
+            uin: '789',
+        });
+        expect(third.socket.destroyed).toBe(true);
     });
     it.each([
         {
@@ -521,6 +578,98 @@ describe('reference one-socket attempt (synthetic only)', () => {
             expect(attempt.getState()).toBe('failed');
         }
     });
+    it.each(['whole', 'subarray'] as const)(
+        'snapshots a signer %s view before wiping its owned request copy',
+        async (view) => {
+            let expected!: Uint8Array;
+            let retained!: Uint8Array;
+            const { attempt } = await setup(
+                (socket, request) => {
+                    expect(request.reserved).toEqual(Buffer.from(expected));
+                    socket.write(reply(request, fetchBody()));
+                },
+                {
+                    buildReserved: async ({ body }) => {
+                        retained = body;
+                        const result = view === 'whole' ? body : body.subarray(0, 4);
+                        expected = Uint8Array.from(result);
+                        Object.defineProperty(body, 'fill', {
+                            value: () => {
+                                throw new Error('overridden fill');
+                            },
+                        });
+                        return result;
+                    },
+                },
+            );
+            await attempt.fetch(fetchFields);
+            expect(retained.every((byte) => byte === 0)).toBe(true);
+        },
+    );
+    it.each(['throw', 'abort'] as const)(
+        'cleans the signer input and closes the attempt on signer %s',
+        async (ending) => {
+            const controller = new AbortController();
+            let retained!: Uint8Array;
+            const requests: Request[] = [];
+            const { attempt } = await setup((_socket, request) => requests.push(request), {
+                signal: controller.signal,
+                buildReserved: async ({ body }) => {
+                    retained = body;
+
+                    if (ending === 'abort') {
+                        controller.abort();
+                        return body.subarray(0, 4);
+                    }
+
+                    throw new Error('private signer details');
+                },
+            });
+            await expect(attempt.fetch(fetchFields)).rejects.toThrow('attempt fetch failed');
+            expect(retained.every((byte) => byte === 0)).toBe(true);
+            expect(attempt.getState()).toBe('failed');
+            expect(requests).toHaveLength(0);
+        },
+    );
+    it.each(['requestFrame', 'requestOicq', 'responseFrame'] as const)(
+        'wipes each verifier copy despite modified or detached %s',
+        async (selected) => {
+            for (const mode of ['override', 'detach'] as const) {
+                let retained!: Record<'requestFrame' | 'requestOicq' | 'responseFrame', Uint8Array>;
+                const { attempt } = await setup(
+                    (socket, request) => socket.write(reply(request, fetchBody())),
+                    {
+                        verifyRaw: (evidence) => {
+                            retained = evidence;
+
+                            if (mode === 'detach') {
+                                structuredClone(evidence[selected].buffer, {
+                                    transfer: [evidence[selected].buffer as ArrayBuffer],
+                                });
+                            } else {
+                                Object.defineProperty(evidence[selected], 'fill', {
+                                    value: () => {
+                                        throw new Error('overridden fill');
+                                    },
+                                });
+                            }
+
+                            return true;
+                        },
+                    },
+                );
+                await attempt.fetch(fetchFields);
+
+                for (const name of ['requestFrame', 'requestOicq', 'responseFrame'] as const) {
+                    if (mode === 'detach' && name === selected) {
+                        expect(retained[name].byteLength).toBe(0);
+                    } else {
+                        expect(retained[name].every((byte) => byte === 0)).toBe(true);
+                    }
+                }
+            }
+        },
+    );
     it('wipes decoded WT bodies when a business boundary rejects', async () => {
         const original = wtOicq.decodeWtOicqResponse;
         let decoded: ReturnType<typeof original> | undefined;
@@ -607,6 +756,45 @@ describe('reference one-socket attempt (synthetic only)', () => {
         controller.abort();
         expect(attempt.getState()).toBe('failed');
     });
+    it.each(['abort', 'timeout'] as const)(
+        'does not return an account when an in-flight login ends by %s',
+        async (ending) => {
+            const controller = new AbortController();
+            let loginReceived!: () => void;
+            const loginStarted = new Promise<void>((resolve) => {
+                loginReceived = resolve;
+            });
+            let ownedSocket!: Socket;
+            const { attempt } = await setup(
+                (socket, request) => {
+                    if (request.kind === 0x810) {
+                        loginReceived();
+                    } else {
+                        socket.write(
+                            reply(request, request.kind === 0x31 ? fetchBody() : pollBody(0)),
+                        );
+                    }
+                },
+                { signal: controller.signal, timeoutMs: 100 },
+                (options) => {
+                    ownedSocket = options.socket;
+                },
+            );
+            await attempt.fetch(fetchFields);
+            expect(await attempt.poll()).toEqual({ status: 'confirmed' });
+            const result = attempt.login(loginFields);
+            const rejection = expect(result).rejects.toThrow('attempt login failed');
+            await loginStarted;
+
+            if (ending === 'abort') {
+                controller.abort();
+            }
+
+            await rejection;
+            expect(attempt.getState()).toBe('failed');
+            expect(ownedSocket.destroyed).toBe(true);
+        },
+    );
     it('expires held confirmation without a later login write', async () => {
         const requests: Request[] = [];
         const { attempt } = await setup(

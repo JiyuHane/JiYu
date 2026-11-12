@@ -98,8 +98,15 @@ observed V12 head encoder, but static inspection did not establish its runtime
 receiver type or complete calling chain. A separately bounded wrapper path
 at `0x6664434` passes a stack request to `0x66672f0`; immediately before that,
 `0x6664411` calls `0x6665a90` with a destination at request `+0x98` and a
-stack-sourced input. The helper's actual writes and that input's origin are
-not yet established.
+stack-sourced input. That helper transfers a pointer and clears the source slot;
+if the destination held an old object, it releases that object's resources. On a
+conditional earlier path, `0x6673480` invokes a virtual method and moves three
+0x18-byte string-like objects from its output into a newly allocated object;
+failure returns a null pointer. Nearby static diagnostic strings include
+`security_sign_manager.cc`, `GetSignInfo` and `sign success`, which link this
+bounded path to a signing-manager context. They do not establish the virtual
+method implementation, field meanings, runtime reachability, signing algorithm
+or usable signing service.
 These are bounded static observations, not runtime or peer-compatibility
 evidence. Field meanings, upstream collection construction and signature
 behavior remain unverified.
@@ -379,8 +386,13 @@ remain to be recovered and independently verified.
   fetch/poll and `0x810` on one caller-supplied connected socket. Explicit raw
   trust, context, signing and business-slice policies are mandatory. Temporary
   tickets remain private to a single-use confirmation state; local lifetime
-  limits include that state. Its successful ticket result does not mark online
-  status or attach to Bridge. See the reference lifecycle notes below for the
+  limits include that state. Its successful ticket result includes the confirmed
+  UIN associated with that attempt, rather than substituting the initial transport
+  UIN; the account remains subject to the caller's verification policy. Signer
+  output is copied before the callback's input buffer is cleared, including when
+  it aliases that input. Callback-visible verification copies are independently
+  cleared best-effort. Neither behavior establishes server authentication. The
+  result does not mark online status or attach to Bridge. See the reference lifecycle notes below for the
   synthetic coverage and remaining verification gaps.
 - `src/direct/wt-qr-flow.ts` coordinates a reference-style fetch and poll on
   one caller-supplied connected socket, with explicit timestamp, response and

@@ -40,6 +40,8 @@ type Context = {
 export type WtReferenceLoginResult =
     | {
           status: 'tickets';
+          /** Confirmed UIN accepted by the caller's context policy; not server authentication. */
+          readonly uin: string;
           tickets: { d2: Uint8Array; d2Key: Uint8Array; a1: Uint8Array; a2: Uint8Array };
       }
     | { status: 'verification-required' | 'nonzero' | 'incomplete'; state: number }
@@ -54,6 +56,7 @@ type Held = {
     temporaryA1: Uint8Array;
 };
 
+const typedArrayFill = Uint8Array.prototype.fill;
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
 const byteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get!;
 const backingBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
@@ -68,6 +71,14 @@ const sharedLength = Object.getOwnPropertyDescriptor(
 const signalAborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted')!.get!;
 const addListener = EventTarget.prototype.addEventListener;
 const removeListener = EventTarget.prototype.removeEventListener;
+
+function wipeOwned(bytes: Uint8Array): void {
+    try {
+        typedArrayFill.call(bytes, 0);
+    } catch {
+        /* Detached callback-visible buffers cannot be erased. */
+    }
+}
 
 function snapshotRecord(value: object): object {
     if (!value || typeof value !== 'object' || isProxy(value)) {
@@ -634,21 +645,21 @@ export class WtReferenceLoginAttempt {
 
                     this.active();
                     const signed = Buffer.from(oicq);
-                    let reserved: Uint8Array;
 
                     try {
-                        reserved = await this.signer({
+                        const reserved = await this.signer({
                             uin: account,
                             sequence,
                             command,
                             body: signed,
                         });
+                        this.active();
+                        metadata = snapshotBytes(reserved, 0xffff);
                     } finally {
-                        signed.fill(0);
+                        wipeOwned(signed);
                     }
 
                     this.active();
-                    metadata = snapshotBytes(reserved, 0xffff);
                     inner = encodeSso12Request({
                         sequence: sequence | 0,
                         subAppId: this.p.subAppId,
@@ -706,9 +717,9 @@ export class WtReferenceLoginAttempt {
                     this.active();
                     return valid === true;
                 } finally {
-                    requestFrame.fill(0);
-                    requestOicq.fill(0);
-                    responseFrame.fill(0);
+                    wipeOwned(requestFrame);
+                    wipeOwned(requestOicq);
+                    wipeOwned(responseFrame);
                 }
             },
             consumeCandidate: async (frame, ctx, identity) => {
@@ -898,6 +909,7 @@ export class WtReferenceLoginAttempt {
                                     type: 'login',
                                     result: {
                                         status: 'tickets',
+                                        uin: this.held!.decimal,
                                         tickets: {
                                             d2: Uint8Array.from(login.tickets.d2),
                                             d2Key: Uint8Array.from(login.tickets.d2Key),
