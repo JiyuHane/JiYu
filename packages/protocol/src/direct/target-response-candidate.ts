@@ -2,7 +2,9 @@ import { isProxy } from 'node:util/types';
 import { transformTargetResponse } from './target-response-transform';
 import { decodeTargetServiceDecryptCandidate } from './target-service-decrypt-candidate';
 import { decodeTargetServiceResponseBasic } from './target-service-response-basic';
+import { selectTargetResponseBusinessSkip } from './target-sso12-lookup';
 import { decodeTargetSso12ResponseFinal } from './target-sso12-response-final';
+import { decodeTargetSso12ResponseHead } from './target-sso12-response-head';
 
 /** Local limit on the entire supplied frame view, not a target framing rule. */
 export const MAX_TARGET_RESPONSE_CANDIDATE_BYTES = 16 * 1024 * 1024;
@@ -99,6 +101,26 @@ type Candidate = {
 };
 
 type CandidateWithFinal = Candidate & { finalWord: number; finalWordRead: boolean };
+export type CandidateWithLookup = Candidate & { lookupMatched: boolean; skip: 0 | 4 };
+
+/**
+ * Observe the lookup on the private plaintext. Only an empty reserve is accepted:
+ * the target's nonempty CPBMessageOpti parsing is not modeled here. The caller
+ * must independently verify and isolate the same frame, key and collection until
+ * their respective snapshots; collection is copied only after decryption and head
+ * parsing. Lookup proves neither collection origin nor packet authentication or
+ * completeness. Per-view limits do not bound aggregate memory, and JS, cipher,
+ * zlib internals and hostile global replacements are outside best-effort wiping.
+ */
+export function composeTargetResponseCandidateWithLookup(
+    frame: Uint8Array,
+    collection: readonly Uint8Array[],
+    compression: 'reject' | 'node-zlib-strict',
+    maxOutputBytes: number,
+    key: Uint8Array | undefined,
+): CandidateWithLookup {
+    return composeCandidate(frame, 0, compression, maxOutputBytes, key, undefined, { collection });
+}
 
 /**
  * Inspect the final word on the same private plaintext as the business transform.
@@ -140,14 +162,27 @@ function composeCandidate(
     compression: 'reject' | 'node-zlib-strict',
     maxOutputBytes: number,
     key: Uint8Array | undefined,
+    final: undefined,
+    lookup: { collection: readonly Uint8Array[] },
+): CandidateWithLookup;
+
+function composeCandidate(
+    frame: Uint8Array,
+    skip: 0 | 4,
+    compression: 'reject' | 'node-zlib-strict',
+    maxOutputBytes: number,
+    key: Uint8Array | undefined,
     final: { prior: number } | undefined,
-): Candidate | CandidateWithFinal {
+    lookup?: { collection: readonly Uint8Array[] },
+): Candidate | CandidateWithFinal | CandidateWithLookup {
     let snapshot: Uint8Array | undefined;
     let keyCopy: Uint8Array | undefined;
     let basic: ReturnType<typeof decodeTargetServiceResponseBasic> | undefined;
     let candidate: Uint8Array | undefined;
     let transformed: ReturnType<typeof transformTargetResponse> | undefined;
     let finalResult: ReturnType<typeof decodeTargetSso12ResponseFinal> | undefined;
+    let lookupHead: ReturnType<typeof decodeTargetSso12ResponseHead> | undefined;
+    let selection: ReturnType<typeof selectTargetResponseBusinessSkip> | undefined;
     let trailing: Uint8Array | undefined;
     let success = false;
 
@@ -214,6 +249,21 @@ function composeCandidate(
             finalResult = decodeTargetSso12ResponseFinal(candidate, 0, final.prior);
         }
 
+        if (lookup) {
+            lookupHead = decodeTargetSso12ResponseHead(candidate);
+
+            if (lookupHead.reserve.length !== 0) {
+                throw new Error('nonempty reserve');
+            }
+
+            selection = selectTargetResponseBusinessSkip(
+                lookupHead.field2,
+                lookup.collection,
+                candidate.length - lookupHead.nextOffset,
+            );
+            skip = selection.skip;
+        }
+
         transformed = transformTargetResponse(candidate, skip, compression, maxOutputBytes);
         trailing = new Uint8Array(candidate.length - transformed.nextOffset);
         copyBytes.call(
@@ -240,7 +290,9 @@ function composeCandidate(
                   finalWord: finalResult.finalWord,
                   finalWordRead: finalResult.finalWordRead,
               }
-            : result;
+            : selection
+              ? { ...result, lookupMatched: selection.matched, skip: selection.skip }
+              : result;
         success = true;
         return complete;
     } catch {
@@ -254,6 +306,11 @@ function composeCandidate(
         clear(finalResult?.head.field3);
         clear(finalResult?.head.reserve);
         clear(finalResult?.head.tail);
+        clear(lookupHead?.field1);
+        clear(lookupHead?.field2);
+        clear(lookupHead?.field3);
+        clear(lookupHead?.reserve);
+        clear(lookupHead?.tail);
 
         if (!success) {
             clear(basic?.opaque);

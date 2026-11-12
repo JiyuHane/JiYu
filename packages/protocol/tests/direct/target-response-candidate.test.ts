@@ -5,6 +5,7 @@ import { qqTeaEncrypt } from '../../src/direct/qq-tea';
 import {
     composeTargetResponseCandidate,
     composeTargetResponseCandidateWithFinal,
+    composeTargetResponseCandidateWithLookup,
     MAX_TARGET_RESPONSE_CANDIDATE_BYTES as cap,
 } from '../../src/direct/target-response-candidate';
 
@@ -64,6 +65,332 @@ function withTail(body: Uint8Array, flags: number, skip: 0 | 4, tail: number[]):
     new DataView(result.buffer).setUint32(0, 36 + tail.length);
     return result;
 }
+
+// Strict response head with an explicitly empty reserve by default.
+function lookupPlain(
+    field2: Uint8Array,
+    after: Uint8Array,
+    flags = 0,
+    reserve = new Uint8Array(),
+): Uint8Array {
+    const headLength = 12 + 5 + 4 + field2.length + 5 + 4 + 4 + reserve.length + 2;
+    const result = new Uint8Array(headLength + after.length);
+    const view = new DataView(result.buffer);
+    view.setUint32(0, headLength);
+    view.setUint32(4, 0x80000001);
+    view.setUint32(8, 0xffffffff);
+    let cursor = 12;
+
+    for (const field of [Uint8Array.of(0xa1), field2, Uint8Array.of(0xc3)]) {
+        view.setUint32(cursor, 4 + field.length);
+        cursor += 4;
+        result.set(field, cursor);
+        cursor += field.length;
+    }
+
+    view.setUint32(cursor, flags);
+    cursor += 4;
+    view.setUint32(cursor, 4 + reserve.length);
+    cursor += 4;
+    result.set(reserve, cursor);
+    cursor += reserve.length;
+    result.set([0xe5, 0xf6], cursor);
+    result.set(after, headLength);
+    return result;
+}
+
+describe('lookup on the private candidate', () => {
+    const name = Uint8Array.of(0, 0xff, 0x80, 0x41);
+    const emptyWrapper = Uint8Array.of(0, 0, 0, 4);
+    const skippedWrapper = Uint8Array.of(0x71, 0x72, 0x73, 0x74, 0, 0, 0, 4);
+
+    it.each([0, 1, 2])(
+        'observes exact binary matches and preserves inputs for selector %i',
+        (selector) => {
+            const collection = [Uint8Array.of(0, 0xff, 0x80), name.slice()];
+            const input = frame(lookupPlain(name, skippedWrapper), selector);
+            const before = input.slice();
+            const collectionBefore = collection.map((item) => item.slice());
+            const keyBefore = key.slice();
+            const secret = selector ? key : undefined;
+            const result = composeTargetResponseCandidateWithLookup(
+                input,
+                collection,
+                'reject',
+                cap,
+                secret,
+            );
+            const { lookupMatched, skip, ...oldShape } = result;
+            expect(lookupMatched).toBe(true);
+            expect(skip).toBe(4);
+            expect(oldShape).toEqual(
+                composeTargetResponseCandidate(input, 4, 'reject', cap, secret),
+            );
+            expect(result.body).toEqual(new Uint8Array());
+            expect(result.head.field2).toEqual(name);
+            expect(result.head.reserve).toEqual(new Uint8Array());
+            expect(Object.keys(result)).toEqual([
+                'kind',
+                'basic',
+                'head',
+                'body',
+                'trailing',
+                'businessOffset',
+                'nextOffset',
+                'compression',
+                'lookupMatched',
+                'skip',
+            ]);
+            expect(input).toEqual(before);
+            expect(collection).toEqual(collectionBefore);
+            expect(key).toEqual(keyBefore);
+            const field = result.head.field2.slice();
+            input.fill(0);
+            collection[1].fill(0);
+            expect(result.head.field2).toEqual(field);
+        },
+    );
+
+    it('uses the exact 4, 5–7 and 8 remaining-byte boundaries', () => {
+        const four = composeTargetResponseCandidateWithLookup(
+            frame(lookupPlain(name, emptyWrapper)),
+            [name],
+            'reject',
+            cap,
+            undefined,
+        );
+        expect(four.lookupMatched).toBe(true);
+        expect(four.skip).toBe(0);
+        expect(four.body).toEqual(new Uint8Array());
+
+        for (let length = 5; length <= 7; length++) {
+            expect(() =>
+                composeTargetResponseCandidateWithLookup(
+                    frame(lookupPlain(name, skippedWrapper.slice(0, length))),
+                    [name],
+                    'reject',
+                    cap,
+                    undefined,
+                ),
+            ).toThrow(failure);
+        }
+
+        const eight = composeTargetResponseCandidateWithLookup(
+            frame(lookupPlain(name, skippedWrapper)),
+            [name],
+            'reject',
+            cap,
+            undefined,
+        );
+        expect(eight.skip).toBe(4);
+        expect(eight.body).toEqual(new Uint8Array());
+        const miss = composeTargetResponseCandidateWithLookup(
+            frame(lookupPlain(name, Uint8Array.of(0, 0, 0, 5, 0x77))),
+            [Uint8Array.of(0, 0xff, 0x80)],
+            'reject',
+            cap,
+            undefined,
+        );
+        expect(miss.lookupMatched).toBe(false);
+        expect(miss.skip).toBe(0);
+        expect(miss.body).toEqual(Uint8Array.of(0x77));
+    });
+
+    it('applies the real strict zlib transform only after selection', () => {
+        const body = Uint8Array.of(0, 0xff, 1, 2);
+        const compressed = Uint8Array.from(deflateSync(body));
+        const after = new Uint8Array(8 + compressed.length);
+        after.set([9, 8, 7, 6]);
+        new DataView(after.buffer).setUint32(4, compressed.length + 4);
+        after.set(compressed, 8);
+        const input = frame(lookupPlain(name, after, 1), 2);
+        expect(() =>
+            composeTargetResponseCandidateWithLookup(input, [name], 'reject', body.length, key),
+        ).toThrow(failure);
+        const result = composeTargetResponseCandidateWithLookup(
+            input,
+            [name],
+            'node-zlib-strict',
+            body.length,
+            key,
+        );
+        expect(result.skip).toBe(4);
+        expect(result.body).toEqual(body);
+        expect(result.compression).toBe('node-zlib-strict');
+        expect(() =>
+            composeTargetResponseCandidateWithLookup(
+                input,
+                [name],
+                'node-zlib-strict',
+                body.length - 1,
+                key,
+            ),
+        ).toThrow(failure);
+    });
+
+    it('rejects all nonempty reserve bytes and invalid collection entries without partial results', () => {
+        for (const reserve of [Uint8Array.of(0), Uint8Array.of(0x0a, 0)]) {
+            const input = frame(lookupPlain(name, skippedWrapper, 0, reserve));
+            expect(() =>
+                composeTargetResponseCandidateWithLookup(input, [name], 'reject', cap, undefined),
+            ).toThrow(failure);
+        }
+
+        const input = frame(lookupPlain(name, skippedWrapper));
+        let calls = 0;
+        const accessor = [name, name];
+        Object.defineProperty(accessor, '1', {
+            get() {
+                calls++;
+                throw new Error('SECRET');
+            },
+        });
+        const proxy = new Proxy([name], {
+            get() {
+                calls++;
+                throw new Error('SECRET');
+            },
+        });
+
+        for (const collection of [
+            accessor,
+            proxy,
+            [name, new Uint8Array(new SharedArrayBuffer(4))],
+        ]) {
+            expect(() =>
+                composeTargetResponseCandidateWithLookup(
+                    input,
+                    collection,
+                    'reject',
+                    cap,
+                    undefined,
+                ),
+            ).toThrow(failure);
+        }
+
+        expect(calls).toBe(0);
+    });
+
+    it('ignores shadow byte getters and preserves the entire validated collection', () => {
+        const input = frame(lookupPlain(name, skippedWrapper));
+        const item = name.slice();
+        let calls = 0;
+
+        for (const property of [
+            'length',
+            'byteLength',
+            'byteOffset',
+            'buffer',
+            Symbol.iterator,
+            Symbol.toStringTag,
+        ]) {
+            Object.defineProperty(item, property, {
+                get() {
+                    calls++;
+                    throw new Error('SECRET');
+                },
+            });
+        }
+
+        const result = composeTargetResponseCandidateWithLookup(
+            input,
+            [item],
+            'reject',
+            cap,
+            undefined,
+        );
+        expect(result.lookupMatched).toBe(true);
+        expect(result.skip).toBe(4);
+        expect(calls).toBe(0);
+    });
+
+    it('wipes lookup and transform outputs after the trailing copy fails', async () => {
+        const input = frame(lookupPlain(name, Uint8Array.of(...skippedWrapper, 0xfa, 0xfb)), 1);
+        const before = input.slice();
+        const keyBefore = key.slice();
+        const collection = [name.slice()];
+        const collectionBefore = collection[0].slice();
+        const original = Uint8Array.prototype.set;
+        const copies: Uint8Array[] = [];
+        vi.resetModules();
+        const spy = vi.spyOn(Uint8Array.prototype, 'set').mockImplementation(function (
+            this: Uint8Array,
+            source: ArrayLike<number>,
+            offset?: number,
+        ) {
+            copies.push(this);
+            original.call(this, source, offset);
+
+            if (source.length === 2 && source[0] === 0xfa && source[1] === 0xfb) {
+                throw new Error('SECRET');
+            }
+        });
+
+        try {
+            const module = await import('../../src/direct/target-response-candidate');
+            expect(() =>
+                module.composeTargetResponseCandidateWithLookup(
+                    input,
+                    collection,
+                    'reject',
+                    cap,
+                    key,
+                ),
+            ).toThrow(failure);
+        } finally {
+            spy.mockRestore();
+        }
+
+        expect(copies.length).toBeGreaterThanOrEqual(15);
+        expect(copies.every((value) => value.every((byte) => byte === 0))).toBe(true);
+        expect(input).toEqual(before);
+        expect(key).toEqual(keyBefore);
+        expect(collection[0]).toEqual(collectionBefore);
+    });
+
+    it('attempts independent lookup-head wipes even when one wipe throws', async () => {
+        const input = frame(lookupPlain(name, skippedWrapper));
+        const before = input.slice();
+        const original = Uint8Array.prototype.fill;
+        const attempts: Uint8Array[] = [];
+        let failed: Uint8Array | undefined;
+        vi.resetModules();
+        const spy = vi.spyOn(Uint8Array.prototype, 'fill').mockImplementation(function (
+            this: Uint8Array,
+            value: number,
+            start?: number,
+            end?: number,
+        ) {
+            attempts.push(this);
+
+            if (!failed && this.length === 1 && this[0] === 0xa1) {
+                failed = this;
+                throw new Error('SECRET');
+            }
+
+            return original.call(this, value, start, end);
+        });
+
+        try {
+            const module = await import('../../src/direct/target-response-candidate');
+            const result = module.composeTargetResponseCandidateWithLookup(
+                input,
+                [name],
+                'reject',
+                cap,
+                undefined,
+            );
+            expect(result.head.field1).toEqual(Uint8Array.of(0xa1));
+            expect(result.head.field2).toEqual(name);
+        } finally {
+            spy.mockRestore();
+        }
+
+        expect(failed).toBeDefined();
+        expect(attempts.slice(attempts.indexOf(failed!) + 1).length).toBeGreaterThanOrEqual(4);
+        expect(input).toEqual(before);
+    });
+});
 
 describe('final observation from the composed private plaintext', () => {
     it.each([0, 1, 2])('reads every tail/skip combination for selector %i', (selector) => {

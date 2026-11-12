@@ -233,7 +233,14 @@ inspection of the reserve parser also shows presence checks using API indices
 been mapped to a complete protobuf wire schema. For index 23, an empty retrieved
 array takes a failure path; a nonempty array whose child conversion fails can
 instead continue without updating the corresponding output. These distinctions
-are not yet implemented as a faithful reserve parser.
+are not yet implemented as a faithful reserve parser. A later bounded trace
+resolves the nonempty-vector parser entry to `0x8b54360`; its dispatch at
+`0x8b54480` separates a tag into `tag & 7` and `tag >> 3` before a wire-index
+jump table. In the inspected branches, wire indices 0, 1 and 5 forward
+`tag >> 3` to a numeric-storage lookup; index 2 forwards it to a separate
+function. The exact relationship between those storage objects and the API
+presence lookup, as well as the expected wire type for each field, remains
+unverified.
 
 The decrypt caller bypasses `0x666c5a0` for selector 0. Inside that function,
 selector 1 takes a primary 16-byte candidate from one context object's `+0x78`
@@ -383,9 +390,16 @@ remain to be recovered and independently verified.
   it repeats the strict head parse and snapshot, so the per-view cap is not a
   peak-memory cap. A successful candidate necessarily has a complete business
   prefix and therefore a readable final word; the caller-supplied prior is
-  observable only in shorter spans handled by the standalone final reader. A
-  synthetic loopback test composes this stage inside `transactRaw()` after a
-  fixture verifier accepts its frame and publishes only after the transaction
+  observable only in shorter spans handled by the standalone final reader.
+  The additive `composeTargetResponseCandidateWithLookup` variant performs the
+  caller-supplied collection lookup on the same private decrypted candidate and
+  applies its selected skip before transforming the body. It rejects nonempty
+  reserve vectors because their target parser is not yet implemented; empty
+  reserve is the statically observed successful subset. The collection is
+  validated and copied after decryption and head parsing, not at API entry; the
+  caller remains responsible for input stability and peer trust. A synthetic
+  loopback test composes the original explicit-skip candidate inside
+  `transactRaw()` after a fixture verifier accepts its frame and publishes only after the transaction
   succeeds. On cancellation the test caller clears its staged result; the raw
   transport itself does not clear arbitrary values returned by a consumer. The
   loopback framing requires the first word to equal frame length, a local
