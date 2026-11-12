@@ -2,6 +2,7 @@ import { isProxy } from 'node:util/types';
 import { transformTargetResponse } from './target-response-transform';
 import { decodeTargetServiceDecryptCandidate } from './target-service-decrypt-candidate';
 import { decodeTargetServiceResponseBasic } from './target-service-response-basic';
+import { decodeTargetSso12ResponseFinal } from './target-sso12-response-final';
 
 /** Local limit on the entire supplied frame view, not a target framing rule. */
 export const MAX_TARGET_RESPONSE_CANDIDATE_BYTES = 16 * 1024 * 1024;
@@ -82,7 +83,11 @@ export function composeTargetResponseCandidate(
     compression: 'reject' | 'node-zlib-strict',
     maxOutputBytes: number,
     key?: Uint8Array,
-): {
+): Candidate {
+    return composeCandidate(frame, skip, compression, maxOutputBytes, key, undefined);
+}
+
+type Candidate = {
     kind: 'unverified-response-candidate';
     basic: ReturnType<typeof decodeTargetServiceResponseBasic>;
     head: ReturnType<typeof transformTargetResponse>['head'];
@@ -91,12 +96,58 @@ export function composeTargetResponseCandidate(
     businessOffset: number;
     nextOffset: number;
     compression: 'none' | 'node-zlib-strict';
-} {
+};
+
+type CandidateWithFinal = Candidate & { finalWord: number; finalWordRead: boolean };
+
+/**
+ * Inspect the final word on the same private plaintext as the business transform.
+ * This is a local observation, not authentication: the caller remains responsible
+ * for frame trust and key selection. The final reader performs another strict head
+ * parse and copies the full view; the per-view limit is not a peak-memory limit.
+ */
+export function composeTargetResponseCandidateWithFinal(
+    frame: Uint8Array,
+    skip: 0 | 4,
+    compression: 'reject' | 'node-zlib-strict',
+    maxOutputBytes: number,
+    key: Uint8Array | undefined,
+    prior: number,
+): CandidateWithFinal {
+    return composeCandidate(frame, skip, compression, maxOutputBytes, key, { prior });
+}
+
+function composeCandidate(
+    frame: Uint8Array,
+    skip: 0 | 4,
+    compression: 'reject' | 'node-zlib-strict',
+    maxOutputBytes: number,
+    key: Uint8Array | undefined,
+    final: undefined,
+): Candidate;
+function composeCandidate(
+    frame: Uint8Array,
+    skip: 0 | 4,
+    compression: 'reject' | 'node-zlib-strict',
+    maxOutputBytes: number,
+    key: Uint8Array | undefined,
+    final: { prior: number },
+): CandidateWithFinal;
+
+function composeCandidate(
+    frame: Uint8Array,
+    skip: 0 | 4,
+    compression: 'reject' | 'node-zlib-strict',
+    maxOutputBytes: number,
+    key: Uint8Array | undefined,
+    final: { prior: number } | undefined,
+): Candidate | CandidateWithFinal {
     let snapshot: Uint8Array | undefined;
     let keyCopy: Uint8Array | undefined;
     let basic: ReturnType<typeof decodeTargetServiceResponseBasic> | undefined;
     let candidate: Uint8Array | undefined;
     let transformed: ReturnType<typeof transformTargetResponse> | undefined;
+    let finalResult: ReturnType<typeof decodeTargetSso12ResponseFinal> | undefined;
     let trailing: Uint8Array | undefined;
     let success = false;
 
@@ -107,7 +158,12 @@ export function composeTargetResponseCandidate(
             typeof maxOutputBytes !== 'number' ||
             !Number.isSafeInteger(maxOutputBytes) ||
             maxOutputBytes < 0 ||
-            maxOutputBytes > MAX_TARGET_RESPONSE_CANDIDATE_BYTES
+            maxOutputBytes > MAX_TARGET_RESPONSE_CANDIDATE_BYTES ||
+            (final !== undefined &&
+                (typeof final.prior !== 'number' ||
+                    !Number.isInteger(final.prior) ||
+                    final.prior < 0 ||
+                    final.prior > 0xffffffff))
         ) {
             throw new TypeError('invalid options');
         }
@@ -153,6 +209,11 @@ export function composeTargetResponseCandidate(
             input.length - basic.nextOffset,
         );
         candidate = decodeTargetServiceDecryptCandidate(basic.selector, remainder, keyCopy).data;
+
+        if (final) {
+            finalResult = decodeTargetSso12ResponseFinal(candidate, 0, final.prior);
+        }
+
         transformed = transformTargetResponse(candidate, skip, compression, maxOutputBytes);
         trailing = new Uint8Array(candidate.length - transformed.nextOffset);
         copyBytes.call(
@@ -173,14 +234,26 @@ export function composeTargetResponseCandidate(
             nextOffset: transformed.nextOffset,
             compression: transformed.compression,
         };
+        const complete = finalResult
+            ? {
+                  ...result,
+                  finalWord: finalResult.finalWord,
+                  finalWordRead: finalResult.finalWordRead,
+              }
+            : result;
         success = true;
-        return result;
+        return complete;
     } catch {
         throw new Error('target response candidate decoding failed');
     } finally {
         clear(snapshot);
         clear(keyCopy);
         clear(candidate);
+        clear(finalResult?.head.field1);
+        clear(finalResult?.head.field2);
+        clear(finalResult?.head.field3);
+        clear(finalResult?.head.reserve);
+        clear(finalResult?.head.tail);
 
         if (!success) {
             clear(basic?.opaque);

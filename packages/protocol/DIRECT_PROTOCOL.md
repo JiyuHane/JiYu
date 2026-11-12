@@ -151,9 +151,14 @@ The packaged application declares an entry inside `application.asar`. The two
 selected launcher entries in that archive were not valid UTF-8 in the static
 analysis, so their code was not recovered. Separate plaintext launcher files
 outside the archive contain calls to `major.node.load(...)`; they must not be
-substituted for the archive entries. No path from those plaintext files to
-`wrapper.node` or the signing-manager setter has been established. This is a
-bounded static result, not proof that no such path exists.
+substituted for the archive entries. In the inspected `major.node`, the exported
+`Init` function statically registers a `load` property using the exported `Load`
+callback. A separate exported `LoadInternal` searches a symbolically named
+`map_for_bytecode` by exact name bytes and can return a pointer and length; this
+observation alone does not identify the stored format or prove which resources
+are loaded at runtime. No path from the plaintext launchers to `wrapper.node` or
+the signing-manager setter has been established. This is a bounded static
+result, not proof that no such path exists.
 
 The same outbound path builds the business buffer by a direct call at
 `0x666794d` to `0x6667fa0`, not another virtual-table slot. That helper reads
@@ -215,11 +220,20 @@ virtual slot `+0x28` resolves to `0x6669900`, which forwards that vector to
 `0x666ad40`. An empty vector returns success without updating the initialized
 output; a nonempty vector is passed to a `CPBMessageOpti` parser, and failure
 stops packet decoding. On success, the caller compares an extracted head string
-against a local collection. Only if that lookup succeeds and at least five bytes
-remain after the declared head does it skip four bytes before decoding the
-business wrapper. The skipped bytes are not checked on this branch. The
-collection's origin, complete reserve wire types and business meaning are not
-established; the conditional offset must not be inferred from synthetic headers.
+against a local collection. A bounded recheck shows that the lookup key is the
+second decoded head string (`field2`, stored at head `+0x28`), not a string from
+the separately parsed reserve output. The collection lookup compares string
+length and bytes. Only if it succeeds and at least five bytes remain after the
+declared head does the caller skip four bytes before decoding the business
+wrapper. The skipped bytes are not checked on this branch. The collection's
+origin, complete reserve wire types and business meaning are not established;
+the conditional offset must not be inferred from synthetic headers. Bounded
+inspection of the reserve parser also shows presence checks using API indices
+9, 22, 23 and 25 and nested extraction. These indices have not independently
+been mapped to a complete protobuf wire schema. For index 23, an empty retrieved
+array takes a failure path; a nonempty array whose child conversion fails can
+instead continue without updating the corresponding output. These distinctions
+are not yet implemented as a faithful reserve parser.
 
 The decrypt caller bypasses `0x666c5a0` for selector 0. Inside that function,
 selector 1 takes a primary 16-byte candidate from one context object's `+0x78`
@@ -337,6 +351,14 @@ remain to be recovered and independently verified.
   It assumes no conditional four-byte skip, whose target applicability depends
   on a separate string-collection lookup; it does not infer a compression flag,
   prove full native header/reserve decoding, or authenticate a peer.
+- `src/direct/target-sso12-lookup.ts` provides the observed bytewise `field2`
+  collection match and the conditional zero-or-four-byte skip decision. The
+  caller supplies the collection and the number of bytes after the declared
+  head, and remains responsible for their origin, their association with the
+  same plaintext, and successful reserve parsing. A match with five to seven
+  bytes remaining selects four but does not make the following wrapper valid.
+  The count and aggregate-byte limits are local resource policies; the result
+  does not authenticate a peer or prove full target compatibility.
 - `src/direct/target-response-transform.ts` composes the strict head and business
   wrapper parsers for an already caller-accepted view. The caller explicitly
   chooses a final skip of zero or four bytes and a compression policy; a set
@@ -355,7 +377,13 @@ remain to be recovered and independently verified.
   fall back. The first basic word is preserved rather than treated as a frame
   length. Basic offsets refer to the supplied frame view; head and business
   offsets refer to the plaintext candidate, not the encrypted wire. Opaque basic
-  data, head tail and post-business trailing bytes remain separate outputs. A
+  data, head tail and post-business trailing bytes remain separate outputs. An
+  additive `composeTargetResponseCandidateWithFinal` variant also reads the
+  final word from the same private plaintext, before business transformation;
+  it repeats the strict head parse and snapshot, so the per-view cap is not a
+  peak-memory cap. A successful candidate necessarily has a complete business
+  prefix and therefore a readable final word; the caller-supplied prior is
+  observable only in shorter spans handled by the standalone final reader. A
   synthetic loopback test composes this stage inside `transactRaw()` after a
   fixture verifier accepts its frame and publishes only after the transaction
   succeeds. On cancellation the test caller clears its staged result; the raw
