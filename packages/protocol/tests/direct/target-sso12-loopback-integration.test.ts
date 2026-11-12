@@ -10,6 +10,7 @@ import { decodeTargetServiceDecryptCandidate } from '../../src/direct/target-ser
 import { decodeTargetSso12ResponseHead } from '../../src/direct/target-sso12-response-head';
 import { decodeTargetServiceBusinessResponse } from '../../src/direct/target-service-business-response';
 import { inflateTargetZlibCandidate } from '../../src/direct/target-zlib-candidate';
+import { composeTargetResponseCandidate } from '../../src/direct/target-response-candidate';
 
 // Synthetic loopback composition, not peer authentication or QQ compatibility.
 // ServiceFrameDecoder requires the first BE32 to be the full frame length, so
@@ -141,6 +142,239 @@ afterEach(async () => {
 }, 5000);
 
 describe('synthetic target response over SSO12 raw loopback', () => {
+    it('composes the independently checked candidate before publishing the raw response', async () => {
+        const candidate = response();
+        const expectedHex = candidate.toString('hex');
+        const order: string[] = [];
+        const client = await setup(candidate, order);
+        let verifiedCopy: Uint8Array | undefined;
+        let consumedCopy: Uint8Array | undefined;
+        const published: ReturnType<typeof composeTargetResponseCandidate>[] = [];
+        const result = await client.transactRaw({
+            timeoutMs: 2000,
+            buildRequest: () => ({ frame: request, context: null }),
+            verifyCandidate: (bytes) => {
+                verifiedCopy = bytes;
+                expect(Buffer.from(bytes).toString('hex')).toBe(expectedHex);
+                bytes.fill(0x44);
+                return true;
+            },
+            consumeCandidate: (bytes) => {
+                consumedCopy = bytes;
+                expect(Buffer.from(bytes).toString('hex')).toBe(expectedHex);
+                return composeTargetResponseCandidate(
+                    bytes,
+                    0,
+                    'node-zlib-strict',
+                    payload.length,
+                    key,
+                );
+            },
+        });
+        expect(result.kind).toBe('response');
+
+        if (result.kind !== 'response') {
+            throw new Error('expected synthetic response');
+        }
+
+        try {
+            published.push(result.value);
+            expect(published).toHaveLength(1);
+            expect(result.value).toEqual({
+                kind: 'unverified-response-candidate',
+                basic: {
+                    word0: candidate.length,
+                    word4: 0x87654321,
+                    selector: 1,
+                    flag9: 0xa5,
+                    opaque: Uint8Array.of(0xbe, 0xef),
+                    nextOffset: 16,
+                },
+                head: {
+                    headLength: 43,
+                    sequenceBits: 0x80000001,
+                    followingWord: 0xfedcba98,
+                    field1: Uint8Array.of(0xff, 0),
+                    field2: Uint8Array.of(0x80),
+                    field3: Uint8Array.of(1, 2, 3),
+                    flagsWord: 0xfedcba99,
+                    reserve: Uint8Array.of(0x81, 0x82),
+                    tail: Uint8Array.of(0xde, 0xad, 0x7e),
+                    nextOffset: 43,
+                },
+                businessOffset: 43,
+                nextOffset: 47 + compressed.length,
+                compression: 'node-zlib-strict',
+                body: payload,
+                trailing: Uint8Array.of(0xca, 0xfe),
+            });
+            expect(result.writeState).toBe('written');
+            expect(verifiedCopy?.every((byte) => byte === 0)).toBe(true);
+            expect(consumedCopy?.every((byte) => byte === 0)).toBe(true);
+            expect(order).toEqual(['peer-received', 'peer-wrote']);
+        } finally {
+            for (const bytes of [
+                result.value.basic.opaque,
+                result.value.head.field1,
+                result.value.head.field2,
+                result.value.head.field3,
+                result.value.head.reserve,
+                result.value.head.tail,
+                result.value.body,
+                result.value.trailing,
+            ]) {
+                bytes.fill(0);
+            }
+        }
+    }, 10000);
+
+    it.each([false, 'truthy'] as const)(
+        'short-circuits consumer and real composer when verifier returns %s',
+        async (verdict) => {
+            const candidate = response();
+            const expectedHex = candidate.toString('hex');
+            const order: string[] = [];
+            const client = await setup(candidate, order);
+            const compose = vi.fn(composeTargetResponseCandidate);
+            const consume = vi.fn((bytes: Uint8Array) =>
+                compose(bytes, 0, 'node-zlib-strict', payload.length, key),
+            );
+            const verify = vi.fn((bytes: Uint8Array) => {
+                expect(Buffer.from(bytes).toString('hex')).toBe(expectedHex);
+                return verdict as unknown as boolean;
+            });
+            const result = await client.transactRaw({
+                timeoutMs: 2000,
+                buildRequest: () => ({ frame: request, context: null }),
+                verifyCandidate: verify,
+                consumeCandidate: consume,
+            });
+            expect(result).toEqual({
+                kind: 'failure',
+                code: 'raw-rejected',
+                writeState: 'unknown',
+            });
+            expect(verify).toHaveBeenCalledOnce();
+            expect(consume).not.toHaveBeenCalled();
+            expect(compose).not.toHaveBeenCalled();
+            expect(order).toEqual(['peer-received', 'peer-wrote']);
+            expect((await client.whenClosed).code).toBe('raw-rejected');
+        },
+        10000,
+    );
+
+    it('discards caller-staged composition after cancellation during an asynchronous consumer', async () => {
+        const candidate = response();
+        const expectedHex = candidate.toString('hex');
+        const order: string[] = [];
+        const client = await setup(candidate, order);
+        const write = vi.spyOn(sockets[sockets.length - 2], 'write');
+        const controller = new AbortController();
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        let markEntered!: () => void;
+        const entered = new Promise<void>((resolve) => {
+            markEntered = resolve;
+        });
+        let markSettled!: () => void;
+        const settled = new Promise<void>((resolve) => {
+            markSettled = resolve;
+        });
+        let verifiedCopy: Uint8Array | undefined;
+        let consumedCopy: Uint8Array | undefined;
+        let staged: ReturnType<typeof composeTargetResponseCandidate> | undefined;
+        const published: ReturnType<typeof composeTargetResponseCandidate>[] = [];
+        const compose = vi.fn(composeTargetResponseCandidate);
+        const consume = vi.fn(async (bytes: Uint8Array) => {
+            consumedCopy = bytes;
+
+            try {
+                expect(Buffer.from(bytes).toString('hex')).toBe(expectedHex);
+                staged = compose(bytes, 0, 'node-zlib-strict', payload.length, key);
+                markEntered();
+                await gate;
+                return staged;
+            } finally {
+                markSettled();
+            }
+        });
+        const transaction = client.transactRaw({
+            timeoutMs: 2000,
+            signal: controller.signal,
+            buildRequest: () => ({ frame: request, context: null }),
+            verifyCandidate: (bytes) => {
+                verifiedCopy = bytes;
+                expect(Buffer.from(bytes).toString('hex')).toBe(expectedHex);
+                bytes.fill(0x44);
+                return true;
+            },
+            consumeCandidate: consume,
+        });
+
+        try {
+            await Promise.race([
+                entered,
+                transaction.then(() => {
+                    throw new Error('transaction ended before consumer entered');
+                }),
+            ]);
+            expect(compose).toHaveBeenCalledOnce();
+            expect(staged?.body).toEqual(payload);
+            controller.abort();
+            const result = await transaction;
+
+            if (result.kind === 'response') {
+                published.push(result.value);
+            }
+
+            expect(result).toEqual({
+                kind: 'failure',
+                code: 'raw-cancelled',
+                writeState: 'unknown',
+            });
+            expect(published).toEqual([]);
+            // Observe transport-owned callback copies before caller cleanup.
+            expect(verifiedCopy?.every((byte) => byte === 0)).toBe(true);
+            expect(consumedCopy?.every((byte) => byte === 0)).toBe(true);
+            expect(write).toHaveBeenCalledOnce();
+            expect(consume).toHaveBeenCalledOnce();
+            expect(order).toEqual(['peer-received', 'peer-wrote']);
+            expect((await client.whenClosed).code).toBe('raw-cancelled');
+        } finally {
+            controller.abort();
+            release();
+            await transaction;
+
+            if (consume.mock.calls.length > 0) {
+                await settled;
+            }
+
+            if (staged) {
+                for (const bytes of [
+                    staged.basic.opaque,
+                    staged.head.field1,
+                    staged.head.field2,
+                    staged.head.field3,
+                    staged.head.reserve,
+                    staged.head.tail,
+                    staged.body,
+                    staged.trailing,
+                ]) {
+                    bytes.fill(0);
+                    expect(bytes.every((byte) => byte === 0)).toBe(true);
+                }
+            }
+
+            verifiedCopy?.fill(0);
+            consumedCopy?.fill(0);
+            expect(published).toEqual([]);
+            expect(write).toHaveBeenCalledOnce();
+            expect(consume).toHaveBeenCalledOnce();
+        }
+    }, 10000);
+
     it('writes the fake request before fixture comparison and real decoding', async () => {
         const candidate = response();
         const order: string[] = [];

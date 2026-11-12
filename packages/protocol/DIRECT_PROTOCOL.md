@@ -130,8 +130,16 @@ connection to the signer setter. The dispatch receiver's `+0x28` and the
 constructed objects' `+0x30` slots belong to different objects. The inspected
 candidate paths both access the second receiver's `+0x30` and call `0x6725fb0`;
 the clear path's subsequent pointer/count changes and releases are consistent
-with deleting a node from an associated structure. This does not establish the
-structure's business meaning or a link to the signing-manager setter.
+with deleting a node from an associated structure. A later bounded inspection
+of the notify candidate `0x6724ce0` also shows a node insertion/update path:
+`0x6724f3a` calls `0x6726100`, the new-node branch links a node and increments
+a count, and `0x672502b–0x6725045` moves a temporary object into node `+0x28`.
+Earlier in the same bounded path, `0x6724ce0` searches an associated structure,
+compares three node fields, and returns zero when all three compare equal. The
+examined continuation of `0x67252d0` cleans up temporaries and returns a saved
+boolean; no direct call to the signing-manager setter was seen in those windows.
+This does not establish the structure's business meaning, callback execution,
+or a link to the signing-manager setter.
 These are bounded static observations, not runtime or peer-compatibility
 evidence. Field meanings, upstream collection construction and signature
 behavior remain unverified.
@@ -324,7 +332,13 @@ remain to be recovered and independently verified.
   fall back. The first basic word is preserved rather than treated as a frame
   length. Basic offsets refer to the supplied frame view; head and business
   offsets refer to the plaintext candidate, not the encrypted wire. Opaque basic
-  data, head tail and post-business trailing bytes remain separate outputs.
+  data, head tail and post-business trailing bytes remain separate outputs. A
+  synthetic loopback test composes this stage inside `transactRaw()` after a
+  fixture verifier accepts its frame and publishes only after the transaction
+  succeeds. On cancellation the test caller clears its staged result; the raw
+  transport itself does not clear arbitrary values returned by a consumer. The
+  loopback framing requires the first word to equal frame length, a local
+  transport condition not established for the target's basic decoder.
 - `src/direct/target-service-business.ts` frames a nonempty raw request body as
   `BE32(body length + 4) || body` for the observed main-request path. The
   standalone helper's empty-body behavior differs from the main entry; this
