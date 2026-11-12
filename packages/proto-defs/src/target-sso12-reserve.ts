@@ -15,6 +15,12 @@ export interface TargetSso12ReserveField24 {
     field3?: pb<3, bytes>;
 }
 
+// Separate local response candidate; this is not a complete target reserve schema.
+export interface TargetSso12NumericReserveResponse {
+    field9?: pb_optional<9, uint_32>;
+    field25?: pb_optional<25, uint_32>;
+}
+
 export interface TargetSso12ReserveMessage {
     field12?: pb<12, bytes>;
     field13?: pb_optional<13, bytes>;

@@ -161,7 +161,12 @@ the signing-manager setter has been established. This is a bounded static
 result, not proof that no such path exists.
 
 The same outbound path builds the business buffer by a direct call at
-`0x666794d` to `0x6667fa0`, not another virtual-table slot. That helper reads
+`0x666794d` to `0x6667fa0`, not another virtual-table slot. A bounded
+backtrace identifies a direct call at `0x6664434` through thunk `0x66672f0` to
+`0x66678b0`; at that call site the request is a caller-owned stack object. Its
+body pointer and length correspond to `rsp+0xe0` and `rsp+0xe8` at that point,
+but their upstream construction and relationship to either login command remain
+unknown. The helper reads
 the request object's byte pointer at `+0x80` and 32-bit length at `+0x88`, then
 calls `0x6669c80` to write `BE32(length + 4)` followed by the unchanged body.
 The main request entry rejects a null pointer or zero length; the lower-level
@@ -229,8 +234,10 @@ wrapper. The skipped bytes are not checked on this branch. The collection's
 origin, complete reserve wire types and business meaning are not established;
 the conditional offset must not be inferred from synthetic headers. Bounded
 inspection of the reserve parser also shows presence checks using API indices
-9, 22, 23 and 25 and nested extraction. These indices have not independently
-been mapped to a complete protobuf wire schema. For index 23, an empty retrieved
+9, 22, 23 and 25 and nested extraction. Further bounded inspection establishes
+that these indices compare against `tag >> 3` keys in the same underlying
+object's field table; this maps the observed indices to field numbers, but does
+not establish a complete protobuf wire schema. For index 23, an empty retrieved
 array takes a failure path; a nonempty array whose child conversion fails can
 instead continue without updating the corresponding output. These distinctions
 are not yet implemented as a faithful reserve parser. A later bounded trace
@@ -238,9 +245,15 @@ resolves the nonempty-vector parser entry to `0x8b54360`; its dispatch at
 `0x8b54480` separates a tag into `tag & 7` and `tag >> 3` before a wire-index
 jump table. In the inspected branches, wire indices 0, 1 and 5 forward
 `tag >> 3` to a numeric-storage lookup; index 2 forwards it to a separate
-function. The exact relationship between those storage objects and the API
-presence lookup, as well as the expected wire type for each field, remains
-unverified.
+function. Follow-up inspection of the constructor and the parser's eight-byte
+`this` adjustment shows that their storage and the API presence lookup refer to
+the same field table. The observed tag bytes `48` and `c8 01` identify wire-0
+fields 9 and 25; one-byte values `00..7f` take the direct value path. For a
+single valid wire-0 value, the inspected numeric setter's internal ZigZag
+encoding is reversed by the field getter, yielding the wire value's low 32 bits;
+the wire value itself is not ZigZag-encoded. Field 9 writes output `+0`, while
+field 25 writes `+0x50` and sets a presence flag at `+0x54`. Complete parser
+behavior, longer values and other wire types remain unverified.
 
 The decrypt caller bypasses `0x666c5a0` for selector 0. Inside that function,
 selector 1 takes a primary 16-byte candidate from one context object's `+0x78`
@@ -358,6 +371,14 @@ remain to be recovered and independently verified.
   It assumes no conditional four-byte skip, whose target applicability depends
   on a separate string-collection lookup; it does not infer a compression flag,
   prove full native header/reserve decoding, or authenticate a peer.
+- `src/direct/target-sso12-numeric-reserve.ts` provides a local, strict candidate
+  for an empty reserve or a reserve consisting only of single wire-0 fields 9
+  and/or 25 with one-byte values `0..127`. Its result distinguishes an absent
+  field from an explicitly encoded zero; an absent field means no observed
+  update, not a known native default. Rejecting duplicates, unknown fields,
+  larger values and other wire types is a local policy, not a claim that the
+  target rejects them. This candidate has not been integrated into the lookup
+  pipeline and does not establish native acceptance or QQ interoperability.
 - `src/direct/target-sso12-lookup.ts` provides the observed bytewise `field2`
   collection match and the conditional zero-or-four-byte skip decision. The
   caller supplies the collection and the number of bytes after the declared
