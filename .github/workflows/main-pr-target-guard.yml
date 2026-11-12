@@ -1,0 +1,36 @@
+name: PR policy guard
+
+# pull_request_target uses the default branch's trusted workflow and script.
+# This policy becomes active after it reaches main through Promote.
+on:
+  pull_request_target:
+    types: [opened, reopened, edited, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: write
+
+concurrency:
+  group: pr-policy-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Read the trusted policy script
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts/pr-policy-guard.cjs
+          sparse-checkout-cone-mode: false
+
+      - name: Enforce target branch and linked issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const guard = require('./.github/scripts/pr-policy-guard.cjs');
+            await guard({ github, context, core });
