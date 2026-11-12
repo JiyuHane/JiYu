@@ -164,9 +164,14 @@ The same outbound path builds the business buffer by a direct call at
 `0x666794d` to `0x6667fa0`, not another virtual-table slot. A bounded
 backtrace identifies a direct call at `0x6664434` through thunk `0x66672f0` to
 `0x66678b0`; at that call site the request is a caller-owned stack object. Its
-body pointer and length correspond to `rsp+0xe0` and `rsp+0xe8` at that point,
-but their upstream construction and relationship to either login command remain
-unknown. The helper reads
+body pointer and length correspond to `rsp+0xe0` and `rsp+0xe8` at that point.
+In the inspected caller, `0x6664347–0x6664367` obtains a vector-like pair via
+`T = [rbp]` and `V = [T+0x20]`, copies `[V]` into the request body pointer,
+and stores the low 32 bits of `[V+8] - [V]` as its length. A conditional
+branch also passes the same `T` to classifier `0x6667140`, and another call
+copies it into request `+0x28`. The source object was returned by a prior virtual
+call; its construction, the actual command on this path and the body semantics
+remain unknown. The helper reads
 the request object's byte pointer at `+0x80` and 32-bit length at `+0x88`, then
 calls `0x6669c80` to write `BE32(length + 4)` followed by the unchanged body.
 The main request entry rejects a null pointer or zero length; the lower-level
@@ -249,11 +254,13 @@ function. Follow-up inspection of the constructor and the parser's eight-byte
 `this` adjustment shows that their storage and the API presence lookup refer to
 the same field table. The observed tag bytes `48` and `c8 01` identify wire-0
 fields 9 and 25; one-byte values `00..7f` take the direct value path. For a
-single valid wire-0 value, the inspected numeric setter's internal ZigZag
-encoding is reversed by the field getter, yielding the wire value's low 32 bits;
-the wire value itself is not ZigZag-encoded. Field 9 writes output `+0`, while
-field 25 writes `+0x50` and sets a presence flag at `+0x54`. Complete parser
-behavior, longer values and other wire types remain unverified.
+single new field with a complete canonical wire-0 value up to `0xffffffff`,
+the inspected multi-byte reader yields that value, and the numeric setter's
+internal ZigZag encoding is reversed by the field getter, yielding its low 32
+bits. The wire value itself is not ZigZag-encoded. Field 9 writes output `+0`,
+while field 25 writes `+0x50` and sets a presence flag at `+0x54`. This is a
+bit pattern, not a determination of business signedness. Complete parser
+behavior, repeated values and other wire types remain unverified.
 
 The decrypt caller bypasses `0x666c5a0` for selector 0. Inside that function,
 selector 1 takes a primary 16-byte candidate from one context object's `+0x78`
@@ -373,10 +380,11 @@ remain to be recovered and independently verified.
   prove full native header/reserve decoding, or authenticate a peer.
 - `src/direct/target-sso12-numeric-reserve.ts` provides a local, strict candidate
   for an empty reserve or a reserve consisting only of single wire-0 fields 9
-  and/or 25 with one-byte values `0..127`. Its result distinguishes an absent
-  field from an explicitly encoded zero; an absent field means no observed
-  update, not a known native default. Rejecting duplicates, unknown fields,
-  larger values and other wire types is a local policy, not a claim that the
+  and/or 25 with canonical unsigned values `0..0xffffffff`. Its result distinguishes
+  an absent field from an explicitly encoded zero; an absent field means no
+  observed update, not a known native default. Rejecting duplicates, unknown
+  fields, noncanonical or larger values, and other wire types is a local policy,
+  not a claim that the
   target rejects them. This candidate has not been integrated into the lookup
   pipeline and does not establish native acceptance or QQ interoperability.
 - `src/direct/target-sso12-lookup.ts` provides the observed bytewise `field2`
@@ -424,7 +432,11 @@ remain to be recovered and independently verified.
   succeeds. On cancellation the test caller clears its staged result; the raw
   transport itself does not clear arbitrary values returned by a consumer. The
   loopback framing requires the first word to equal frame length, a local
-  transport condition not established for the target's basic decoder.
+  transport condition not established for the target's basic decoder. A separate
+  synthetic loopback test connects the target-static request encoders to the
+  raw transaction and empty-reserve lookup candidate; its fixture verification
+  and local sequence assignment do not establish server authentication or
+  target request/response binding.
 - `src/direct/target-service-business.ts` frames a nonempty raw request body as
   `BE32(body length + 4) || body` for the observed main-request path. The
   standalone helper's empty-body behavior differs from the main entry; this

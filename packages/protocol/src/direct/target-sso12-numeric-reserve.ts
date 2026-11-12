@@ -60,7 +60,7 @@ export function decodeTargetSso12NumericReserveCandidate(input: Uint8Array): {
         const length = apply(typedArrayLength, input, []) as number;
         const offset = apply(typedArrayOffset, input, []) as number;
 
-        if (length > 5) {
+        if (length > 13) {
             throw new RangeError();
         }
 
@@ -81,7 +81,32 @@ export function decodeTargetSso12NumericReserveCandidate(input: Uint8Array): {
                 throw new TypeError();
             }
 
-            if (cursor >= length || snapshot[cursor++] > 0x7f) {
+            // Proton accepts longer uint32 varints and truncates them; restrict the
+            // local candidate before handing the same snapshot to the decoder.
+            let terminated = false;
+
+            for (let index = 0; index < 5; index++) {
+                if (cursor >= length) {
+                    throw new TypeError();
+                }
+
+                const byte = snapshot[cursor++];
+
+                if (index === 4 && byte > 0x0f) {
+                    throw new TypeError();
+                }
+
+                if ((byte & 0x80) === 0) {
+                    if (index > 0 && byte === 0) {
+                        throw new TypeError();
+                    }
+
+                    terminated = true;
+                    break;
+                }
+            }
+
+            if (!terminated) {
                 throw new TypeError();
             }
         }

@@ -19,6 +19,8 @@ describe('local numeric reserve candidate', () => {
         ['c8017f4800', 0, 127],
         ['487fc80100', 127, 0],
         ['c80100487f', 127, 0],
+        ['48ffffffff0fc801ffffffff0f', 4294967295, 4294967295],
+        ['c801ffffffff0f48ffffffff0f', 4294967295, 4294967295],
     ] as const)('decodes literal %s with explicit presence', (hex, field9, field25) => {
         const input = bytes(hex);
         const before = Uint8Array.from(input);
@@ -30,12 +32,54 @@ describe('local numeric reserve candidate', () => {
     });
 
     it.each([
+        ['00', 0],
+        ['7f', 127],
+        ['8001', 128],
+        ['ff7f', 16383],
+        ['808001', 16384],
+        ['ffff7f', 2097151],
+        ['80808001', 2097152],
+        ['ffffff7f', 268435455],
+        ['8080808001', 268435456],
+        ['ffffffff07', 2147483647],
+        ['8080808008', 2147483648],
+        ['ffffffff0f', 4294967295],
+    ] as const)('decodes canonical uint32 literal %s in either field', (hex, value) => {
+        expect(decode(bytes(`48${hex}`))).toEqual({
+            kind: 'numeric-reserve-candidate',
+            field9: value,
+            field25: null,
+        });
+        expect(decode(bytes(`c801${hex}`))).toEqual({
+            kind: 'numeric-reserve-candidate',
+            field9: null,
+            field25: value,
+        });
+    });
+
+    it.each([
         '48014802',
         'c80100c80101',
         '48000801',
+        '490000000000000000',
         '4a00',
+        'c9010000000000000000',
+        'ca0100',
         '488000',
+        '488100',
         '4880',
+        '48808000',
+        '4880808000',
+        '488080808000',
+        '48ffffffff10',
+        '488080808010',
+        '48808080808000',
+        '48ffffffff8f00',
+        '48feffffffffffffffff01',
+        '4880808080808080808000',
+        'c8018000',
+        'c801ffffffff10',
+        'c801808080808000',
         'c8810001',
         '480100',
         'b20100',
@@ -45,6 +89,7 @@ describe('local numeric reserve candidate', () => {
         'c801',
         'c80180',
         '4801c80100ff',
+        '48ffffffff0fc801ffffffff0f00',
         '00',
     ])('rejects unsupported local shape %s with a fixed error', (hex) => {
         const input = bytes(hex);
@@ -140,6 +185,49 @@ describe('local numeric reserve candidate', () => {
             field25: null,
         });
     });
+
+    it.each([
+        ['48ffffffff0f', '48ffffffff10', 4294967295],
+        ['48ffffffff10', '48ffffffff0f', null],
+    ] as const)(
+        'validates and decodes the same private snapshot of %s',
+        async (initial, replacement, value) => {
+            const input = bytes(initial);
+            const actualSet = Uint8Array.prototype.set;
+            const set = vi.spyOn(Uint8Array.prototype, 'set').mockImplementation(function (
+                this: Uint8Array,
+                source,
+                offset,
+            ) {
+                actualSet.call(this, source, offset);
+
+                if (ArrayBuffer.isView(source) && source.buffer === input.buffer) {
+                    actualSet.call(input, bytes(replacement));
+                }
+            });
+
+            try {
+                vi.resetModules();
+                const { decodeTargetSso12NumericReserveCandidate } =
+                    await import('../../src/direct/target-sso12-numeric-reserve');
+
+                if (value === null) {
+                    expect(() => decodeTargetSso12NumericReserveCandidate(input)).toThrow(failure);
+                } else {
+                    expect(decodeTargetSso12NumericReserveCandidate(input)).toEqual({
+                        kind: 'numeric-reserve-candidate',
+                        field9: value,
+                        field25: null,
+                    });
+                }
+
+                expect(input).toEqual(bytes(replacement));
+            } finally {
+                set.mockRestore();
+                vi.resetModules();
+            }
+        },
+    );
 
     it.each(['success', 'invalid', 'copy-error'] as const)(
         'best-effort wipes the private snapshot on %s',
