@@ -47,6 +47,28 @@ describe('service TCP stream framing', () => {
         decoder.finish();
     });
 
+    it('consumes at most one frame and exposes only a read-only partial flag', () => {
+        const decoder = new ServiceFrameDecoder();
+        expect(decoder.hasPartial).toBe(false);
+        expect(decoder.pushFirst(wire.subarray(0, 3))).toEqual({ frame: null, consumed: 3 });
+        expect(decoder.hasPartial).toBe(true);
+        const joined = Buffer.concat([wire.subarray(3), wire]);
+        expect(decoder.pushFirst(joined)).toEqual({
+            frame: Uint8Array.from(wire),
+            consumed: wire.length - 3,
+        });
+        expect(decoder.hasPartial).toBe(false);
+        expect(decoder.pushFirst(joined.subarray(wire.length - 3))).toEqual({
+            frame: Uint8Array.from(wire),
+            consumed: wire.length,
+        });
+        expect(decoder.hasPartial).toBe(false);
+        decoder.pushFirst(wire.subarray(0, 7));
+        expect(decoder.hasPartial).toBe(true);
+        decoder.discard();
+        expect(decoder.hasPartial).toBe(false);
+        expect(() => decoder.push(wire)).toThrow(/closed/);
+    });
     it('rejects invalid declared lengths and poisons the decoder', () => {
         for (const length of [0, 3, 13, 16 * 1024 * 1024 + 1, 0xffffffff]) {
             const prefix = Buffer.alloc(4);

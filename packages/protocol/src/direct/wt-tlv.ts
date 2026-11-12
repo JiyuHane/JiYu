@@ -63,26 +63,41 @@ export function decodeWtTlv(input: Uint8Array): WtTlvEntry[] {
     let offset = 2;
     const entries: WtTlvEntry[] = [];
 
-    for (let i = 0; i < count; i++) {
-        if (input.length - offset < 4) {
-            throw new RangeError('truncated WT TLV header');
+    let complete = false;
+
+    try {
+        for (let i = 0; i < count; i++) {
+            if (input.length - offset < 4) {
+                throw new RangeError('truncated WT TLV header');
+            }
+
+            const tag = view.getUint16(offset);
+            const length = view.getUint16(offset + 2);
+            offset += 4;
+
+            if (length > input.length - offset) {
+                throw new RangeError('truncated WT TLV value');
+            }
+
+            entries.push({ tag, value: Uint8Array.from(input.subarray(offset, offset + length)) });
+            offset += length;
         }
 
-        const tag = view.getUint16(offset);
-        const length = view.getUint16(offset + 2);
-        offset += 4;
-
-        if (length > input.length - offset) {
-            throw new RangeError('truncated WT TLV value');
+        if (offset !== input.length) {
+            throw new RangeError('trailing WT TLV bytes');
         }
 
-        entries.push({ tag, value: Uint8Array.from(input.subarray(offset, offset + length)) });
-        offset += length;
+        complete = true;
+        return entries;
+    } finally {
+        if (!complete) {
+            for (const entry of entries) {
+                try {
+                    entry.value.fill(0);
+                } catch {
+                    // Best effort for each owned copy without masking the parse error.
+                }
+            }
+        }
     }
-
-    if (offset !== input.length) {
-        throw new RangeError('trailing WT TLV bytes');
-    }
-
-    return entries;
 }

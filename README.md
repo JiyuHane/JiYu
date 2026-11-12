@@ -14,7 +14,7 @@ OneBot v11 · WebUI · SDK · MCP
 **[项目仓库](https://github.com/shizukugo/Jiyu)** · **[快速开始](#快速开始)** · **[独立协议研发进展](packages/protocol/DIRECT_PROTOCOL.md)**<br>
 [原项目部署指南](https://snowluma.github.io/zh/docs/guide/deploy) · [原项目动作参考](https://snowluma.github.io/zh/docs/api)
 
-目前运行时仍通过 QQ 客户端接入；不依赖客户端或 Hook 的独立协议正在研发，尚未完成登录与运行时接入。
+目前运行时仍通过 QQ 客户端接入；不依赖客户端或 Hook 的独立协议正在研发。现有离线组件已覆盖部分协议封包和扫码数据处理，但独立登录及运行时接入尚未完成。
 
 <sub>Windows x64 · Linux x64 / arm64</sub>
 
@@ -93,6 +93,8 @@ pnpm test
 现阶段源码中的包名、配置项和命令仍沿用 `@snowluma/*` 与 `SNOWLUMA_*`；更名不会改变这些兼容接口。贡献流程见 [`CONTRIBUTING.md`](CONTRIBUTING.md)，开发方向见 [`RoadMap.md`](RoadMap.md)。
 
 ## 使用边界与许可
+
+本仓库保留 SnowLuma 的原有著作权、署名及许可声明；项目更名不改变原有源码和原生组件的许可条件。
 
 > [!IMPORTANT]
 > SnowLuma 使用**源码可见非商业许可**，不是 OSI 开源许可。源码可用于查看、学习、非商业自托管及私下修改；商业使用，以及公开发布修改版或衍生版，均需事先取得书面授权。

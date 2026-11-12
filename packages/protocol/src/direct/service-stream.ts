@@ -8,6 +8,49 @@ export class ServiceFrameDecoder {
     private frameUsed = 0;
     private failed = false;
 
+    /** Whether an incomplete frame or length prefix is currently retained. */
+    get hasPartial(): boolean {
+        return this.prefixUsed !== 0 || this.frame !== null;
+    }
+
+    /** Consume at most one complete frame, leaving subsequent bytes with the caller. */
+    pushFirst(chunk: Uint8Array): { frame: Uint8Array | null; consumed: number } {
+        if (this.failed) {
+            throw new Error('service stream decoder is closed');
+        }
+
+        let cursor = 0;
+
+        if (!this.frame && this.prefixUsed < 4) {
+            const count = Math.min(4 - this.prefixUsed, chunk.length);
+            const frames = this.push(chunk.subarray(0, count));
+            cursor += count;
+
+            if (frames.length) {
+                return { frame: frames[0], consumed: cursor };
+            }
+        }
+
+        if (this.frame && cursor < chunk.length) {
+            const count = Math.min(this.frame.length - this.frameUsed, chunk.length - cursor);
+            const frames = this.push(chunk.subarray(cursor, cursor + count));
+            cursor += count;
+            return { frame: frames[0] ?? null, consumed: cursor };
+        }
+
+        return { frame: null, consumed: cursor };
+    }
+
+    /** Discard retained partial bytes during connection teardown. */
+    discard(): void {
+        this.prefix.fill(0);
+        this.frame?.fill(0);
+        this.prefixUsed = 0;
+        this.frame = null;
+        this.frameUsed = 0;
+        this.failed = true;
+    }
+
     /**
      * Returns complete frames in order and retains at most one partial frame.
      * An invalid length poisons this decoder: discard it with the connection.

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { decodeWtTlv, encodeWtTlv, MAX_WT_TLV_BYTES } from '../../src/direct/wt-tlv';
 
 // Independent, manually assembled byte vector; synthetic, not a real packet.
@@ -50,6 +50,41 @@ describe('WT TLV blocks', () => {
         expect(() => decodeWtTlv(Buffer.from('000000', 'hex'))).toThrow(/trailing/);
         expect(() => decodeWtTlv(Buffer.from('000100010002aa', 'hex'))).toThrow(/value/);
         expect(() => decodeWtTlv(Buffer.from('000200010000', 'hex'))).toThrow(/header/);
+    });
+
+    it.each([
+        {
+            input: Buffer.from('000200010002aabb', 'hex'),
+            error: /truncated WT TLV header/,
+            copies: 1,
+        },
+        {
+            input: Buffer.from('000200010002aabb00020002cc', 'hex'),
+            error: /truncated WT TLV value/,
+            copies: 1,
+        },
+        { input: Buffer.concat([vector, Buffer.of(1)]), error: /trailing WT TLV bytes/, copies: 4 },
+    ])('clears actual owned copies on late parse failure ($error)', ({ input, error, copies }) => {
+        const before = Buffer.from(input);
+        const capture = vi.spyOn(Uint8Array, 'from');
+        let owned: Uint8Array[];
+
+        try {
+            expect(() => decodeWtTlv(input)).toThrow(error);
+            owned = capture.mock.results.flatMap((result) =>
+                result.type === 'return' ? [result.value as Uint8Array] : [],
+            );
+        } finally {
+            capture.mockRestore();
+        }
+
+        expect(owned).toHaveLength(copies);
+
+        for (const value of owned) {
+            expect(value).toEqual(new Uint8Array(value.length));
+        }
+
+        expect(input).toEqual(before);
     });
 
     it('supports maximum count, tag, and value length', () => {

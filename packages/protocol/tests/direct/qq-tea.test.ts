@@ -1,3 +1,4 @@
+import { runInNewContext } from 'node:vm';
 import { describe, expect, it } from 'vitest';
 import { qqTeaDecrypt, qqTeaEncrypt } from '../../src/direct/qq-tea';
 
@@ -97,6 +98,116 @@ describe('QQ-TEA', () => {
         expect(() => qqTeaEncrypt(new Uint8Array(), key, (n) => new Uint8Array(n + 1))).toThrow(
             /random/,
         );
+    });
+
+    it('rejects a forged length without reading caller properties', () => {
+        let accessed = false;
+        expect(() =>
+            qqTeaEncrypt(new Uint8Array(), key, (n) => {
+                const bytes = new Uint8Array(n + 3).fill(0x41);
+                Object.defineProperty(bytes, 'length', { value: n });
+                Object.defineProperty(bytes, 'byteLength', {
+                    get() {
+                        accessed = true;
+                        throw new Error('SECRET');
+                    },
+                });
+                return bytes;
+            }),
+        ).toThrow('QQ-TEA random source returned an invalid prefix');
+        expect(accessed).toBe(false);
+    });
+
+    it('copies cross-realm sliced prefixes without touching shadow properties or caller bytes', () => {
+        const plain = Uint8Array.of(1, 2, 3);
+        let caller: Uint8Array | undefined;
+        let accesses = 0;
+        let calls = 0;
+        let requested = 0;
+        const cipher = qqTeaEncrypt(plain, key, (n) => {
+            calls++;
+            requested = n;
+            caller = runInNewContext(
+                `new Uint8Array(${n + 2}).fill(0x34).subarray(1, ${n + 1})`,
+            ) as Uint8Array;
+
+            for (const name of [
+                'length',
+                'byteLength',
+                'byteOffset',
+                'buffer',
+                'fill',
+                Symbol.iterator,
+                Symbol.toStringTag,
+            ]) {
+                Object.defineProperty(caller, name, {
+                    get() {
+                        accesses++;
+                        throw new Error('SECRET');
+                    },
+                });
+            }
+
+            return caller;
+        });
+        expect(calls).toBe(1);
+        expect(accesses).toBe(0);
+        expect(qqTeaDecrypt(cipher, key)).toEqual(plain);
+        expect(Array.from({ length: requested }, (_, index) => caller![index])).toEqual(
+            Array(requested).fill(0x34),
+        );
+    });
+
+    it('rejects proxies, shared buffers, detached views and other typed arrays with fixed errors', () => {
+        let traps = 0;
+        const cases: Array<(n: number) => Uint8Array> = [
+            (n) =>
+                new Proxy(new Uint8Array(n), {
+                    get() {
+                        traps++;
+                        throw new Error('SECRET');
+                    },
+                }),
+            (n) => new Uint8Array(new SharedArrayBuffer(n)),
+            (n) => runInNewContext(`new Uint8Array(new SharedArrayBuffer(${n}))`) as Uint8Array,
+            (n) => {
+                const bytes = new Uint8Array(n);
+                structuredClone(bytes.buffer, { transfer: [bytes.buffer] });
+                return bytes;
+            },
+            (n) => new Uint8ClampedArray(n) as unknown as Uint8Array,
+        ];
+
+        for (const source of cases) {
+            try {
+                qqTeaEncrypt(Uint8Array.of(1, 2), key, source);
+                expect.fail('expected invalid prefix');
+            } catch (error) {
+                expect(String(error)).toBe(
+                    'Error: QQ-TEA random source returned an invalid prefix',
+                );
+                expect(String(error)).not.toContain('SECRET');
+            }
+        }
+
+        expect(traps).toBe(0);
+    });
+
+    it('preserves exceptions thrown by the random callback', () => {
+        const failure = new Error('synthetic callback failure');
+        expect(() =>
+            qqTeaEncrypt(new Uint8Array(), key, () => {
+                throw failure;
+            }),
+        ).toThrow(failure);
+
+        try {
+            qqTeaEncrypt(new Uint8Array(), key, () => {
+                throw failure;
+            });
+        } catch (error) {
+            expect(error).toBe(failure);
+        }
     });
 
     it('rejects independently encoded impossible padding and a nonzero trailer', () => {

@@ -32,9 +32,21 @@
       "types": "./src/direct-login.ts",
       "default": "./src/direct-login.ts"
     },
+    "./wt-qr": {
+      "types": "./src/wt-qr.ts",
+      "default": "./src/wt-qr.ts"
+    },
     "./sso-reserve": {
       "types": "./src/sso-reserve.ts",
       "default": "./src/sso-reserve.ts"
+    },
+    "./sso-register": {
+      "types": "./src/sso-register.ts",
+      "default": "./src/sso-register.ts"
+    },
+    "./target-sso12-reserve": {
+      "types": "./src/target-sso12-reserve.ts",
+      "default": "./src/target-sso12-reserve.ts"
     },
     "./element": {
       "types": "./src/element.ts",

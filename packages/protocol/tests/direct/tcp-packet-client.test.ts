@@ -119,6 +119,102 @@ afterEach(async () => {
 });
 
 describe('TCP packet client with synthetic loopback peers', () => {
+    it('waits for actual socket close, preserves the first reason and supports late subscribers', async () => {
+        const { client, socket } = await setup(() => {});
+        const destroy = socket.destroy.bind(socket);
+        const intercept = vi.spyOn(socket, 'destroy').mockImplementation(() => socket);
+        const pending = client.sendPacket('a', Buffer.alloc(0));
+        const originalPromise = client.whenClosed;
+        const listener = vi.fn();
+        void originalPromise.then(listener);
+        client.close();
+        client.close();
+        expect(await pending).toMatchObject({ success: false, gotResponse: false });
+        expect((client as unknown as { key: Uint8Array }).key).toEqual(new Uint8Array(16));
+        expect(intercept).toHaveBeenCalledTimes(1);
+        await Promise.resolve();
+        expect(listener).not.toHaveBeenCalled();
+        intercept.mockRestore();
+        destroy();
+        expect(await originalPromise).toEqual({ kind: 'local', code: 'local-close' });
+        expect(socket.closed).toBe(true);
+        expect(client.whenClosed).toBe(originalPromise);
+        expect(await client.whenClosed).toEqual({ kind: 'local', code: 'local-close' });
+        expect(listener).toHaveBeenCalledTimes(1);
+    });
+    it('reports clean peer EOF after the socket closes and rejects in-flight requests', async () => {
+        const { client, socket } = await setup((peer) => peer.end());
+        const result = client.sendPacket('a', Buffer.alloc(0));
+        expect(await client.whenClosed).toEqual({ kind: 'remote', code: 'remote-end' });
+        expect(socket.closed).toBe(true);
+        expect(await result).toMatchObject({ success: false, gotResponse: false });
+        client.close();
+        expect(await client.whenClosed).toEqual({ kind: 'remote', code: 'remote-end' });
+    });
+    it('reports transport errors without revealing socket errors', async () => {
+        const { client, socket } = await setup(() => {});
+        const result = client.sendPacket('a', Buffer.alloc(0));
+        socket.destroy(new Error('secret transport details'));
+        expect(await client.whenClosed).toEqual({ kind: 'transport-error', code: 'socket-error' });
+        expect(await result).toMatchObject({
+            success: false,
+            gotResponse: false,
+            errorMessage: 'socket error',
+        });
+        client.close();
+        expect(await client.whenClosed).toEqual({ kind: 'transport-error', code: 'socket-error' });
+        expect(JSON.stringify(await client.whenClosed)).not.toContain('secret');
+    });
+    it('reports a socket closed without EOF as an unexpected transport close', async () => {
+        let release!: (value: Uint8Array) => void;
+        const { client, socket } = await setup(() => {}, {
+            buildReserved: () =>
+                new Promise((resolve) => {
+                    release = resolve;
+                }),
+        });
+        const result = client.sendPacket('a', Buffer.alloc(0));
+        socket.destroy();
+        expect(await client.whenClosed).toEqual({ kind: 'transport-error', code: 'socket-closed' });
+        expect(await result).toMatchObject({ success: false, gotResponse: false });
+        release(Buffer.alloc(0));
+    });
+    it('reports a truncated frame at EOF as a protocol error', async () => {
+        const { client } = await setup((peer) => peer.end(Buffer.from([0, 0, 0])));
+        const result = client.sendPacket('a', Buffer.alloc(0));
+        expect(await client.whenClosed).toEqual({
+            kind: 'protocol-error',
+            code: 'truncated-stream',
+        });
+        expect(await result).toMatchObject({ success: false, gotResponse: false });
+    });
+    it('reports protocol errors separately from handler errors', async () => {
+        const invalid = await setup((peer) => peer.write(Buffer.from('ffffffff', 'hex')));
+        const pending = invalid.client.sendPacket('a', Buffer.alloc(0));
+        expect(await invalid.client.whenClosed).toEqual({
+            kind: 'protocol-error',
+            code: 'invalid-response',
+        });
+        expect(await pending).toMatchObject({ success: false, gotResponse: false });
+        const throwing = await setup(
+            (peer, frame) => {
+                const r = request(frame);
+                peer.write(reply(r.sequence, r.command, 'data'));
+            },
+            {
+                classifyIncoming: () => {
+                    throw new Error('sensitive handler details');
+                },
+            },
+        );
+        const waiting = throwing.client.sendPacket('a', Buffer.alloc(0));
+        expect(await throwing.client.whenClosed).toEqual({
+            kind: 'handler-error',
+            code: 'classification-failed',
+        });
+        expect(await waiting).toMatchObject({ success: false, gotResponse: false });
+        expect(JSON.stringify(await throwing.client.whenClosed)).not.toContain('sensitive');
+    });
     it('handles fragmentation, coalescing, out-of-order replies, push and signed sequence conversion', async () => {
         const requests: ReturnType<typeof request>[] = [];
         const pushed: number[] = [];
@@ -292,6 +388,10 @@ describe('TCP packet client with synthetic loopback peers', () => {
             success: false,
             errorMessage: 'push callback failed',
         });
+        expect(await two.client.whenClosed).toEqual({
+            kind: 'handler-error',
+            code: 'push-handler-failed',
+        });
     });
     it('checks the monotonic deadline before writing after synchronous preparation', async () => {
         const { client, socket } = await setup(() => {}, {
@@ -350,6 +450,7 @@ describe('TCP packet client with synthetic loopback peers', () => {
         const writes = vi.spyOn(socket, 'write');
         const result = client.sendPacket('a', Buffer.from('request'));
         client.close();
+        expect(await client.whenClosed).toEqual({ kind: 'local', code: 'local-close' });
         expect(await result).toMatchObject({ success: false, gotResponse: false });
         release(Buffer.alloc(0));
         await Promise.resolve();
@@ -438,6 +539,14 @@ describe('TCP packet client with synthetic loopback peers', () => {
             two.client.sendPacket('b', Buffer.alloc(0)),
         ]);
         expect(all.every((result) => !result.success && !result.gotResponse)).toBe(true);
+        expect(await one.client.whenClosed).toEqual({
+            kind: 'transport-error',
+            code: 'write-failed',
+        });
+        expect(await two.client.whenClosed).toEqual({
+            kind: 'transport-error',
+            code: 'write-failed',
+        });
     });
     it('bounds pending preparation and applies backpressure without buffering extra writes', async () => {
         let release!: (value: Uint8Array) => void;

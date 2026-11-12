@@ -5,6 +5,7 @@ import {
     decodeWtCode2dResponse,
     decodeWtOicqResponse,
     encodeWtCode2dRequest,
+    encodeWtPcLoginOicqRequest,
 } from '../../src/direct/wt-oicq';
 
 // Synthetic vectors, not QQ client traffic. The ciphertexts for 00..02 and
@@ -72,6 +73,184 @@ function layer(body: Uint8Array, encrypted = false): Buffer {
     b.set(body, 5);
     return b;
 }
+
+describe('reference PC OICQ 0x810 framing', () => {
+    const login = () => ({
+        uin: 0x0102030405060708n,
+        clientVersion: 0x7788,
+        body: Uint8Array.of(0, 1, 2),
+        randomKey: Uint8Array.from(key),
+        ecdh: createWtEcdh(scalar(1)),
+        peerPublicKey: createWtEcdh(scalar(1)).publicKey,
+        randomSource: fixtureRandom,
+    });
+
+    it('matches a manually assembled envelope and independent MiraiGo QQ-TEA vector', () => {
+        // Synthetic only: scalar 1 with the secp192k1 generator yields TEA key
+        // eac0f2871a65d3e4712830f89e57f02a, independently covered in wt-ecdh.test.
+        // Ciphertext is from MiraiGo tea.go fixed revision with F8/zero padding;
+        // the complete header is manually derived from WtLogin and BinaryPacket.
+        const actual = Buffer.from(encodeWtPcLoginOicqRequest(login()));
+        expect(actual.toString('hex')).toBe(
+            '02005a1f41081000000506070803870000000002000077880000' +
+                '0101000102030405060708090a0b0c0d0e0f01020019' +
+                '03db4ff10ec057e9ae26b07d0280b7f4341da5d1b1eae06c7d' +
+                '2ca8df5e470d27345d036004e01c70be03',
+        );
+        expect(actual.readUInt16BE(1)).toBe(actual.length);
+        expect(
+            qqTeaDecrypt(
+                actual.subarray(73, -1),
+                Buffer.from('eac0f2871a65d3e4712830f89e57f02a', 'hex'),
+            ),
+        ).toEqual(Uint8Array.of(0, 1, 2));
+    });
+
+    it('keeps input slices, return bytes and factory public key isolated', () => {
+        const input = login();
+        const bodyBacking = Buffer.from([0xaa, 0, 1, 2, 0xbb]);
+        const keyBacking = Buffer.concat([Buffer.of(0xaa), key, Buffer.of(0xbb)]);
+        const peerBacking = Buffer.concat([
+            Buffer.of(0xaa),
+            Buffer.from(input.peerPublicKey),
+            Buffer.of(0xbb),
+        ]);
+        const bodyBefore = Buffer.from(bodyBacking),
+            keyBefore = Buffer.from(keyBacking),
+            peerBefore = Buffer.from(peerBacking);
+        input.body = bodyBacking.subarray(1, 4);
+        input.randomKey = keyBacking.subarray(1, 17);
+        input.peerPublicKey = peerBacking.subarray(1, 26);
+        const changedCopy = input.ecdh.publicKey;
+        changedCopy.fill(0);
+        expect(Reflect.set(input.ecdh, 'publicKey', new Uint8Array(25))).toBe(false);
+        const packet = encodeWtPcLoginOicqRequest(input);
+        const output = Uint8Array.from(packet);
+        expect(bodyBacking).toEqual(bodyBefore);
+        expect(keyBacking).toEqual(keyBefore);
+        expect(peerBacking).toEqual(peerBefore);
+        bodyBacking.fill(0xff);
+        keyBacking.fill(0xff);
+        peerBacking.fill(0xff);
+        expect(Uint8Array.from(packet)).toEqual(output);
+        expect(Buffer.from(packet).subarray(48, 73)).toEqual(Buffer.from(input.ecdh.publicKey));
+        packet.fill(0);
+        expect(bodyBacking).toEqual(Buffer.alloc(bodyBacking.length, 0xff));
+    });
+
+    it('snapshots login body and context bytes before the random source runs', () => {
+        const input = login();
+
+        input.randomSource = (n) => {
+            input.body.fill(0xff);
+            input.randomKey.fill(0xff);
+            input.peerPublicKey.fill(0);
+            return fixtureRandom(n);
+        };
+
+        const packet = Buffer.from(encodeWtPcLoginOicqRequest(input));
+        expect(packet.subarray(28, 44)).toEqual(key);
+        expect(
+            qqTeaDecrypt(
+                packet.subarray(73, -1),
+                Buffer.from('eac0f2871a65d3e4712830f89e57f02a', 'hex'),
+            ),
+        ).toEqual(Uint8Array.of(0, 1, 2));
+    });
+
+    it('handles its maximal u16 envelope and rejects overflow before encryption', () => {
+        const request = login();
+        const empty = Buffer.from(
+            encodeWtPcLoginOicqRequest({ ...request, body: new Uint8Array() }),
+        );
+        expect(empty.length).toBe(90);
+        expect(
+            qqTeaDecrypt(empty.subarray(73, -1), request.ecdh.deriveTeaKey(request.peerPublicKey)),
+        ).toEqual(new Uint8Array());
+        const packet = Buffer.from(
+            encodeWtPcLoginOicqRequest({ ...request, body: new Uint8Array(65446) }),
+        );
+        expect(packet.length).toBe(65530);
+        expect(packet.readUInt16BE(1)).toBe(65530);
+        expect(() =>
+            encodeWtPcLoginOicqRequest({ ...request, body: new Uint8Array(65447) }),
+        ).toThrow(/length/);
+        expect(() =>
+            encodeWtPcLoginOicqRequest({ ...request, body: new Uint8Array(65536) }),
+        ).toThrow(/body/);
+    });
+
+    it('rejects invalid UIN, version, key, context, point and random source', () => {
+        const request = login();
+
+        for (const uin of [-1n, 0x8000000000000000n, 1 as unknown as bigint]) {
+            expect(() => encodeWtPcLoginOicqRequest({ ...request, uin })).toThrow(/UIN/);
+        }
+
+        for (const clientVersion of [-1, 0x10000, 1.5, NaN]) {
+            expect(() => encodeWtPcLoginOicqRequest({ ...request, clientVersion })).toThrow(
+                /client version/,
+            );
+        }
+
+        expect(() =>
+            encodeWtPcLoginOicqRequest({ ...request, body: [] as unknown as Uint8Array }),
+        ).toThrow(/body/);
+        expect(() =>
+            encodeWtPcLoginOicqRequest({ ...request, randomKey: new Uint8Array(15) }),
+        ).toThrow(/key/);
+        expect(() => encodeWtPcLoginOicqRequest({ ...request, ecdh: null as never })).toThrow(
+            /ECDH/,
+        );
+        const ecdh = request.ecdh;
+
+        for (const publicKey of [
+            new Uint8Array(24),
+            new Uint8Array(25),
+            Buffer.concat([Buffer.of(2), Buffer.alloc(24, 0xff)]),
+        ]) {
+            expect(() =>
+                encodeWtPcLoginOicqRequest({ ...request, ecdh: { ...ecdh, publicKey } }),
+            ).toThrow();
+        }
+
+        expect(() =>
+            encodeWtPcLoginOicqRequest({ ...request, peerPublicKey: new Uint8Array(25) }),
+        ).toThrow();
+        expect(() =>
+            encodeWtPcLoginOicqRequest({ ...request, randomSource: (n) => new Uint8Array(n - 1) }),
+        ).toThrow(/random/);
+    });
+
+    it('preserves randomized padding and supports alternate valid structural contexts', () => {
+        const request = login();
+        const custom = {
+            publicKey: request.ecdh.publicKey,
+            deriveTeaKey: request.ecdh.deriveTeaKey,
+            sharedSecret: request.ecdh.sharedSecret,
+        };
+        const first = encodeWtPcLoginOicqRequest({
+            ...request,
+            ecdh: custom,
+            randomSource: (n) => new Uint8Array(n).fill(0x11),
+        });
+        const second = encodeWtPcLoginOicqRequest({
+            ...request,
+            ecdh: custom,
+            randomSource: (n) => new Uint8Array(n).fill(0x22),
+        });
+        expect(first).not.toEqual(second);
+
+        for (const packet of [first, second]) {
+            expect(
+                qqTeaDecrypt(
+                    packet.subarray(73, -1),
+                    request.ecdh.deriveTeaKey(request.peerPublicKey),
+                ),
+            ).toEqual(request.body);
+        }
+    });
+});
 
 describe('reference OICQ 0x812 framing', () => {
     it('encodes independently specified request fields and inclusive lengths', () => {

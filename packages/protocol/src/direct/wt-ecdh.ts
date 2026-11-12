@@ -44,7 +44,7 @@ function validatePoint(point: Uint8Array): void {
  * The closure retains private key material and JavaScript does not guarantee erasure.
  */
 export function createWtEcdh(privateKey?: Uint8Array): {
-    publicKey: Uint8Array;
+    readonly publicKey: Uint8Array;
     sharedSecret: (peerPublicKey: Uint8Array) => Uint8Array;
     deriveTeaKey: (peerPublicKey: Uint8Array) => Uint8Array;
 } {
@@ -75,11 +75,15 @@ export function createWtEcdh(privateKey?: Uint8Array): {
         return Uint8Array.from(shared);
     }
 
-    return {
-        publicKey: Uint8Array.from(ecdh.getPublicKey(undefined, 'compressed')),
+    const publicKey = ecdh.getPublicKey(undefined, 'compressed');
+    return Object.freeze({
+        // A copy on every read keeps callers from changing the point paired with this scalar.
+        get publicKey(): Uint8Array {
+            return Uint8Array.from(publicKey);
+        },
         sharedSecret,
         deriveTeaKey(peerPublicKey: Uint8Array): Uint8Array {
             return Uint8Array.from(createHash('md5').update(sharedSecret(peerPublicKey)).digest());
         },
-    };
+    });
 }

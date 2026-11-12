@@ -1,11 +1,20 @@
 # Independent QQ protocol research
 
 This directory's `src/direct` modules are **experimental protocol building
-blocks**, not an alternative login mode. SnowLuma still requires its existing QQ
-process and Hook session. The transport uses a caller-supplied connected socket;
-these modules do not establish a QQ session, calculate QQ signatures, manage
-session tickets, or connect to the OneBot runtime. Tests use offline vectors and
-loopback peers. A successful unit test is not evidence of QQ login or delivery.
+blocks**, not an alternative login mode. Jiyu, based on SnowLuma, still requires
+its existing QQ process and Hook session. The transport uses a caller-supplied
+connected socket; these modules do not establish a verified QQ session,
+calculate QQ signatures, persist an online ticket lifecycle, or connect to the
+OneBot runtime. The experimental attempt owner temporarily holds synthetic or
+caller-validated login material in memory. Tests use
+offline vectors and loopback peers. A successful unit test is not evidence of
+QQ login or delivery.
+
+Evidence in this document is separated into **target-static** (bytes and
+instructions from the specified QQ build), **reference-static** (source from a
+separately identified implementation), and **synthetic** (locally generated
+vectors or loopback interactions). A finding in one category does not establish
+the others.
 
 ## Target and evidence
 
@@ -24,6 +33,111 @@ Its bytes contain `wtlogin64.trans_emp` at file offset `0x883394`,
 `trpc.login.ecdh.EcdhService.SsoKeyExchange` at `0x88dc33`, and
 `wtlogin_ecdh_session.cc` at `0x8fa1db`. String presence does not establish
 the enclosing function, complete call graph, or byte-level login protocol.
+The ELF's first `PT_LOAD` maps file offset zero to module-relative address zero,
+so those string offsets also identify their module-relative addresses. The
+`wtlogin64.trans_emp` and `wtlogin64.login` addresses appear as addends in
+`R_X86_64_RELATIVE` relocation records at file offsets `0x576470` and `0x576488`,
+respectively. A bounded disassembly at `0x6667140` shows a static lookup over a
+24-byte-record table based at `0x902ac70`: it compares string lengths and bytes,
+and the two command records both carry classification value `2`. A verified
+static call chain from `0x66680b4` passes this classification into `0x666c390`;
+for class `2`, that function selects a fixed data location and passes its 16 bytes
+as the key to a 16-round TEA-style encryptor. In the observed branch the inputs
+called `EncodeReqHead` and `EncodeBusiBuff` in adjacent diagnostics are combined
+before encryption; the output is appended to the preceding `EncodeBasic` buffer,
+then the overall byte length is written big-endian at offset zero. A bounded
+inspection of `EncodeBasic` shows a four-byte placeholder, another big-endian
+four-byte value, a classification byte, a conditional four-byte value or
+inclusive-length-prefixed byte span, then another byte and an inclusive-length
+prefixed string. An adjacent diagnostic labels the last string `uin`; the two
+virtual-call results and field semantics are not fully resolved. In particular,
+our reference-derived service encoder writes zero for the byte after the
+conditional field, whereas the target reads a byte from its request object; it
+is not yet established whether that target byte can be nonzero. A direct caller
+at `0x66679aa` lies near `codec_processor.cc` and `EncodePacket` logs,
+supporting an outbound packet-encoding interpretation. The relationship between
+this target classification and the reference's encryption flags is not yet
+established; the value `2` alone must not be equated with a zero TEA key. The
+precise protocol fields and runtime reachability remain unknown; this is not
+proof of signing behavior. No key material is recorded here.
+
+The protocol-12 factory branch installs a virtual table whose `+0x20` entry
+resolves to `EncodeReqHead` at `0x6669490`. Its bounded disassembly writes a
+length, the request sequence, two caller-context 32-bit fields, then a 12-byte
+region whose first byte is zero and whose next-to-last byte comes from a context
+field. The reference-derived encoder instead writes `02` followed by eleven
+zero bytes there, and hardcodes one preceding 32-bit value. Several subsequent
+inclusive-length-prefixed byte strings are visible, but their complete semantics
+remain unknown. Thus the reference encoder is not established as byte-equivalent
+to this target's V12 branch; the observed differences are static code facts, not
+a claim about any particular live session. Its reserve-building path calls an
+object associated with `CPBMessageOpti`. Bounded inspection of its serialization
+path shows fields 12, 13, 15, 16 and 32 written as wire-type-2 byte strings,
+fields 21 and 26 as wire-type-0 unsigned values, and field 24 as a wire-type-2
+nested message with up to three byte-string fields. Further bounded inspection
+of `0x6669da0` and the repeated-object writer `0x8b47f10` identifies field 23 as
+repeated wire-type-2 child messages, each with two wire-type-2 byte strings.
+Source records are traversed in `0x30`-byte steps and appended in input order;
+empty child fields remain present, so an all-empty record has the statically
+derived encoding `ba01040a001200`. Empty collections omit field 23. The observed
+builder skips serialization if only field 12 or field 23 was set; several
+other fields enable serialization. In particular, `0x666a268–0x666a2d5` selects
+field 13 by presence without a nonempty check, `0x8b47741–0x8b47768` and
+`0x8b47b28–0x8b47b37` show the empty-byte wire path, `0x666a35c–0x666a383`
+sets field 21 to 32 when both flags hold, `0x666a465–0x666a484` forwards field
+26 when its presence flag is set without testing its value, and
+`0x666a660–0x666a6bb` checks the three child strings before creating field 24.
+These are bounded static observations, not runtime or peer-compatibility
+evidence. Field meanings, upstream collection construction and signature
+behavior remain unverified.
+
+The same outbound path builds the business buffer by a direct call at
+`0x666794d` to `0x6667fa0`, not another virtual-table slot. That helper reads
+the request object's byte pointer at `+0x80` and 32-bit length at `+0x88`, then
+calls `0x6669c80` to write `BE32(length + 4)` followed by the unchanged body.
+The main request entry rejects a null pointer or zero length; the lower-level
+length helper itself can write a length-four prefix for an empty span. This
+separates the observed request precondition from the helper's empty behavior.
+Upstream body semantics and full native overflow/allocation behavior remain
+unknown.
+
+On the response side, bounded inspection of `0x6668330` shows an initial call
+to `DecodeBasic` at `0x6668a50`, followed by a check that the consumed basic
+length is smaller than the received buffer. A nonzero byte in the decoded basic
+structure selects `0x666c5a0` on the remaining bytes and requires nonempty
+output; the zero branch keeps the remainder. The resulting span is passed to
+`DecodeRspHead` at `0x6668b50`, and its consumed length is checked against the
+span before additional processing and a call to `0x6668d00`. The helper
+`0x6669a10` reads an inclusive BE32 business length: values below four fail,
+four yields an empty body, and larger values describe the following bytes. A
+low bit of a decoded head field selects `UncompressBuffer` at `0x666c890`.
+That function passes the body to the imported `uncompress` symbol, with at most
+four attempts whose output capacities are computed in 32-bit arithmetic as
+10, 20, 40 and 80 times the input length. Return code `-5` triggers a retry;
+other nonzero codes fail. The ELF declares a dependency on `libz.so.1`, so zlib
+wrapping is a reasonable inference, but the actual runtime binding, version,
+supported input formats, dictionary and trailing-byte behavior remain unknown.
+No absolute output limit was established on this path. The preceding length
+helper also adjusts allocation before checking the read result; these static
+observations are not a resource-safety guarantee. A later diagnostic uses a decoded BE32 head field
+as `seq_id`, but its binding to a particular request is unproven. The decrypt
+selector value 2 references the same fixed data location as the outbound branch,
+without proving the outbound classifier and response selector always correspond.
+This establishes local decoding stages, not server authentication or response
+compatibility.
+
+A bounded x86-64 disassembly also shows a `lea` at module-relative address
+`0x34f8b6e` referring to `wtlogin_ecdh_session.cc`, near references to
+`WTLoginECDHSession` and an ECDH V1 server-key-rotation message; another at
+`0x34f97ec` occurs near `DecodeData` and an ECDH-decryption message. In the
+latter neighborhood, the call at `0x34f97b1` targets `0x8866060`; bounded
+instruction inspection shows big-endian word operations and a 16-round loop
+with the TEA delta and shifts. Further bounded inspection of that candidate
+shows the first decoded byte's low three bits used as padding length, output
+length `input − padding − 10`, two block-feedback chains, and a seven-zero-byte
+trailer check. These operations are structurally consistent with QQ-TEA
+unpacking, but static analysis does not establish runtime reachability, key
+provenance, a complete executable equivalence, or wire compatibility.
 The fixed public reference's server point and verification key were not found as
 contiguous raw byte sequences in this one ELF; encoded constants, other modules,
 and different implementations remain possible. No QQ client was executed or
@@ -38,13 +152,61 @@ remain to be recovered and independently verified.
 
 ## Offline components
 
+- `src/direct/target-sso12-reserve.ts` uses Proton to encode a constrained
+  subset of the target's statically observed reserve fields. It preserves empty
+  values where the observed path has presence flags and returns an empty buffer
+  when only fields 12 and/or 23 are supplied. Field 23 is a repeated child message
+  with two explicitly present byte fields, including empty values; collection
+  order is preserved. The local policy limits that collection to 4096 records
+  and rejects sparse arrays, accessors and shared buffers.
+  Fields 13, 15 and 16 retain explicitly present empty bytes, field 26 retains
+  an explicitly present zero, and field 24 is emitted only if a child is nonempty.
+  Enabling field 21 writes the observed constant 32. Field numbers are
+  intentionally not assigned business or signing semantics; the encoder is not
+  a complete model of the target reserve.
+- `src/direct/target-sso12-head.ts` encodes the statically observed V12 request
+  header. The sequence, context numbers, opaque byte strings and already-encoded
+  reserve are explicit inputs; it does not infer their semantics or create a
+  signature. Its return value already contains the header's inclusive length and
+  can be supplied as the head to `target-service-request.ts`. Length limits and
+  rejection of shared buffers are local policies; target runtime compatibility
+  is unverified. Head and reserve encoders best-effort clear their own temporary
+  snapshots after success or failure; their returned buffers and caller input
+  remain intact. This does not guarantee erasure of JS or Proton internal copies.
+- `src/direct/target-service-business-response.ts` parses one inclusive-length
+  response business wrapper at a caller-selected offset and returns an independent
+  body copy and next offset. A length of four is valid and produces an empty
+  body; incomplete, undersized and locally oversized declarations fail before
+  body allocation. It does not interpret the head flag, decompress the body,
+  verify peer identity or bind the response to a request. Its 16 MiB cap and
+  rejected shared buffers are local policies, not observed target limits.
+- `src/direct/target-service-business.ts` frames a nonempty raw request body as
+  `BE32(body length + 4) || body` for the observed main-request path. The
+  standalone helper's empty-body behavior differs from the main entry; this
+  encoder deliberately models the latter's nonempty precondition. The 16 MiB
+  inclusive cap and rejected shared buffers are local policies, not target limits.
+- `src/direct/target-service-request.ts` models the observed class-2 outbound
+  branch of the selected build: it constructs `EncodeBasic`, encrypts the
+  caller-provided request head and business bytes together, appends them, and
+  writes the overall length. Only the two observed `wtlogin64` commands are
+  accepted; protocol value, basic branch, request byte, identifiers and the
+  16-byte TEA key must be explicitly supplied. The key is neither embedded nor
+  extracted by this module. Synthetic integration tests compose reserve, target
+  V12 head, business framing and this branch, check each inclusive length and
+  decrypt the result using a test-only key. Its 16 MiB limit and input validation
+  are local choices; these vectors do not demonstrate target execution or server
+  compatibility.
 - `src/direct/qq-tea.ts` implements the 16-cycle QQ-TEA primitive and framing.
   Its tests include synthetic vectors generated with the independent
   [MiraiGo implementation at a fixed revision](https://github.com/Mrs4s/MiraiGo/blob/2b2be6693df1219d867300c6f6cd0f804c59d620/binary/tea.go).
   A [format reference](https://github.com/hzruandd/python-qq/blob/master/socket-qq/tea.py)
   describes the padding and feedback. QQ-TEA is not authenticated encryption;
   successful trailer validation does not prove authenticity or a correct key.
-  Do not expose detailed decryption outcomes to a network peer.
+  This implementation rejects nonzero trailer bytes. The cited Lagrange reference
+  does not explicitly clear every trailer byte in its stack-allocated encryption
+  path, so strict trailer validation is a local policy, not proof that every
+  reference-generated packet will pass. Do not expose detailed decryption
+  outcomes to a network peer.
 - `src/direct/sso.ts` implements an inner protocol-12/13 request encoder and
   response parser based on the field order in a
   [public protocol implementation](https://github.com/LagrangeDev/Lagrange.Core/blob/fe789c4a23796fbc82fa09e70a9c44c8a5cf2948/Lagrange.Core/Internal/Packets/Struct/SsoPacker.cs).
@@ -78,7 +240,79 @@ remain to be recovered and independently verified.
 - `src/direct/wt-tlv.ts` encodes and decodes counted WT TLV records with bounded
   lengths and preserves repeated tags. `src/direct/wt-ecdh.ts` implements the
   reference secp192k1 shared-X and TEA-key derivation; the peer key must be
-  supplied explicitly. These are building blocks, not a QR-login implementation.
+  supplied explicitly. `src/direct/wt-oicq.ts` encodes reference-style OICQ
+  `0x812` and PC login `0x810` requests and decodes selected response encryption
+  forms. The `0x810` encoder wraps a caller-provided body; it does not sign,
+  send or log in. Its response framing checks are stricter than the reference,
+  and the caller must bind decoded account, command and sequence to the active
+  session. QQ-TEA decryption alone
+  does not authenticate the response.
+- `src/direct/wt-qr-request.ts`, `wt-qr-protobuf.ts` and `wt-qr-response.ts`
+  implement reference-style QR request bodies, D1 protobuf and selected response
+  bodies. The response parser rejects duplicate TLV tags (the reference uses
+  last-wins) and requires the caller to delimit the exact business body: a final
+  byte is not automatically treated as an OICQ trailer. D1 unknown fields retain
+  diagnostic metadata only; their raw values are not replayed on re-encoding.
+  Response tickets are sensitive and must not be logged.
+- `src/direct/wt-qr-frame.ts` constructs reference-style QR OICQ bodies and can
+  also compose a protocol-12/zero-key service frame. Construct an OICQ body once
+  and pass those same bytes to the SSO sender: separate constructions use fresh
+  random TEA padding and produce different signatures. The service name, peer
+  key, skipped bytes, account and signing policy are explicitly supplied. A
+  loopback test combines the OICQ builder with the protocol-12 sender; this is
+  not a QQ login or target compatibility test. The standard ECDH context returns
+  a fresh public-key copy on each read and prevents facade replacement; callers
+  supplying substitute contexts remain responsible for key pairing.
+- `src/direct/wt-login-request.ts` builds the reference PC `0x810/9` business
+  body with caller-provided device values and temporary tickets. The reference
+  skips twelve bytes when constructing TLV `0x124`; their contents are not
+  established, so this implementation requires those bytes as explicit input.
+  It also rejects UINs larger than 32 bits rather than silently truncating the
+  reference's corresponding field. A synthetic integration test composes this
+  body with the `0x810` envelope and checks it with an independent ECDH peer;
+  these local constraints and vectors do not prove target compatibility.
+- `src/direct/wt-login-response.ts` parses reference-style `0x810/9` business
+  responses and decrypts `0x119` using a caller-supplied `TgtgtKey`. Ticket
+  fields are only returned after local structural checks; parsed tickets do not
+  prove an authenticated login. The caller must bind the outer command, account
+  and sequence to the pending session. Failure now best-effort clears owned TLV
+  and partial ticket copies, and the returned decryption plaintext is cleared on
+  both success and failure. The TLV parser similarly clears its unreturned copies
+  after a late parse failure. Successful results transfer independent copies to
+  the caller; caller input and keys are preserved. This does not guarantee erasure
+  of crypto-internal padded data, strings or runtime copies. No ticket data should
+  be logged.
+- `src/direct/wt-reference-login-attempt.ts` experimentally joins reference QR
+  fetch/poll and `0x810` on one caller-supplied connected socket. Explicit raw
+  trust, context, signing and business-slice policies are mandatory. Temporary
+  tickets remain private to a single-use confirmation state; local lifetime
+  limits include that state. Its successful ticket result does not mark online
+  status or attach to Bridge. See the reference lifecycle notes below for the
+  synthetic coverage and remaining verification gaps.
+- `src/direct/wt-qr-flow.ts` coordinates a reference-style fetch and poll on
+  one caller-supplied connected socket, with explicit timestamp, response and
+  context verification and business-body boundaries. It closes on confirmation,
+  terminal failure or cancellation, without handing off its socket or ECDH
+  context to `0x810`. Its response verifier sees decoded OICQ bytes and local
+  SSO binding, not the complete wire frame; it must not be mistaken for an
+  implemented server-authentication protocol. The current fetch/poll errors are
+  generic and do not distinguish timeout, trust-policy rejection and parse
+  failure. QR URLs, signatures and tickets are sensitive; do not log them.
+- `src/direct/wt-login-flow.ts` combines the reference-style login body, OICQ
+  envelope and SSO 12 frame into a one-shot transaction. It requires the caller
+  to provide an exchange, an independent server-verification policy and exact
+  business-body boundaries. A permissive test callback is not authentication;
+  the module returns ticket copies but neither stores them nor registers online.
+  It is not wired to `Sso12PacketClient` and does not establish continuity with
+  the preceding QR flow. JavaScript and external callbacks may retain copies of
+  sensitive data, so memory clearing is best effort.
+- `src/direct/sso-register.ts` encodes the reference PC registration and SSO
+  heartbeat bodies, and classifies a registration response using its command,
+  SSO return code and exact `register success` message. Account and sequence
+  binding remain the transport caller's responsibility. Explicit defaults follow
+  static analysis of the reference serializer; hand-derived vectors have not
+  been compared with the running reference or target. These codecs do not perform
+  registration, change online state, schedule heartbeats or validate server identity.
 - `src/direct/key-exchange.ts` provides P-256 ECDH and AES-256-GCM primitives
   matching a public reference's key-exchange construction. Tests use synthetic
   vectors cross-checked with Node and .NET cryptography, not the target client.
@@ -92,13 +326,43 @@ remain to be recovered and independently verified.
   policy is not implemented here. Synthetic tests use a permissive verifier
   only for their in-process peer. Cancellation discards the retained handle, but
   JavaScript and the crypto provider do not guarantee secure memory erasure.
+- `src/direct/sso12-packet-client.ts` is a single-flight protocol-12 client for
+  an already-connected socket, with caller-supplied account policy, classifier,
+  signing metadata, device parameters and zero-key or D2-key encryption. It
+  closes on a classified push, timeout or cancellation and never replays the
+  request; a timeout after writing leaves its outcome unknown. The protocol-12
+  and protocol-13 adapters share a socket ownership registry so they cannot
+  simultaneously own the same socket; callers must also avoid attaching other
+  consumers. `getProfile()` returns a fresh GUID copy along with the configured
+  account, sub-app ID and version; account and device identifiers should not be
+  logged.
+  `sendBoundPacket()` reports the sequence and command matched to the pending
+  request, including for nonzero SSO return codes. Such binding follows the
+  caller's policies and is not server authentication. Its experimental
+  `transactRaw()` offers a separate single-flight path that gives a bounded
+  candidate wire frame to caller callbacks before the library decodes it. The
+  returned sequence is the local allocation, not proof of a response match; the
+  caller must verify all semantics and peer trust. Callback context is caller-owned,
+  and callback byte copies are best-effort wiped after use; a callback must make
+  its own copy of any bytes it needs to retain. `writeState: unknown` means a
+  write was attempted, not that the peer received or rejected it. Extra observed
+  data during this strict transaction closes the connection; external code must not
+  pause the owned socket or alter its reading mode. These checks cannot establish
+  when bytes still in the operating-system buffer arrived. The client cannot verify
+  that an opaque body was built for the same account and device profile; an
+  eventual login orchestrator must enforce that relationship. This reference-only
+  client neither logs in nor completes registration and has only synthetic
+  loopback coverage.
 - `src/direct/tcp-packet-client.ts` adapts an already-connected socket to the
   existing `PacketSender` contract for protocol-13 frames. The caller must
   supply the account's D2 key, reserved-metadata builder and a response/push
   classifier; it must also handle classified pushes. Tests use a loopback peer,
   not QQ. No classifier or signing implementation for the target build has been
-  recovered. An incorrect classifier can misroute messages. Once a request has
-  been written, a timeout has an unknown outcome and must not trigger an
+  recovered. An incorrect classifier can misroute messages. `whenClosed`
+  resolves after socket closure, pending-request failure and internal key cleanup
+  with a typed, bounded reason; it does not automatically reconnect. This adapter
+  cannot send protocol-12 registration or SSO-heartbeat requests. Once a request
+  has been written, a timeout has an unknown outcome and must not trigger an
   automatic retry of a potentially non-idempotent action.
 
 Run focused offline tests from the repository root with the pinned Node version:
@@ -109,6 +373,45 @@ pnpm --filter @snowluma/protocol exec vitest run tests/direct
 
 The package exports these source modules through `@snowluma/protocol/direct/*`.
 Existing package and Proton build requirements still apply.
+
+## Experimental integration contracts
+
+The two encoding families are separate:
+
+| Family | Inputs supplied by caller | Current boundary |
+| --- | --- | --- |
+| Target-static reserve/head/service | Opaque target-context fields, already-encoded business bytes and the class-2 TEA key | Pure encoding only; no socket, signature or authenticated response implementation |
+| Reference login attempt | An already-connected socket, device profile, signing callback, independent raw/context verification and exact business slices | Synthetic QR-to-ticket lifecycle; no online registration or Bridge integration |
+
+For the target family, pass the reserve encoder's bytes directly to the head
+encoder's `reserved` field, and pass the head's complete output directly to the
+service encoder's `head` field. Each output already contains the length framing
+specified by its own layer; do not insert another head-length prefix. The service
+encoder's `busi` is the separately encoded business buffer, not automatically a
+raw OICQ message. For the observed target path, this buffer is an inclusive BE32
+length followed by the raw request body. The current service encoder does not
+add that business prefix or validate its contents; passing an unwrapped OICQ
+message would omit a statically observed layer. Use
+`encodeTargetServiceBusiness(rawBody)` to produce this buffer for a nonempty
+body, then pass its result as `busi`. Never substitute a zero or invented key
+for the target's key and interpret a local encryption success as protocol
+compatibility.
+
+For the reference attempt, the caller retains responsibility for endpoint
+selection and connection establishment. Call `fetch()`, manually poll while the
+result is `wait` or `confirm`, and call `login()` only after `confirmed`. Status
+`confirm` still means waiting for user confirmation. Do not log the QR URL,
+image contents, raw frames or ticket results. `timeoutMs` bounds a transaction;
+`attemptTimeoutMs` also covers idle time while confirmation is held, and neither
+is a recovered server-expiry rule. Always close an abandoned attempt.
+
+Raw and context callbacks returning `true` in synthetic tests are fixture
+policies, not reusable production authentication. Raw verification precedes
+library response decoding; a verifier's own metadata parsing is only an
+untrusted preview unless supported by independent trust. Verification inputs are
+copies and are cleared after use. Any retained callback data or asynchronous
+external side effects remain the callback owner's responsibility. No automatic
+verification-challenge completion or failed-write replay is provided.
 
 ## Reference-only QR research notes
 
@@ -125,6 +428,74 @@ provides D2, D2Key, A2, and A1 via another response. A working client also needs
 online registration and heartbeat. The selected binary contains
 `wtlogin64.trans_emp`, not the reference's exact `wtlogin.trans_emp` literal;
 the relationship between these names remains unknown.
+
+The reference's confirmed QR response supplies temporary `TgtgtKey`, `NoPicSig`
+and A1 values. Its PC `wtlogin.login` then constructs OICQ `0x810` subcommand
+`0x09` with 15 TLVs. On a successful login response, the reference decrypts
+TLV `0x119` using `TgtgtKey` and reads D2 (`0x143`), D2Key (`0x305`), A2
+(`0x10a`), and A1 (`0x106`). The temporary A1 and returned A1 are separate
+values. These details are [static reference observations](https://github.com/LagrangeDev/Lagrange.Core/blob/fe789c4a23796fbc82fa09e70a9c44c8a5cf2948/Lagrange.Core/Internal/Services/Login/LoginService.cs),
+not evidence of the selected build's behavior. A complete ticket set is not by
+itself proof of registration or server acceptance.
+
+In the reference's ordinary PC path, QR and `0x810` use the same keystore's
+secp192k1 context and random key. After confirmation the returned UIN is assigned
+before the login request; the uninterrupted path uses the same `SocketContext`
+without an explicit reconnect. The QR business fields containing zero UIN do not
+prove that every surrounding header uses zero: those headers use the keystore's
+current UIN. See the [reference transition](https://github.com/LagrangeDev/Lagrange.Core/blob/fe789c4a23796fbc82fa09e70a9c44c8a5cf2948/Lagrange.Core/Internal/Logic/WtExchangeLogic.cs#L425-L465)
+and [packet sending path](https://github.com/LagrangeDev/Lagrange.Core/blob/fe789c4a23796fbc82fa09e70a9c44c8a5cf2948/Lagrange.Core/Internal/Context/PacketContext.cs#L34-L81).
+This does not establish what the target server requires. The current experimental
+QR flow closes its socket after confirmation and does not transfer its ECDH
+context to the separate login transaction, so those two modules are not yet a
+complete reference lifecycle.
+
+The separate experimental `WtReferenceLoginAttempt` now models that continuity
+using one socket owner, sequence allocator, ECDH context and random key. Its
+manual `fetch()`, `poll()` and `login()` operations use `transactRaw()` and keep
+confirmed temporary tickets private. The confirmed UIN is range-checked and
+used for login, while the transport lease still reports the initial UIN. A
+successful synthetic loopback exchanges fetch, waiting states, confirmation
+and `0x810` over one connection; this does not prove target compatibility or
+that the server requires one physical socket.
+
+This new owner passes independent copies of the actual request frame and raw
+candidate response to the caller's explicit trust policy before library
+response decoding. It does not re-encode responses as evidence or add another
+socket reader. Consumer results are staged until the raw transaction succeeds;
+local per-request and whole-attempt deadlines include time spent holding
+confirmation. Failure closes the attempt without automatic write replay.
+Tickets only establish a parsed structure, not registration or online state.
+The owner remains reference-only, separate from both the target encoders and
+the production Bridge. After raw and context verification and a successful
+transaction, `login()` can also return `verification-required`, `nonzero` or
+`incomplete` with the numeric business state, or `error` with state and numeric
+code. These non-ticket outcomes terminate the attempt and clear its temporary
+material; they do not initiate a verification challenge or retry. Server error
+text and raw TLVs are omitted. Malformed bodies and rejected trust/context
+policies still throw generic errors; an incomplete parsed outcome is not a
+replacement for structural validation. Its complete response-mismatch,
+reentrancy, late-callback and cleanup-race matrix is not yet fully covered.
+Additional real-Proton loopback regressions cover mismatched SSO sequence and
+command, mismatched login OICQ UIN and command with valid business bodies, a
+positive control, out-of-range confirmed UIN, socket ownership contention and
+cancellation during raw verification. These tests verify local rejection behavior,
+not the target's response conventions or cryptographic trust.
+Bounded independent probes covered invalid login byte inputs, malicious slice
+objects, signal handling, cleanup after a slice failure, and staged tickets
+invalidated before commit. Follow-up bounded probes checked typed non-ticket
+results, rejected raw/context policies, malformed inner ticket data and closure
+after a non-ticket result was staged but before commit. Some probe inputs used
+a local protobuf stub, so those probes establish lifecycle behavior only, not
+complete codec integration.
+
+In the same reference, `SsoInfoSync` registration and `SsoHeartBeat` use
+protocol 12 with D2-key encryption. The registration logic marks the account
+online only when the response message is exactly `register success`; a zero SSO
+return code alone is insufficient. A separate `Heartbeat.Alive` uses protocol 13
+without encryption. These are [reference implementation observations](https://github.com/LagrangeDev/Lagrange.Core/blob/fe789c4a23796fbc82fa09e70a9c44c8a5cf2948/Lagrange.Core/Internal/Logic/WtExchangeLogic.cs),
+not verified facts about the supplied QQ build. Current standalone code does not
+complete the registration or heartbeat lifecycle.
 
 ## Work remaining for direct operation
 

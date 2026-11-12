@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { createWtEcdh, referenceWtServerPublicKey } from '../../src/direct/wt-ecdh';
+import { buildWtQrFrame } from '../../src/direct/wt-qr-frame';
+import { qqTeaDecrypt } from '../../src/direct/qq-tea';
 
 // Synthetic fixtures only. Generator coordinates are from SEC 2 secp192k1;
 // the server point is the complete point in the cited WtLogin source.
@@ -113,6 +115,63 @@ describe('OICQ secp192k1 ECDH', () => {
             expect(() => alice.sharedSecret(point)).toThrow();
             expect(() => alice.deriveTeaKey(point)).toThrow();
         }
+    });
+
+    it('returns isolated public-key copies and prevents property replacement', () => {
+        const alice = createWtEcdh(scalar(1));
+        const first = alice.publicKey;
+        const second = alice.publicKey;
+        expect(first).not.toBe(second);
+        expect(first).toEqual(second);
+        first.fill(0);
+        expect(second).toEqual(Uint8Array.from(compressedGenerator));
+        expect(alice.publicKey).toEqual(Uint8Array.from(compressedGenerator));
+        expect(Object.isFrozen(alice)).toBe(true);
+        expect(Reflect.set(alice, 'publicKey', new Uint8Array(25))).toBe(false);
+        expect(() =>
+            Object.defineProperty(alice, 'publicKey', { value: new Uint8Array(25) }),
+        ).toThrow();
+        expect(alice.publicKey).toEqual(Uint8Array.from(compressedGenerator));
+    });
+
+    it('keeps the QR head consistent with the ECDH scalar after a caller changes a copy', async () => {
+        const alice = createWtEcdh(scalar(1));
+        const bob = createWtEcdh(scalar(2));
+        alice.publicKey.fill(0);
+        expect(Reflect.set(alice, 'publicKey', new Uint8Array(25))).toBe(false);
+        let signedBody: Uint8Array | undefined;
+        await buildWtQrFrame(
+            {
+                uin: '0',
+                sequence: 1,
+                timestamp: 1234,
+                appId: 1,
+                subAppId: 2,
+                clientVersion: 3,
+                ssoVersion: 'test',
+                guid: Uint8Array.of(1),
+                unknown21: new Uint8Array(21),
+                randomKey: new Uint8Array(16),
+                ecdh: alice,
+                peerPublicKey: bob.publicKey,
+                serviceCommand: 'test',
+                buildReserved: async ({ body }) => {
+                    signedBody = Uint8Array.from(body);
+                    return new Uint8Array();
+                },
+            },
+            { type: 'poll', qrSig: Uint8Array.of(1) },
+        );
+        expect(signedBody).toBeDefined();
+        const oicq = Buffer.from(signedBody!);
+        expect(oicq.readUInt16BE(46)).toBe(25);
+        const transmitted = oicq.subarray(48, 73);
+        expect(transmitted).toEqual(compressedGenerator);
+        const decoded = Buffer.from(
+            qqTeaDecrypt(oicq.subarray(73, -1), bob.deriveTeaKey(transmitted)),
+        );
+        expect(decoded.readUInt32BE(14)).toBe(1234);
+        expect(decoded.readUInt16BE(21)).toBe(0x12);
     });
 
     it('does not mutate input views or retain mutable output aliases', () => {

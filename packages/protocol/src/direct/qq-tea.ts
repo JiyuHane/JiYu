@@ -4,6 +4,39 @@ const BLOCK_SIZE = 8;
 const KEY_SIZE = 16;
 const DELTA = 0x9e3779b9;
 const ROUNDS = 16;
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const typedArrayTag = Object.getOwnPropertyDescriptor(
+    typedArrayPrototype,
+    Symbol.toStringTag,
+)!.get!;
+const typedArrayLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get!;
+const typedArrayOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get!;
+const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
+const arrayBufferLength = Object.getOwnPropertyDescriptor(
+    ArrayBuffer.prototype,
+    'byteLength',
+)!.get!;
+const typedArrayFill = Uint8Array.prototype.fill;
+
+function randomPrefix(randomSource: (length: number) => Uint8Array, length: number): Uint8Array {
+    const value = randomSource(length);
+
+    try {
+        if (typedArrayTag.call(value) !== 'Uint8Array' || typedArrayLength.call(value) !== length) {
+            throw new Error();
+        }
+
+        const buffer: ArrayBuffer = typedArrayBuffer.call(value);
+        // The ArrayBuffer intrinsic rejects SharedArrayBuffer, including across realms.
+        arrayBufferLength.call(buffer);
+        const offset: number = typedArrayOffset.call(value);
+        // Constructing this view also rejects detached buffers. It avoids all
+        // caller-defined properties, iterators and methods when copying bytes.
+        return new Uint8Array(new Uint8Array(buffer, offset, length));
+    } catch {
+        throw new Error('QQ-TEA random source returned an invalid prefix');
+    }
+}
 
 /**
  * QQ-TEA wire format: big-endian TEA words, 16 cycles, and two feedback
@@ -67,14 +100,16 @@ export function qqTeaEncrypt(
 ): Uint8Array {
     const words = keyWords(key);
     const padding = (8 - ((plaintext.length + 10) % 8)) % 8;
-    const prefix = randomSource(padding + 3);
+    const prefix = randomPrefix(randomSource, padding + 3);
+    let padded: Uint8Array;
 
-    if (!(prefix instanceof Uint8Array) || prefix.length !== padding + 3) {
-        throw new Error('QQ-TEA random source returned an invalid prefix');
+    try {
+        padded = new Uint8Array(plaintext.length + padding + 10);
+        padded.set(prefix);
+    } finally {
+        typedArrayFill.call(prefix, 0);
     }
 
-    const padded = new Uint8Array(plaintext.length + padding + 10);
-    padded.set(prefix);
     padded[0] = (padded[0] & 0xf8) | padding;
     padded.set(plaintext, padding + 3);
 

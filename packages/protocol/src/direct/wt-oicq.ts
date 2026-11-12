@@ -1,3 +1,4 @@
+import { ECDH } from 'node:crypto';
 import { qqTeaDecrypt, qqTeaEncrypt } from './qq-tea';
 import { createWtEcdh } from './wt-ecdh';
 
@@ -28,6 +29,18 @@ export interface WtCode2dRequest {
     clientVersion: number;
     encryption: WtOicqRequestEncryption;
     head: WtOicqRequestHead;
+    randomSource?: RandomSource;
+}
+
+/** Input for the reference PC 0x810 envelope; the login body is already encoded. */
+export interface WtPcLoginOicqRequest {
+    uin: bigint;
+    clientVersion: number;
+    body: Uint8Array;
+    randomKey: Uint8Array;
+    ecdh: WtEcdh;
+    peerPublicKey: Uint8Array;
+    /** Test-only deterministic padding source; omit for fresh randomness. */
     randomSource?: RandomSource;
 }
 
@@ -129,6 +142,24 @@ export function encodeWtCode2dRequest(request: WtCode2dRequest): Uint8Array {
     // Empty rollback has its one-byte length immediately before wrapped.
     payload.set(wrapped, 14 + st.length);
 
+    return encodeOicqEnvelope({
+        command: 0x812,
+        payload,
+        uin: request.uin,
+        clientVersion: request.clientVersion,
+        encryption: request.encryption,
+        head: request.head,
+        randomSource: request.randomSource,
+    });
+}
+
+type EnvelopeRequest = Pick<
+    WtCode2dRequest,
+    'uin' | 'clientVersion' | 'encryption' | 'head' | 'randomSource'
+> & { command: 0x810 | 0x812; payload: Uint8Array };
+
+function encodeOicqEnvelope(request: EnvelopeRequest): Uint8Array {
+    const payload = request.payload;
     let teaKey: Uint8Array;
     const encryption = request.encryption;
 
@@ -173,7 +204,7 @@ export function encodeWtCode2dRequest(request: WtCode2dRequest): Uint8Array {
     packet[0] = 2;
     packet.writeUInt16BE(length, 1); // inclusive: marker + prefix + remainder
     packet.writeUInt16BE(8001, 3);
-    packet.writeUInt16BE(0x812, 5);
+    packet.writeUInt16BE(request.command, 5);
     packet.writeUInt32BE(Number(request.uin & 0xffffffffn), 9);
     packet[13] = 3;
     packet[14] = encryption.method;
@@ -183,6 +214,57 @@ export function encodeWtCode2dRequest(request: WtCode2dRequest): Uint8Array {
     packet.set(cipher, 26 + head.length);
     packet[length - 1] = 3;
     return packet;
+}
+
+/**
+ * Build the reference PC 0x810 envelope over an already encoded login body.
+ * The caller supplies the peer and all account context. Standard createWtEcdh
+ * contexts expose the point paired with their private scalar; custom ECDH
+ * implementations must preserve that pairing themselves. The returned packet
+ * owns its bytes. This does not sign, send or establish a login.
+ */
+export function encodeWtPcLoginOicqRequest(request: WtPcLoginOicqRequest): Uint8Array {
+    if (!request || typeof request !== 'object') {
+        throw new TypeError('invalid OICQ login request');
+    }
+
+    if (typeof request.uin !== 'bigint' || request.uin < 0n || request.uin > 0x7fffffffffffffffn) {
+        throw new RangeError('invalid UIN');
+    }
+
+    integer(request.clientVersion, 0xffff, 'client version');
+    bytes(request.body, 'login body');
+    const body = Uint8Array.from(request.body);
+    const randomKey = Uint8Array.from(key(request.randomKey, 'random'));
+    bytes(request.peerPublicKey, 'peer public key');
+    const peerPublicKey = Uint8Array.from(request.peerPublicKey);
+    const ecdh = request.ecdh;
+
+    if (!ecdh || typeof ecdh.deriveTeaKey !== 'function') {
+        throw new TypeError('invalid ECDH context');
+    }
+
+    const publicKey = ecdh.publicKey;
+
+    if (
+        !(publicKey instanceof Uint8Array) ||
+        publicKey.length !== 25 ||
+        (publicKey[0] !== 2 && publicKey[0] !== 3)
+    ) {
+        throw new RangeError('invalid ECDH public key');
+    }
+
+    const publicKeySnapshot = Uint8Array.from(publicKey);
+    ECDH.convertKey(publicKeySnapshot, 'secp192k1', undefined, undefined, 'uncompressed');
+    return encodeOicqEnvelope({
+        command: 0x810,
+        uin: request.uin,
+        clientVersion: request.clientVersion,
+        payload: body,
+        encryption: { method: 0x87, ecdh, peerPublicKey },
+        head: { type: 'ecdh', randomKey, publicKey: publicKeySnapshot },
+        randomSource: request.randomSource,
+    });
 }
 
 /** Decode the asymmetric inbound OICQ envelope. Caller must bind UIN/sequence to its context. */

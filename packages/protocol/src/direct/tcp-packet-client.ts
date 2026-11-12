@@ -2,6 +2,7 @@ import type { Socket } from 'node:net';
 import type { PacketSender, SendPacketResult } from '@snowluma/common/packet-sender';
 import { decodeServiceResponse, encodeServiceRequest } from './service-frame';
 import { ServiceFrameDecoder } from './service-stream';
+import { claimDirectSocket } from './socket-ownership';
 import { decodeSsoResponse, encodeSso13Request, type SsoResponse } from './sso';
 
 export interface TcpPacketClientOptions {
@@ -24,6 +25,38 @@ export interface TcpPacketClientOptions {
     maxPending?: number;
     maxWriteBufferBytes?: number;
 }
+
+const CLOSE_REASONS = {
+    'local-close': { kind: 'local', message: 'connection closed' },
+    'remote-end': { kind: 'remote', message: 'connection ended' },
+    'socket-closed': { kind: 'transport-error', message: 'connection closed' },
+    'socket-error': { kind: 'transport-error', message: 'socket error' },
+    'write-failed': { kind: 'transport-error', message: 'socket write failed' },
+    'unexpected-envelope': {
+        kind: 'protocol-error',
+        message: 'unexpected account or service envelope',
+    },
+    'invalid-classification': {
+        kind: 'protocol-error',
+        message: 'invalid incoming classification',
+    },
+    'unissued-sequence': { kind: 'protocol-error', message: 'response has unissued sequence' },
+    'response-before-write': { kind: 'protocol-error', message: 'response before request write' },
+    'command-mismatch': { kind: 'protocol-error', message: 'response command mismatch' },
+    'invalid-response': { kind: 'protocol-error', message: 'invalid service response' },
+    'truncated-stream': { kind: 'protocol-error', message: 'truncated service stream' },
+    'classification-failed': {
+        kind: 'handler-error',
+        message: 'incoming classification callback failed',
+    },
+    'push-handler-missing': { kind: 'handler-error', message: 'push handler missing' },
+    'push-handler-failed': { kind: 'handler-error', message: 'push callback failed' },
+} as const;
+
+type CloseCode = keyof typeof CLOSE_REASONS;
+export type TcpPacketCloseReason = {
+    [Code in CloseCode]: Readonly<{ kind: (typeof CLOSE_REASONS)[Code]['kind']; code: Code }>;
+}[CloseCode];
 
 type Pending = {
     command: string;
@@ -49,7 +82,13 @@ function failure(message: string, code = -1): SendPacketResult {
  * A timeout after a write has an unknown outcome; do not automatically retry.
  */
 export class TcpPacketClient implements PacketSender {
+    private resolveClosed!: (reason: TcpPacketCloseReason) => void;
+    private readonly closedPromise = new Promise<TcpPacketCloseReason>((resolve) => {
+        this.resolveClosed = resolve;
+    });
+    private closeReason?: TcpPacketCloseReason;
     private readonly socket: Socket;
+    private readonly releaseSocket: () => void;
     private readonly uin: string;
     private readonly key: Uint8Array;
     private readonly buildReserved: TcpPacketClientOptions['buildReserved'];
@@ -118,11 +157,28 @@ export class TcpPacketClient implements PacketSender {
         this.defaultTimeoutMs = timeout;
         this.maxPending = maxPending;
         this.maxWriteBufferBytes = maxWrite;
-        this.socket.on('data', this.handleData);
-        this.socket.on('drain', this.handleDrain);
-        this.socket.on('error', this.handleError);
-        this.socket.on('end', this.handleEnd);
-        this.socket.on('close', this.handleClose);
+        this.releaseSocket = claimDirectSocket(this.socket);
+
+        try {
+            this.socket.on('data', this.handleData);
+            this.socket.on('drain', this.handleDrain);
+            this.socket.on('error', this.handleError);
+            this.socket.on('end', this.handleEnd);
+            this.socket.on('close', this.handleClose);
+        } catch (error) {
+            this.socket.off('data', this.handleData);
+            this.socket.off('drain', this.handleDrain);
+            this.socket.off('error', this.handleError);
+            this.socket.off('end', this.handleEnd);
+            this.socket.off('close', this.handleClose);
+            this.releaseSocket();
+            throw error;
+        }
+    }
+
+    /** Resolves once the socket closes, after pending requests fail and the internal key is cleared. */
+    get whenClosed(): Promise<TcpPacketCloseReason> {
+        return this.closedPromise;
     }
 
     sendPacket(
@@ -178,7 +234,7 @@ export class TcpPacketClient implements PacketSender {
     }
 
     close(): void {
-        this.shutdown('connection closed');
+        this.shutdown('local-close');
     }
 
     private async prepareAndWrite(sequence: number, command: string, body: Buffer): Promise<void> {
@@ -237,7 +293,7 @@ export class TcpPacketClient implements PacketSender {
             try {
                 const accepted = this.socket.write(frame, (error?: Error | null) => {
                     if (error) {
-                        this.shutdown('socket write failed');
+                        this.shutdown('write-failed');
                     }
                 });
 
@@ -245,7 +301,7 @@ export class TcpPacketClient implements PacketSender {
                     this.blocked = true;
                 }
             } catch {
-                this.shutdown('socket write failed');
+                this.shutdown('write-failed');
             }
         } catch {
             this.settle(sequence, failure('request preparation or write failed'));
@@ -261,7 +317,7 @@ export class TcpPacketClient implements PacketSender {
                 const outer = decodeServiceResponse(frame, this.key);
 
                 if (outer.uin !== this.uin || outer.protocol !== 13 || outer.encryption !== 'd2') {
-                    this.shutdown('unexpected account or service envelope');
+                    this.shutdown('unexpected-envelope');
                     return;
                 }
 
@@ -271,20 +327,20 @@ export class TcpPacketClient implements PacketSender {
                 try {
                     classification = this.classifyIncoming(response);
                 } catch {
-                    this.shutdown('incoming classification callback failed');
+                    this.shutdown('classification-failed');
                     return;
                 }
 
                 if (classification === 'push') {
                     if (!this.onPush) {
-                        this.shutdown('push handler missing');
+                        this.shutdown('push-handler-missing');
                         return;
                     }
 
                     try {
                         this.onPush(response);
                     } catch {
-                        this.shutdown('push callback failed');
+                        this.shutdown('push-handler-failed');
                         return;
                     }
 
@@ -296,7 +352,7 @@ export class TcpPacketClient implements PacketSender {
                 }
 
                 if (classification !== 'response') {
-                    this.shutdown('invalid incoming classification');
+                    this.shutdown('invalid-classification');
                     return;
                 }
 
@@ -306,16 +362,16 @@ export class TcpPacketClient implements PacketSender {
                 if (!pending) {
                     // Retired response sequences are discarded, never reused.
                     if ((sequence - this.firstSequence) >>> 0 >= this.issued) {
-                        this.shutdown('response has unissued sequence');
+                        this.shutdown('unissued-sequence');
                         return;
                     }
                 } else if (this.hasExpired(sequence)) {
                     continue;
                 } else if (!pending.written) {
-                    this.shutdown('response before request write');
+                    this.shutdown('response-before-write');
                     return;
                 } else if (pending.command !== response.command) {
-                    this.shutdown('response command mismatch');
+                    this.shutdown('command-mismatch');
                     return;
                 } else {
                     this.settle(sequence, {
@@ -332,7 +388,7 @@ export class TcpPacketClient implements PacketSender {
                 }
             }
         } catch {
-            this.shutdown('invalid service response');
+            this.shutdown('invalid-response');
         }
     };
 
@@ -340,20 +396,22 @@ export class TcpPacketClient implements PacketSender {
         this.blocked = false;
     };
     private readonly handleError = (): void => {
-        this.shutdown('socket error');
+        this.shutdown('socket-error');
     };
     private readonly handleEnd = (): void => {
         try {
             this.decoder.finish();
-            this.shutdown('connection ended');
+            this.shutdown('remote-end');
         } catch {
-            this.shutdown('truncated service stream');
+            this.shutdown('truncated-stream');
         }
     };
     private readonly handleClose = (): void => {
-        this.shutdown('connection closed');
+        this.shutdown('socket-closed');
         this.socket.off('error', this.handleError);
         this.socket.off('close', this.handleClose);
+        this.releaseSocket();
+        this.resolveClosed(this.closeReason!);
     };
 
     private hasExpired(sequence: number): boolean {
@@ -383,12 +441,14 @@ export class TcpPacketClient implements PacketSender {
         pending.resolve(result);
     }
 
-    private shutdown(message: string): void {
+    private shutdown(code: CloseCode): void {
         if (this.closed) {
             return;
         }
 
         this.closed = true;
+        const { kind, message } = CLOSE_REASONS[code];
+        this.closeReason = Object.freeze({ kind, code }) as TcpPacketCloseReason;
         this.socket.off('data', this.handleData);
         this.socket.off('drain', this.handleDrain);
         this.socket.off('end', this.handleEnd);
