@@ -298,6 +298,15 @@ length `input − padding − 10`, two block-feedback chains, and a seven-zero-b
 trailer check. These operations are structurally consistent with QQ-TEA
 unpacking, but static analysis does not establish runtime reachability, key
 provenance, a complete executable equivalence, or wire compatibility.
+A subsequent bounded inspection of the `DecodeData` candidate at `0x34f9710`
+shows the primary decoder receives a pointer from receiver `+0x18`; receiver
+byte `+4` can bypass it, and a fallback calls the same decoder with an embedded
+address at receiver `+7`. The candidate constructor at `0x34f8af0` passes the
+`+0x18` output to mode-dependent routines. One mode reaches `0x34f7740`, where
+`0x2c7` is passed to an unresolved function near a secp192k1 diagnostic. The
+curve, input provenance and key derivation remain unproved; the diagnostic is
+only a clue. The disassembler automatically displayed an annotation that may
+contain a hardcoded public-key string; its value was not retained in this record.
 The fixed public reference's server point and verification key were not found as
 contiguous raw byte sequences in this one ELF; encoded constants, other modules,
 and different implementations remain possible. No QQ client was executed or
@@ -437,6 +446,27 @@ remain to be recovered and independently verified.
   raw transaction and empty-reserve lookup candidate; its fixture verification
   and local sequence assignment do not establish server authentication or
   target request/response binding.
+- `src/direct/target-raw-transaction.ts` offers one experimental transaction
+  on a caller-supplied connected `Sso12PacketClient`. That existing client's
+  constructor still requires reference-shaped profile options even though this
+  raw path does not use its reference packet encoders or classifier. The adapter
+  snapshots caller inputs, encodes the target-static head, business and outer
+  frame, uses the raw client's locally allocated sequence, and invokes the
+  caller's raw verifier before
+  decoding the response. The response selector, key and lookup collection are
+  explicit caller inputs; the lookup path currently accepts only empty reserve.
+  The verifier receives copies and must supply the trust policy. A result is
+  transferred only after the raw transaction succeeds; failures after writing
+  retain an unknown write outcome and are not retried. Synchronous preparation
+  counts against the required timeout but cannot be preempted. The head's input
+  sequence is a placeholder replaced by the raw client's local sequence, while
+  reserved/signing bytes are prepared beforehand; this adapter cannot itself
+  construct a signature that depends on the newly assigned sequence. The raw
+  client's inclusive-length framing remains a local constraint, not a proven
+  target rule, and the adapter does not establish real QQ authentication,
+  response binding, login or online state. Its encoder dependencies assume
+  untampered JavaScript built-ins; cleanup is best effort and cannot erase engine
+  or callback-owned copies.
 - `src/direct/target-service-business.ts` frames a nonempty raw request body as
   `BE32(body length + 4) || body` for the observed main-request path. The
   standalone helper's empty-body behavior differs from the main entry; this
