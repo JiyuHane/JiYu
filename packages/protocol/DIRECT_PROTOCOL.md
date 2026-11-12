@@ -106,7 +106,12 @@ failure returns a null pointer. Nearby static diagnostic strings include
 `security_sign_manager.cc`, `GetSignInfo` and `sign success`, which link this
 bounded path to a signing-manager context. They do not establish the virtual
 method implementation, field meanings, runtime reachability, signing algorithm
-or usable signing service.
+or usable signing service. The observed getter `0x6613810` copies a global
+object/control-pointer pair and increments a reference count; `0x66137b0` sets
+that pair from an input supplied elsewhere. Thus this observation does not
+identify the implementation behind the signing-related virtual call. Bounded
+searches did not establish the setter's caller or dynamic type; indirect calls,
+other encodings and other modules remain possible.
 These are bounded static observations, not runtime or peer-compatibility
 evidence. Field meanings, upstream collection construction and signature
 behavior remain unverified.
@@ -411,6 +416,17 @@ remain to be recovered and independently verified.
   It is not wired to `Sso12PacketClient` and does not establish continuity with
   the preceding QR flow. JavaScript and external callbacks may retain copies of
   sensitive data, so memory clearing is best effort.
+- `src/direct/sso-reference-register-flow.ts` composes an experimental one-shot
+  registration transaction using a new caller-supplied connected socket, a
+  reference login ticket result, caller-supplied signer and raw-frame verifier.
+  It verifies through that caller policy before decoding, then checks the
+  reference envelope account, command and local sequence before classification.
+  SSO header version and registration build version remain distinct. It closes
+  the claimed socket and does not retry, mark the account online, authenticate
+  the server or establish compatibility with the selected QQ build. Callback
+  byte snapshots are wiped best-effort after completion or cancellation; the
+  callback may retain copies or continue its own side effects. These behaviors
+  have synthetic loopback coverage only.
 - `src/direct/sso-register.ts` encodes the reference PC registration and SSO
   heartbeat bodies, and classifies a registration response using its command,
   SSO return code and exact `register success` message. Account and sequence
@@ -442,8 +458,12 @@ remain to be recovered and independently verified.
   account, sub-app ID and version; account and device identifiers should not be
   logged.
   `sendBoundPacket()` reports the sequence and command matched to the pending
-  request, including for nonzero SSO return codes. Such binding follows the
-  caller's policies and is not server authentication. Its experimental
+  request, including for nonzero SSO return codes. The ordinary `sendPacket()`
+  and `sendBoundPacket()` paths decode and may decrypt an incoming service frame
+  before checking its UIN; they offer no raw-frame verifier and can report
+  different failures for decryption and UIN mismatch. Such binding follows the
+  caller's policies and is not server authentication. Use the separate raw path
+  when caller verification must precede decoding. Its experimental
   `transactRaw()` offers a separate single-flight path that gives a bounded
   candidate wire frame to caller callbacks before the library decodes it. The
   returned sequence is the local allocation, not proof of a response match; the
@@ -501,6 +521,7 @@ The two encoding families are separate:
 | --- | --- | --- |
 | Target-static reserve/head/service | Opaque target-context fields, already-encoded business bytes and the class-2 TEA key | Pure encoding only; no socket, signature or authenticated response implementation |
 | Reference login attempt | An already-connected socket, device profile, signing callback, independent raw/context verification and exact business slices | Synthetic QR-to-ticket lifecycle; no online registration or Bridge integration |
+| Reference registration attempt | A new connected socket, account-bound ticket result, device fields, signing callback and independent raw verifier | One synthetic request and reference classification; no server-authentication implementation, heartbeat lifecycle or online state |
 
 For the target family, pass the reserve encoder's bytes directly to the head
 encoder's `reserved` field, and pass the head's complete output directly to the
