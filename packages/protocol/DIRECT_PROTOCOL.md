@@ -195,10 +195,71 @@ to a WT session routine which constructs node tags `0x016a` and `0x0318`.
 For these nodes the encoder is virtual slot `+0x10` and writes BE16 tag, BE16
 value length and raw bytes; an empty value still produces a zero-length node.
 Another optional node `0x0108` exists, but its presence flag is clear on this
-observed QR branch, and it has not been tied to tag `0x3f`. The inspected node
-construction does not establish that a later request actually encodes or sends
-these nodes. These observations do not establish runtime execution, interpret
-the bytes as tickets, or prove login.
+observed QR branch, and it has not been tied to tag `0x3f`. Further bounded
+static inspection connects the constructed node pointers to a conditional login
+body producer: `0x34fe100` passes the object containing pointers at session
+`+0x268` and `+0x270` to `0x3469090`, which conditionally inserts them under
+`0x016a` and `0x0318` in a second tree. A pointer and length derived from
+session `+0x2b0/+0x2b8` are copied into a `0x0106` node; a separate span from
+`+0x298/+0x2a0` supplies a span to `0x3468790` before a `0x0144` node is
+built. In the inspected normal path, `0x3469090` constructs a four-pointer
+vector containing a locally constructed `0x016e` node, `[session+0x200]`,
+`[session+0x230]`, and the result of the `0x0124` factory selector. Given
+valid objects and successful writers, `0x3468660` prefixes the number of
+objects as BE16 and calls each object's virtual slot `+0x10` in that order.
+`0x3468790` passes the resulting plaintext and the `+0x298` span's starting
+pointer to `0x8865bb0`; the inspected encryption path reads four 32-bit words
+from that pointer. At least 16 readable bytes are therefore a precondition of
+that path. The observed call sequence does not establish a local length check;
+an earlier call and other invariants were not ruled out. The `0x016e` value
+contains a copied global string whose first initialization is empty; subsequent
+writes and the value at send time are not established by that initializer.
+A separate getter produces `Linux` for a field in the third node, not for the
+`0x016e` string. These observations do not identify the sender instance or
+prove that this branch executes. The key's business identity, actual input
+bytes, the two session-owned node types and complete transformation remain
+unknown.
+
+`0x3467d50` first checks for nine required tags, then visits them in this order:
+`0106, 0144, 0116, 0142, 0145, 0018, 0141, 0177, 0191`. Only after all are
+present does it traverse the optional tag table in its own order. In that table
+`0318` precedes `016a`; present nodes are invoked through virtual slot `+0x10`.
+When the required nodes exist, the two optional nodes remain present and
+unreplaced, and the calls and writer succeed, that path therefore invokes their
+known encoders in that order. This is not a claim about the encoding of other
+nodes or a unique-node count: inspected duplicate-key branches have separate
+count behavior. The resulting nonempty producer output is captured in a heap
+closure whose wrapper targets `0x34ffbe0`; its callback conditionally passes the
+captured container to `0x34f6610` with `wtlogin.login` and command `0x810`.
+On a candidate sender-construction path through `0x34a9e00`, `0x34f05e0`,
+`0x34f4e70` and `0x34f63e0`, the value ultimately assigned to sender `+0x38`
+is the address-adjusted subobject `X+0x10` when `X = [H+0x90]` is non-null.
+The guarded send then calls that receiver's virtual slot `+0x20`. The dynamic
+subobject type and slot target, and any bridge from it to `GetSignInfo`, are
+not established; the same-offset sender constructions are not proof of the
+same runtime instance. A separately inspected `0x34b9130` construction zeros
+`H+0x90/+0x98` and installs a vtable connected to an
+`onUnusualDeviceNeedVerify` candidate thunk. That does not establish its
+identity with the QR-success instance. In the inspected normal path,
+`0x34bafd0` reads and copies that pair into a new control-block-backed object;
+no direct write back to the input pair was observed, subject to pointer-alias
+and indirect-call limitations. Other inspected factory calls pass the address
+of this pair into newly constructed objects, but do not establish its nonzero
+origin or the receiver's dynamic type. The precise execution conditions,
+callback scheduling, downstream signer and key identity, and whether a server
+accepts any resulting frame remain unknown.
+These static observations do not establish an actual QR scan, network send, or
+successful login. The offline `encodeTargetWtLoginOrder` helper models only the
+conditional writer order: it calls the known encoders for `0318` and `016a`,
+while other complete writer fragments are opaque caller assertions. It adds no
+outer header or count and does not establish that a supplied fragment actually
+belongs to its declared tag. Its 16 MiB aggregate output limit and its input
+validation are local policies, not measured native limits or a bound on peak
+intermediate allocations. The separate offline
+`encodeTargetWtLoginFrameCandidate` composes the existing target-local data and
+OICQ encoders with command `0x0810`; the caller must explicitly supply the body,
+header values, context and key material. It does not derive a live session,
+select a signer or establish that the constructed frame is accepted.
 
 The protocol-12 factory branch installs a virtual table whose `+0x20` entry
 resolves to `EncodeReqHead` at `0x6669490`. Its bounded disassembly writes a

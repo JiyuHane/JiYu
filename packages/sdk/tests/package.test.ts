@@ -13,7 +13,7 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterAll, beforeAll, describe, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 const sdkRoot = fileURLToPath(new URL('..', import.meta.url));
 const compiler = createRequire(import.meta.url).resolve('typescript/bin/tsc');
@@ -47,7 +47,7 @@ function node(args: string[]): void {
 
 beforeAll(() => {
     consumerRoot = mkdtempSync(path.join(tmpdir(), 'snowluma-sdk-package-'));
-    const installed = path.join(consumerRoot, 'node_modules', '@snowluma', 'sdk');
+    const installed = path.join(consumerRoot, 'node_modules', '@harehane', 'sdk');
     mkdirSync(installed, { recursive: true });
     copyFileSync(path.join(sdkRoot, 'package.json'), path.join(installed, 'package.json'));
     // Install the declared runtime dependency into this isolated consumer. Node
@@ -80,8 +80,13 @@ beforeAll(() => {
 
     writeFileSync(
         path.join(consumerRoot, 'reverse-types.mts'),
-        `import { text } from '@snowluma/sdk';
-import { createReverseWebSocketServer, type SnowLumaReverseWebSocketSession } from '@snowluma/sdk/node';
+        `import { text } from '@harehane/sdk';
+import { createReverseWebSocketServer, type SnowLumaReverseWebSocketSession } from '@harehane/sdk/node';
+import { createOneBot12ReverseWebSocketServer, type OneBot12ReverseWebSocketSession } from '@harehane/sdk/v12/node';
+const reverse12 = createOneBot12ReverseWebSocketServer({ port: 0 });
+reverse12.on('connection', (session: OneBot12ReverseWebSocketSession) => {
+    void session.request('get_status', {});
+});
 const reverse = createReverseWebSocketServer({ port: 0, selfIds: ['10001'] });
 reverse.on('connection', (bot: SnowLumaReverseWebSocketSession) => {
     const id: string = bot.selfId;
@@ -96,8 +101,14 @@ reverse.on('connection', (bot: SnowLumaReverseWebSocketSession) => {
     writeFileSync(
         path.join(consumerRoot, 'browser-types.mts'),
         `
-import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
+import { SnowLumaWebSocketClient, text } from '@harehane/sdk';
+import { OneBot12HttpClient, OneBot12WebSocketClient, type OneBot12Event } from '@harehane/sdk/v12';
 new SnowLumaWebSocketClient().onMessage(async (_event, context) => { await context.reply(text('hello')); });
+const http = new OneBot12HttpClient({ baseUrl: 'http://127.0.0.1:3012/' });
+const ws = new OneBot12WebSocketClient({ url: 'ws://127.0.0.1:3012/' });
+const listen = (event: OneBot12Event) => event.type;
+ws.onEvent(listen);
+void http;
 // @ts-expect-error Node globals must not leak through the browser entry.
 process.cwd();
 `,
@@ -129,13 +140,13 @@ process.cwd();
     ]);
     writeFileSync(
         path.join(consumerRoot, 'consumer.mts'),
-        `import { SnowLumaHttpClient, text, type SnowLumaKnownAction as RootKnownAction } from '@snowluma/sdk';
-import { SnowLumaWebSocketClient, type SnowLumaHttpClientOptions } from '@snowluma/sdk/client';
-import { MessageChain } from '@snowluma/sdk/messages';
-import { isMessageEvent, type EventMiddleware } from '@snowluma/sdk/events';
-import { SnowLumaApiError } from '@snowluma/sdk/errors';
-import { SNOWLUMA_ACTIONS, isSnowLumaAction, type SnowLumaKnownAction } from '@snowluma/sdk/actions';
-import type { ActionParams, StatusInfo } from '@snowluma/sdk/types';
+        `import { SnowLumaHttpClient, text, type SnowLumaKnownAction as RootKnownAction } from '@harehane/sdk';
+import { SnowLumaWebSocketClient, type SnowLumaHttpClientOptions } from '@harehane/sdk/client';
+import { MessageChain } from '@harehane/sdk/messages';
+import { isMessageEvent, type EventMiddleware } from '@harehane/sdk/events';
+import { SnowLumaApiError } from '@harehane/sdk/errors';
+import { SNOWLUMA_ACTIONS, isSnowLumaAction, type SnowLumaKnownAction } from '@harehane/sdk/actions';
+import type { ActionParams, StatusInfo } from '@harehane/sdk/types';
 
 const options: SnowLumaHttpClientOptions = { baseUrl: 'http://127.0.0.1:3000/' };
 const client = new SnowLumaHttpClient(options);
@@ -167,6 +178,10 @@ afterAll(() => {
 });
 
 describe('SDK package entry points', () => {
+    it('uses the Jiyu SDK package name', () => {
+        expect(manifest.name).toBe('@harehane/sdk');
+    });
+
     it('keeps browser consumers independent of Node server declarations', () => {
         node([compiler, '-p', path.join(consumerRoot, 'tsconfig.browser.json')]);
     }, 30_000);
@@ -177,7 +192,7 @@ describe('SDK package entry points', () => {
             '--eval',
             `
 import assert from 'node:assert/strict';
-import { createReverseWebSocketServer } from '@snowluma/sdk/node';
+import { createReverseWebSocketServer } from '@harehane/sdk/node';
 const server = createReverseWebSocketServer({ port: 0 });
 await server.listen();
 assert.ok(server.address.port > 0);
@@ -195,12 +210,12 @@ await server.close();
             '--input-type=module',
             '--eval',
             `import assert from 'node:assert/strict';
-import * as sdk from '@snowluma/sdk';
-import * as client from '@snowluma/sdk/client';
-import * as messages from '@snowluma/sdk/messages';
-import * as events from '@snowluma/sdk/events';
-import * as errors from '@snowluma/sdk/errors';
-import * as actions from '@snowluma/sdk/actions';
+import * as sdk from '@harehane/sdk';
+import * as client from '@harehane/sdk/client';
+import * as messages from '@harehane/sdk/messages';
+import * as events from '@harehane/sdk/events';
+import * as errors from '@harehane/sdk/errors';
+import * as actions from '@harehane/sdk/actions';
 assert.equal(sdk.SnowLumaHttpClient, client.SnowLumaHttpClient);
 assert.equal(sdk.SnowLumaWebSocketClient, client.SnowLumaWebSocketClient);
 assert.equal(sdk.MessageChain, messages.MessageChain);

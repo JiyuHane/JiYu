@@ -27,6 +27,9 @@ export type MessageFormat = 'array' | 'string';
 
 export type NetworkKind = 'httpServers' | 'httpClients' | 'wsServers' | 'wsClients';
 
+/** Reserved only while the per-account v12 listener is enabled. */
+export const ONEBOT_V12_ADAPTER_NAME = 'OneBot v12';
+
 export interface NetworkBase {
     name: string;
     /** When `false`, the adapter is configured but inactive. Defaults to `true`. */
@@ -137,9 +140,20 @@ export interface HistorySyncConfig {
     enabled: boolean;
 }
 
+/** Independent per-account OneBot v12 listener. Absence means disabled. */
+export interface OneBotV12Config {
+    enabled: boolean;
+    host: string;
+    port: number;
+    accessToken: string;
+    /** Explicitly permit a plaintext listener on a non-loopback address. */
+    allowNonLoopback: boolean;
+}
+
 /** Per-UIN OneBot configuration. */
 export interface OneBotConfig {
     networks: OneBotNetworks;
+    v12?: OneBotV12Config;
     /** Built-in `#sl` status command settings. Always present after normalization. */
     statusCommand: StatusCommandConfig;
     /** Silent login-time history backfill. Always present after normalization. */

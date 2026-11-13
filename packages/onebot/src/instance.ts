@@ -8,6 +8,7 @@ import {
     formatUser,
 } from '@snowluma/protocol/format';
 import path from 'path';
+import { lstatSync, mkdirSync, realpathSync } from 'node:fs';
 import { ApiHandler, type ActionObserver } from './api-handler';
 import type { ConverterContext } from './event-converter';
 import { registerEventPipeline, type EventPipelineHandle } from './event-pipeline';
@@ -40,9 +41,11 @@ import {
     type NetworkReconcileResult,
     type NetworkShutdownResult,
 } from './network';
+import { PluginHost, type PluginStatus } from './plugin-host';
 import { ReactionStore } from './reaction-store';
 import { sameSelfSentMessage, selfSentEventKey, SELF_SENT_ECHO_WINDOW_MS } from './self-sent-event';
 import type { ApiResponse, JsonObject, JsonValue, MessageMeta, OneBotConfig } from './types';
+import { V12Runtime } from './v12-runtime/runtime';
 
 const moduleLog = createLogger('Event');
 
@@ -75,6 +78,9 @@ export class OneBotInstance {
     private disposeRequested = false;
     private acceptingActions = true;
     private readonly inFlightActions = new Set<Promise<void>>();
+    private readonly pluginWorkspace = path.resolve(process.cwd());
+    private pluginHost: PluginHost | null = null;
+    private pluginShutdown: Promise<void> | null = null;
     private readonly historySyncAbortController = new AbortController();
     private readonly historySyncEnabledAtStartup: boolean;
     private historySyncStartRequested = false;
@@ -87,6 +93,9 @@ export class OneBotInstance {
 
     private readonly pids = new Set<number>();
     private online = true;
+    // V12 reports the explicit account-session edge, not listener connectivity.
+    private v12Online = false;
+    private v12Adapter: V12Runtime | null = null;
     private heartbeatTimer: NodeJS.Timeout | null = null;
     private static readonly HEARTBEAT_INTERVAL = 30000;
     private readonly log: Logger;
@@ -98,6 +107,93 @@ export class OneBotInstance {
     /** Live status of this account's OneBot network adapters. */
     getConnectionStatuses(): AdapterStatus[] {
         return this.networkManager.describeStatuses();
+    }
+
+    /**
+     * Execute an explicitly selected local ESM plugin in this Node process.
+     * Plugins have full process permissions; this is not an isolation boundary.
+     * Disable and shutdown do not unload ESM or guarantee that background work stopped.
+     * This trusted local API must not be exposed directly to untrusted web input.
+     */
+    enablePlugin(id: string, absoluteDirectory: string): Promise<void> {
+        if (this.disposeRequested) {
+            return Promise.reject(new Error(`OneBot instance UIN=${this.uin} is disposing`));
+        }
+
+        try {
+            const stateRoot = this.preparePluginStateRoot();
+            this.pluginHost ??= new PluginHost({
+                accountId: this.uin,
+                stateRoot,
+                // Network credentials and account configuration are not plugin context.
+                managerConfig: Object.freeze({}),
+                invokeAction: (action, params) => this.invokeAction(action, params),
+                isStreamAction: (action) => this.apiHandler.isStreamAction(action),
+                // Plugin-supplied log arguments can contain secrets. Keep diagnostics
+                // bounded and do not forward arbitrary objects or strings.
+                logger: (level, pluginId) =>
+                    this.log.warn('plugin [%s] emitted log level=%s', pluginId, level),
+            });
+            return this.pluginHost.enable(id, absoluteDirectory);
+        } catch (error) {
+            return Promise.reject(error);
+        }
+    }
+
+    /** Stop new events, drain accepted hooks and retry a failed plugin cleanup.
+     * With no host this is a no-op, not proof that process resources stopped. */
+    disablePlugin(id: string): Promise<void> {
+        return this.pluginHost?.disable(id) ?? Promise.resolve();
+    }
+
+    /** Snapshot for management UI; enablePlugin rechecks when invoked. */
+    canEnablePlugins(): boolean {
+        return !this.disposeRequested;
+    }
+
+    /** Live host observations; a missing plugin does not prove its resources stopped. */
+    listPlugins(): PluginStatus[] {
+        return this.pluginHost?.listStatuses() ?? [];
+    }
+
+    getPluginStatus(id: string): PluginStatus | null {
+        return this.listPlugins().find((status) => status.id === id) ?? null;
+    }
+
+    private preparePluginStateRoot(): string {
+        const workspace = realpathSync(this.pluginWorkspace);
+        let parent = workspace;
+
+        for (const component of ['data', 'plugins']) {
+            const candidate = path.join(parent, component);
+
+            try {
+                mkdirSync(candidate);
+            } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+                    throw error;
+                }
+            }
+
+            const info = lstatSync(candidate);
+            const resolved = realpathSync(candidate);
+            const relative = path.relative(workspace, resolved);
+
+            if (
+                info.isSymbolicLink() ||
+                !info.isDirectory() ||
+                !relative ||
+                relative === '..' ||
+                relative.startsWith(`..${path.sep}`) ||
+                path.isAbsolute(relative)
+            ) {
+                throw new Error('Plugin state root escapes workspace data');
+            }
+
+            parent = resolved;
+        }
+
+        return parent;
     }
 
     // ── Debug taps (WebUI debug stream / tester) ──
@@ -204,6 +300,8 @@ export class OneBotInstance {
     /** Bridge session edge → OneBot notice. Awaited so offline can leave
      *  adapters before this generation is disposed. */
     emitBotStatus(subType: 'online' | 'offline'): Promise<void> {
+        this.v12Online = subType === 'online';
+        this.v12Adapter?.statusUpdate();
         return this.dispatchEvent(makeBotStatusEvent(parseInt(this.uin, 10) || 0, subType));
     }
 
@@ -289,6 +387,7 @@ export class OneBotInstance {
             );
         }
 
+        this.v12Adapter?.forceClose();
         this.networkManager.forceRelease();
     }
 
@@ -304,7 +403,17 @@ export class OneBotInstance {
 
         this.disposeRequested = true;
         this.acceptingActions = false;
+        this.v12Online = false;
+        this.v12Adapter?.quiesce();
         this.apiHandler.quiesce();
+
+        // shutdown() closes plugin event admission synchronously. Existing hooks
+        // and cleanup can drain, but new actions follow the normal quiesce gate.
+        if (this.pluginHost) {
+            this.pluginShutdown = this.pluginHost.shutdown();
+            void this.pluginShutdown.catch(() => undefined);
+        }
+
         this.online = false;
         this.stopHeartbeat();
         this.historySyncAbortController?.abort(
@@ -326,6 +435,20 @@ export class OneBotInstance {
 
         this.quiesce();
         const attempt = this.enqueueLifecycle(async () => {
+            if (this.pluginHost) {
+                const pluginShutdown = this.pluginShutdown ?? this.pluginHost.shutdown();
+                this.pluginShutdown = null;
+
+                try {
+                    await pluginShutdown;
+                } catch (error) {
+                    throw new AggregateError(
+                        [error],
+                        `plugin shutdown incomplete for UIN=${this.uin}; stores remain open`,
+                    );
+                }
+            }
+
             await Promise.all([
                 Promise.all(this.inFlightActions),
                 this.eventPipelineDrain,
@@ -458,6 +581,17 @@ export class OneBotInstance {
         }
 
         this.traceEventHandoffTerminal(event, startedAt, 'reporting_started');
+
+        try {
+            const result = this.pluginHost?.dispatch(event);
+
+            if (result && result.dropped > 0) {
+                this.log.warn('plugin event admission dropped=%d', result.dropped);
+            }
+        } catch {
+            // A plugin failure must not prevent the v11 network handoff.
+            this.log.warn('plugin event admission failed');
+        }
 
         try {
             await this.networkManager.emitEvent(event);
@@ -599,6 +733,21 @@ export class OneBotInstance {
                 return new WsServerAdapter(desired.name, desired.config, ctx);
             case 'wsClient':
                 return new WsClientAdapter(desired.name, desired.config, ctx);
+
+            case 'v12Server': {
+                const adapter = new V12Runtime(desired.config, ctx, {
+                    getStatus: () => ({
+                        online: this.v12Online,
+                        good: this.v12Online && this.bridge.receiveHealthy,
+                    }),
+                    getSentMessageTime: async (id) =>
+                        (await this.messageStore.findMeta(id))?.timestamp ?? null,
+                    trackAction: (label, start) => this.trackAction(label, start),
+                    canAccept: () => !this.disposeRequested,
+                });
+                this.v12Adapter = adapter;
+                return adapter;
+            }
         }
     }
 

@@ -373,7 +373,9 @@ describe('bounded parallel highway uploads', () => {
         await upload(source, 3);
         const retried = requests.filter((request) => request.offset === BLOCK);
         expect(retried).toHaveLength(2);
-        expect(retried[1].bytes).toEqual(retried[0].bytes);
+        // Byte-wise native comparison avoids Vitest's slow per-element deep
+        // comparison of two 1 MiB typed arrays while retaining exact equality.
+        expect(Buffer.from(retried[1].bytes).equals(Buffer.from(retried[0].bytes))).toBe(true);
         expect(retried[1].head.msgBaseHead?.retryTimes).toBe(1);
         expect(retried[1].head.msgBaseHead?.seq).not.toBe(retried[0].head.msgBaseHead?.seq);
         expect(source.reads).toHaveLength(6);

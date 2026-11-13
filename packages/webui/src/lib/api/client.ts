@@ -30,6 +30,7 @@ import type {
 } from '@/types';
 import type { PasswordRule } from '@/components/pages/change-password-form';
 import { normalizeOneBotConfig } from '@/lib/onebot-config';
+import { parsePluginIndex, parseLocalPlugins, parseLocalPluginMutation } from '@/lib/plugin-index';
 import {
     type AgreementsPayload,
     ApiError,
@@ -102,6 +103,7 @@ class HttpApiClient implements ApiClient {
     private lastLogStatus: StreamStatus = 'closed';
 
     // namespaced surfaces are bound up-front so callers can destructure
+    readonly plugins: ApiClient['plugins'];
     readonly processes: ApiClient['processes'];
     readonly config: ApiClient['config'];
     readonly logs: ApiClient['logs'];
@@ -119,6 +121,33 @@ class HttpApiClient implements ApiClient {
         this.tokenStore = opts.tokenStore ?? localStorageTokenStore(DEFAULT_TOKEN_KEY);
         this.currentToken = this.tokenStore.load();
         this.onUnauthorized = opts.onUnauthorized;
+
+        this.plugins = {
+            index: async (refresh, signal) =>
+                parsePluginIndex(
+                    await this.fetchPluginJson(
+                        `/api/plugins/index${refresh ? '?refresh=1' : ''}`,
+                        {},
+                        signal,
+                    ),
+                ),
+            local: async (uin, signal) =>
+                parseLocalPlugins(
+                    await this.fetchPluginJson(
+                        `/api/plugins/local/${encodeURIComponent(uin)}`,
+                        {},
+                        signal,
+                    ),
+                ),
+            change: async (uin, id, operation) =>
+                parseLocalPluginMutation(
+                    await this.fetchPluginJson(
+                        `/api/plugins/local/${encodeURIComponent(uin)}/${encodeURIComponent(id)}/${operation}`,
+                        { method: 'POST' },
+                    ),
+                    operation,
+                ),
+        };
 
         this.processes = {
             list: () =>
@@ -520,6 +549,160 @@ class HttpApiClient implements ApiClient {
         } finally {
             clearTimeout(timer);
             init.signal?.removeEventListener('abort', onCallerAbort);
+        }
+    }
+
+    /** Bound plugin JSON requests through their body reads without changing streaming APIs. */
+    private async fetchPluginJson(url: string, init: RequestInit = {}, signal?: AbortSignal) {
+        if (signal?.aborted) {
+            throw signal.reason ?? new DOMException('Aborted', 'AbortError');
+        }
+
+        const token = this.currentToken;
+        const controller = new AbortController();
+        let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+
+        const safeCancel = (target: { cancel(): Promise<unknown> } | null) => {
+            if (!target) {
+                return;
+            }
+
+            try {
+                void Promise.resolve(target.cancel()).catch(() => {});
+            } catch {
+                // A malformed or non-compliant transport may throw synchronously.
+            }
+        };
+
+        const releaseReader = (target: ReadableStreamDefaultReader<Uint8Array>) => {
+            if (reader !== target) {
+                return;
+            }
+
+            reader = null;
+
+            try {
+                target.releaseLock();
+            } catch {
+                // A malformed transport may refuse release; never hide the request result.
+            }
+        };
+
+        const cancelRead = () => {
+            const active = reader;
+
+            if (active) {
+                safeCancel(active);
+                releaseReader(active);
+            }
+        };
+
+        let interrupt!: (reason: unknown) => void;
+        const interrupted = new Promise<never>((_, reject) => {
+            interrupt = reject;
+        });
+
+        const onAbort = () => {
+            const reason = signal?.reason ?? new DOMException('Aborted', 'AbortError');
+            interrupt(reason);
+            controller.abort(reason);
+            cancelRead();
+        };
+
+        signal?.addEventListener('abort', onAbort, { once: true });
+        const timer = setTimeout(() => {
+            const error = new ApiError(408, '请求超时，请重试', 'REQUEST_TIMEOUT');
+            interrupt(error);
+            controller.abort(error);
+            cancelRead();
+        }, REQUEST_TIMEOUT_MS);
+
+        const readBody = async (response: Response): Promise<unknown> => {
+            if (!response.body) {
+                return readJson<unknown>(response);
+            }
+
+            const activeReader = response.body.getReader();
+            reader = activeReader;
+            const decoder = new TextDecoder();
+            let text = '';
+            let bytes = 0;
+            let chunks = 0;
+
+            try {
+                while (true) {
+                    const part = await activeReader.read();
+
+                    if (part.done) {
+                        break;
+                    }
+
+                    chunks += 1;
+                    bytes += part.value.byteLength;
+
+                    if (chunks > 8192 || bytes > 4 * 1024 * 1024) {
+                        cancelRead();
+                        throw new ApiError(502, '插件索引响应过大', 'INVALID_RESPONSE');
+                    }
+
+                    if (part.value.byteLength > 0) {
+                        text += decoder.decode(part.value, { stream: true });
+                    }
+                }
+
+                text += decoder.decode();
+                let payload: unknown;
+
+                try {
+                    payload = JSON.parse(text);
+                } catch {
+                    throw invalidJsonResponse(response);
+                }
+
+                if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+                    throw invalidJsonResponse(response);
+                }
+
+                return payload;
+            } finally {
+                releaseReader(activeReader);
+            }
+        };
+
+        const work = async () => {
+            const response = await fetch(url, {
+                ...init,
+                headers: webuiSessionHeaders(token, init.headers),
+                signal: controller.signal,
+            });
+
+            // A non-compliant transport may finish after the deadline or cancellation.
+            if (controller.signal.aborted) {
+                safeCancel(response.body);
+                throw controller.signal.reason;
+            }
+
+            if (response.status === 401) {
+                this.expireSession(token);
+            }
+
+            if (!response.ok) {
+                const payload = (await readBody(response)) as ErrorPayload;
+                throw new ApiError(
+                    response.status,
+                    extractErrorMessage(payload, response.statusText || '请求失败'),
+                    payload.code,
+                );
+            }
+
+            return readBody(response);
+        };
+
+        try {
+            return await Promise.race([work(), interrupted]);
+        } finally {
+            clearTimeout(timer);
+            signal?.removeEventListener('abort', onAbort);
         }
     }
 

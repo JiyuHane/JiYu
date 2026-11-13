@@ -1,3 +1,4 @@
+import { assessAccessToken } from '@snowluma/common/access-token';
 import { positiveIntEnv } from '@snowluma/common/env';
 import { createLogger } from '@snowluma/common/logger';
 import { isRealUin } from '@snowluma/common/uin';
@@ -5,6 +6,7 @@ import { randomBytes } from 'crypto';
 import fs from 'fs';
 import { isIP } from 'node:net';
 import path from 'path';
+import { ONEBOT_V12_ADAPTER_NAME } from './types';
 import type {
     HttpClientNetwork,
     HttpServerNetwork,
@@ -12,6 +14,7 @@ import type {
     MessageFormat,
     OneBotConfig,
     OneBotNetworks,
+    OneBotV12Config,
     StatusCommandConfig,
     WsClientNetwork,
     WsRole,
@@ -105,6 +108,11 @@ export function loadOneBotConfig(uin: string, options: LoadOneBotConfigOptions =
 
     const perUinPath = path.join(CONFIG_DIR, `onebot_${uin}.json`);
     const globalRaw = tryLoadJson(DEFAULT_CONFIG_PATH);
+
+    if (globalRaw && Object.prototype.hasOwnProperty.call(globalRaw, 'v12')) {
+        invalid('v12 is only supported in per-account configuration');
+    }
+
     // A per-account desired config is authoritative state. Corruption must stop
     // startup instead of silently reviving global/default endpoints.
     const perUinRaw = tryLoadJson(perUinPath, true);
@@ -249,6 +257,10 @@ export function prepareOneBotConfigForRestore(
 
     validateOneBotRestoreSource(value);
 
+    if (scope === 'global' && Object.prototype.hasOwnProperty.call(value, 'v12')) {
+        invalid('v12 is only supported in per-account configuration');
+    }
+
     let global: JsonObject | null = null;
 
     if (inheritedGlobal !== undefined && inheritedGlobal !== null) {
@@ -257,6 +269,11 @@ export function prepareOneBotConfigForRestore(
         }
 
         validateOneBotRestoreSource(inheritedGlobal);
+
+        if (Object.prototype.hasOwnProperty.call(inheritedGlobal, 'v12')) {
+            invalid('v12 is only supported in per-account configuration');
+        }
+
         global = inheritedGlobal;
     }
 
@@ -294,6 +311,7 @@ const RESTORE_TOP_LEVEL_KEYS = new Set([
     'statusCommand',
     'historySync',
     'notifications',
+    'v12',
     'musicSignUrl',
     'httpServers',
     'httpClients',
@@ -389,6 +407,10 @@ function validateOneBotRestoreSource(value: JsonObject): void {
     validateRestoreStatusCommand(value.statusCommand);
     validateRestoreHistorySync(value.historySync);
     validateRestoreNotifications(value.notifications);
+
+    if (value.v12 !== undefined) {
+        validateV12Config(value.v12);
+    }
 
     const parsed = fromJson([value], false);
 
@@ -729,6 +751,33 @@ export function assertValidOneBotConfig(value: unknown): asserts value is OneBot
         }
     });
 
+    if (value.v12 !== undefined) {
+        validateV12Config(value.v12);
+        const v12 = value.v12 as unknown as OneBotV12Config;
+
+        // Separate servers cannot share a port, even if their URL paths differ.
+        // Hostnames and dual-stack wildcard mappings can alias; conservatively
+        // require a distinct port from every enabled v11 listener in this account.
+        if (v12.enabled) {
+            if (seen.has(ONEBOT_V12_ADAPTER_NAME)) {
+                invalid(
+                    `network adapter name "${ONEBOT_V12_ADAPTER_NAME}" is reserved while v12 is enabled`,
+                );
+            }
+
+            for (const [kind, servers] of [
+                ['httpServers', value.networks.httpServers],
+                ['wsServers', value.networks.wsServers],
+            ] as const) {
+                for (const server of servers as JsonObject[]) {
+                    if (server.enabled !== false && server.port === v12.port) {
+                        invalid(`v12.port conflicts with an enabled networks.${kind} listener`);
+                    }
+                }
+            }
+        }
+    }
+
     if (!isObject(value.statusCommand)) {
         invalid('statusCommand must be an object');
     }
@@ -786,6 +835,66 @@ export function assertValidOneBotConfig(value: unknown): asserts value is OneBot
             }
         }
     }
+}
+
+function validateV12Config(value: unknown): asserts value is OneBotV12Config {
+    if (!isObject(value)) {
+        invalid('v12 must be an object');
+    }
+
+    rejectUnknownKeys(
+        value,
+        new Set(['enabled', 'host', 'port', 'accessToken', 'allowNonLoopback']),
+        'v12',
+    );
+
+    if (typeof value.enabled !== 'boolean' || typeof value.allowNonLoopback !== 'boolean') {
+        invalid('v12.enabled and v12.allowNonLoopback must be booleans');
+    }
+
+    if (
+        typeof value.host !== 'string' ||
+        value.host !== value.host.trim() ||
+        !isValidBindHost(value.host)
+    ) {
+        invalid('v12.host must be a valid TCP bind host');
+    }
+
+    if (
+        typeof value.port !== 'number' ||
+        !Number.isSafeInteger(value.port) ||
+        value.port < 1 ||
+        value.port > 65535
+    ) {
+        invalid('v12.port must be an integer between 1 and 65535');
+    }
+
+    if (
+        typeof value.accessToken !== 'string' ||
+        value.accessToken.length > 1024 ||
+        (value.accessToken.length > 0 && !/^[A-Za-z0-9._~+\x2f-]+={0,2}$/u.test(value.accessToken))
+    ) {
+        invalid('v12.accessToken must be an unmasked bearer token of at most 1024 characters');
+    }
+
+    if (value.enabled) {
+        if (!value.allowNonLoopback && !isLoopbackV12Host(value.host)) {
+            invalid('v12 non-loopback binding requires allowNonLoopback=true');
+        }
+
+        if (!assessAccessToken(value.accessToken, ['v12', value.host, value.port]).acceptable) {
+            invalid('v12.accessToken must be a strong non-empty token');
+        }
+    }
+}
+
+function isLoopbackV12Host(host: string): boolean {
+    const normalized = host.toLowerCase().replace(/\.$/u, '');
+    return (
+        normalized === 'localhost' ||
+        normalized === '::1' ||
+        (isIP(normalized) === 4 && normalized.split('.')[0] === '127')
+    );
 }
 
 function validateNetworkList(
@@ -1077,6 +1186,7 @@ function toJsonObject(config: OneBotConfig, mode: 'snapshot' | 'overlay'): JsonO
         },
         historySync: { enabled: config.historySync.enabled },
         notifications: { channelIds: config.notifications?.channelIds ?? [] },
+        ...(config.v12 ? { v12: { ...config.v12 } } : {}),
     };
 }
 
@@ -1208,6 +1318,13 @@ function fromJson(sources: JsonObject[], freshInstall: boolean): OneBotConfig {
         historySync: parseHistorySync(sources),
         notifications: parseNotifications(sources),
     };
+    const v12: unknown = sources.at(-1)?.v12;
+
+    if (v12 !== undefined) {
+        validateV12Config(v12);
+        config.v12 = { ...v12 };
+    }
+
     assertValidOneBotConfig(config);
     return config;
 }

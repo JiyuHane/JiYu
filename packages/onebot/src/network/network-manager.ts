@@ -2,6 +2,7 @@ import { createLogger } from '@snowluma/common/logger';
 import { errorMessage } from '@snowluma/common/errors';
 import { assertValidOneBotConfig } from '../config';
 import { buildDispatchPayload } from '../event-filter';
+import { safeV12Error, V12_ADAPTER_NAME, type V12ManagedConfig } from '../v12-runtime/identity';
 import type {
     HttpClientNetwork,
     HttpServerNetwork,
@@ -22,7 +23,10 @@ export type DesiredNetworkAdapter =
     | { name: string; kind: 'httpServer'; config: HttpServerNetwork }
     | { name: string; kind: 'httpClient'; config: HttpClientNetwork }
     | { name: string; kind: 'wsServer'; config: WsServerNetwork }
-    | { name: string; kind: 'wsClient'; config: WsClientNetwork };
+    | { name: string; kind: 'wsClient'; config: WsClientNetwork }
+    | { name: string; kind: 'v12Server'; config: V12ManagedConfig };
+
+type ManagedKind = NetworkAdapterKind | 'v12Server';
 
 export type NetworkApplyPhase = 'open' | 'reload' | 'close' | 'replace' | 'restore' | 'shutdown';
 
@@ -51,7 +55,7 @@ export interface NetworkShutdownResult {
 export type NetworkAdapterFactory = (desired: DesiredNetworkAdapter) => AnyAdapter;
 
 interface ManagedAdapter {
-    kind: NetworkAdapterKind;
+    kind: ManagedKind;
     adapter: AnyAdapter;
 }
 
@@ -71,6 +75,9 @@ export class OneBotNetworkManager {
     private accepting = true;
     private readonly inFlightEmits = new Set<Promise<void>>();
     private shutdownPromise: Promise<NetworkShutdownResult> | null = null;
+    /** Once v12 is configured, captured failures use fixed diagnostics for this
+     * generation; revoked credentials are never retained just to redact logs. */
+    private protectErrors = false;
 
     /** Debug-stream taps — notified for every emitted event regardless of adapter
      *  state. Attached on-demand (ref-counted) by the WebUI debug stream. */
@@ -135,6 +142,19 @@ export class OneBotNetworkManager {
      *  behind network I/O and can be rejected before a WebUI save. */
     compileDesiredPlan(config: OneBotConfig): DesiredNetworkAdapter[] {
         assertValidOneBotConfig(config);
+
+        if (
+            config.v12?.enabled &&
+            [
+                ...config.networks.httpServers,
+                ...config.networks.httpClients,
+                ...config.networks.wsServers,
+                ...config.networks.wsClients,
+            ].some((network) => network.name === V12_ADAPTER_NAME)
+        ) {
+            throw new Error('OneBot v12 is a reserved network adapter name');
+        }
+
         return [
             ...config.networks.httpServers.map((network) => ({
                 name: network.name,
@@ -156,6 +176,20 @@ export class OneBotNetworkManager {
                 kind: 'wsClient' as const,
                 config: structuredClone(network),
             })),
+            ...(config.v12?.enabled
+                ? [
+                      {
+                          name: V12_ADAPTER_NAME,
+                          kind: 'v12Server' as const,
+                          config: {
+                              ...structuredClone(config.v12),
+                              name: V12_ADAPTER_NAME,
+                              messageFormat: 'array' as const,
+                              reportSelfMessage: true,
+                          },
+                      },
+                  ]
+                : []),
         ];
     }
 
@@ -164,6 +198,10 @@ export class OneBotNetworkManager {
 
         if (!this.accepting) {
             return Promise.reject(new Error('network manager is shutting down'));
+        }
+
+        if (config.v12 !== undefined) {
+            this.protectErrors = true;
         }
 
         return this.enqueue(() => this.reconcileNow(desired));
@@ -183,7 +221,7 @@ export class OneBotNetworkManager {
                     await entry.adapter.open();
                     entry.adapter.clearApplyFailure();
                 } catch (error) {
-                    entry.adapter.markApplyFailure(error);
+                    this.markFailure(entry.adapter, error);
                     errors.push(this.report(entry.adapter.name, entry.kind, 'open', error));
                 }
             }
@@ -204,8 +242,12 @@ export class OneBotNetworkManager {
                 return;
             }
 
-            await entry.adapter.close();
-            this.adapters.delete(name);
+            try {
+                await entry.adapter.close();
+                this.adapters.delete(name);
+            } catch (error) {
+                throw this.redactReconcileError(error);
+            }
         });
     }
 
@@ -225,7 +267,7 @@ export class OneBotNetworkManager {
                 if (dispatch.status === 'rejected') {
                     log.error(
                         'in-flight event dispatch failed during shutdown: %s',
-                        errorMessage(dispatch.reason),
+                        errorMessage(this.redactReconcileError(dispatch.reason)),
                     );
                 }
             }
@@ -237,7 +279,7 @@ export class OneBotNetworkManager {
                     await entry.adapter.close();
                     this.adapters.delete(name);
                 } catch (error) {
-                    entry.adapter.markApplyFailure(error);
+                    this.markFailure(entry.adapter, error);
                     errors.push(this.report(name, entry.kind, 'shutdown', error));
                 }
             }
@@ -268,7 +310,10 @@ export class OneBotNetworkManager {
             try {
                 adapter.forceClose();
             } catch (error) {
-                log.error('forced adapter release failed: %s', errorMessage(error));
+                log.error(
+                    'forced adapter release failed: %s',
+                    errorMessage(this.redactReconcileError(error)),
+                );
             }
         }
     }
@@ -302,7 +347,10 @@ export class OneBotNetworkManager {
                 try {
                     cb(event);
                 } catch (error) {
-                    log.warn('debug subscriber error: %s', errorMessage(error));
+                    log.warn(
+                        'debug subscriber error: %s',
+                        errorMessage(this.redactReconcileError(error)),
+                    );
                 }
             }
         }
@@ -326,11 +374,12 @@ export class OneBotNetworkManager {
             Promise.resolve()
                 .then(() => adapter.onEvent(event, payload))
                 .catch((error) => {
-                    log.warn('adapter [%s] onEvent error: %s', adapter.name, errorMessage(error));
+                    const safe = this.redactReconcileError(error);
+                    log.warn('adapter [%s] onEvent error: %s', adapter.name, errorMessage(safe));
                     log.trace(() => [
                         'report_target_failed target=%s error=%s',
                         adapter.name,
-                        error instanceof Error ? (error.stack ?? error.message) : String(error),
+                        safe instanceof Error ? (safe.stack ?? safe.message) : String(safe),
                     ]);
                 }),
         );
@@ -341,6 +390,92 @@ export class OneBotNetworkManager {
     private async reconcileNow(desired: DesiredNetworkAdapter[]): Promise<NetworkReconcileResult> {
         const errors: NetworkApplyError[] = [];
         const desiredByName = new Map(desired.map((entry) => [entry.name, entry]));
+
+        // A listener moving between v11 and v12 may need the other version's
+        // previous port. Release that old owner before applying either side;
+        // never orphan or replace a resource when its close fails.
+        const nextV12 = desired.find((entry) => entry.kind === 'v12Server');
+        const oldV12 = this.adapters.get(V12_ADAPTER_NAME);
+
+        if (
+            oldV12?.kind === 'v12Server' &&
+            (!nextV12 || oldV12.adapter.currentConfig.accessToken !== nextV12.config.accessToken)
+        ) {
+            // Revoke old credentials before attempting unrelated port handoffs.
+            // close() first quiesces ingress even if actual release later fails.
+            try {
+                await oldV12.adapter.close();
+            } catch (error) {
+                this.markFailure(oldV12.adapter, error);
+                errors.push(this.report(V12_ADAPTER_NAME, oldV12.kind, 'close', error));
+                return this.result(errors);
+            }
+        }
+
+        const nextV11Ports = new Set(
+            desired.flatMap((entry) =>
+                (entry.kind === 'httpServer' || entry.kind === 'wsServer') &&
+                entry.config.enabled !== false
+                    ? [entry.config.port]
+                    : [],
+            ),
+        );
+        const released: Array<[string, ManagedAdapter, boolean]> = [];
+
+        for (const [name, live] of this.adapters) {
+            const current = live.adapter.currentConfig;
+            const port =
+                'port' in current && typeof current.port === 'number' ? current.port : null;
+            const handoff =
+                (live.adapter.isActive || live.adapter.hasApplyFailure) &&
+                port !== null &&
+                ((live.kind === 'v12Server' && nextV11Ports.has(port)) ||
+                    ((live.kind === 'httpServer' || live.kind === 'wsServer') &&
+                        nextV12?.config.port === port));
+
+            if (!handoff) {
+                continue;
+            }
+
+            const wasActive = live.adapter.isActive;
+
+            try {
+                await live.adapter.close();
+                released.push([name, live, wasActive]);
+            } catch (error) {
+                this.markFailure(live.adapter, error);
+                errors.push(this.report(name, live.kind, 'close', error));
+
+                for (const [releasedName, previous, wasActive] of released.reverse()) {
+                    if (!wasActive) {
+                        continue;
+                    }
+
+                    if (
+                        previous.kind === 'v12Server' &&
+                        (!nextV12 ||
+                            previous.adapter.currentConfig.accessToken !==
+                                nextV12.config.accessToken)
+                    ) {
+                        previous.adapter.markApplyFailure(
+                            new Error('v12 token revoked during failed port handoff'),
+                        );
+                        continue;
+                    }
+
+                    try {
+                        await previous.adapter.open();
+                    } catch (restoreError) {
+                        this.markFailure(previous.adapter, restoreError);
+                        errors.push(
+                            this.report(releasedName, previous.kind, 'restore', restoreError),
+                        );
+                    }
+                }
+
+                return this.result(errors);
+            }
+        }
 
         // Retire removed adapters first so their ports/resources are available to
         // newly added entries in the same plan. Close is deliberately sequential.
@@ -353,7 +488,7 @@ export class OneBotNetworkManager {
                 await live.adapter.close();
                 this.adapters.delete(name);
             } catch (error) {
-                live.adapter.markApplyFailure(error);
+                this.markFailure(live.adapter, error);
                 errors.push(this.report(name, live.kind, 'close', error));
             }
         }
@@ -392,7 +527,7 @@ export class OneBotNetworkManager {
             await adapter.open();
             adapter.clearApplyFailure();
         } catch (error) {
-            adapter.markApplyFailure(error);
+            this.markFailure(adapter, error);
             errors.push(this.report(next.name, next.kind, 'open', error));
         }
     }
@@ -416,6 +551,14 @@ export class OneBotNetworkManager {
             await live.adapter.reload(next.config);
             live.adapter.clearApplyFailure();
         } catch (error) {
+            // Revoked credentials must not become valid again after a failed
+            // rotation. Keep the failed adapter for cleanup and retry instead.
+            if (live.kind === 'v12Server' && previous.accessToken !== next.config.accessToken) {
+                this.markFailure(live.adapter, error);
+                errors.push(this.report(next.name, next.kind, 'reload', error, false));
+                return;
+            }
+
             let restored = false;
 
             try {
@@ -425,7 +568,7 @@ export class OneBotNetworkManager {
                 errors.push(this.report(next.name, live.kind, 'restore', restoreError));
             }
 
-            live.adapter.markApplyFailure(error);
+            this.markFailure(live.adapter, error);
             errors.push(this.report(next.name, next.kind, 'reload', error, restored));
         }
     }
@@ -435,10 +578,14 @@ export class OneBotNetworkManager {
         next: DesiredNetworkAdapter,
         errors: NetworkApplyError[],
     ): Promise<void> {
+        // The name may be reused by v11 only after v12 is disabled. Its old
+        // listener and credentials are revoked, including on replacement failure.
+        const revokedV12 = live.kind === 'v12Server';
+
         try {
             await live.adapter.close();
         } catch (error) {
-            live.adapter.markApplyFailure(error);
+            this.markFailure(live.adapter, error);
             errors.push(this.report(next.name, live.kind, 'replace', error));
             return;
         }
@@ -448,18 +595,37 @@ export class OneBotNetworkManager {
         try {
             replacement = this.create(next);
         } catch (error) {
+            if (revokedV12) {
+                const failure = new Error(safeV12Error(error));
+                this.markFailure(live.adapter, failure);
+                errors.push(this.report(next.name, next.kind, 'replace', failure, false));
+                return;
+            }
+
             let restored = false;
 
             try {
                 await live.adapter.open();
                 restored = true;
             } catch (restoreError) {
-                errors.push(this.report(next.name, live.kind, 'restore', restoreError));
+                errors.push(
+                    this.report(
+                        next.name,
+                        live.kind,
+                        'restore',
+                        next.kind === 'v12Server'
+                            ? new Error(safeV12Error(restoreError))
+                            : restoreError,
+                    ),
+                );
             }
 
             // Whether restoration succeeds or not, the desired kind was not
             // applied. Preserve that root failure on the still-managed old adapter.
-            live.adapter.markApplyFailure(error);
+            this.markFailure(
+                live.adapter,
+                next.kind === 'v12Server' ? new Error(safeV12Error(error)) : error,
+            );
             errors.push(this.report(next.name, next.kind, 'replace', error, restored));
             return;
         }
@@ -471,6 +637,8 @@ export class OneBotNetworkManager {
             replacement.clearApplyFailure();
             return;
         } catch (error) {
+            const failure = revokedV12 ? new Error(safeV12Error(error)) : error;
+
             // The desired kind failed after the old resource was released. Clean up
             // the partial replacement, then make a best-effort restoration of the
             // previous live adapter. The original apply error remains the primary
@@ -481,9 +649,22 @@ export class OneBotNetworkManager {
                 // The replacement may still own a bound resource. Keep it in the map
                 // and do not start the old adapter: overwriting this reference would
                 // orphan a potentially-live transport and could double-bind a port.
-                replacement.markApplyFailure(error);
-                errors.push(this.report(next.name, next.kind, 'close', cleanupError));
-                errors.push(this.report(next.name, next.kind, 'replace', error, false));
+                this.markFailure(replacement, failure);
+                errors.push(
+                    this.report(
+                        next.name,
+                        next.kind,
+                        'close',
+                        revokedV12 ? new Error(safeV12Error(cleanupError)) : cleanupError,
+                    ),
+                );
+                errors.push(this.report(next.name, next.kind, 'replace', failure, false));
+                return;
+            }
+
+            if (revokedV12) {
+                this.markFailure(replacement, failure);
+                errors.push(this.report(next.name, next.kind, 'replace', failure, false));
                 return;
             }
 
@@ -491,12 +672,22 @@ export class OneBotNetworkManager {
 
             try {
                 await live.adapter.open();
-                live.adapter.markApplyFailure(error);
+                this.markFailure(
+                    live.adapter,
+                    next.kind === 'v12Server' ? new Error(safeV12Error(error)) : error,
+                );
                 this.adapters.set(next.name, live);
                 restored = true;
             } catch (restoreError) {
-                replacement.markApplyFailure(error);
-                errors.push(this.report(next.name, live.kind, 'restore', restoreError));
+                // A failed open may still own resources. The replacement has
+                // closed, so keep the old adapter as the sole tracked owner.
+                this.adapters.set(next.name, live);
+                const safeRestore =
+                    next.kind === 'v12Server'
+                        ? new Error(safeV12Error(restoreError))
+                        : restoreError;
+                this.markFailure(live.adapter, safeRestore);
+                errors.push(this.report(next.name, live.kind, 'restore', safeRestore));
             }
 
             errors.push(this.report(next.name, next.kind, 'replace', error, restored));
@@ -527,18 +718,36 @@ export class OneBotNetworkManager {
         };
     }
 
+    private redactReconcileError(error: unknown): unknown {
+        if (!this.protectErrors) {
+            return error;
+        }
+
+        const category = safeV12Error(error);
+        return new Error(
+            category === 'v12 operation failed' ? 'network operation failed' : category,
+        );
+    }
+
+    private markFailure(adapter: AnyAdapter, error: unknown): void {
+        adapter.markApplyFailure(this.redactReconcileError(error));
+    }
+
     private report(
         name: string,
-        kind: NetworkAdapterKind,
+        kind: ManagedKind,
         phase: NetworkApplyPhase,
         error: unknown,
         restored?: boolean,
     ): NetworkApplyError {
         const detail: NetworkApplyError = {
             name,
-            kind,
+            kind: kind === 'v12Server' ? 'httpServer' : kind,
             phase,
-            message: errorMessage(error),
+            message:
+                kind === 'v12Server'
+                    ? safeV12Error(error)
+                    : errorMessage(this.redactReconcileError(error)),
             at: Date.now(),
             ...(restored === undefined ? {} : { restored }),
         };

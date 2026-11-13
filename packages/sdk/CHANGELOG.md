@@ -2,19 +2,22 @@
 
 ## Unreleased
 
+- Rename the Jiyu SDK package from `@snowluma/sdk` to `@harehane/sdk`. This changes dependency and import paths; existing `SnowLuma` API identifiers and OneBot v11 behavior remain unchanged. The old package name is not an automatic alias; see [VERSIONING.md](VERSIONING.md#package-name-migration).
+- Add independent OneBot 12 HTTP and forward WebSocket clients, a Node-only reverse WebSocket listener, and bounded JSON codecs under `@harehane/sdk/v12` and `@harehane/sdk/v12/node`. Supported implementation capabilities vary; see [ONEBOT_V12.md](ONEBOT_V12.md).
+
 - Fix ordinary WebSocket request deadlines to include connection waits, prevent expired requests from being sent after a late open, and preserve shared connections when an individual request times out or is cancelled. Refs #666.
 
 - Add typed public contact profiles and opt-in friend-list enrichment via `getFriendList({ withProfile: true })` or `with_profile` on either list action; existing request options remain compatible. See [contact profiles](../onebot/CONTACT_PROFILES.md).
 
 - Add a Node reverse WebSocket server with authenticated per-account sessions, Universal and paired API/Event channels, existing action/event/stream helpers, bounded buffers and explicit disconnect handling; see [REVERSE_WEBSOCKET.md](REVERSE_WEBSOCKET.md).
 
-- Add one-step local media sends, the optional `@snowluma/sdk/node` file source, stage-aware errors, explicit quoted replies, and cancellable WebSocket event waits; see [MESSAGING.md](MESSAGING.md). Existing methods and handler/context types remain compatible.
+- Add one-step local media sends, the optional `@harehane/sdk/node` file source, stage-aware errors, explicit quoted replies, and cancellable WebSocket event waits; see [MESSAGING.md](MESSAGING.md). Existing methods and handler/context types remain compatible.
 - Report group-file chat publication failures through the runtime's existing error response instead of returning a successful upload result after publication fails.
 - Add HTTP and WebSocket `requestStream()` / `stream()`, incremental `uploadFileStream()` / `downloadFileStream()` helpers, cancellation, bounded response buffering, and transfer validation. Existing single-response methods remain unchanged; see [STREAMING.md](STREAMING.md).
 - Add parameter and result types for the remaining 57 actions and three aliases, covering every registered action name while preserving existing client methods and type mappings.
 - Describe album pagination and media, Qzone, flash transfers, stickers, group settings, and stream frame payloads; retain numeric-string inputs and signed message IDs.
 - Fix native Node.js ESM imports for the package root and all supported subpaths without requiring a bundler.
-- Restore `@snowluma/sdk/actions` and the root exports `SNOWLUMA_ACTIONS`, `isSnowLumaAction`, and `SnowLumaKnownAction`, including current action names and compatibility aliases.
+- Restore the actions subpath (now `@harehane/sdk/actions`) and the root exports `SNOWLUMA_ACTIONS`, `isSnowLumaAction`, and `SnowLumaKnownAction`, including current action names and compatibility aliases.
 - Require patched Node.js releases: 24.22.1 or newer in the 24.x line, or 26.12.1 and newer.
 
 ## 2.0.0

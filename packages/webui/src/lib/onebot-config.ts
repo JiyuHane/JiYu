@@ -64,6 +64,9 @@ export function normalizeOneBotConfig(raw: unknown): OneBotConfig {
     const list = (x: unknown): Record<string, unknown>[] =>
         Array.isArray(x) ? x.map((it) => normalize(it as Record<string, unknown>)) : [];
 
+    // This editor does not own v12. Deliberately omit it from the submitted
+    // snapshot so a stale page cannot overwrite another client's v12 update;
+    // the backend merges its latest per-account v12 before saving.
     return {
         networks: {
             httpServers: list(

@@ -7,8 +7,8 @@ These helpers are additive. Existing string media paths still refer to the SnowL
 Both HTTP and WebSocket clients provide `sendGroupImage`, `sendPrivateImage`, `sendGroupRecord`, `sendPrivateRecord`, `sendGroupVideo`, `sendPrivateVideo`, `sendGroupFile`, and `sendPrivateFile`.
 
 ```ts
-import { SnowLumaHttpClient } from '@snowluma/sdk';
-import { localFile } from '@snowluma/sdk/node';
+import { SnowLumaHttpClient } from '@harehane/sdk';
+import { localFile } from '@harehane/sdk/node';
 
 const bot = new SnowLumaHttpClient({ baseUrl: 'http://127.0.0.1:3000/' });
 const receipt = await bot.sendGroupImage(12345, await localFile('./picture.png'), {
@@ -24,14 +24,14 @@ await bot.sendPrivateFile(67890, await localFile('./report.pdf'), { name: 'Repor
 
 Sources may be `Uint8Array` (including Node `Buffer`), `Blob` / browser `File`, `ReadableStream<Uint8Array>`, or `AsyncIterable<Uint8Array>` (including a byte-mode Node readable). Streams and async iterables require `fileSize`. A `{ source, filename }` wrapper supplies a name without changing the byte source. Browser `File` names are inferred; an explicit `filename` option overrides them.
 
-`localFile(pathOrFileURL)` is available **only** from `@snowluma/sdk/node`. It returns a named, file-backed Blob without reading the entire file into memory. The file must remain unchanged until sending finishes; missing, non-regular, or changed files produce errors. The root and browser-facing entry points do not import Node filesystem modules. A browser can pass a selected `File` directly.
+`localFile(pathOrFileURL)` is available **only** from `@harehane/sdk/node`. It returns a named, file-backed Blob without reading the entire file into memory. The file must remain unchanged until sending finishes; missing, non-regular, or changed files produce errors. The root and browser-facing entry points do not import Node filesystem modules. A browser can pass a selected `File` directly.
 
 The helpers await every chunk acknowledgement and upload completion, then use the returned **server path** in the final action. Image, record, and video methods return the ordinary `{ message_id }` result. File methods call the existing file publishing actions and return `{ file_id }`. `sendGroupFile` accepts `folder` / `folderId`; file methods accept a display `name`, defaulting to the uploaded name. Media attributes go under `image`, `record`, or `video`. A `video.thumb` path still refers to the server and is not uploaded automatically.
 
 All [upload options](STREAMING.md) apply, including `chunkSize`, `expectedSha256`, `fileRetention`, `signal`, and `onProgress`. Progress measures acknowledged uploaded bytes, not message delivery. `timeoutMs` is a timeout **per upload request and final send request**, not a deadline for the entire operation or source reads. Use an `AbortSignal` with your own deadline for an overall cancellation policy.
 
 ```ts
-import { SnowLumaMediaSendError } from '@snowluma/sdk';
+import { SnowLumaMediaSendError } from '@harehane/sdk';
 
 try {
     await bot.sendPrivateImage(67890, new Uint8Array([/* image bytes */]), {
@@ -51,7 +51,7 @@ Errors carry `stage: 'upload' | 'send'`, the original `cause` (including API, ab
 ## Quote a message explicitly
 
 ```ts
-import { SnowLumaWebSocketClient, quoteMessage, text } from '@snowluma/sdk';
+import { SnowLumaWebSocketClient, quoteMessage, text } from '@harehane/sdk';
 
 const bot = new SnowLumaWebSocketClient();
 bot.onGroupMessage(async (event, context) => {
@@ -65,7 +65,7 @@ await bot.connect();
 await bot.sendGroupMessage(12345, quoteMessage(-42, 'Reply body'));
 ```
 
-`context.quote()` routes to the event's group or private conversation and uses its message ID. It rejects non-message events. IDs are non-zero signed 32-bit integers; negative IDs are preserved. `quoteMessage(id, body, options?)` is also exported from `@snowluma/sdk/messages` and only composes content, without making a request.
+`context.quote()` routes to the event's group or private conversation and uses its message ID. It rejects non-message events. IDs are non-zero signed 32-bit integers; negative IDs are preserved. `quoteMessage(id, body, options?)` is also exported from `@harehane/sdk/messages` and only composes content, without making a request.
 
 Bodies accept strings, CQ strings, a segment, arrays of segments, and message chains. String CQ content retains its original fields and escaping. With `autoEscape: true`, a string becomes literal text following the quote; arrays and chains remain structured. A body that already contains a reply segment is rejected, and inputs are not mutated. This does not fetch the referenced message; the server must be able to resolve its ID.
 

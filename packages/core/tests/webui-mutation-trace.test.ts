@@ -93,7 +93,7 @@ describe('traceAuthenticatedWebuiMutation', () => {
 
         try {
             const response = await traceAuthenticatedWebuiMutation(
-                new Request('http://127.0.0.1/api/system/backup/import', {
+                new Request('http://127.0.0.1/api/system/example-binary', {
                     method: 'POST',
                     headers: { 'content-type': 'application/octet-stream' },
                     body: requestBytes,
@@ -425,10 +425,41 @@ describe('traceAuthenticatedWebuiMutation', () => {
         }
     });
 
+    it.each(['/api/config/12345?source=test', '/api/system/backup/import'])(
+        'does not capture credentials for %s in TRACE',
+        async (pathname) => {
+            const entries: LogEntry[] = [];
+            setLogLevel('trace');
+            const unsubscribe = subscribeLogs((entry) => entries.push(entry));
+            const token = 'secret-token-for-v12';
+            const request = new Request(`http://127.0.0.1${pathname}`, {
+                method: 'POST',
+                headers: { authorization: `Bearer ${token}` },
+                body: JSON.stringify({ v12: { accessToken: token } }),
+            });
+            const clone = vi.spyOn(request, 'clone');
+
+            try {
+                const response = await traceAuthenticatedWebuiMutation(
+                    request,
+                    async () => new Response(JSON.stringify({ v12: { accessToken: token } })),
+                );
+                expect(await response.text()).toContain(token);
+                expect(clone).not.toHaveBeenCalled();
+                expect(mutationTrace(entries)).toEqual([]);
+            } finally {
+                unsubscribe();
+            }
+        },
+    );
+
     it.each([
         ['GET', '/api/config/12345'],
         ['HEAD', '/api/config/12345'],
         ['OPTIONS', '/api/config/12345'],
+        ['POST', '/api/config/12345'],
+        ['POST', '/api/system/backup/import'],
+        ['POST', '/api/system/backup/import/'],
         ['POST', '/api/auth/check-strength'],
         ['POST', '/api/logs/level'],
     ])('keeps %s %s outside mutation TRACE', async (method, pathname) => {

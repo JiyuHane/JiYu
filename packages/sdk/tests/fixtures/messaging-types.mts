@@ -15,11 +15,11 @@ import {
     type SnowLumaEventContextWithQuote,
     type SnowLumaHttpClient,
     type SnowLumaWebSocketClient,
-} from '@snowluma/sdk';
-import { localFile } from '@snowluma/sdk/node';
-import type { EventWaitOptions as ClientWaitOptions } from '@snowluma/sdk/client';
-import type { SendImageOptions } from '@snowluma/sdk/types';
-import { quoteMessage as messageQuote } from '@snowluma/sdk/messages';
+} from '@harehane/sdk';
+import { localFile } from '@harehane/sdk/node';
+import type { EventWaitOptions as ClientWaitOptions } from '@harehane/sdk/client';
+import type { SendImageOptions } from '@harehane/sdk/types';
+import { quoteMessage as messageQuote } from '@harehane/sdk/messages';
 
 declare const http: SnowLumaHttpClient;
 declare const ws: SnowLumaWebSocketClient;

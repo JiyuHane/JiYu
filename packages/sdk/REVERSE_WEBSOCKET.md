@@ -1,14 +1,14 @@
 # Reverse WebSocket connections
 
-`@snowluma/sdk/node` can accept OneBot reverse WebSocket connections. SnowLuma
+`@harehane/sdk/node` can accept OneBot reverse WebSocket connections. SnowLuma
 connects **to your SDK program** and sends events; your program sends actions
 back over that same connection. The ordinary `createWebSocketClient()` continues
 to dial a SnowLuma WebSocket server. Neither SDK entry acts as a QQ implementation
 for NoneBot/AstrBot; SnowLuma's `networks.wsClients` already serves that use case.
 
 ```ts
-import { text } from '@snowluma/sdk';
-import { createReverseWebSocketServer } from '@snowluma/sdk/node';
+import { text } from '@harehane/sdk';
+import { createReverseWebSocketServer } from '@harehane/sdk/node';
 
 const server = createReverseWebSocketServer({
   host: '127.0.0.1',

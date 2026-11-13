@@ -1,7 +1,9 @@
 // Phase 3 — download stream actions (#163): server-push multi-frame.
 import { describe, it, expect, afterEach } from 'vitest';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
+import { pathToFileURL } from 'node:url';
 import { ApiHandler, type ApiActionContext } from '../src/api-handler';
 import { __test } from '../src/actions/stream-download';
 import { STREAM_DOWNLOAD_DIR, __test as fileTest } from '../src/actions/stream-file';
@@ -108,21 +110,44 @@ describe('download_file_stream (local, fenced)', () => {
     });
 
     it('refuses an arbitrary local path outside the stream root [arbitrary-read guard]', async () => {
-        await expect(
-            __test.resolveDownload('/etc/passwd', {} as ApiActionContext, 'auto', 65536),
-        ).rejects.toThrow(/restricted to the stream temp/i);
-        await expect(
-            __test.resolveDownload('file:///etc/hosts', {} as ApiActionContext, 'auto', 65536),
-        ).rejects.toThrow(/restricted to the stream temp/i);
+        // Use a real synthetic file outside the stream root on every platform;
+        // nonexistent paths are deliberately interpreted as potential cache IDs.
+        const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'jiyu-stream-outside-'));
+        const file = path.join(outside, 'private.txt');
 
-        // and end-to-end the dispatch surfaces it as an error frame, not a leak
-        const h = new ApiHandler({} as ApiActionContext);
-        const frames: string[] = [];
-        await h.processStreamRequest(
-            JSON.stringify({ action: 'download_file_stream', params: { file: '/etc/passwd' } }),
-            (j) => frames.push(j),
-        );
-        expect(parse(frames).at(-1)).toMatchObject({ status: 'failed', data: { type: 'error' } });
+        try {
+            fs.writeFileSync(file, 'synthetic fixture');
+            await expect(
+                __test.resolveDownload(file, {} as ApiActionContext, 'auto', 65536),
+            ).rejects.toThrow(/restricted to the stream temp/i);
+            await expect(
+                __test.resolveDownload(
+                    pathToFileURL(file).href,
+                    {} as ApiActionContext,
+                    'auto',
+                    65536,
+                ),
+            ).rejects.toThrow(/restricted to the stream temp/i);
+
+            // End-to-end dispatch surfaces an error frame, not the file contents.
+            const h = new ApiHandler({} as ApiActionContext);
+            const frames: string[] = [];
+            await h.processStreamRequest(
+                JSON.stringify({ action: 'download_file_stream', params: { file } }),
+                (j) => frames.push(j),
+            );
+            expect(parse(frames)).toHaveLength(1);
+            expect(parse(frames)[0]).toMatchObject({
+                status: 'failed',
+                data: { type: 'error' },
+            });
+            expect(frames.join('')).not.toContain('synthetic fixture');
+            expect(frames.join('')).not.toContain(
+                Buffer.from('synthetic fixture').toString('base64'),
+            );
+        } finally {
+            fs.rmSync(outside, { recursive: true, force: true });
+        }
     });
 
     it('protects a local stream file from cleanup while it is being downloaded', async () => {

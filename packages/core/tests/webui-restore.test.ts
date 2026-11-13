@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -43,6 +43,7 @@ describe('restoreBackup transaction', () => {
     });
 
     afterEach(() => {
+        vi.restoreAllMocks();
         fs.rmSync(root, { recursive: true, force: true });
     });
 
@@ -70,9 +71,10 @@ describe('restoreBackup transaction', () => {
         });
     }
 
-    it('commits every prepared file, enforces credential mode, and removes the temporary snapshot', () => {
+    it('commits prepared files, requests private credential mode, and removes the snapshot', () => {
         writeLive('runtime.json', '{"old":true}');
         writeLive('webui.json', JSON.stringify(validAuth()), 0o644);
+        const chmod = vi.spyOn(fs, 'chmodSync');
 
         const result = run({
             'runtime.json': runtime(5100),
@@ -81,7 +83,16 @@ describe('restoreBackup transaction', () => {
 
         expect(JSON.parse(readLive('runtime.json')).webuiPort).toBe(5100);
         expect(JSON.parse(readLive('webui.json')).passwordHash).toBe(validAuth().passwordHash);
-        expect(fs.statSync(livePath('webui.json')).mode & 0o777).toBe(0o600);
+        expect(chmod).toHaveBeenCalledWith(
+            path.join(root, '.restore-transaction-test-transaction', 'staged', 'webui.json'),
+            0o600,
+        );
+
+        // Windows stat mode bits do not describe Windows ACL permissions.
+        if (process.platform !== 'win32') {
+            expect(fs.statSync(livePath('webui.json')).mode & 0o777).toBe(0o600);
+        }
+
         expect(result).toEqual(
             expect.objectContaining({
                 transactionId: 'test-transaction',
@@ -215,6 +226,7 @@ describe('restoreBackup transaction', () => {
     it('retains the snapshot and reports its path only when rollback itself fails', () => {
         writeLive('runtime.json', '{"old":"runtime"}');
         writeLive('notifications.json', '{"old":"notifications"}');
+        const chmod = vi.spyOn(fs, 'chmodSync');
 
         let thrown: unknown;
 
@@ -256,7 +268,13 @@ describe('restoreBackup transaction', () => {
         );
         const snapshotDir = (thrown as RestoreTransactionError).snapshotDir!;
         expect(fs.existsSync(snapshotDir)).toBe(true);
-        expect(fs.statSync(snapshotDir).mode & 0o777).toBe(0o700);
+        expect(chmod).toHaveBeenCalledWith(snapshotDir, 0o700);
+
+        // Windows stat mode bits do not describe Windows ACL permissions.
+        if (process.platform !== 'win32') {
+            expect(fs.statSync(snapshotDir).mode & 0o777).toBe(0o700);
+        }
+
         expect(fs.existsSync(path.join(snapshotDir, 'snapshot', 'runtime.json'))).toBe(true);
         const causes = ((thrown as RestoreTransactionError).cause as AggregateError).errors;
         expect(

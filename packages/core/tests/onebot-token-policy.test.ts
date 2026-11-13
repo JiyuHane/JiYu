@@ -135,6 +135,20 @@ describe('OneBot access token save policy', () => {
         expect(() => validate(previous, next, '192.0.2.10')).not.toThrow();
     });
 
+    it('requires a strong v12 token even for a loopback client and host', () => {
+        const config = makeDefaultOneBotConfig();
+        config.v12 = {
+            enabled: true,
+            host: '127.0.0.1',
+            port: 3012,
+            accessToken: 'weak',
+            allowNonLoopback: false,
+        };
+        expect(() => validate(null, config, '127.0.0.1')).toThrow(OneBotAccessTokenPolicyError);
+        config.v12.accessToken = 'E5xqVb7_9pLt2QwR4M8kZ1nY';
+        expect(() => validate(null, config, '127.0.0.1')).not.toThrow();
+    });
+
     it('accepts a newly changed strong inbound token', () => {
         const previous = makeDefaultOneBotConfig();
         const next = structuredClone(previous);

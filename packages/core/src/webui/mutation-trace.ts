@@ -14,7 +14,13 @@ const STREAMED_REQUEST_PATHS = new Set(['/api/debug/upload']);
 const STREAMED_RESPONSE_PATHS = new Set(['/api/debug/invoke-stream']);
 // This route can disable TRACE while its own operation is in flight; its
 // existing WebUI info record is the authoritative result.
-const TRACE_EXCLUDED_PATHS = new Set(['/api/auth/check-strength', '/api/logs/level']);
+const TRACE_EXCLUDED_PATHS = new Set([
+    '/api/auth/check-strength',
+    '/api/logs/level',
+    // A credentials-enabled backup contains OneBot access tokens and keys.
+    '/api/system/backup/import',
+    '/api/system/backup/import/',
+]);
 
 interface CapturedBody {
     bytes: Uint8Array;
@@ -30,7 +36,25 @@ function shouldTraceMutation(request: Request): boolean {
         return false;
     }
 
-    return !TRACE_EXCLUDED_PATHS.has(new URL(request.url).pathname);
+    const pathname = new URL(request.url).pathname;
+
+    // Hono may decode an encoded route segment before dispatch. Do not capture
+    // raw bodies or headers for encoded mutation paths, including aliases of
+    // excluded routes; malformed encodings are excluded as well.
+    if (pathname.includes('%')) {
+        return false;
+    }
+
+    // Account config contains access tokens in both request and response bodies.
+    // Exclude the whole route rather than relying on JSON-only redaction: TRACE
+    // also renders the original raw bytes and headers.
+    // Local plugin management can execute code; requests may contain a session
+    // header or arbitrary ignored bodies. Do not capture either as raw TRACE.
+    return (
+        !TRACE_EXCLUDED_PATHS.has(pathname) &&
+        !/^\/api\/config\/[^/]+\/?$/u.test(pathname) &&
+        !/^\/api\/plugins\/local(?:\/|$)/u.test(pathname)
+    );
 }
 
 async function captureBody(message: Request | Response): Promise<CapturedBody> {

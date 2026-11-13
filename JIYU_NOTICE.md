@@ -2,9 +2,9 @@
 
 ## 项目与来源 / Project and origin
 
-霁羽（Jiyu）是独立维护的 QQ 互操作项目，仓库为 <https://github.com/JiyuHane/Jiyu>。项目继承了部分 SnowLuma 软件、资源和原始声明，并研究减少对 QQ 客户端进程及 Hook 依赖的实现。霁羽与 SnowLuma 官方项目独立维护；现存的 `SnowLuma` 名称、包名与配置标识也可能用于兼容。
+霁羽（Jiyu）是独立维护的 QQ 互操作项目，仓库为 <https://github.com/JiyuHane/JiYu>。项目继承了部分 SnowLuma 软件、资源和原始声明，并研究减少对 QQ 客户端进程及 Hook 依赖的实现。霁羽与 SnowLuma 官方项目独立维护；现存的 `SnowLuma` 名称、包名与配置标识也可能用于兼容。
 
-Jiyu is an independently maintained QQ interoperability project at <https://github.com/JiyuHane/Jiyu>. It inherits parts of the SnowLuma software, assets and original notices, and researches implementations with less dependence on QQ client processes and hooks. Jiyu is maintained independently of the official SnowLuma project; existing `SnowLuma` names, package names and configuration identifiers may also serve compatibility purposes.
+Jiyu is an independently maintained QQ interoperability project at <https://github.com/JiyuHane/JiYu>. It inherits parts of the SnowLuma software, assets and original notices, and researches implementations with less dependence on QQ client processes and hooks. Jiyu is maintained independently of the official SnowLuma project; existing `SnowLuma` names, package names and configuration identifiers may also serve compatibility purposes.
 
 ## 版权与许可 / Copyright and licensing
 
@@ -29,9 +29,9 @@ These examples are not an exhaustive data-flow inventory or a commitment coverin
 
 ## 联系与说明性质 / Contact and status
 
-一般项目问题可在 [Jiyu Issues](https://github.com/JiyuHane/Jiyu/issues) 咨询；安全或隐私问题也可先在公开 issue 咨询合适的私下联系渠道，**请勿公开粘贴个人信息、凭据或敏感日志**。目前尚未确认专门的霁羽隐私或安全邮箱。
+一般项目问题可在 [Jiyu Issues](https://github.com/JiyuHane/JiYu/issues) 咨询；安全或隐私问题也可先在公开 issue 咨询合适的私下联系渠道，**请勿公开粘贴个人信息、凭据或敏感日志**。目前尚未确认专门的霁羽隐私或安全邮箱。
 
-General project questions may be raised at [Jiyu Issues](https://github.com/JiyuHane/Jiyu/issues). For security or privacy matters, a public issue may be used to ask for an appropriate private contact channel; **do not post personal information, credentials or sensitive logs**. A dedicated Jiyu privacy or security email address has not been confirmed.
+General project questions may be raised at [Jiyu Issues](https://github.com/JiyuHane/JiYu/issues). For security or privacy matters, a public issue may be used to ask for an appropriate private contact channel; **do not post personal information, credentials or sensitive logs**. A dedicated Jiyu privacy or security email address has not been confirmed.
 
 本文件仅为项目说明，不是新的 EULA 或正式隐私政策，不自行确立自然人或法定主体，也不修改原许可或转移原权利。正式条款或隐私政策可在维护者确认相关事实与主体后另行起草。
 

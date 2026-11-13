@@ -134,7 +134,78 @@ export interface StateStreamOptions {
     onStatus?: (status: StreamStatus) => void;
 }
 
+export interface CommunityPlugin {
+    id: string;
+    name: string;
+    version: string;
+    description: string;
+    author: string;
+    homepage: string;
+    downloadUrl: string;
+    tags?: string[];
+    minVersion: string;
+}
+
+export interface CommunityIndexResult {
+    index: { version: string; updateTime: string; plugins: CommunityPlugin[] } | null;
+    fetchedAt: number | null;
+    stale: boolean;
+    error: 'timeout' | 'network' | 'http' | 'too_large' | 'invalid' | null;
+    verified: false;
+    minVersionTarget: 'NapCat';
+}
+
+export interface LocalPluginStatus {
+    id: string;
+    state: 'initializing' | 'active' | 'stopping' | 'cleanup_failed';
+    cleanupFailed: boolean;
+    initializationFailed: boolean;
+    pendingActions: number;
+    processResources: 'unknown';
+}
+
+export interface LocalPluginAction {
+    id: string;
+    canEnable: boolean;
+    canDisable: boolean;
+    enableReason: string | null;
+    disableReason: string | null;
+}
+
+export interface LocalPluginsResult {
+    status: 'ok';
+    accountOnline: boolean;
+    candidates: string[];
+    runtime: LocalPluginStatus[] | null;
+    actions: LocalPluginAction[];
+    pendingOperations: {
+        id: string;
+        operation: 'enable';
+        phase: 'resolving' | 'invoked';
+        cancelled: boolean;
+        currentInstance: boolean;
+    }[];
+    processResources: 'unknown';
+}
+
+export interface LocalPluginMutationResult {
+    status: 'ok';
+    operation: 'enable' | 'disable';
+    outcome?: 'cancelled_before_execution';
+    runtime: LocalPluginStatus | null;
+    processResources: 'unknown';
+}
+
 export interface ApiClient {
+    plugins: {
+        index(refresh?: boolean, signal?: AbortSignal): Promise<CommunityIndexResult>;
+        local(uin: string, signal?: AbortSignal): Promise<LocalPluginsResult>;
+        change(
+            uin: string,
+            id: string,
+            operation: 'enable' | 'disable',
+        ): Promise<LocalPluginMutationResult>;
+    };
     // ---- auth ----
     login(
         password: string,

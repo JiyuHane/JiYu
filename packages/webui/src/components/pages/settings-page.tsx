@@ -31,6 +31,7 @@ import {
     Palette,
     PanelTop,
     Plus,
+    Puzzle,
     RefreshCw,
     RotateCcw,
     Server,
@@ -93,6 +94,7 @@ import { cn, downloadBlob, toColorInputValue } from '@/lib/utils';
 import { settingsRoute, type SettingsTab } from '@/router';
 import { NotificationsPanel } from '@/components/settings/notifications-panel';
 import { GlobalConfigPanel } from '@/components/settings/global-config-panel';
+import { PluginsPanel } from '@/components/settings/plugins-panel';
 import { SystemPanel } from '@/components/settings/system-panel';
 import { JIYU_REPO_URL, UpdateAvailability } from '@/components/settings/update-availability';
 import { UpdateInstaller } from '@/components/settings/update-installer';
@@ -124,6 +126,7 @@ const TAB_GROUPS: { title: string; tabs: TabDef[] }[] = [
         title: '霁羽',
         tabs: [
             { key: 'globalConfig', label: '全局配置', icon: SlidersHorizontal },
+            { key: 'plugins', label: '插件', icon: Puzzle },
             { key: 'storage', label: '存储管理', icon: HardDrive },
             { key: 'notifications', label: '通知', icon: Bell },
         ],
@@ -178,6 +181,7 @@ export function SettingsPage() {
                     {tab === 'storage' && <StoragePanel />}
                     {tab === 'notifications' && <NotificationsPanel />}
                     {tab === 'globalConfig' && <GlobalConfigPanel />}
+                    {tab === 'plugins' && <PluginsPanel />}
                     {tab === 'developer' && <DeveloperPanel />}
                     {tab === 'about' && <AboutPanel />}
                 </motion.div>

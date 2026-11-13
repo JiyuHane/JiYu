@@ -24,9 +24,19 @@ const cleanup: Array<() => Promise<void>> = [];
 let build: string;
 
 beforeAll(async () => {
-    build = mkdtempSync(path.join(tmpdir(), 'snowluma-mcp-protocol-'));
+    // Windows junctions can reinterpret pnpm's relative dependency symlinks
+    // against the temporary path. Keep the compiled output fresh while letting
+    // Node resolve the actual workspace node_modules via the parent directory.
+    build =
+        process.platform === 'win32'
+            ? mkdtempSync(path.join(root, '.mcp-protocol-test-'))
+            : mkdtempSync(path.join(tmpdir(), 'snowluma-mcp-protocol-'));
     copyFileSync(path.join(root, 'package.json'), path.join(build, 'package.json'));
-    symlinkSync(path.join(root, 'node_modules'), path.join(build, 'node_modules'), 'junction');
+
+    if (process.platform !== 'win32') {
+        symlinkSync(path.join(root, 'node_modules'), path.join(build, 'node_modules'), 'junction');
+    }
+
     const compiler = createRequire(import.meta.url).resolve('typescript/bin/tsc');
     const result = spawnSync(
         process.execPath,
@@ -588,7 +598,11 @@ describe('published stdio entry', () => {
                 name: 'invoke_action_background',
                 arguments: { action: 'test_download_stream' },
             });
-            expect(handle).toMatchObject({ resultType: 'task', status: 'working', ttlMs: null });
+            expect(handle).toMatchObject({
+                resultType: 'task',
+                status: 'working',
+                ttlMs: null,
+            });
             const completedId = handle.taskId;
 
             if (typeof completedId !== 'string') {
@@ -610,9 +624,17 @@ describe('published stdio entry', () => {
             });
             await pendingStarted.promise;
             await first.close(shutdown === 'SIGTERM' ? shutdown : undefined);
-            expect(readdirSync(taskDirectory).filter((file) => file.startsWith('.lease-'))).toEqual(
-                [],
-            );
+
+            const leases = readdirSync(taskDirectory).filter((file) => file.startsWith('.lease-'));
+
+            // Windows SIGTERM force-kills the child, so its surviving lease is
+            // evidence that restart must exercise stale-owner recovery.
+            if (process.platform === 'win32' && shutdown === 'SIGTERM') {
+                expect(leases).toHaveLength(1);
+            } else {
+                expect(leases).toEqual([]);
+            }
+
             const second = await open();
             expect(await second.request('tasks/get', { taskId: completedId })).toMatchObject({
                 status: 'completed',

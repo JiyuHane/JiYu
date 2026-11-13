@@ -47,13 +47,13 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Type check SDK
-        run: pnpm --filter @snowluma/sdk typecheck
+        run: pnpm --filter @harehane/sdk typecheck
 
       - name: Test SDK
-        run: pnpm --filter @snowluma/sdk test
+        run: pnpm --filter @harehane/sdk test
 
       - name: Build SDK
-        run: pnpm --filter @snowluma/sdk build
+        run: pnpm --filter @harehane/sdk build
 
       - name: Check npm package version
         id: npm

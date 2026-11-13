@@ -108,6 +108,9 @@ import { loadNotificationsConfig, saveNotificationsConfig } from '../notificatio
 import type { NotificationManager } from '../notifications/manager';
 import { StorageManagementService } from './storage-management';
 import { registerStorageRoutes } from './storage-routes';
+import { createCommunityIndexService } from './plugin-index';
+import { createLocalPluginCatalog } from './plugin-local';
+import { registerLocalPluginRoutes } from './plugin-routes';
 import { LogStorageSettingsManager } from './storage-settings';
 import {
     clearAvatarSessionCookie,
@@ -1282,6 +1285,15 @@ export async function initWebUI(
     });
 
     // ─── Read-only API ───────────────────────────────────────────────────────
+    // Constructing the service does not access the network. Only an
+    // authenticated request explicitly asking for the catalog fetches it.
+    const communityPluginIndex = createCommunityIndexService();
+    registerLocalPluginRoutes(app, oneBotManager, createLocalPluginCatalog());
+    app.get('/api/plugins/index', async (c) => {
+        const force = c.req.query('refresh') === '1';
+        return c.json(await communityPluginIndex.get(force));
+    });
+
     app.get('/api/status', (c) => {
         // Refresh the path-scoped avatar cookie for a still-valid localStorage
         // session (for example after upgrading from a version without the cookie).
@@ -1985,8 +1997,21 @@ export async function initWebUI(
                     uin,
                     err instanceof Error ? err.message : String(err),
                 );
+
+                if (nextConfig.v12 === undefined) {
+                    throw new OneBotConfigValidationError(
+                        'existing configuration could not be read; submit v12 explicitly to repair it',
+                    );
+                }
             }
 
+            // Old clients omit v12. Load, merge and atomic save are synchronous,
+            // so another config POST in this process cannot interleave here.
+            if (nextConfig.v12 === undefined && previousConfig?.v12 !== undefined) {
+                nextConfig = { ...nextConfig, v12: structuredClone(previousConfig.v12) };
+            }
+
+            assertValidOneBotConfig(nextConfig);
             validateOneBotAccessTokenChanges(previousConfig, nextConfig, {
                 clientIp: getSecurityClientIp(c),
                 uin,
@@ -2039,16 +2064,18 @@ export async function initWebUI(
                 online: apply.online,
                 errors: apply.errors,
                 adapters: apply.adapters,
-                config: body,
+                config: nextConfig,
                 // Legacy compatibility: this field used to mean "a live instance was
                 // asked to reload". It now only claims success after the awaitable
                 // reconcile actually completed.
                 reloaded: apply.online && apply.applied,
                 message,
             });
-        } catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
-            log.error('config saved but apply crashed for uin=%s: %s', uin, message);
+        } catch {
+            // Exception messages may include transport credentials or local paths.
+            // Report the failure class without copying arbitrary exception text.
+            const message = '配置热重载异常（CONFIG_APPLY_FAILED）';
+            log.error('config saved but apply failed for uin=%s code=CONFIG_APPLY_FAILED', uin);
             return c.json({
                 success: true,
                 saved: true,
@@ -2056,7 +2083,7 @@ export async function initWebUI(
                 online: oneBotManager.getInstance(uin) !== null,
                 reloaded: false,
                 errors: [{ name: 'network-manager', phase: 'reload', message, at: Date.now() }],
-                config: body,
+                config: nextConfig,
                 message: '配置已保存，但热重载失败，请检查服务器日志。',
             });
         }

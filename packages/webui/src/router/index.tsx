@@ -71,6 +71,7 @@ export const SETTINGS_TABS = [
     'storage',
     'notifications',
     'globalConfig',
+    'plugins',
     'developer',
     'about',
 ] as const;

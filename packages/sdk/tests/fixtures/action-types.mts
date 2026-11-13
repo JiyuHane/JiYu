@@ -10,7 +10,7 @@ import type {
     SnowLumaWebSocketClient,
     StreamApiResponse,
     UploadFileStreamComplete,
-} from '@snowluma/sdk';
+} from '@harehane/sdk';
 import { actionParams, actionResults, type CoveredAction } from './action-contracts.js';
 
 type AssertNever<T extends never> = T;

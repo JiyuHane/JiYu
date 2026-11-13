@@ -8,6 +8,41 @@ export type SqliteRow = Record<string, unknown>;
 const MAX_PENDING_OPERATIONS = 2048;
 const context = new AsyncLocalStorage<{ database: SqliteDatabase; active: boolean }>();
 
+// Serialize only connection initialization, not store operations or connection lifetimes.
+// Keys are lexical, not realpath/inode identities: different symlinks or hardlinks
+// remain different opens. In particular, Windows file symlinks may have separate
+// SQLite WAL sidecars; unknown historical aliases cannot be discovered here. Never
+// redirect opens or merge/delete those sidecars. Other processes and workers remain
+// outside this isolate-local coordination.
+const opening = new Map<string, Promise<void>>();
+
+function initializationKey(filename: string): string {
+    return process.platform === 'win32' ? filename.toLowerCase() : filename;
+}
+
+async function serializeInitialization(
+    key: string,
+    initialize: () => Promise<void>,
+): Promise<void> {
+    const previous = opening.get(key);
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+        release = resolve;
+    });
+    opening.set(key, current);
+
+    try {
+        await previous;
+        await initialize();
+    } finally {
+        if (opening.get(key) === current) {
+            opening.delete(key);
+        }
+
+        release();
+    }
+}
+
 /** Owns one native asynchronous connection. Serialize whole store operations,
  * not only statements, so unrelated calls cannot enter another call's transaction.
  */
@@ -25,35 +60,44 @@ export class SqliteDatabase {
     ) {
         this.initialization = (async () => {
             await options.beforeOpen;
+            // Freeze the same path for directory setup, coordination and native
+            // open, even if the process working directory changes while waiting.
+            const temporary = filename === ':memory:' || filename === '';
+            const resolvedFilename = temporary ? filename : path.resolve(filename);
 
-            if (!options.readOnly && filename !== ':memory:') {
-                await mkdir(path.dirname(filename), { recursive: true });
-            }
+            const initialize = async () => {
+                const database = await openDatabase(resolvedFilename, options.readOnly ?? false);
+                this.database = database;
 
-            const database = await openDatabase(filename, options.readOnly ?? false);
-            this.database = database;
-
-            try {
-                await database.exec(`PRAGMA busy_timeout = ${options.busyTimeout ?? 1000}`);
-                await database.exec('PRAGMA foreign_keys = ON');
-
-                if (!options.readOnly) {
-                    await database.exec('PRAGMA journal_mode = WAL');
-                    await database.exec('PRAGMA synchronous = NORMAL');
-                }
-            } catch (error) {
                 try {
-                    await database.close();
-                    this.database = null;
-                } catch (closeError) {
-                    throw new AggregateError(
-                        [error, closeError],
-                        'SQLite initialization and cleanup failed',
-                        { cause: error },
-                    );
-                }
+                    await database.exec(`PRAGMA busy_timeout = ${options.busyTimeout ?? 1000}`);
+                    await database.exec('PRAGMA foreign_keys = ON');
 
-                throw error;
+                    if (!options.readOnly) {
+                        await database.exec('PRAGMA journal_mode = WAL');
+                        await database.exec('PRAGMA synchronous = NORMAL');
+                    }
+                } catch (error) {
+                    try {
+                        await database.close();
+                        this.database = null;
+                    } catch (closeError) {
+                        throw new AggregateError(
+                            [error, closeError],
+                            'SQLite initialization and cleanup failed',
+                            { cause: error },
+                        );
+                    }
+
+                    throw error;
+                }
+            };
+
+            if (!options.readOnly && !temporary) {
+                await mkdir(path.dirname(resolvedFilename), { recursive: true });
+                await serializeInitialization(initializationKey(resolvedFilename), initialize);
+            } else {
+                await initialize();
             }
         })();
         this.tail = this.initialization.catch(() => undefined);

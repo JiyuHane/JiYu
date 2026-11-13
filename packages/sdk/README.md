@@ -1,11 +1,12 @@
-# @snowluma/sdk
+# @harehane/sdk
 
-SnowLuma 的 TypeScript SDK，提供 OneBot HTTP / WebSocket 客户端、事件中间件、命令匹配和消息链式构造器。
+霁羽 Jiyu 的 TypeScript SDK，提供 OneBot v11 HTTP / WebSocket 客户端、事件中间件、命令匹配和消息链式构造器，并提供独立的 OneBot v12 客户端入口。现有 `SnowLuma` 类名、类型名和其他兼容标识保持不变。v12 的传输、数据限制及服务端能力范围见 [OneBot 12 指南](./ONEBOT_V12.md)。
 
 ## 导航
 
 - [安装](#安装)
 - [快速开始](#快速开始)
+- [OneBot 12 指南](./ONEBOT_V12.md)
 - [HTTP Client](#http-client)
 - [WebSocket Client](#websocket-client)
 - [事件中间件与命令](#事件中间件与命令)
@@ -26,19 +27,21 @@ SnowLuma 的 TypeScript SDK，提供 OneBot HTTP / WebSocket 客户端、事件�
 在本 monorepo 内直接通过 workspace 引用：
 
 ```bash
-pnpm add @snowluma/sdk --workspace
+pnpm add @harehane/sdk --workspace
 ```
 
-发布到 npm 后可直接安装：
+待 `@harehane/sdk` 发布到 npm 后，可直接安装：
 
 ```bash
-pnpm add @snowluma/sdk
+pnpm add @harehane/sdk
 ```
+
+从 `@snowluma/sdk` 迁移时，先安装新包，再将依赖与所有导入路径（包括 `/node` 等子路径）改为 `@harehane/sdk`；保留已有 `SnowLuma` 导出名。两个 npm 包名彼此独立，本仓库不会自动发布、提供或更新旧包，也不会自动重定向旧导入。参见[迁移说明](./VERSIONING.md#package-name-migration)。
 
 ## 快速开始
 
 ```ts
-import { SnowLumaHttpClient, text } from '@snowluma/sdk';
+import { SnowLumaHttpClient, text } from '@harehane/sdk';
 
 const bot = new SnowLumaHttpClient({
   baseUrl: 'http://127.0.0.1:3000/',
@@ -54,7 +57,7 @@ SnowLuma 的 OneBot HTTP / WebSocket 端口和 `accessToken` 来自 `config/oneb
 ## HTTP Client
 
 ```ts
-import { SnowLumaHttpClient, message, text } from '@snowluma/sdk';
+import { SnowLumaHttpClient, message, text } from '@harehane/sdk';
 
 const bot = new SnowLumaHttpClient({
   baseUrl: 'http://127.0.0.1:3000/',
@@ -77,7 +80,7 @@ await bot.sendGroupMessage(123456, [
 WebSocket 客户端会用 `echo` 关联 API 响应，并把无 `echo` 的包作为事件分发。
 
 ```ts
-import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
+import { SnowLumaWebSocketClient, text } from '@harehane/sdk';
 
 const bot = new SnowLumaWebSocketClient({
   url: 'ws://127.0.0.1:3001/',
@@ -294,7 +297,7 @@ await bot.raw('set_group_admin_receive_verify', {
 ## Message Builder
 
 ```ts
-import { fromCQString, message, text, toCQString } from '@snowluma/sdk';
+import { fromCQString, message, text, toCQString } from '@harehane/sdk';
 
 const segments = [
   message.reply(42),
@@ -396,7 +399,7 @@ import {
   SnowLumaApiError,
   SnowLumaAuthError,
   SnowLumaTimeoutError,
-} from '@snowluma/sdk';
+} from '@harehane/sdk';
 
 try {
   await bot.getStatus({ timeoutMs: 1000 });
@@ -418,18 +421,18 @@ try {
 - SDK 自身使用 Vitest 覆盖消息构造、事件上下文、WebSocket 响应关联、错误模型和取消逻辑。
 - 对接真实 SnowLuma 时建议使用单独测试账号和测试群，避免把自动化消息发到生产环境。
 - 集成测试里优先显式设置 `echo` 和较短 `timeoutMs`，这样失败时更容易定位是哪一次 action。
-- 发布前运行 `pnpm --filter @snowluma/sdk typecheck`、`pnpm --filter @snowluma/sdk test`、`pnpm --filter @snowluma/sdk build`。
+- 发布前运行 `pnpm --filter @harehane/sdk typecheck`、`pnpm --filter @harehane/sdk test`、`pnpm --filter @harehane/sdk build`。
 
 ## 子路径导入
 
 ```ts
-import { SnowLumaHttpClient } from '@snowluma/sdk/client';
-import { text } from '@snowluma/sdk/messages';
-import { isMessageEvent } from '@snowluma/sdk/events';
-import { SnowLumaApiError } from '@snowluma/sdk/errors';
+import { SnowLumaHttpClient } from '@harehane/sdk/client';
+import { text } from '@harehane/sdk/messages';
+import { isMessageEvent } from '@harehane/sdk/events';
+import { SnowLumaApiError } from '@harehane/sdk/errors';
 ```
 
-根入口 `@snowluma/sdk` 仍导出正式公开 API；不再保留旧的根级兼容 barrel 或别名 API。
+根入口 `@harehane/sdk` 仍导出正式公开 API；不再保留旧的根级兼容 barrel 或别名 API。
 
 ## Action 同步
 
@@ -448,8 +451,8 @@ src/
 
 ## 版本策略
 
-当前包版本为 `0.1.0`。版本规则、发布检查清单和破坏性变更边界见 [VERSIONING.md](./VERSIONING.md)。
+当前包版本以 [package.json](./package.json) 为准。版本规则、发布检查清单和破坏性变更边界见 [VERSIONING.md](./VERSIONING.md)。
 
 ## 接收反向 WebSocket 连接
 
-Node 程序可通过 `@snowluma/sdk/node` 的 `createReverseWebSocketServer()` 接受 SnowLuma 的反向连接，按账号使用原有消息监听、动作和流式接口。支持统一连接或分开的 API/Event 通道。配置、鉴权和重连处理见 [REVERSE_WEBSOCKET.md](REVERSE_WEBSOCKET.md)。
+Node 程序可通过 `@harehane/sdk/node` 的 `createReverseWebSocketServer()` 接受 SnowLuma 的反向连接，按账号使用原有消息监听、动作和流式接口。支持统一连接或分开的 API/Event 通道。配置、鉴权和重连处理见 [REVERSE_WEBSOCKET.md](REVERSE_WEBSOCKET.md)。

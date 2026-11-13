@@ -66,6 +66,14 @@ export function validateOneBotAccessTokenChanges(
     options: OneBotAccessTokenPolicyOptions,
 ): void {
     const allowEmptyFromClient = isLoopbackClientIp(options.clientIp);
+    const v12 = next.v12;
+
+    if (
+        v12?.enabled &&
+        !assessAccessToken(v12.accessToken, [options.uin, 'v12', v12.host, v12.port]).acceptable
+    ) {
+        throw new OneBotAccessTokenPolicyError('OneBot v12 的令牌需要使用高强度随机值。');
+    }
 
     for (const kind of INBOUND_KINDS) {
         const previousList = previous?.networks[kind] ?? [];

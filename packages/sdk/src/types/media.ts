@@ -1,7 +1,7 @@
 import type { ImageSegment, RecordSegment, VideoSegment } from './messages.js';
 import type { UploadFileSource, UploadFileStreamOptions } from './streaming.js';
 
-/** A byte source with a filename, including files opened by @snowluma/sdk/node. */
+/** A byte source with a filename, including files opened by @harehane/sdk/node. */
 export interface NamedMediaSource {
     readonly source: UploadFileSource;
     readonly filename: string;

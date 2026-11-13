@@ -1,4 +1,4 @@
-import type { ActionParams, ActionResult } from '@snowluma/sdk';
+import type { ActionParams, ActionResult } from '@harehane/sdk';
 
 const album = { group_id: '10001', album_id: 'album' };
 const mediaLike = { ...album, batch_id: '9007199254740993', lloc: 'photo' };

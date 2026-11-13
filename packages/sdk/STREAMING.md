@@ -10,7 +10,7 @@ when a response contains multiple frames.
 ```ts
 import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
-import { SnowLumaHttpClient } from '@snowluma/sdk';
+import { SnowLumaHttpClient } from '@harehane/sdk';
 
 const client = new SnowLumaHttpClient({ baseUrl: 'http://127.0.0.1:3000/' });
 const controller = new AbortController();
@@ -124,7 +124,7 @@ for await (const response of client.requestStream('test_download_stream', {})) {
   HTTP reads follow consumption; WebSocket has no per-request backpressure, so
   prefer HTTP for large downloads to a slow destination.
 
-All new types are exported from `@snowluma/sdk` and `@snowluma/sdk/types`. Custom
+All new types are exported from `@harehane/sdk` and `@harehane/sdk/types`. Custom
 `SnowLumaApiClient` subclasses can opt in by implementing `requestStream()`;
 request-only subclasses remain compatible and receive an explicit unsupported
 error if streaming is attempted.
