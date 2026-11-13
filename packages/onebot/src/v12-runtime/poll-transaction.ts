@@ -16,7 +16,8 @@ import type { PollOptions, PollResult } from './event-poll-buffer';
  * writing state. The host owns error handling before and after this transaction and
  * for late sink errors. Local finish is not evidence of remote receipt. Real transport
  * needs its own authentication, source provenance, admission and effect accounting.
- * The offline policy writes [] for empty or timeout, with a local outcome reason.
+ * Legacy mode writes [] for empty or timeout; ordered mode instead returns an
+ * internal empty_unresolved outcome without a write. It is not an HTTP response.
  * Timeout says only this consumer did not reserve events before its wait expired;
  * other waiters or reservations may exist. This mapping still needs transport and
  * fairness review; it does not establish delivery, global emptiness or event order.
@@ -58,6 +59,7 @@ type PollCoreOutcome =
     | { readonly kind: 'release_unknown' }
     | { readonly kind: 'fatal_budget' }
     | { readonly kind: 'queue_error' }
+    | { readonly kind: 'empty_unresolved'; readonly reason: 'empty' | 'timeout' }
     | { readonly kind: 'invalid_input' | 'already_started' }
     | {
           readonly kind:
@@ -98,9 +100,14 @@ export class PollCoordinator {
         private readonly maxQueueBytes: number,
         private readonly now: () => number,
         private readonly isEpochValid: () => boolean,
+        private readonly emptyPolicy: 'legacy' | 'unavailable' = 'legacy',
     ) {
         if (!nonnegativeInteger(maxQueueBytes) || maxQueueBytes < 2) {
             throw new RangeError('invalid queue budget');
+        }
+
+        if (emptyPolicy !== 'legacy' && emptyPolicy !== 'unavailable') {
+            throw new RangeError('invalid empty policy');
         }
     }
 
@@ -121,6 +128,7 @@ export class PollCoordinator {
                 return true;
             },
             () => this.transactions.delete(transaction),
+            this.emptyPolicy,
         );
 
         return transaction;
@@ -166,7 +174,12 @@ export class PollTransaction {
         private readonly sink: PollSink,
         private readonly onStart: () => boolean,
         private readonly onDone: () => void,
+        private readonly emptyPolicy: 'legacy' | 'unavailable' = 'legacy',
     ) {
+        if (emptyPolicy !== 'legacy' && emptyPolicy !== 'unavailable') {
+            throw new RangeError('invalid empty policy');
+        }
+
         this.request = {
             limit: request.limit,
             timeoutMs: request.timeoutMs,
@@ -539,6 +552,10 @@ export class PollTransaction {
 
             if (result.status !== 'reserved') {
                 if (result.status === 'empty' || result.status === 'timeout') {
+                    if (this.emptyPolicy === 'unavailable') {
+                        return { kind: 'empty_unresolved', reason: result.status };
+                    }
+
                     const body = `${prefix}[]${suffix}`;
 
                     if (Buffer.byteLength(body, 'utf8') > maxOutputBytes) {

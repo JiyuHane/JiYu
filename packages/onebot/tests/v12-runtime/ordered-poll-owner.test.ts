@@ -134,11 +134,28 @@ describe('ordered poll owner: in-process only', () => {
         o.invalidate();
         await settle();
     });
-    it('ordered start never reads a sink or emits an empty response', async () => {
+    it('ordered start reports unresolved empty without writing a response', async () => {
         const f = fixture();
         const owner = active(f);
-        const result = owner.start();
-        expect(await result.result).toEqual({ kind: 'ordering_not_ready' });
+        const sink = {
+            isOpen: () => true,
+            on: () => {},
+            off: () => {},
+            writeHead: vi.fn(),
+            end: vi.fn(),
+        };
+        const result = owner.start(
+            {
+                limit: 0,
+                timeoutMs: 0,
+                maxOutputBytes: 1024,
+                responseDeadline: performance.now() + 1000,
+            },
+            sink,
+        );
+        expect(await result.result).toEqual({ kind: 'empty_unresolved', reason: 'empty' });
+        expect(sink.writeHead).not.toHaveBeenCalled();
+        expect(sink.end).not.toHaveBeenCalled();
         result.cancel();
         owner.invalidate();
         await settle();

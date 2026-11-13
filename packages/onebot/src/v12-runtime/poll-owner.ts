@@ -184,6 +184,7 @@ function validOrderedEvent(event: unknown, self: OrderedSelf): boolean {
     );
 }
 
+type PollGapReason = IngressFailure | 'committed_unsent' | 'delivery_unknown';
 type Counter =
     'accepted' | 'full' | 'invalid' | 'too_large' | 'closing_discard' | 'postcommit_unknown';
 type Counters = Record<Counter, number>;
@@ -200,7 +201,7 @@ export interface PollGate {
 }
 
 type GateState = {
-    gap: { source: V12Source; reason: IngressFailure } | null;
+    gap: { source: V12Source; reason: PollGapReason } | null;
     history: V12Source[];
     historyOverflow: boolean;
     transition: object;
@@ -246,7 +247,7 @@ export type PollActivation =
 
 /** Trusted in-process seam only; it is not connected to pipeline or HTTP. */
 export interface OrderedPollOwner {
-    start(): { result: Promise<{ kind: 'ordering_not_ready' }>; cancel(): void };
+    start(request: PollRequest, sink: PollSink): { result: Promise<PollOutcome>; cancel(): void };
     begin(source: V12Source | undefined): IngressParent | null;
     invalidate(): void;
 }
@@ -288,7 +289,7 @@ export function activatePollOwner(runtime: object): PollActivation {
     return result.status === 'ready' ? { status: 'ready', owner: result.owner.facade } : result;
 }
 
-/** Explicit ordered prototype; start() always reports ordering_not_ready. */
+/** Explicit in-process prototype; empty polls do not produce an HTTP response. */
 export function activateOrderedPollOwner(runtime: object): OrderedPollActivation {
     const result = activate(runtime, true);
     return result.status === 'ready'
@@ -448,7 +449,7 @@ export function pollOwnerStats(runtime: object): Readonly<
         cleanup_pending: boolean;
         cleanup_uncertain: boolean;
         ordering_gap: boolean;
-        ordering_reason: IngressFailure | null;
+        ordering_reason: PollGapReason | null;
         history_overflow: boolean;
     }
 > | null {
@@ -559,10 +560,7 @@ class Owner implements PollOwner {
         invalidate: () => this.invalidate(),
     });
     readonly orderedFacade: OrderedPollOwner = Object.freeze({
-        start: () => ({
-            result: Promise.resolve({ kind: 'ordering_not_ready' as const }),
-            cancel() {},
-        }),
+        start: (request: PollRequest, sink: PollSink) => this.start(request, sink),
         begin: (source: V12Source | undefined) => this.begin(source),
         invalidate: () => this.invalidate(),
     });
@@ -633,6 +631,7 @@ class Owner implements PollOwner {
             limits.maxQueueBytes,
             () => performance.now(),
             () => this.valid(),
+            ordered ? 'unavailable' : 'legacy',
         );
     }
 
@@ -661,6 +660,54 @@ class Owner implements PollOwner {
         }
 
         if (!this.invalidating) {
+            this.invalidate();
+        }
+    }
+
+    /** May run after invalidate detached this owner, before its tracked transaction settles. */
+    private recordDeliveryGap(reason: 'committed_unsent' | 'delivery_unknown'): void {
+        if (!this.ownsGate() || (this.slot.owner !== null && this.slot.owner !== this)) {
+            this.markUncertain();
+
+            if (this.slot.owner === this && !this.retired) {
+                this.invalidate();
+            }
+
+            return;
+        }
+
+        const state = gateState(this.slot.gate);
+        const gap = state.gap;
+
+        if (gap !== null && sameSourceEpoch(gap.source, this.source) !== 'same') {
+            this.markUncertain();
+
+            if (this.slot.owner === this && !this.retired) {
+                this.invalidate();
+            }
+
+            return;
+        }
+
+        if (
+            !this.ownsGate() ||
+            (this.slot.owner !== null && this.slot.owner !== this) ||
+            state.gap !== gap
+        ) {
+            this.markUncertain();
+
+            if (this.slot.owner === this && !this.retired) {
+                this.invalidate();
+            }
+
+            return;
+        }
+
+        if (gap === null) {
+            state.gap = { source: this.source, reason };
+        }
+
+        if (this.slot.owner === this && !this.retired) {
             this.invalidate();
         }
     }
@@ -959,38 +1006,54 @@ class Owner implements PollOwner {
             started = true;
             void result.then(
                 (outcome) => {
-                    const core = outcome.kind === 'cleanup_uncertain' ? outcome.outcome : outcome;
-                    const uncertain =
-                        outcome.kind === 'cleanup_uncertain' ||
-                        core.kind === 'release_unknown' ||
-                        core.kind === 'commit_unknown';
+                    try {
+                        const core =
+                            outcome.kind === 'cleanup_uncertain' ? outcome.outcome : outcome;
+                        const uncertain =
+                            outcome.kind === 'cleanup_uncertain' ||
+                            core.kind === 'release_unknown' ||
+                            core.kind === 'commit_unknown';
 
-                    if (uncertain) {
+                        if (uncertain) {
+                            this.markUncertain();
+                        }
+
+                        // The tracked promise remains unresolved until this synchronous
+                        // observer finishes, so retirement cannot release our claim first.
+                        if (this.ordered && core.kind === 'committed_unsent') {
+                            this.recordDeliveryGap('committed_unsent');
+                        } else if (this.ordered && core.kind === 'unknown' && core.committed) {
+                            this.recordDeliveryGap('delivery_unknown');
+                        }
+
+                        if (
+                            core.kind === 'commit_unknown' ||
+                            core.kind === 'committed_unsent' ||
+                            (core.kind === 'unknown' && core.committed) ||
+                            (outcome.kind === 'cleanup_uncertain' && outcome.committed !== false)
+                        ) {
+                            increment(this.slot, 'postcommit_unknown');
+                        }
+
+                        if (uncertain) {
+                            this.invalidate();
+                        }
+                    } catch {
                         this.markUncertain();
+                    } finally {
+                        this.running.delete(tracked);
+                        finish();
                     }
-
-                    if (
-                        core.kind === 'commit_unknown' ||
-                        core.kind === 'committed_unsent' ||
-                        (core.kind === 'unknown' && core.committed) ||
-                        (outcome.kind === 'cleanup_uncertain' && outcome.committed !== false)
-                    ) {
-                        increment(this.slot, 'postcommit_unknown');
-                    }
-
-                    if (uncertain) {
-                        this.invalidate();
-                    }
-
-                    this.running.delete(tracked);
-                    finish();
                 },
                 () => {
-                    this.markUncertain();
-                    increment(this.slot, 'postcommit_unknown');
-                    this.invalidate();
-                    this.running.delete(tracked);
-                    finish();
+                    try {
+                        this.markUncertain();
+                        increment(this.slot, 'postcommit_unknown');
+                        this.invalidate();
+                    } finally {
+                        this.running.delete(tracked);
+                        finish();
+                    }
                 },
             );
             return { result, cancel: () => tx.cancel() };
