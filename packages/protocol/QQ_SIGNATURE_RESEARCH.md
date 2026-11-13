@@ -39,6 +39,16 @@ Under the JNI function-table convention these are `FindClass` and
 linear addresses alone that the two call sites execute in that order, that the
 table remains unchanged, or that registration succeeds. The bounded entry
 window at `0x2b6454` does not establish its cryptographic or signing semantics.
+In a nearby bounded window, conditional blocks call `malloc(0x40)`, then on a
+non-null allocation set a 32-bit field at offset `0x18` to 4 and allocate
+`strlen(x21)+1` bytes. A later non-null branch copies that many bytes from
+`x21`; it then re-reads a saved pointer before storing it at offset `0x20` of
+the first allocation. The null second-allocation branch stores zero instead.
+This local reconstruction assumes the indicated state transitions, stable
+saved slots and registers, valid NUL-terminated input, non-overflowing length,
+valid non-aliasing memory, and normally returning AAPCS64-conforming callees.
+The complete function boundary, input's origin, structure's purpose, execution
+and any connection to signing remain unknown.
 Separately, `0x2fe5b4–0x2fe5d0` forms the string address for
 `com/tencent/mobileqq/qsec/qseccodec/SecCipher$SecInfo` in `x0` and calls
 `0x33ec58`; its result is stored at `[sp+0x338]`. The helper passes the same
