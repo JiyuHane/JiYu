@@ -175,11 +175,30 @@ whether that second call modifies `P` remain unknown. A selector at `T+0x28`
 passes through `0x6664830`, yielding `0x0c`, `0x0d`, `0x14` or `0x15` for
 `P+0xc8`; its business meaning and any connection to wt commands are unproved.
 Separately, `0x6662f70` stores its second argument at `[rdi+0x10]` and, when
-that argument is nonzero, transfers control to `0x6662f80`. If `rdi` is `Q`,
-this assigns `U`; the actual caller, `U`'s concrete type and its construction
-remain unverified.
-Nearby `AsyncRunLoop` diagnostics alone do not establish that type. Raw rel32
-matches were not checked as instruction boundaries and are not treated as calls.
+that argument is nonzero, transfers control to `0x6662f80`. Bounded continuous
+instruction decoding independently confirmed direct calls at `0x665b27c` and
+`0x665b59a`. Assuming the preceding calls return normally and preserve
+callee-saved registers under the x86-64 System V ABI, both take the first
+argument from the receiver's `+0x60`; the former passes zero as the second
+argument and the latter passes the receiver itself. If that first argument is
+`Q`, the latter stores the receiver into `Q+0x10` at that point; subsequent
+changes are not excluded. Three further calls at `0x665b6a8`, `0x665b727`, and
+`0x665bd1f` were decoded in a separate bounded pass with the same receiver and
+`+0x60` pattern; their complete enclosing function boundaries were not established.
+
+At `0x665b130–0x665b137`, code writes the address `0x902aa80` to an object's
+first word. For this static vptr address point, independently checked ELF
+`R_X86_64_RELATIVE` relocations at `0x902aa90` and `0x902aa98` have addends
+`0x665d870` and `0x665d9f0` respectively. The corresponding on-disk words are
+zero; the relocated values are load bias plus the respective addends, not those
+on-disk words.
+The `0x665d870` path can return a value read from the receiver's `+0x58`, while
+`0x665d9f0` reads that field and another field of its second argument. Calls
+within these paths may change state. The static assignment does not prove the
+receiver still has that vptr at the setter, that either virtual call actually
+uses these entries, or that the `+0x58` value remains equal to the earlier `P`.
+The concrete receiver type, queue producer, business body and actual command
+remain unknown; nearby `AsyncRunLoop` diagnostics do not establish the type.
 A conditional branch also passes the same `T` to classifier `0x6667140`, and another call
 copies it into request `+0x28`. The source object was returned by a prior virtual
 call; its construction, the actual command on this path and the body semantics
