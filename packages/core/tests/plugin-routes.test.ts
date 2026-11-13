@@ -863,7 +863,7 @@ describe('explicit plugin configuration routes', () => {
         );
         expect((await request(`${base}/disable`, 'POST')).status).toBe(200);
         const observed = await Promise.race([
-            writing.then(() => 'settled' as const),
+            Promise.resolve(writing).then(() => 'settled' as const),
             new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), 25)),
         ]);
         const state = await (await request('/api/plugins/local/10001')).json();
@@ -909,7 +909,7 @@ describe('explicit plugin configuration routes', () => {
         } as RequestInit & { duplex: 'half' });
         const writing = app.request(req);
         const observed = await Promise.race([
-            writing.then(() => 'settled' as const),
+            Promise.resolve(writing).then(() => 'settled' as const),
             new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), 25)),
         ]);
         const extraControllers: ReadableStreamDefaultController<Uint8Array>[] = [];
@@ -978,8 +978,8 @@ describe('explicit plugin configuration routes', () => {
         let disabling!: Promise<Response>;
         let cancelled = false;
         instance.getPluginConfigGeneration.mockImplementationOnce(() => {
-            nested = configRequest('write', { body: '{}' });
-            disabling = request(`${base}/disable`, 'POST');
+            nested = Promise.resolve(configRequest('write', { body: '{}' }));
+            disabling = Promise.resolve(request(`${base}/disable`, 'POST'));
             return GENERATION_A;
         });
         const writing = app.request(
@@ -1046,7 +1046,7 @@ describe('explicit plugin configuration routes', () => {
                 .mockReturnValueOnce(GENERATION_A)
                 .mockImplementationOnce(() => {
                     if (change === 'disable') {
-                        disabled = request(`${base}/disable`, 'POST');
+                        disabled = Promise.resolve(request(`${base}/disable`, 'POST'));
                     } else if (change === 'instance') {
                         setCurrent({ ...instance });
                     } else {
@@ -1103,7 +1103,7 @@ describe('explicit plugin configuration routes', () => {
                 .mockImplementationOnce(() => {
                     instance.canEnablePlugins.mockImplementationOnce(() => {
                         if (change === 'disable') {
-                            disabled = request(`${base}/disable`, 'POST');
+                            disabled = Promise.resolve(request(`${base}/disable`, 'POST'));
                         } else if (change === 'instance') {
                             setCurrent({ ...instance });
                         } else {
@@ -1401,17 +1401,19 @@ describe('explicit plugin configuration routes', () => {
                 },
             });
             writes.push(
-                app.request(
-                    new Request(`http://localhost/api/plugins/local/10001/p${i}/config/write`, {
-                        method: 'POST',
-                        headers: {
-                            authorization: 'Bearer test-session',
-                            'x-jiyu-plugin-generation': GENERATION_A,
-                        },
-                        body,
-                        signal: abort.signal,
-                        duplex: 'half',
-                    } as RequestInit & { duplex: 'half' }),
+                Promise.resolve(
+                    app.request(
+                        new Request(`http://localhost/api/plugins/local/10001/p${i}/config/write`, {
+                            method: 'POST',
+                            headers: {
+                                authorization: 'Bearer test-session',
+                                'x-jiyu-plugin-generation': GENERATION_A,
+                            },
+                            body,
+                            signal: abort.signal,
+                            duplex: 'half',
+                        } as RequestInit & { duplex: 'half' }),
+                    ),
                 ),
             );
             await vi.waitFor(async () => {
@@ -1475,7 +1477,7 @@ describe('explicit plugin configuration routes', () => {
                         setCurrent({ ...instance });
                     }
 
-                    nested = request(`${base}/disable`, 'POST');
+                    nested = Promise.resolve(request(`${base}/disable`, 'POST'));
 
                     if (replace) {
                         setCurrent(instance);
@@ -1522,7 +1524,7 @@ describe('explicit plugin configuration routes', () => {
         instance.getPluginConfig.mockImplementationOnce(() => gate.promise);
         let nested!: Promise<Response>;
         instance.canEnablePlugins.mockImplementationOnce(() => {
-            nested = configRequest('read');
+            nested = Promise.resolve(configRequest('read'));
             return true;
         });
         const outer = configRequest('write', { body: '{}' });
