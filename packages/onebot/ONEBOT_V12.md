@@ -56,11 +56,17 @@ match that account's platform and user ID. Existing v11 adapters continue to
 use their own protocol and authentication behavior. `get_status.good` reflects the
 current online state and Bridge aggregate receive/request health when queried.
 Apart from the initial connection snapshot, `status_update` is triggered by
-online/offline changes; independent health changes do not yet trigger a push.
-Reentrant status broadcasts are serialized using bounded latest-state
-coalescing. Short-lived intermediate states may be merged, and pending updates
-may be discarded during shutdown or transport failure. A send attempt does not
-establish delivery to a client.
+online/offline changes and observed Bridge aggregate health changes while the
+account session is online. Health notifications describe current aggregate
+state rather than a complete history; short-lived intermediate changes can be
+merged and duplicate notifications are possible. Reentrant status broadcasts
+are serialized using bounded latest-state
+coalescing, and pending updates may be discarded during shutdown, transport
+failure, output queue overflow, or sustained reentry. A send attempt does not
+establish delivery to a client. Notifications come from normal BridgeManager
+routing; direct external Bridge calls do not necessarily notify this listener.
+Hook process identity has no generation marker for a reused PID, and these
+notifications do not change the underlying health determination.
 
 `get_self_info` returns the validated account ID as a string, the existing v11
 login nickname as `user_name`, and an empty `user_displayname` because no

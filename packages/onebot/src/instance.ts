@@ -345,6 +345,15 @@ export class OneBotInstance {
         return this.networkReady;
     }
 
+    /** Refresh only this live account's v12 status from its current Bridge. */
+    receiveHealthChanged(bridge: BridgeInterface): void {
+        if (this.disposeRequested || !this.v12Online || this.bridge !== bridge) {
+            return;
+        }
+
+        this.v12Adapter?.statusUpdate();
+    }
+
     /** Bridge session edge → OneBot notice. Awaited so offline can leave
      *  adapters before this generation is disposed. */
     emitBotStatus(subType: 'online' | 'offline'): Promise<void> {

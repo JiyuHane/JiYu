@@ -9,19 +9,45 @@ import type { BridgeSessionListener, BridgeSessionSource } from './bridge-interf
 const log = createLogger('Bridge');
 const packetLog = createLogger('Bridge.Packet');
 const runtimeLog = createLogger('Bridge.Runtime');
+const HEALTH_FLUSH_BUDGET = 32;
+
+type HealthCandidate = {
+    uin: string;
+    bridge: Bridge;
+    before: boolean | null;
+    healthy: boolean;
+    revision: object;
+};
 
 export class BridgeManager implements BridgeSessionSource {
     private readonly bridges = new Map<string, Bridge>();
     private readonly pidToUin_ = new Map<number, string>();
     private readonly closingSessions_ = new Map<string, Set<Promise<void>>>();
     private readonly sessionSubscriptions = new Set<{ listener: BridgeSessionListener }>();
+    private readonly healthRevisions = new WeakMap<Bridge, object>();
+    private readonly pendingHealth = new Map<Bridge, HealthCandidate>();
+    private readonly healthBaselines = new Map<Bridge, boolean | null>();
+    private healthInFlight: HealthCandidate | undefined;
+    private healthRoutingDepth = 0;
+    private healthFlushing = false;
+    private healthDeferred = false;
+    private healthImmediate: NodeJS.Immediate | undefined;
     private disposal_: Promise<void> | null = null;
 
     /** Hook callbacks remain synchronous; shutdown awaits every detached account. */
     dispose(): Promise<void> {
+        const disposal = (this.disposal_ ??= Promise.resolve().then(() => this.disposeSessions()));
         this.sessionSubscriptions.clear();
+        this.pendingHealth.clear();
+        this.healthBaselines.clear();
+
+        if (this.healthImmediate) {
+            clearImmediate(this.healthImmediate);
+            this.healthImmediate = undefined;
+        }
+
         // Finish synchronous lifecycle observers before collecting detached sessions.
-        return (this.disposal_ ??= Promise.resolve().then(() => this.disposeSessions()));
+        return disposal;
     }
 
     private async disposeSessions(): Promise<void> {
@@ -40,6 +66,225 @@ export class BridgeManager implements BridgeSessionSource {
 
         if (errors.length) {
             throw new AggregateError(errors, 'Bridge persistence shutdown failed');
+        }
+    }
+
+    // Only manager-observed changes are included; direct Bridge mutation and
+    // same-PID callbacks from earlier Hook generations cannot be distinguished.
+    private withHealthRouting<T>(route: () => T): T {
+        this.healthRoutingDepth++;
+
+        try {
+            return route();
+        } catch (error) {
+            // A partial route may already have changed an older session. Do not
+            // notify synchronously before the original exception reaches its caller.
+            this.healthDeferred = true;
+            throw error;
+        } finally {
+            this.healthRoutingDepth--;
+
+            if (this.healthRoutingDepth === 0) {
+                this.healthBaselines.clear();
+            }
+
+            if (this.healthRoutingDepth === 0 && !this.disposal_) {
+                if (this.healthDeferred && this.pendingHealth.size) {
+                    this.scheduleHealthFlush();
+                } else if (!this.healthFlushing && !this.healthDeferred) {
+                    this.flushHealth();
+                } else if (!this.healthFlushing && !this.pendingHealth.size) {
+                    this.healthDeferred = false;
+                }
+            }
+        }
+    }
+
+    private captureHealth(bridge: Bridge): { before: boolean; revision: object | undefined } {
+        const before = bridge.receiveHealthy;
+
+        if (!this.healthBaselines.has(bridge)) {
+            const pending = this.pendingHealth.get(bridge);
+            // A listener may have seen an in-flight value that later listeners
+            // have not. Replay the final value even if nested changes form ABA.
+            const baseline =
+                this.healthInFlight?.bridge === bridge ? null : pending ? pending.before : before;
+            this.healthBaselines.set(bridge, baseline);
+        }
+
+        return { before, revision: this.healthRevisions.get(bridge) };
+    }
+
+    private recordHealthChange(
+        uin: string,
+        bridge: Bridge,
+        before: boolean,
+        revision: object | undefined,
+    ): void {
+        if (
+            this.disposal_ ||
+            this.bridges.get(uin) !== bridge ||
+            bridge.empty ||
+            this.healthRevisions.get(bridge) !== revision
+        ) {
+            return;
+        }
+
+        const healthy = bridge.receiveHealthy;
+
+        if (healthy === before) {
+            return;
+        }
+
+        const next = {};
+        this.healthRevisions.set(bridge, next);
+        const previous = this.pendingHealth.get(bridge);
+        const baseline = this.healthBaselines.has(bridge)
+            ? this.healthBaselines.get(bridge)!
+            : previous
+              ? previous.before
+              : before;
+
+        if (baseline !== null && healthy === baseline) {
+            this.pendingHealth.delete(bridge);
+        } else {
+            this.pendingHealth.set(bridge, {
+                uin,
+                bridge,
+                before: baseline,
+                healthy,
+                revision: next,
+            });
+        }
+    }
+
+    // started observers can see the first bound value before nested mutations.
+    private markStartedHealthBoundary(bridge: Bridge): void {
+        // An empty session may first bind from inside a started observer.
+        this.healthBaselines.set(bridge, null);
+        const candidate = this.pendingHealth.get(bridge);
+
+        if (candidate) {
+            candidate.before = null;
+        }
+    }
+
+    private scheduleHealthFlush(): void {
+        if (this.disposal_ || this.healthImmediate || !this.pendingHealth.size) {
+            return;
+        }
+
+        try {
+            this.healthImmediate = setImmediate(() => {
+                this.healthImmediate = undefined;
+
+                if (this.disposal_) {
+                    return;
+                }
+
+                this.healthDeferred = false;
+                this.flushHealth();
+            });
+            this.healthImmediate.unref();
+        } catch {
+            // Scheduling failures never replace the original routing exception.
+            try {
+                log.warn('receive health notification scheduling failed');
+            } catch {
+                /* no diagnostics available */
+            }
+        }
+    }
+
+    private currentHealth(candidate: HealthCandidate): boolean {
+        return (
+            !this.disposal_ &&
+            this.bridges.get(candidate.uin) === candidate.bridge &&
+            this.healthRevisions.get(candidate.bridge) === candidate.revision &&
+            candidate.bridge.receiveHealthy === candidate.healthy
+        );
+    }
+
+    private flushHealth(): void {
+        if (
+            this.disposal_ ||
+            this.healthFlushing ||
+            this.healthRoutingDepth !== 0 ||
+            this.healthDeferred
+        ) {
+            return;
+        }
+
+        this.healthFlushing = true;
+
+        try {
+            let count = 0;
+
+            while (
+                !this.disposal_ &&
+                !this.healthDeferred &&
+                this.pendingHealth.size &&
+                count < HEALTH_FLUSH_BUDGET
+            ) {
+                const candidate = this.pendingHealth.values().next().value;
+
+                if (!candidate) {
+                    break;
+                }
+
+                this.pendingHealth.delete(candidate.bridge);
+                count++;
+
+                if (!this.currentHealth(candidate)) {
+                    continue;
+                }
+
+                this.healthInFlight = candidate;
+
+                try {
+                    for (const { listener } of [...this.sessionSubscriptions]) {
+                        if (this.healthDeferred || !this.currentHealth(candidate)) {
+                            break;
+                        }
+
+                        try {
+                            listener.receiveHealthChanged?.(candidate.uin, candidate.bridge);
+                        } catch {
+                            try {
+                                log.warn('receive health listener failed');
+                            } catch {
+                                /* no diagnostics available */
+                            }
+                        }
+                    }
+                } finally {
+                    if (
+                        this.healthDeferred &&
+                        this.currentHealth(candidate) &&
+                        !this.pendingHealth.has(candidate.bridge)
+                    ) {
+                        this.pendingHealth.set(candidate.bridge, { ...candidate, before: null });
+                    }
+
+                    this.healthInFlight = undefined;
+                }
+            }
+        } finally {
+            this.healthFlushing = false;
+
+            if (this.disposal_) {
+                this.pendingHealth.clear();
+            } else if (this.pendingHealth.size) {
+                this.healthDeferred = true;
+                this.scheduleHealthFlush();
+            } else {
+                this.healthDeferred = false;
+
+                if (this.healthImmediate) {
+                    clearImmediate(this.healthImmediate);
+                    this.healthImmediate = undefined;
+                }
+            }
         }
     }
 
@@ -110,44 +355,50 @@ export class BridgeManager implements BridgeSessionSource {
             return;
         }
 
-        runWithTraceRequest(() => {
-            const startedAt = Date.now();
-            runtimeLog.trace('bridge_detach_start pid=%d uin=%j', pid, uin);
+        this.withHealthRouting(() =>
+            runWithTraceRequest(() => {
+                const startedAt = Date.now();
+                runtimeLog.trace('bridge_detach_start pid=%d uin=%j', pid, uin);
 
-            try {
-                const closed = this.detachPidFromSession(pid, uin);
-                const activePid = this.bridges.get(uin)?.activePid ?? null;
+                try {
+                    const closed = this.detachPidFromSession(pid, uin);
+                    const activePid = this.bridges.get(uin)?.activePid ?? null;
 
-                if (closed) {
+                    if (closed) {
+                        runtimeLog.trace(
+                            'bridge_detach_branch pid=%d uin=%j branch=session_closed',
+                            pid,
+                            uin,
+                        );
+                    }
+
                     runtimeLog.trace(
-                        'bridge_detach_branch pid=%d uin=%j branch=session_closed',
+                        'bridge_detach_terminal pid=%d uin=%j outcome=completed reason=%s activePid=%j elapsedMs=%d',
                         pid,
                         uin,
+                        closed ? 'session_closed' : 'pid_detached',
+                        activePid,
+                        Date.now() - startedAt,
                     );
+                } catch (error) {
+                    runtimeLog.trace(
+                        'bridge_detach_terminal pid=%d uin=%j outcome=failed reason=invariant_violation error=%j elapsedMs=%d',
+                        pid,
+                        uin,
+                        error instanceof Error ? error.message : String(error),
+                        Date.now() - startedAt,
+                    );
+                    throw error;
                 }
-
-                runtimeLog.trace(
-                    'bridge_detach_terminal pid=%d uin=%j outcome=completed reason=%s activePid=%j elapsedMs=%d',
-                    pid,
-                    uin,
-                    closed ? 'session_closed' : 'pid_detached',
-                    activePid,
-                    Date.now() - startedAt,
-                );
-            } catch (error) {
-                runtimeLog.trace(
-                    'bridge_detach_terminal pid=%d uin=%j outcome=failed reason=invariant_violation error=%j elapsedMs=%d',
-                    pid,
-                    uin,
-                    error instanceof Error ? error.message : String(error),
-                    Date.now() - startedAt,
-                );
-                throw error;
-            }
-        });
+            }),
+        );
     }
 
     onPidReceiveHealthChanged(pid: number, healthy: boolean): void {
+        this.withHealthRouting(() => this.setPidReceiveHealth(pid, healthy));
+    }
+
+    private setPidReceiveHealth(pid: number, healthy: boolean): void {
         if (this.disposal_) {
             return;
         }
@@ -168,7 +419,9 @@ export class BridgeManager implements BridgeSessionSource {
             throw new Error(message);
         }
 
+        const { before, revision } = this.captureHealth(session);
         session.setPidReceiveHealthy(pid, healthy);
+        this.recordHealthChange(uin, session, before, revision);
     }
 
     onHookLogin(pid: number, uin: string, packetClient: PacketSender): void {
@@ -176,67 +429,72 @@ export class BridgeManager implements BridgeSessionSource {
             return;
         }
 
-        runWithTraceRequest(() => {
-            const startedAt = Date.now();
-            const previousUin = this.pidToUin_.get(pid) ?? null;
-            runtimeLog.trace(
-                'bridge_binding_start pid=%d uin=%j source=login previousUin=%j',
-                pid,
-                uin,
-                previousUin,
-            );
-
-            try {
-                const { session, created } = this.bindPid(pid, uin, packetClient, 'login');
-
-                if (previousUin && previousUin !== uin) {
-                    runtimeLog.trace(
-                        'bridge_binding_branch pid=%d uin=%j branch=account_rebind previousUin=%j',
-                        pid,
-                        uin,
-                        previousUin,
-                    );
-                    const previousSession = this.bridges.get(previousUin);
-                    runtimeLog.trace(
-                        'bridge_binding_branch pid=%d uin=%j branch=%s previousUin=%j activePid=%j',
-                        pid,
-                        uin,
-                        previousSession ? 'previous_session_retained' : 'previous_session_closed',
-                        previousUin,
-                        previousSession?.activePid ?? null,
-                    );
-                }
-
-                if (created) {
-                    runtimeLog.trace(
-                        'bridge_binding_branch pid=%d uin=%j branch=session_created',
-                        pid,
-                        uin,
-                    );
-                    log.debug('session started: UIN=%s', uin);
-                    this.fireSessionStarted(uin, session);
-                }
-
+        this.withHealthRouting(() =>
+            runWithTraceRequest(() => {
+                const startedAt = Date.now();
+                const previousUin = this.pidToUin_.get(pid) ?? null;
                 runtimeLog.trace(
-                    'bridge_binding_terminal pid=%d uin=%j source=login outcome=completed reason=%s created=%s activePid=%j elapsedMs=%d',
+                    'bridge_binding_start pid=%d uin=%j source=login previousUin=%j',
                     pid,
                     uin,
-                    previousUin && previousUin !== uin ? 'rebound' : 'bound',
-                    created,
-                    session.activePid,
-                    Date.now() - startedAt,
+                    previousUin,
                 );
-            } catch (error) {
-                runtimeLog.trace(
-                    'bridge_binding_terminal pid=%d uin=%j source=login outcome=failed reason=binding_failed error=%j elapsedMs=%d',
-                    pid,
-                    uin,
-                    error instanceof Error ? error.message : String(error),
-                    Date.now() - startedAt,
-                );
-                throw error;
-            }
-        });
+
+                try {
+                    const { session, created } = this.bindPid(pid, uin, packetClient, 'login');
+
+                    if (previousUin && previousUin !== uin) {
+                        runtimeLog.trace(
+                            'bridge_binding_branch pid=%d uin=%j branch=account_rebind previousUin=%j',
+                            pid,
+                            uin,
+                            previousUin,
+                        );
+                        const previousSession = this.bridges.get(previousUin);
+                        runtimeLog.trace(
+                            'bridge_binding_branch pid=%d uin=%j branch=%s previousUin=%j activePid=%j',
+                            pid,
+                            uin,
+                            previousSession
+                                ? 'previous_session_retained'
+                                : 'previous_session_closed',
+                            previousUin,
+                            previousSession?.activePid ?? null,
+                        );
+                    }
+
+                    if (created) {
+                        runtimeLog.trace(
+                            'bridge_binding_branch pid=%d uin=%j branch=session_created',
+                            pid,
+                            uin,
+                        );
+                        log.debug('session started: UIN=%s', uin);
+                        this.markStartedHealthBoundary(session);
+                        this.fireSessionStarted(uin, session);
+                    }
+
+                    runtimeLog.trace(
+                        'bridge_binding_terminal pid=%d uin=%j source=login outcome=completed reason=%s created=%s activePid=%j elapsedMs=%d',
+                        pid,
+                        uin,
+                        previousUin && previousUin !== uin ? 'rebound' : 'bound',
+                        created,
+                        session.activePid,
+                        Date.now() - startedAt,
+                    );
+                } catch (error) {
+                    runtimeLog.trace(
+                        'bridge_binding_terminal pid=%d uin=%j source=login outcome=failed reason=binding_failed error=%j elapsedMs=%d',
+                        pid,
+                        uin,
+                        error instanceof Error ? error.message : String(error),
+                        Date.now() - startedAt,
+                    );
+                    throw error;
+                }
+            }),
+        );
     }
 
     onPacket(pkt: PacketInfo): void {
@@ -244,7 +502,7 @@ export class BridgeManager implements BridgeSessionSource {
             return;
         }
 
-        runWithTraceRequest(() => this.onPacketInContext(pkt));
+        this.withHealthRouting(() => runWithTraceRequest(() => this.onPacketInContext(pkt)));
     }
 
     private onPacketInContext(pkt: PacketInfo): void {
@@ -288,6 +546,7 @@ export class BridgeManager implements BridgeSessionSource {
             // Notify session started on first real packet
             if (created) {
                 log.debug('session started: UIN=%s', uin);
+                this.markStartedHealthBoundary(session);
                 this.fireSessionStarted(uin, session);
             }
 
@@ -355,8 +614,35 @@ export class BridgeManager implements BridgeSessionSource {
         }
 
         const result = this.ensureSession(uin);
-        result.session.bindPid(pid, packetClient);
+        const { before, revision } = this.captureHealth(result.session);
+        const ownedBefore =
+            previousUin === uin &&
+            this.bridges.get(uin) === result.session &&
+            result.session.hasPid(pid);
+
+        try {
+            result.session.bindPid(pid, packetClient);
+        } catch (error) {
+            // A logging callback can throw after an already-owned PID was reset
+            // healthy. Report only if both sides of ownership remain consistent.
+            try {
+                if (
+                    ownedBefore &&
+                    this.bridges.get(uin) === result.session &&
+                    this.pidToUin_.get(pid) === uin &&
+                    result.session.hasPid(pid)
+                ) {
+                    this.recordHealthChange(uin, result.session, before, revision);
+                }
+            } catch {
+                // Never replace the original bind failure with diagnostic work.
+            }
+
+            throw error;
+        }
+
         this.pidToUin_.set(pid, uin);
+        this.recordHealthChange(uin, result.session, before, revision);
         return result;
     }
 
@@ -411,13 +697,41 @@ export class BridgeManager implements BridgeSessionSource {
 
         // Validation is complete. Mutate both sides only after the ownership
         // invariant is known to hold, so a fail-fast error preserves the evidence.
+        const { before, revision } = this.captureHealth(session);
         this.pidToUin_.delete(pid);
-        session.detachPid(pid);
+
+        try {
+            session.detachPid(pid);
+        } catch (error) {
+            // A trace listener may throw after non-final removal. Only publish
+            // the completed PID removal on this still-current session.
+            try {
+                const reboundUin = this.pidToUin_.get(pid);
+                const hasCurrentOwner =
+                    reboundUin === undefined ||
+                    (reboundUin !== uin && this.bridges.get(reboundUin)?.hasPid(pid) === true);
+
+                if (
+                    this.bridges.get(uin) === session &&
+                    !session.empty &&
+                    !session.hasPid(pid) &&
+                    hasCurrentOwner
+                ) {
+                    this.recordHealthChange(uin, session, before, revision);
+                }
+            } catch {
+                // Preserve the original detach failure.
+            }
+
+            throw error;
+        }
 
         if (!session.empty) {
+            this.recordHealthChange(uin, session, before, revision);
             return false;
         }
 
+        this.pendingHealth.delete(session);
         this.bridges.delete(uin);
         log.debug('session closed: UIN=%s', uin);
         // Fire before dispose() so listeners can still read bridge.identity.
@@ -438,9 +752,7 @@ export class BridgeManager implements BridgeSessionSource {
         // dispose can still report it) but must not reject this gate — a
         // rejected gate would keep the identity DB of every future session
         // for this UIN closed until the process restarts.
-        const beforeOpen = closing
-            ? Promise.allSettled(closing).then(() => undefined)
-            : undefined;
+        const beforeOpen = closing ? Promise.allSettled(closing).then(() => undefined) : undefined;
         const bridge = new Bridge(IdentityService.openForUin(uin, 'data', beforeOpen));
         this.bridges.set(uin, bridge);
 

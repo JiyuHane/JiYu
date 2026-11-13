@@ -153,6 +153,7 @@ export class OneBotManager {
     private disposePromise: Promise<void> | null = null;
     private disposed = false;
     private unsubscribeSessions: (() => void) | null = null;
+    private sessionBinding: object | null = null;
     private readonly sessionReleaseDeadlineMs: number;
 
     constructor(options: OneBotManagerOptions = {}) {
@@ -189,13 +190,66 @@ export class OneBotManager {
             return;
         }
 
-        this.unsubscribeSessions?.();
-        this.unsubscribeSessions = bridgeManager.subscribeSessions({
-            started: (uin, bridge) => {
+        const binding = {};
+        this.sessionBinding = binding;
+        // Detach the stored handle before calling it: a source may reenter bind.
+        const previousUnsubscribe = this.unsubscribeSessions;
+        this.unsubscribeSessions = null;
+
+        try {
+            previousUnsubscribe?.();
+        } catch (error) {
+            if (this.sessionBinding === binding) {
+                this.sessionBinding = null;
+                this.unsubscribeSessions ??= previousUnsubscribe;
+            }
+
+            throw error;
+        }
+
+        if (this.disposed || this.sessionBinding !== binding) {
+            return;
+        }
+
+        const listener = {
+            started: (uin: string, bridge: BridgeInterface) => {
                 runWithoutRequestContext(() => this.onSessionStarted(uin, bridge));
             },
-            closed: (uin) => this.onSessionClosed(uin),
-        });
+            closed: (uin: string) => this.onSessionClosed(uin),
+            receiveHealthChanged: (uin: string, bridge: BridgeInterface) => {
+                if (this.disposed || this.sessionBinding !== binding) {
+                    return;
+                }
+
+                try {
+                    runWithoutRequestContext(() =>
+                        this.instances.get(uin)?.receiveHealthChanged(bridge),
+                    );
+                } catch {
+                    try {
+                        log.warn('OneBot v12 receive health notification failed');
+                    } catch {
+                        // A diagnostic failure must not escape to the session source.
+                    }
+                }
+            },
+        };
+
+        try {
+            const unsubscribe = bridgeManager.subscribeSessions(listener);
+
+            if (this.disposed || this.sessionBinding !== binding) {
+                unsubscribe();
+            } else {
+                this.unsubscribeSessions = unsubscribe;
+            }
+        } catch (error) {
+            if (this.sessionBinding === binding) {
+                this.sessionBinding = null;
+            }
+
+            throw error;
+        }
     }
 
     getInstance(uin: string): OneBotInstance | null {
@@ -284,6 +338,7 @@ export class OneBotManager {
         }
 
         this.disposed = true;
+        this.sessionBinding = null;
         this.unsubscribeSessions?.();
         this.unsubscribeSessions = null;
 

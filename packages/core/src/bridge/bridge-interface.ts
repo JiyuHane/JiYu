@@ -21,6 +21,9 @@ export interface BridgeInterface extends BridgeContext {
 export interface BridgeSessionListener {
     started?(uin: string, bridge: BridgeInterface): void;
     closed?(uin: string, bridge: BridgeInterface, pid: number): void;
+    /** Manager-observed aggregate health changes, delivered latest-wins for this exact session.
+     *  Direct Bridge disposal and same-PID callbacks from an old generation are outside this contract. */
+    receiveHealthChanged?(uin: string, bridge: BridgeInterface): void;
 }
 
 export interface BridgeSessionSource {
