@@ -36,6 +36,9 @@ jobs:
       - name: Run all package tests
         run: pnpm test
 
+      - name: Test offline native research scanner
+        run: node --test tools/native-aarch64-sbox-scan.test.mjs
+
       # The MCP test suite regenerates the action catalog (catalog.ts + the
       # catalog.json the docs site consumes). Fail if the committed snapshot
       # drifted from the live specs — keeps the API docs from going stale.

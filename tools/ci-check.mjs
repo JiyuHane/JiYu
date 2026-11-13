@@ -15,6 +15,7 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const checks = [
   ['Install dependencies', 'pnpm install --frozen-lockfile'],
   ['Run all package tests', 'pnpm test'],
+  ['Test offline native research scanner', 'node --test tools/native-aarch64-sbox-scan.test.mjs'],
   ['Verify generated action catalog is up to date', 'node tools/check-action-catalog.mjs'],
   ['Type check all packages', 'pnpm typecheck'],
   ['Build release inputs', 'pnpm run build:all'],
