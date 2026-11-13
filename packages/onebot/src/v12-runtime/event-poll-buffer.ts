@@ -41,7 +41,7 @@ export type EnqueueResult = 'accepted' | 'full' | 'oversize' | 'invalid' | 'meta
 export type PollResult =
     | { status: 'reserved'; token: object; eventsJson: string; count: number; bytes: number }
     | { status: 'blocked'; requiredBytes: number }
-    | { status: 'empty' | 'timeout' | 'aborted' | 'closed' | 'busy' | 'invalid' };
+    | { status: 'empty' | 'contended' | 'timeout' | 'aborted' | 'closed' | 'busy' | 'invalid' };
 export interface PollOptions {
     limit?: number;
     timeoutMs?: number;
@@ -369,7 +369,14 @@ export class EventPollBuffer {
         }
 
         if (timeout === 0) {
-            if (this.active || this.waiters.length || !this.queue.length) {
+            // A short poll must not pass an existing reservation or older waiter.
+            // This is distinct from an empty queue, even if the queue currently
+            // contains no entries: the caller has not observed an available head.
+            if (this.active || this.waiters.length) {
+                return Promise.resolve({ status: 'contended' });
+            }
+
+            if (!this.queue.length) {
                 return Promise.resolve({ status: 'empty' });
             }
 

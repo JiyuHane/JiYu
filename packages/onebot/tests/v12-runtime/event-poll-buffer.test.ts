@@ -175,16 +175,35 @@ describe('offline event poll buffer', () => {
         const a = q.reserve({ timeoutMs: 100 });
         const b = q.reserve({ timeoutMs: 100 });
         expect(q.stats().waiters).toBe(2);
+        // A competing short poll cannot conclude that the FIFO has no work,
+        // whether or not a new event has arrived yet.
+        expect(await q.reserve()).toEqual({ status: 'contended' });
         q.enqueue(event(1));
         const first = reserved(await a);
         q.enqueue(event(2));
-        expect(await q.reserve()).toEqual({ status: 'empty' });
+        expect(await q.reserve()).toEqual({ status: 'contended' });
         expect(q.release(first.token)).toBe(true);
         const second = reserved(await b);
         expect(JSON.parse(second.eventsJson)).toEqual([event(1), event(2)]);
         expect(q.stats().waiters).toBe(0);
         expect(q.commit(second.token)).toBe(true);
         expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('distinguishes an active reservation from a genuinely empty short poll', async () => {
+        const q = new EventPollBuffer(config);
+        expect(await q.reserve()).toEqual({ status: 'empty' });
+        expect(q.enqueue(event(1))).toBe('accepted');
+        const first = reserved(await q.reserve());
+        expect(q.stats()).toMatchObject({ count: 1, waiters: 0, reserved: 1 });
+        expect(await q.reserve()).toEqual({ status: 'contended' });
+        expect(q.release(first.token)).toBe(true);
+        const again = reserved(await q.reserve());
+        expect(JSON.parse(again.eventsJson)).toEqual([event(1)]);
+        expect(q.commit(again.token)).toBe(true);
+        expect(await q.reserve()).toEqual({ status: 'empty' });
+        expect(q.close()).toBe(true);
+        expect(await q.reserve()).toEqual({ status: 'closed' });
     });
 
     it('enforces max waiters, timeout and automatic cleanup', async () => {
