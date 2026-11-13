@@ -215,6 +215,24 @@ the `P` denoted in the separate `0x6663d13`/`0x6663d2c` path. Pointer validity,
 arithmetic overflow, synchronization, dynamic reachability and the source or
 contents of the body remain unverified.
 
+A separately decoded caller at `0x665ca70` eventually calls `0x665cc80` at
+`0x665cc0f`. It passes `0xe0` in `edi` to `0x8e10060` and retains that call's
+return as `R`; the callee's allocation semantics are not established by this
+observation alone. After an indirect call at `0x665cb64`, it reads the current
+value `T2` from a slot addressed by the caller's entry `rdx`, clears that slot,
+and writes `T2` to `[R]`. Following additional calls, it places `R` into a
+local slot and passes that slot's address to `0x665cc80`. These observations
+assume preceding calls return normally and preserve the relevant callee-saved
+registers under the System V ABI. They do not prove the slot's contents before
+the indirect call, that later calls leave `[R]` unchanged, or that the callee's
+separate `P1` and `P2` reads both equal `R`. One additional bounded pass found a
+similar direct call at `0x665d325` from the `0x665d160` entry, transferring a
+current value from a slot addressed by entry `rcx` into a call return before
+passing that return in a local slot. Within the scanned virtual-address interval
+`[0x665b120,0x665df80)`, a raw search found no `E8 rel32` candidates targeting
+`0x665ca70`; this does not exclude indirect calls, callers outside the interval,
+or other modules. The construction and contents of `T2` remain unknown.
+
 Returning to the separately inspected `0x6663d13` path, a conditional branch
 also passes its `T` to classifier `0x6667140`, and another call copies it into
 request `+0x28`. The source object was returned by a prior virtual
