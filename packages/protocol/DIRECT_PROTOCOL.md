@@ -115,14 +115,34 @@ raw ciphertext. This differs from the reference header by two bytes. The
 inspected `0x34f9170` path selects between two key inputs or an empty-payload
 branch according to context bytes, then writes a mode byte, context byte,
 16-byte local value, conditional BE16 fields, a BE16-length optional span and
-payload. The selected QR context and keys remain unknown. In the normal bounded
-path of its `0x8865bb0` helper, two independent static inspections found the
-padding, seven zero trailer bytes, big-endian 16-round TEA and two feedback
-chains structurally consistent with local `qqTeaEncrypt`. The target calls its
+payload. Two bounded inspections connected one QR entry at `0x34bcc04` to a
+new owner when its cached owner is initially null: construction and subsequent
+self-binding give the callback that same owner's sender, whose new context has
+selector 1, `ctx+4=0`, `ctx+5=1` and `ctx+6=1`. Under successful construction,
+no intervening replacement and successful callback promotion, this path selects
+the key input at `ctx+0x18`. An initially cached owner and other QR entry points
+remain unresolved. The context constructor can use a fallback when its primary
+initializer returns zero; a nonzero return alone is not proof of a successful
+cryptographic derivation. No actual session key or peer use has been observed.
+In the normal bounded path of its `0x8865bb0` helper, two independent static
+inspections found the padding, seven zero trailer bytes, big-endian 16-round TEA
+and two feedback chains structurally consistent with local `qqTeaEncrypt`. The target calls its
 random generator once per byte, whereas the local implementation requests the
 random bytes in one call; their generators, failures and runtime outputs have
 not been shown equivalent. Static reconstruction alone does not establish the
 QR request's selected encryption branch, session keys or compatibility.
+
+Two bounded static inspections of the security-sign policy found that its
+constructor initializes mode 2 and inserts the exact command
+`wtlogin.trans_emp` into the initial command tree. A mode-2 tree match requests
+a signer without consulting the signer's command-predicate slot. The constructor
+then invokes a configuration loader which can overwrite that mode; a missing or
+unsuitable configuration leaves the initialized value unchanged. The sender's
+receiver has not been identified as this particular policy instance, nor has
+any concrete signer implementation or live configuration been established.
+The inspected signer call site continues packet construction when the signer is
+absent or returns failure; this is not evidence that a server accepts such a
+packet.
 
 A separate bounded inspection of the target's QR31 response decoder at
 `0x3453dc0` finds a BE16-length string, a BE32 word, and a status byte. Status
@@ -156,7 +176,29 @@ those three return values and can continue after a short read. Both branches
 still invoke the tag factory and child decoders. A local parser that requires
 all fields is therefore deliberately stricter on truncation, not a model of
 all native acceptance paths. These status bytes and values have no established
-business meaning or peer authenticity.
+business meaning or peer authenticity. On the inspected status-zero path, the
+child decoders for tags `0x18`, `0x19`, `0x1e`, `0x65` and `0x3f` copy their
+entire outer TLV value, without another length prefix, into response fields
+`+0x68`, `+0x98`, `+0x80`, `+0xb0` and `+0xc8` respectively. In the normal
+successfully decoded path, a repeated one of these tags replaces the previous
+vector, including when the later value is empty. Other tags and exceptional
+native behavior remain outside that observation. A further inspected status-zero
+branch constructs a separate success object: response fields `+0x80`, `+0x68`, `+0x98`, `+0xb0` and `+0xc8`
+are transferred to success offsets `+0x10`, `+0x28`, `+0x40`, `+0x58` and
+`+0x70`. The last two originate from tags `0x65` and `0x3f` respectively on the
+inspected path. Two static traces connect this object through a callback and an
+adjustor thunk to `OnQRCodeSessionSucceed`, conditional on successful self-bound
+owner construction, no later pointer replacement, a successful weak-reference
+promotion and actual callback execution. On an inspected normal branch,
+`OnQRCodeSessionSucceed` supplies the vectors from QR tags `0x19` and `0x65`
+to a WT session routine which constructs node tags `0x016a` and `0x0318`.
+For these nodes the encoder is virtual slot `+0x10` and writes BE16 tag, BE16
+value length and raw bytes; an empty value still produces a zero-length node.
+Another optional node `0x0108` exists, but its presence flag is clear on this
+observed QR branch, and it has not been tied to tag `0x3f`. The inspected node
+construction does not establish that a later request actually encodes or sends
+these nodes. These observations do not establish runtime execution, interpret
+the bytes as tickets, or prove login.
 
 The protocol-12 factory branch installs a virtual table whose `+0x20` entry
 resolves to `EncodeReqHead` at `0x6669490`. Its bounded disassembly writes a
@@ -630,8 +672,8 @@ stored through `context+0x10` and used both by a group-method `+0x40` path with
 the group point and by the `0x8d34270` group-method `+0x38` path with the
 imported point. A candidate table binds both to the same point-multiply-like
 routine, conditional on that table being active and unchanged. This supports an
-ECDH-like relationship but does not prove the point representation, shared X,
-actual peer identity or live server acceptance.
+ECDH-like relationship but does not establish the actual peer identity or live
+server acceptance.
 
 On this bounded path, `0x34f7a74` calls `0x8d34270` with a stack buffer and
 capacity `0x200`. Its return is tested only for zero; a nonzero return is
@@ -641,12 +683,13 @@ which that test does not exclude; this static observation does not establish
 that the error path reaches the call at runtime
 or predict its consequences. Separately, the inspected candidate method-table
 initializer assigns `0x8d78860`, `0x8d90350`, and `0x8d70d20` to slots
-`+0x38`, `+0x18`, and `+0x80` respectively. Whether the `0x2c7` path actually
-selects and retains that table is unproved. The first
-contains scalar-bit selection and point-like operations; the second has a
-first-output path compatible with coordinate conversion; and the third performs
-an unresolved intermediate conversion followed by a group-width byte export.
-Its scalar path reverses bytes, while other inspected paths use SIMD blocks.
+`+0x38`, `+0x18`, and `+0x80` respectively. A subsequent bounded trace links
+this initializer to the `0x2c7` registration on the inspected normal path; it
+still assumes that intervening calls and aliases do not alter the selected table.
+The first contains scalar-bit selection and point-like operations; the second
+has a first-output path compatible with coordinate conversion; and the third
+performs a conversion followed by a group-width byte export. Its scalar path
+reverses bytes, while other inspected paths use SIMD blocks.
 A separately checked instruction sequence in `0x8d90350` tests whether the raw
 limbs at point `+0x90` are nonzero, computes a fixed-width candidate `m-2`, and
 passes that value and those limbs to `0x8d4e390`. It then passes the result twice
@@ -657,11 +700,20 @@ the first helper's result and then combines that value with point `+0x48`, using
 the same helper and writing to the second output. These data dependencies
 assume the helper calls return normally and do not have value-changing aliases;
 the nonzero limb test alone establishes neither point validity nor invertibility.
-The inspected helper structure suggests exponentiation and modular arithmetic,
-but their complete mathematical equivalence and the point-field roles remain
-unproved. These observations do not prove dynamic table selection, the
-intermediate algebra, or that the exported value is a shared X coordinate.
-`0x8b46000` produces 16 bytes using an update and finalization path. One bounded
+The inspected helper structure suggests exponentiation and modular arithmetic;
+their complete mathematical equivalence remains unproved. A later inspection
+traced the same method's first output through point encoding and the second
+output to the parity bit of the compressed-point prefix, supporting the first
+output's identification as affine X. The registered group modulus has 192
+significant bits, and the observed export on this method table writes a
+fixed-width 24-byte big-endian value, including leading zeroes. A second
+inspection independently checked the width and export ordering but did not
+independently complete the coordinate-identification proof. Under normal
+successful arithmetic, unchanged table/parameters, valid memory and the same
+peer and scalar, this supports the interpretation of the returned bytes as
+fixed-width shared X; it is not a runtime observation or a formal proof of
+every field operation. `0x8b46000` produces 16 bytes using an update and
+finalization path. One bounded
 static symbolic inspection compared all 64 compression steps with
 [RFC 1321](https://www.rfc-editor.org/rfc/rfc1321): message-word indices,
 Boolean expressions, constants, rotations, state flow, and final feed-forward
@@ -673,8 +725,10 @@ other 56 steps' Boolean and message-word data flow. Under valid-memory,
 normal-return and non-destructive-alias assumptions, these observations
 support MD5 on the inspected well-formed path; they are not a formal proof or an
 observation of
-runtime execution. The input to this candidate is not established as an ECDH
-shared X coordinate, and its key or peer-point provenance remains unknown.
+runtime execution. On the inspected successful null-callback path, the caller
+passes the fixed-width 24-byte candidate described above to this helper; its
+identification as ECDH shared X depends on the stated table, point and arithmetic
+assumptions. Actual key and peer-point provenance remain unverified.
 The disassembler automatically displayed an
 annotation that may contain a hardcoded public-key string; its value was not
 retained in this record.
@@ -759,11 +813,34 @@ remain to be recovered and independently verified.
   raw span and runtime word. Its cross-layer span limit of 65466 bytes is a
   local policy, not a target limit; input metadata enumeration and peak memory
   are not bounded by the output limit. It does not send or authenticate a query.
+- `src/direct/target-qr12-selected.ts` projects the last raw values for tags
+  `0x18`, `0x19`, `0x1e`, `0x65` and `0x3f` from a strictly extracted
+  status-zero response, distinguishing a missing tag from a present empty value.
+  It does not execute the native tag factory or other child decoders, infer
+  ticket meanings, or establish that the server or target accepts the response.
 - `src/direct/target-qr12-response.ts` separately extracts the QR12 prefix,
   status, BE64 and BE32 words, and raw TLV boundaries from an exact slice. It
   requires complete fields for every status, unlike the inspected target's
   nonzero-status short-read branch. It does not run tag factories or child
   decoders, interpret status, verify a peer or establish login.
+- `src/direct/target-qr-wt-candidate.ts` composes an explicit QR channel byte
+  sequence with local QQ-TEA, the observed conditional WT data wrapper and the
+  target OICQ header. Its mode-1 choices describe only the inspected new-owner
+  path and its documented conditions; keys, extra bytes and random bytes are
+  supplied by the caller. It neither signs nor sends an SSO request, and the
+  result is not proof of a valid QR login.
+- `src/direct/target-wt-login-node.ts` encodes the two observed node forms
+  `0x016a` and `0x0318` from explicitly supplied opaque bytes. A node includes
+  its BE16 tag and BE16 value length but no entry count. Its per-value limit is
+  a local policy; a later enclosing frame may impose a smaller bound. This does
+  not establish that either node is sent in a login request.
+- `src/direct/target-wt-local-data.ts` additionally composes the existing local
+  QQ-TEA encoder with that field layout using explicit caller-supplied key,
+  plaintext and padding bytes. It does not model the target's random generator
+  or automatically choose a QR key. In its `ctx5=0` branch the supplied
+  `local16` is both the encryption key and part of the returned bytes. The
+  underlying encoder retains internal key-word and padded-plaintext allocations
+  that this wrapper cannot wipe; its temporary-buffer cleanup is best effort.
 - `src/direct/target-wt-encode-data.ts` serializes the observed conditional
   `0x34f9170` field layout from an explicit precomputed payload. It does not
   perform encryption or infer which branch a QR session uses; its stricter
