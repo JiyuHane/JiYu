@@ -108,6 +108,16 @@ AAPCS64 preservation and no harmful aliasing or concurrent mutation; cyclic
 links may prevent termination. The purpose, entry reachability and relation to
 signing or AES remain unknown.
 
+Under the inspected state values, both link paths can subsequently dispatch to
+`0x2b7a78`, which calls `memset` with `x21` and length `0x81`, then calls
+`__system_property_get` with `x21` as its buffer. Those argument expressions
+are not directly `Q` or `S`, although aliasing has not been excluded. After the
+call, a 32-bit write to `w19` overwrites the previous `x19=Q`, and the property
+return is stored as 32 bits at `[x23]`; on the traversed path that slot may have
+been changed to `T`. This conditional path assumes valid memory, preserved
+state and normally returning AAPCS64 calls. It establishes no function return,
+actual execution, or relationship to signing or AES.
+
 Separately, `0x2fe5b4–0x2fe5d0` forms the string address for
 `com/tencent/mobileqq/qsec/qseccodec/SecCipher$SecInfo` in `x0` and calls
 `0x33ec58`; its result is stored at `[sp+0x338]`. The helper passes the same
