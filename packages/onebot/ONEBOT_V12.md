@@ -57,6 +57,10 @@ use their own protocol and authentication behavior. `get_status.good` reflects t
 current online state and Bridge aggregate receive/request health when queried.
 Apart from the initial connection snapshot, `status_update` is triggered by
 online/offline changes; independent health changes do not yet trigger a push.
+Reentrant status broadcasts are serialized using bounded latest-state
+coalescing. Short-lived intermediate states may be merged, and pending updates
+may be discarded during shutdown or transport failure. A send attempt does not
+establish delivery to a client.
 
 `get_self_info` returns the validated account ID as a string, the existing v11
 login nickname as `user_name`, and an empty `user_displayname` because no
