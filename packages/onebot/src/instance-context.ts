@@ -40,6 +40,7 @@ import {
 } from './modules/message-actions';
 import { handleGroupAddRequest } from './modules/request-actions';
 import type { ReactionStore } from './reaction-store';
+import { captureSource, tryCaptureSource, type V12Source } from './v12-runtime/source-generation';
 import {
     hasAuthoritativeSequence,
     type JsonObject,
@@ -61,11 +62,26 @@ export interface OneBotInstanceContext {
     musicSignUrl?: string;
     getUptimeMs(): number;
     cacheMessageMeta(messageId: number, meta: MessageMeta): void | Promise<void>;
+    /** Internal source capture; absent in legacy contexts. */
+    [captureSource]?: () => V12Source | undefined;
     dispatchEvent(
         event: JsonObject,
         source?: 'bridge' | 'send',
         startedAt?: number,
+        sourceTicket?: V12Source,
     ): void | Promise<void>;
+}
+
+function selfSentHandler(ref: OneBotInstanceContext): (event: JsonObject) => Promise<void> {
+    const ticket = tryCaptureSource(ref);
+
+    return async (event) => {
+        if (ticket === undefined) {
+            await ref.dispatchEvent(event, 'send');
+        } else {
+            await ref.dispatchEvent(event, 'send', undefined, ticket);
+        }
+    };
 }
 
 export function buildApiContext(ref: OneBotInstanceContext): ApiActionContext {
@@ -94,9 +110,7 @@ export function buildApiContext(ref: OneBotInstanceContext): ApiActionContext {
                 message,
                 autoEscape,
                 tempGroupId,
-                tempGroupId === undefined
-                    ? async (event) => await ref.dispatchEvent(event, 'send')
-                    : undefined,
+                tempGroupId === undefined ? selfSentHandler(ref) : undefined,
             ),
         sendGroupMessage: (groupId, message, autoEscape) =>
             sendGroupMessage(ref, groupId, message, autoEscape),
@@ -120,13 +134,7 @@ export function buildApiContext(ref: OneBotInstanceContext): ApiActionContext {
         sendGroupForwardMsg: (groupId, messages, meta) =>
             sendGroupForwardMessage(ref, groupId, messages, meta),
         sendPrivateForwardMsg: (userId, messages, meta) =>
-            sendPrivateForwardMessage(
-                ref,
-                userId,
-                messages,
-                meta,
-                async (event) => await ref.dispatchEvent(event, 'send'),
-            ),
+            sendPrivateForwardMessage(ref, userId, messages, meta, selfSentHandler(ref)),
         sendForwardMsg: (messages, groupId) => uploadForwardMessage(ref, messages, groupId),
         getForwardMsg: (resId) => getForwardMessage(ref, resId),
         forwardSingleMsg: (messageId, target) =>
@@ -134,9 +142,7 @@ export function buildApiContext(ref: OneBotInstanceContext): ApiActionContext {
                 ref,
                 messageId,
                 target,
-                target.userId !== undefined
-                    ? async (event) => await ref.dispatchEvent(event, 'send')
-                    : undefined,
+                target.userId !== undefined ? selfSentHandler(ref) : undefined,
             ),
         setEssenceMsg: (messageId) => setEssenceMessage(bridge, messageStore, messageId, true),
         deleteEssenceMsg: (messageId) => setEssenceMessage(bridge, messageStore, messageId, false),

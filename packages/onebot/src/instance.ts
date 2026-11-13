@@ -46,6 +46,13 @@ import { ReactionStore } from './reaction-store';
 import { sameSelfSentMessage, selfSentEventKey, SELF_SENT_ECHO_WINDOW_MS } from './self-sent-event';
 import type { ApiResponse, JsonObject, JsonValue, MessageMeta, OneBotConfig } from './types';
 import { V12Runtime } from './v12-runtime/runtime';
+import { V12_ADAPTER_NAME } from './v12-runtime/identity';
+import {
+    captureBinding,
+    captureSource,
+    SourceGeneration,
+    type V12Source,
+} from './v12-runtime/source-generation';
 
 const moduleLog = createLogger('Event');
 
@@ -95,6 +102,7 @@ export class OneBotInstance {
     private online = true;
     // V12 reports the explicit account-session edge, not listener connectivity.
     private v12Online = false;
+    private readonly sourceGeneration = new SourceGeneration();
     private v12Adapter: V12Runtime | null = null;
     private heartbeatTimer: NodeJS.Timeout | null = null;
     private static readonly HEARTBEAT_INTERVAL = 30000;
@@ -315,8 +323,11 @@ export class OneBotInstance {
             getUptimeMs: () => Math.max(0, Date.now() - this.startedAt),
             cacheMessageMeta: async (messageId, meta) =>
                 await this.cacheMessageMeta(messageId, meta),
-            dispatchEvent: (event, source = 'bridge', startedAt) =>
-                this.dispatchEvent(event, source, startedAt),
+            [captureSource]: () => this.captureEventSource(),
+            dispatchEvent: (event, source = 'bridge', startedAt, sourceTicket) =>
+                sourceTicket === undefined
+                    ? this.dispatchEvent(event, source, startedAt)
+                    : this.dispatchEvent(event, source, startedAt, sourceTicket),
         };
         this.ctx = ctx;
 
@@ -357,6 +368,7 @@ export class OneBotInstance {
     /** Bridge session edge → OneBot notice. Awaited so offline can leave
      *  adapters before this generation is disposed. */
     emitBotStatus(subType: 'online' | 'offline'): Promise<void> {
+        this.sourceGeneration?.setOnline(!this.disposeRequested && subType === 'online');
         this.v12Online = subType === 'online';
         this.v12Adapter?.statusUpdate();
         return this.dispatchEvent(makeBotStatusEvent(parseInt(this.uin, 10) || 0, subType));
@@ -459,6 +471,7 @@ export class OneBotInstance {
         }
 
         this.disposeRequested = true;
+        this.sourceGeneration?.setOnline(false);
         this.acceptingActions = false;
         this.v12Online = false;
         this.v12Adapter?.quiesce();
@@ -594,6 +607,7 @@ export class OneBotInstance {
         event: JsonObject,
         source: 'bridge' | 'send' = 'bridge',
         startedAt = Date.now(),
+        sourceTicket?: V12Source,
     ): Promise<void> {
         if (!(await this.cacheMessageEvent(event))) {
             this.traceEventHandoffTerminal(event, startedAt, 'suppressed', 'private_recall');
@@ -651,7 +665,11 @@ export class OneBotInstance {
         }
 
         try {
-            await this.networkManager.emitEvent(event);
+            if (sourceTicket === undefined) {
+                await this.networkManager.emitEvent(event);
+            } else {
+                await this.networkManager.emitEvent(event, sourceTicket);
+            }
         } catch (err) {
             this.log.warn(
                 'emitEvent failed: %s',
@@ -780,6 +798,20 @@ export class OneBotInstance {
         };
     }
 
+    private captureEventSource(): V12Source | undefined {
+        const adapter = this.v12Adapter;
+
+        if (
+            !adapter ||
+            this.disposeRequested ||
+            this.networkManager.get(V12_ADAPTER_NAME) !== adapter
+        ) {
+            return undefined;
+        }
+
+        return this.sourceGeneration?.capture(adapter[captureBinding]());
+    }
+
     private createNetworkAdapter(desired: DesiredNetworkAdapter, ctx: NetworkAdapterContext) {
         switch (desired.kind) {
             case 'httpServer':
@@ -792,7 +824,7 @@ export class OneBotInstance {
                 return new WsClientAdapter(desired.name, desired.config, ctx);
 
             case 'v12Server': {
-                const adapter = new V12Runtime(desired.config, ctx, {
+                const adapter: V12Runtime = new V12Runtime(desired.config, ctx, {
                     getStatus: () => ({
                         online: this.v12Online,
                         good: this.v12Online && this.bridge.receiveHealthy,
@@ -801,6 +833,11 @@ export class OneBotInstance {
                         (await this.messageStore.findMeta(id))?.timestamp ?? null,
                     trackAction: (label, start) => this.trackAction(label, start),
                     canAccept: () => !this.disposeRequested,
+                    isSourceCurrent: (source, binding) =>
+                        !this.disposeRequested &&
+                        this.v12Adapter === adapter &&
+                        this.networkManager.get(V12_ADAPTER_NAME) === adapter &&
+                        (this.sourceGeneration?.isCurrent(source, binding) ?? false),
                 });
                 this.v12Adapter = adapter;
                 return adapter;

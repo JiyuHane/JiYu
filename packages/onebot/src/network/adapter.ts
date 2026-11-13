@@ -7,6 +7,7 @@ import {
     type EventReportOptions,
 } from '../event-filter';
 import type { JsonObject, NetworkBase } from '../types';
+import { receiveSourceEvent, type V12Source } from '../v12-runtime/source-generation';
 
 export interface NetworkAdapterContext {
     uin: string;
@@ -80,6 +81,14 @@ export abstract class IOneBotNetworkAdapter<C extends NetworkBase> {
     }
 
     abstract onEvent(event: JsonObject, payload: DispatchPayload): void | Promise<void>;
+
+    [receiveSourceEvent](
+        event: JsonObject,
+        payload: DispatchPayload,
+        _source: V12Source,
+    ): void | Promise<void> {
+        return this.onEvent(event, payload);
+    }
 
     /** Report live connection health for the WebUI dashboard. */
     abstract describeStatus(): AdapterStatus;

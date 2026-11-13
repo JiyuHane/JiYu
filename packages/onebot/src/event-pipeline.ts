@@ -12,6 +12,7 @@ import {
 import { backfillReplyTarget } from './modules/message-actions';
 import { deliverPttTransText, pttTransKey } from './modules/ptt-trans-waiter';
 import type { MessageMeta } from './types';
+import { tryCaptureSource, type V12Source } from './v12-runtime/source-generation';
 
 const moduleLog = createLogger('Event');
 
@@ -42,8 +43,10 @@ export function registerEventPipeline(ctx: OneBotInstanceContext): EventPipeline
             return Promise.resolve();
         }
 
+        const sourceTicket = tryCaptureSource(ctx);
         return runWithTraceRequest(() => {
             const state: EventTraceState = {
+                sourceTicket,
                 startedAt: Date.now(),
                 handedOff: false,
                 terminalEmitted: false,
@@ -154,6 +157,7 @@ type PipelineDisposition<K extends EventKind> =
 type PipelineRegistry = { [K in EventKind]: PipelineDisposition<K> };
 
 interface EventTraceState {
+    sourceTicket: V12Source | undefined;
     startedAt: number;
     handedOff: boolean;
     terminalEmitted: boolean;
@@ -235,7 +239,12 @@ async function convertAndDispatch(
         return;
     }
 
-    await ctx.dispatchEvent(converted, 'bridge', state.startedAt);
+    if (state.sourceTicket === undefined) {
+        await ctx.dispatchEvent(converted, 'bridge', state.startedAt);
+    } else {
+        await ctx.dispatchEvent(converted, 'bridge', state.startedAt, state.sourceTicket);
+    }
+
     state.handedOff = true;
 }
 

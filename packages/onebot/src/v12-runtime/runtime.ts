@@ -11,6 +11,13 @@ import {
 import type { V12Self } from '../v12/types';
 import type { JsonObject } from '../types';
 import { safeV12Error, V12_ADAPTER_NAME, type V12ManagedConfig } from './identity';
+import {
+    captureBinding,
+    receiveSourceEvent,
+    verifySource,
+    type V12Source,
+} from './source-generation';
+import type { DispatchPayload } from '../event-filter';
 
 /** A v12 listener participates in the same network manager FIFO as v11. */
 export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
@@ -24,6 +31,10 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     private statusImmediate: ReturnType<typeof setImmediate> | null = null;
     private transport: V12Transport | null = null;
     private currentStatusTransportToken: object | null = null;
+    private openingOwner: object | null = null;
+    private closeRevision: object = {};
+    private sourceAttempt: object | null = null;
+    private sourceBinding: object | null = null;
     private accepting = true;
 
     constructor(
@@ -34,6 +45,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             getSentMessageTime: (id: number) => Promise<number | null>;
             trackAction: <T>(label: string, start: () => Promise<T>) => Promise<T>;
             canAccept: () => boolean;
+            isSourceCurrent?: (source: V12Source | undefined, binding: object | null) => boolean;
         },
     ) {
         super(V12_ADAPTER_NAME, config, ctx);
@@ -61,6 +73,10 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
         }
 
         const token = {};
+        const sourceAttempt = {};
+        this.openingOwner = token;
+        this.sourceAttempt = sourceAttempt;
+        this.sourceBinding = null;
         this.currentStatusTransportToken = token;
         let transport: V12Transport;
 
@@ -74,6 +90,11 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                 getConnectEvent: () => createConnectEvent(this.version),
                 subscribe: (listener) => this.subscribeStatus(listener),
                 onError: (error) => {
+                    if (this.sourceAttempt === sourceAttempt) {
+                        this.sourceAttempt = null;
+                        this.sourceBinding = null;
+                    }
+
                     if (this.currentStatusTransportToken !== token) {
                         return;
                     }
@@ -85,6 +106,15 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                 },
             });
         } catch (error) {
+            if (this.sourceAttempt === sourceAttempt) {
+                this.sourceAttempt = null;
+                this.sourceBinding = null;
+            }
+
+            if (this.openingOwner === token) {
+                this.openingOwner = null;
+            }
+
             if (this.currentStatusTransportToken === token) {
                 this.currentStatusTransportToken = null;
             }
@@ -92,39 +122,68 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             throw error;
         }
 
+        // Construction can invoke callbacks synchronously. Never publish an
+        // abandoned transport over a newer owner created by a reentrant callback.
+        if (
+            this.openingOwner !== token ||
+            this.currentStatusTransportToken !== token ||
+            this.transport
+        ) {
+            try {
+                await transport.close();
+            } catch (error) {
+                throw new Error(this.cleanError(error));
+            }
+
+            throw new Error('v12 listener opening superseded');
+        }
+
         this.transport = transport;
+        const ownsOpening = () =>
+            this.transport === transport &&
+            this.currentStatusTransportToken === token &&
+            this.openingOwner === token;
 
         try {
             await transport.open();
 
             if (!this.accepting || !this.options.canAccept()) {
                 await transport.close();
-                this.transport = null;
 
-                if (this.currentStatusTransportToken === token) {
+                if (ownsOpening()) {
+                    this.transport = null;
                     this.currentStatusTransportToken = null;
+                    this.openingOwner = null;
                 }
 
                 throw new Error('v12 instance is disposing');
             }
 
-            this.isEnabled = true;
+            if (ownsOpening()) {
+                this.isEnabled = true;
+
+                if (this.sourceAttempt === sourceAttempt) {
+                    this.sourceBinding = sourceAttempt;
+                }
+            }
         } catch (error) {
-            if (this.currentStatusTransportToken === token) {
-                this.cancelStatus();
+            if (this.sourceAttempt === sourceAttempt) {
+                this.sourceAttempt = null;
+                this.sourceBinding = null;
             }
 
-            this.isEnabled = false;
+            if (ownsOpening()) {
+                this.cancelStatus();
+                this.isEnabled = false;
+            }
 
             try {
                 await transport.close();
 
-                if (this.transport === transport) {
+                if (ownsOpening()) {
                     this.transport = null;
-                }
-
-                if (this.currentStatusTransportToken === token) {
                     this.currentStatusTransportToken = null;
+                    this.openingOwner = null;
                 }
             } catch (closeError) {
                 throw new Error(
@@ -137,7 +196,17 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     }
 
     async close(): Promise<void> {
-        if (!this.transport) {
+        const transport = this.transport;
+        const token = this.currentStatusTransportToken;
+        const previousOpeningOwner = this.openingOwner;
+        const closeRevision = this.closeRevision;
+        this.openingOwner = null;
+        this.sourceAttempt = null;
+        this.sourceBinding = null;
+
+        if (!transport) {
+            this.closeRevision = {};
+            this.currentStatusTransportToken = null;
             this.cancelStatus();
             this.isEnabled = false;
             this.subscribers.clear();
@@ -145,42 +214,94 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             return;
         }
 
-        const token = this.currentStatusTransportToken;
-        this.transport.quiesce();
-        this.isEnabled = false;
+        const ownsTransport = () =>
+            this.transport === transport && this.currentStatusTransportToken === token;
 
-        if (this.currentStatusTransportToken === token) {
+        try {
+            transport.quiesce();
+        } catch (error) {
+            // Restore status ownership only if no nested close or teardown won.
+            // Source admission remains revoked even when quiesce throws.
+            if (
+                ownsTransport() &&
+                this.closeRevision === closeRevision &&
+                this.openingOwner === null &&
+                this.accepting
+            ) {
+                this.openingOwner = previousOpeningOwner;
+            }
+
+            throw error;
+        }
+
+        if (ownsTransport()) {
+            this.closeRevision = {};
+            this.isEnabled = false;
             this.cancelStatus();
         }
 
         try {
-            await this.transport.close();
-            this.transport = null;
+            await transport.close();
 
-            if (this.currentStatusTransportToken === token) {
+            if (ownsTransport()) {
+                this.transport = null;
                 this.currentStatusTransportToken = null;
+                this.subscribers.clear();
+                this.subscriberGenerations.clear();
             }
-
-            this.subscribers.clear();
-            this.subscriberGenerations.clear();
         } catch (error) {
             throw new Error(this.cleanError(error));
         }
     }
 
     quiesce(): void {
+        this.closeRevision = {};
+        this.openingOwner = null;
+        this.sourceAttempt = null;
+        this.sourceBinding = null;
         this.accepting = false;
         this.cancelStatus();
         this.transport?.quiesce();
     }
 
     override forceClose(): void {
+        this.closeRevision = {};
+        this.openingOwner = null;
+        this.sourceAttempt = null;
+        this.sourceBinding = null;
         this.accepting = false;
         this.cancelStatus();
         this.transport?.forceClose();
     }
 
-    onEvent(event: JsonObject): void {
+    [captureBinding](): object | null {
+        return this.isEnabled && this.accepting && this.options.canAccept()
+            ? this.sourceBinding
+            : null;
+    }
+
+    private isSourceCurrent(source: V12Source | undefined): boolean {
+        try {
+            return this.options.isSourceCurrent?.(source, this[captureBinding]()) ?? false;
+        } catch {
+            return false;
+        }
+    }
+
+    [verifySource](source: V12Source | undefined): boolean {
+        return this.isSourceCurrent(source);
+    }
+
+    override [receiveSourceEvent](
+        event: JsonObject,
+        payload: DispatchPayload,
+        _source: V12Source,
+    ): void {
+        // Metadata is carried separately; today's WS broadcast is unchanged.
+        this.onEvent(event, payload);
+    }
+
+    onEvent(event: JsonObject, _payload?: DispatchPayload): void {
         if (!this.isEnabled || !this.accepting) {
             return;
         }
@@ -231,6 +352,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             this.subscriberGenerations.set(listener, {});
         }
 
+        const generation = this.subscriberGenerations.get(listener);
         const ownsLock = !this.statusEmitting;
 
         if (ownsLock) {
@@ -241,8 +363,11 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             // The transport sends connect before invoking this callback.
             listener(createStatusUpdateEvent(this.self, this.options.getStatus()));
         } catch (error) {
-            this.subscribers.delete(listener);
-            this.subscriberGenerations.delete(listener);
+            if (this.subscriberGenerations.get(listener) === generation) {
+                this.subscribers.delete(listener);
+                this.subscriberGenerations.delete(listener);
+            }
+
             this.warnStatus('v12 initial status unavailable');
             throw error;
         } finally {
@@ -256,8 +381,10 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
         }
 
         return () => {
-            this.subscribers.delete(listener);
-            this.subscriberGenerations.delete(listener);
+            if (this.subscriberGenerations.get(listener) === generation) {
+                this.subscribers.delete(listener);
+                this.subscriberGenerations.delete(listener);
+            }
         };
     }
 

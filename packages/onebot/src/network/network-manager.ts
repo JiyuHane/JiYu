@@ -3,6 +3,7 @@ import { errorMessage } from '@snowluma/common/errors';
 import { assertValidOneBotConfig } from '../config';
 import { buildDispatchPayload } from '../event-filter';
 import { safeV12Error, V12_ADAPTER_NAME, type V12ManagedConfig } from '../v12-runtime/identity';
+import { receiveSourceEvent, type V12Source } from '../v12-runtime/source-generation';
 import type {
     HttpClientNetwork,
     HttpServerNetwork,
@@ -318,14 +319,14 @@ export class OneBotNetworkManager {
         }
     }
 
-    emitEvent(event: JsonObject): Promise<void> {
+    emitEvent(event: JsonObject, source?: V12Source): Promise<void> {
         if (!this.accepting) {
             return Promise.reject(
                 new Error('network manager is shutting down; event dispatch rejected'),
             );
         }
 
-        const operation = this.emitEventNow(event);
+        const operation = this.emitEventNow(event, source);
         this.inFlightEmits.add(operation);
         void operation.then(
             () => {
@@ -338,7 +339,7 @@ export class OneBotNetworkManager {
         return operation;
     }
 
-    private async emitEventNow(event: JsonObject): Promise<void> {
+    private async emitEventNow(event: JsonObject, source: V12Source | undefined): Promise<void> {
         // Notify debug taps first — before the adapter check — so the debug stream
         // sees every event even when no adapter is connected. A diagnostic tap is
         // isolated, but its failure is always logged with the root message.
@@ -372,7 +373,17 @@ export class OneBotNetworkManager {
         const payload = buildDispatchPayload(event);
         const tasks = active.map((adapter) =>
             Promise.resolve()
-                .then(() => adapter.onEvent(event, payload))
+                .then(() => {
+                    if (source !== undefined) {
+                        const receive = adapter[receiveSourceEvent];
+
+                        if (typeof receive === 'function') {
+                            return receive.call(adapter, event, payload, source);
+                        }
+                    }
+
+                    return adapter.onEvent(event, payload);
+                })
                 .catch((error) => {
                     const safe = this.redactReconcileError(error);
                     log.warn('adapter [%s] onEvent error: %s', adapter.name, errorMessage(safe));
