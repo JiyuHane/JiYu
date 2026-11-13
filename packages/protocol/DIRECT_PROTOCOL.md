@@ -492,8 +492,20 @@ contains scalar-bit selection and point-like operations; the second has a
 first-output path compatible with coordinate conversion; and the third performs
 an unresolved intermediate conversion followed by a group-width byte export.
 Its scalar path reverses bytes, while other inspected paths use SIMD blocks.
-These observations do not prove the dynamic table selection, the intermediate
-algebra, or that the exported value is a shared X coordinate.
+A separately checked instruction sequence in `0x8d90350` tests whether the raw
+limbs at point `+0x90` are nonzero, computes a fixed-width candidate `m-2`, and
+passes that value and those limbs to `0x8d4e390`. It then passes the result twice
+to `0x8d4e950`; when the first output pointer is nonnull, it passes that
+intermediate and point `+0` to the same helper, writing to the first output.
+When the second output pointer is nonnull, it combines the intermediate with
+the first helper's result and then combines that value with point `+0x48`, using
+the same helper and writing to the second output. These data dependencies
+assume the helper calls return normally and do not have value-changing aliases;
+the nonzero limb test alone establishes neither point validity nor invertibility.
+The inspected helper structure suggests exponentiation and modular arithmetic,
+but their complete mathematical equivalence and the point-field roles remain
+unproved. These observations do not prove dynamic table selection, the
+intermediate algebra, or that the exported value is a shared X coordinate.
 `0x8b46000` produces 16 bytes using an update and finalization path. Independent bounded inspection found its initial state,
 64 compression constants and 64 rotation counts match public MD5 values, with
 MD5-like padding and 64-byte block processing. It is therefore a strong MD5
