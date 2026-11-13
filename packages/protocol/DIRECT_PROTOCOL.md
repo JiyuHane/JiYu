@@ -360,9 +360,16 @@ The two constructed objects have separate virtual-table address points at
 `0x6713c00` in their respective `+0x30` slots. Local instruction windows make
 these slots candidate execution methods, not observed runtime calls. Both load
 a receiver from global `0x9177e20`; their inspected callees did not establish a
-connection to the signer setter. The dispatch receiver's `+0x28` and the
-constructed objects' `+0x30` slots belong to different objects. The inspected
-candidate paths both access the second receiver's `+0x30` and call `0x6725fb0`;
+connection to the signer setter. In one inspected path, `0x6713850` passes that
+receiver and fields of its current object to `0x67252d0`. If the call returns
+normally, it loads a receiver from a different global slot, `0x9177dd0`, and
+indirectly tail-calls that receiver's virtual slot `+0x10` without a local null
+check. The other inspected method, `0x6713c00`, eventually loads the first global
+receiver and tail-calls `0x6725530`. The observed slot addresses differ; their
+runtime object identities and any connection to the signer pair remain unknown.
+The dispatch receiver's `+0x28` and the constructed objects' `+0x30` slots
+belong to different objects. The inspected candidate paths both access the
+`0x9177e20` receiver's `+0x30` and call `0x6725fb0`;
 the clear path's subsequent pointer/count changes and releases are consistent
 with deleting a node from an associated structure. A later bounded inspection
 of the notify candidate `0x6724ce0` also shows a node insertion/update path:
