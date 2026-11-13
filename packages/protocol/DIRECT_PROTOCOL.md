@@ -381,10 +381,16 @@ The caller loads the pair, clears the stack source, saves the old control pointe
 and writes 16 bytes to global `0x9177dd0/8` with one `movups` instruction.
 If the old control pointer is non-null, a subsequent `lock xadd -1` tests its
 old count; old zero enters its virtual cleanup and release path. This is not a
-claim that the 16-byte write is atomic. These are static observations conditional
-on normal returns, valid pointers and no intervening changes, not observed runtime
-dispatch. The globals' business meanings and any connection to the signer pair
-remain unknown. The dispatch receiver's `+0x28` and the constructed objects' `+0x30` slots
+claim that the 16-byte write is atomic. Separately, the bounded function at
+`0x675a330` returns immediately when its input's `+0x68` is zero. Otherwise it
+walks a `+0x60` pointer chain, calling `0x8e10050` per node, clears that field,
+zeroes `+0x58` eight-byte slots at the `+0x50` base, and clears `+0x68`.
+The inspected window does not free the slot array or establish a status return.
+The observations require valid pointers, a finite chain, valid array bounds,
+normal returns and no interfering mutations; they do not establish runtime
+reachability or a protocol operation. The globals' business meanings and any
+connection to the signer pair remain unknown. The dispatch receiver's `+0x28`
+and the constructed objects' `+0x30` slots
 belong to different objects. The inspected candidate paths both access the
 `0x9177e20` receiver's `+0x30` and call `0x6725fb0`;
 the clear path's subsequent pointer/count changes and releases are consistent
