@@ -76,7 +76,13 @@ occupied; a later exit and successful listener cleanup can release it, although
 the already reported cleanup result stays `unknown`. Listener installation or
 removal uncertainty is sticky and keeps the slot occupied, with no cleanup retry.
 A successful outcome does not override uncertain cleanup. If the factory throws
-or returns an invalid handle, the slot remains occupied.
+or returns an invalid handle, the slot remains occupied. Once an error, abort,
+timeout or exit begins its terminal decision, a synchronous callback reentering
+the controller cannot replace that decision; an observed exit during a failure
+decision is held until the decision finishes before cleanup is assessed. Clock
+faults and expired deadlines retain their existing precedence. This protection
+is limited to terminal decisions: message processing before a terminal decision
+is not generally serialized against arbitrary reentrant callbacks.
 
 The factory must return a new, exclusively controlled Worker and faithfully map
 its actual events: event registration and removal must be non-throwing and

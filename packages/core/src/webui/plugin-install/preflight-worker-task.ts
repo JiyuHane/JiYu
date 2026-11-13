@@ -109,6 +109,8 @@ export interface WorkerTaskHandle {
  * A native, unproxied AbortSignal with standard lookup points is required. Its
  * abort callback is checked with getEventListeners at install and after intrinsic
  * EventTarget removal; unavailable evidence keeps cleanup unknown and the slot busy.
+ * Reentrant callbacks cannot replace a terminal decision already in progress;
+ * message processing before any terminal decision is not generally serialized.
  */
 export class PreflightWorkerTask {
     private busy = false;
@@ -217,6 +219,8 @@ export class PreflightWorkerTask {
         let settled = false;
         let cleanupDone = false;
         let exited = false;
+        let terminalDecision: 'failure' | 'exit' | undefined;
+        let deferredExit = false;
         let constructing = true;
         let worker: PreflightWorker | undefined;
         let terminationStarted = false;
@@ -371,13 +375,31 @@ export class PreflightWorkerTask {
             stop();
         };
 
+        const chooseFailure = (
+            code: Extract<WorkerTaskOutcome, { kind: 'failure' }>['code'],
+        ): void => {
+            const overdue = expired();
+            finish({ kind: 'failure', code: clockFault ? 'internal' : overdue ? 'timeout' : code });
+        };
+
         const fail = (code: Extract<WorkerTaskOutcome, { kind: 'failure' }>['code']): void => {
-            if (settled) {
+            if (settled || terminalDecision) {
                 return;
             }
 
-            const overdue = expired();
-            finish({ kind: 'failure', code: clockFault ? 'internal' : overdue ? 'timeout' : code });
+            // Reserve the first terminal decision before the injectable clock can reenter.
+            terminalDecision = 'failure';
+
+            try {
+                chooseFailure(code);
+            } finally {
+                terminalDecision = undefined;
+
+                if (deferredExit) {
+                    deferredExit = false;
+                    release();
+                }
+            }
         };
 
         const onAbort = (): void => {
@@ -393,7 +415,7 @@ export class PreflightWorkerTask {
         };
 
         const onMessage = (message: unknown): void => {
-            if (settled || exited) {
+            if (settled || exited || terminalDecision) {
                 return;
             }
 
@@ -432,17 +454,28 @@ export class PreflightWorkerTask {
             exited = true;
             const exitCandidate = candidate;
 
-            if (!settled) {
-                if (expired()) {
-                    fail('timeout');
-                } else if (code === 0 && exitCandidate !== undefined) {
-                    finish({ kind: 'result', result: exitCandidate });
-                } else {
-                    fail('exit');
-                }
+            // A first failure owns the decision; retain this exit until it finishes.
+            if (terminalDecision) {
+                deferredExit = true;
+                return;
             }
 
-            release();
+            terminalDecision = 'exit';
+
+            try {
+                if (!settled) {
+                    if (expired()) {
+                        chooseFailure('timeout');
+                    } else if (code === 0 && exitCandidate !== undefined) {
+                        finish({ kind: 'result', result: exitCandidate });
+                    } else {
+                        chooseFailure('exit');
+                    }
+                }
+            } finally {
+                terminalDecision = undefined;
+                release();
+            }
         };
 
         try {

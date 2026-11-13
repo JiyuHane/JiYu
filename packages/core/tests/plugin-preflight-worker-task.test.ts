@@ -138,6 +138,280 @@ describe('injected worker task', () => {
         }
     });
 
+    it('preserves error across reentrant native abort and exit without early release', async () => {
+        const worker = new FakeWorker();
+        const signal = new AbortController();
+        let fire = false;
+        let nested: ReturnType<PreflightWorkerTask['start']> | undefined;
+        let errorListeners = 0;
+        const controller = new PreflightWorkerTask(
+            () => worker,
+            30,
+            () => {
+                if (fire) {
+                    fire = false;
+                    signal.abort();
+                    worker.emit('message', message());
+                    worker.emit('exit', 0);
+                    errorListeners = worker.listenerCount('error');
+                    nested = controller.start(input, { timeoutMs: 100 });
+                }
+
+                return 0;
+            },
+        );
+        const task = controller.start(input, { timeoutMs: 1000, signal: signal.signal });
+        worker.emit('message', message());
+        fire = true;
+        worker.emit('error', Error('private'));
+        expect(await nested!.outcome).toEqual(failure('busy'));
+        expect(errorListeners).toBeGreaterThan(0);
+        expect(await task.outcome).toEqual(failure('worker_error'));
+        expect(await task.cleanup).toBe('released');
+        expect(worker.terminate).not.toHaveBeenCalled();
+        expect(worker.eventNames()).toEqual([]);
+        expect(getEventListeners(signal.signal, 'abort')).toHaveLength(0);
+    });
+
+    it.each(['messageerror', 'abort'] as const)(
+        'preserves first %s during reentrant error and exit',
+        async (first) => {
+            const worker = new FakeWorker();
+            const signal = new AbortController();
+            let fire = false;
+            let nested: ReturnType<PreflightWorkerTask['start']> | undefined;
+            const controller = new PreflightWorkerTask(
+                () => worker,
+                30,
+                () => {
+                    if (fire) {
+                        fire = false;
+                        worker.emit('error', Error('private'));
+                        worker.emit('message', message());
+                        worker.emit('exit', 0);
+                        nested = controller.start(input, { timeoutMs: 100 });
+                    }
+
+                    return 0;
+                },
+            );
+            const task = controller.start(input, { timeoutMs: 1000, signal: signal.signal });
+            worker.emit('message', message());
+            fire = true;
+
+            if (first === 'abort') {
+                signal.abort();
+            } else {
+                worker.emit('messageerror', Error('private'));
+            }
+
+            expect(await nested!.outcome).toEqual(failure('busy'));
+            expect(await task.outcome).toEqual(
+                failure(first === 'abort' ? 'abort' : 'message_error'),
+            );
+            expect(await task.cleanup).toBe('released');
+            expect(worker.terminate).not.toHaveBeenCalled();
+        },
+    );
+
+    it.each([true, false])(
+        'keeps first exit against reentrant abort and error, candidate=%s',
+        async (hasCandidate) => {
+            const worker = new FakeWorker();
+            const signal = new AbortController();
+            let fire = false;
+            let nested: ReturnType<PreflightWorkerTask['start']> | undefined;
+            const controller = new PreflightWorkerTask(
+                () => worker,
+                30,
+                () => {
+                    if (fire) {
+                        fire = false;
+                        signal.abort();
+                        worker.emit('error', Error('private'));
+                        worker.emit('message', message());
+                        nested = controller.start(input, { timeoutMs: 100 });
+                    }
+
+                    return 0;
+                },
+            );
+            const task = controller.start(input, { timeoutMs: 1000, signal: signal.signal });
+
+            if (hasCandidate) {
+                worker.emit('message', message());
+            }
+
+            fire = true;
+            worker.emit('exit', 0);
+            expect(await nested!.outcome).toEqual(failure('busy'));
+            const outcome = await task.outcome;
+
+            if (hasCandidate) {
+                expect(outcome.kind).toBe('result');
+            } else {
+                expect(outcome).toEqual(failure('exit'));
+            }
+
+            expect(await task.cleanup).toBe('released');
+            expect(worker.terminate).not.toHaveBeenCalled();
+            expect(getEventListeners(signal.signal, 'abort')).toHaveLength(0);
+        },
+    );
+
+    it.each(['deadline', 'throw', 'nonfinite'] as const)(
+        'keeps %s priority during failure and reentrant exit',
+        async (mode) => {
+            const worker = new FakeWorker();
+            let fire = false;
+            const controller = new PreflightWorkerTask(
+                () => worker,
+                30,
+                () => {
+                    if (fire) {
+                        fire = false;
+                        worker.emit('exit', 0);
+
+                        if (mode === 'throw') {
+                            throw Error('private');
+                        }
+
+                        return mode === 'deadline' ? 100 : NaN;
+                    }
+
+                    return 0;
+                },
+            );
+            const task = controller.start(input, { timeoutMs: 10 });
+            worker.emit('message', message());
+            fire = true;
+            worker.emit('error', Error('private'));
+            expect(await task.outcome).toEqual(
+                failure(mode === 'deadline' ? 'timeout' : 'internal'),
+            );
+            expect(await task.cleanup).toBe('released');
+            expect(worker.terminate).not.toHaveBeenCalled();
+        },
+    );
+
+    it('preserves timeout when its clock synchronously emits error and exit', async () => {
+        vi.useFakeTimers();
+
+        try {
+            const worker = new FakeWorker();
+            let fire = false;
+            let nested: ReturnType<PreflightWorkerTask['start']> | undefined;
+            const controller = new PreflightWorkerTask(
+                () => worker,
+                30,
+                () => {
+                    if (fire) {
+                        fire = false;
+                        worker.emit('error', Error('private'));
+                        worker.emit('message', message());
+                        worker.emit('exit', 0);
+                        nested = controller.start(input, { timeoutMs: 100 });
+                    }
+
+                    return 0;
+                },
+            );
+            const task = controller.start(input, { timeoutMs: 10 });
+            worker.emit('message', message());
+            fire = true;
+            vi.advanceTimersByTime(10);
+            expect(await nested!.outcome).toEqual(failure('busy'));
+            expect(await task.outcome).toEqual(failure('timeout'));
+            expect(await task.cleanup).toBe('released');
+            expect(worker.terminate).not.toHaveBeenCalled();
+            expect(vi.getTimerCount()).toBe(0);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('preserves unknown cleanup after reentrant abort and permits release only after late exit', async () => {
+        const worker = new FakeWorker();
+        const signal = new AbortController();
+        let fire = false;
+        const controller = new PreflightWorkerTask(
+            () => worker,
+            10,
+            () => {
+                if (fire) {
+                    fire = false;
+                    signal.abort();
+                }
+
+                return 0;
+            },
+        );
+        const task = controller.start(input, { timeoutMs: 1000, signal: signal.signal });
+        worker.emit('message', message());
+        fire = true;
+        worker.emit('error', Error('private'));
+        expect(await task.outcome).toEqual(failure('worker_error'));
+        expect(await task.cleanup).toBe('unknown');
+        expect(await controller.start(input, { timeoutMs: 100 }).outcome).toEqual(failure('busy'));
+        worker.emit('error', Error('private'));
+        worker.emit('exit', 1);
+        expect(await task.cleanup).toBe('unknown');
+        const next = controller.start(input, { timeoutMs: 100 });
+        worker.emit('exit', 0);
+        expect(await next.cleanup).toBe('released');
+        expect(worker.terminate).toHaveBeenCalledOnce();
+    });
+
+    it('defers synchronous exit emitted by terminate until the first failure settles', async () => {
+        const worker = new FakeWorker();
+        let nested: ReturnType<PreflightWorkerTask['start']> | undefined;
+        let errorsDuringTermination = 0;
+        const controller = new PreflightWorkerTask(() => worker, 30);
+        worker.terminate.mockImplementation(() => {
+            worker.emit('exit', 1);
+            errorsDuringTermination = worker.listenerCount('error');
+            nested = controller.start(input, { timeoutMs: 100 });
+            return Promise.reject(Error('private'));
+        });
+        const task = controller.start(input, { timeoutMs: 1000 });
+        worker.emit('error', Error('private'));
+        expect(await task.outcome).toEqual(failure('worker_error'));
+        expect(await nested!.outcome).toEqual(failure('busy'));
+        expect(errorsDuringTermination).toBeGreaterThan(0);
+        expect(await task.cleanup).toBe('released');
+        expect(worker.terminate).toHaveBeenCalledOnce();
+        expect(worker.eventNames()).toEqual([]);
+    });
+
+    it('keeps cleanup unknown and slot occupied after reentrant exit if listener removal fails', async () => {
+        const worker = new FakeWorker();
+        worker.on('removeListener', (event) => {
+            if (event === 'message') {
+                throw Error('private');
+            }
+        });
+        let fire = false;
+        const controller = new PreflightWorkerTask(
+            () => worker,
+            30,
+            () => {
+                if (fire) {
+                    fire = false;
+                    worker.emit('exit', 0);
+                }
+
+                return 0;
+            },
+        );
+        const task = controller.start(input, { timeoutMs: 1000 });
+        worker.emit('message', message());
+        fire = true;
+        worker.emit('error', Error('private'));
+        expect(await task.outcome).toEqual(failure('worker_error'));
+        expect(await task.cleanup).toBe('unknown');
+        expect(await controller.start(input, { timeoutMs: 100 }).outcome).toEqual(failure('busy'));
+    });
+
     it('rejects proxies and accessors without invoking them, and enforces bounds/hash', async () => {
         let invoked = false;
         const getter = Object.defineProperty({}, 'ok', {
