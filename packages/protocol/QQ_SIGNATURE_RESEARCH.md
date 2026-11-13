@@ -48,7 +48,10 @@ Separate bounded AArch64 instruction windows also construct these table
 addresses and use byte-indexed loads. For example, `0x844c48–0x844c60`
 constructs `0x911eff`, loads an index byte, reads the forward table and writes
 the result back; `0x860268–0x860274` constructs `0x912094` and reads the
-inverse table by index. These are static instructions, not observed execution.
+inverse table by index. A radare2 `pdc` view of a manually bounded block at
+`0x844c40` agrees with that local substitution. The artificial block's `void`
+signature and return in that view are not evidence of real function boundaries
+or return values. These are static instructions, not observed execution.
 They do not establish a complete AES operation, mode, keys, or a connection to
 a signing path. These are file-backed static virtual addresses, not live process
 addresses. No keys were extracted or recorded.
