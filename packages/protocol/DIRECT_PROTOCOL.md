@@ -242,7 +242,16 @@ also be returned when the receiver is absent or the later `channel+0x40`
 control-block promotion fails; an earlier weak-reference failure instead
 unwinds. The two inspected callers do not branch on the return. Neither the
 return value nor this static path establishes a network send or a connection
-to `GetSignInfo`. On a candidate sender-construction path through `0x34a9e00`, `0x34f05e0`,
+to `GetSignInfo`. In the inspected normal branch, tree lookup uses the full
+64-bit entry key, a newly constructed node starts with a zero 16-bit value, and
+the old value is copied to the local header before incrementing modulo 65536.
+The header also receives the key's low 32 bits, the command's low 16 bits,
+and `0x87`. The offline `targetWtSendCounterCandidate` computes only those
+numeric projections from explicit caller inputs. Equal low-bit projections do
+not establish equal full keys or shared nodes; the model does not assign
+counters, serialize a header, sign, send, or establish interoperability.
+
+On a candidate sender-construction path through `0x34a9e00`, `0x34f05e0`,
 `0x34f4e70` and `0x34f63e0`, the value ultimately assigned to sender `+0x38`
 is the address-adjusted subobject `X+0x10` when `X = [H+0x90]` is non-null.
 The guarded send then calls that receiver's virtual slot `+0x20`. The dynamic
@@ -329,10 +338,14 @@ bounded path to a signing-manager context. They do not establish the virtual
 method implementation, field meanings, runtime reachability, signing algorithm
 or usable signing service. The observed getter `0x6613810` copies a global
 object/control-pointer pair and increments a reference count; `0x66137b0` sets
-that pair from an input supplied elsewhere. Thus this observation does not
-identify the implementation behind the signing-related virtual call. Bounded
-searches did not establish the setter's caller or dynamic type; indirect calls,
-other encodings and other modules remain possible. A complete inventory of this
+that pair from an input supplied elsewhere. A bounded inspection identifies
+`0x6613200` as one caller: it copies its caller-supplied pair into a temporary
+and passes that pair to `0x66137b0`. The getter and setter access the two global
+slots separately; these windows do not establish an atomic snapshot or exclude
+external synchronization. They also do not identify the input object's dynamic
+type, its constructor, or a connection to the `channel+0x38` receiver. Searches
+for the wrapper's callers were limited to selected instruction forms and address
+ranges; indirect calls, other encodings and other modules remain possible. A complete inventory of this
 ELF's 885 defined default/protected dynamic exports contains no symbol whose
 value equals `0x6613200` or `0x66137b0` (REA evidence
 `ev_6829f3d51f172faae17c5de300ab034d8496bae4e5913bea953c39d2f68b7722`).
