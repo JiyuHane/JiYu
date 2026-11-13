@@ -42,11 +42,13 @@ server-side zero when omitted: `limit: 0` places no protocol count limit and
 `timeout: 0` uses short polling. `timeout` is the server's wait in **seconds**;
 `options.timeoutMs` is the client's total request deadline in **milliseconds**,
 defaulting to 30,000. Use an appropriate client deadline with network margin,
-or set `timeoutMs: 0` to disable that client deadline. When a cancellation
-notification reaches the SDK, it cancels the local wait. Use a trusted
-`AbortSignal`: earlier listeners calling `stopImmediatePropagation()` can
-prevent the existing transport from observing an abort. The SDK does not alter
-either timeout or retry.
+or set `timeoutMs: 0` to disable that client deadline. Where the host supports
+native `AbortSignal.any`, the SDK uses a dependent signal so an earlier source
+listener calling `stopImmediatePropagation()` does not block cancellation. In
+older environments without `AbortSignal.any`, the ordinary listener fallback
+can still be blocked this way. Use trusted native signals and built-ins;
+cross-realm compatibility depends on the host. The SDK does not alter either
+timeout or retry.
 Cancellation or a lost response does not establish server-side cancellation,
 queue rollback, or event delivery; a retry may lose or duplicate observations.
 

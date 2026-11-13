@@ -265,7 +265,11 @@ describe('OneBot 12 HTTP getLatestEvents', () => {
                 }),
         });
         const aborter = new AbortController();
-        const waiting = client.getLatestEvents({ timeout: 30 }, { signal: aborter.signal });
+        aborter.signal.addEventListener('abort', (event) => event.stopImmediatePropagation());
+        const waiting = client.getLatestEvents(
+            { timeout: 30 },
+            { signal: aborter.signal, timeoutMs: 0 },
+        );
         await Promise.resolve();
         aborter.abort();
         await expect(waiting).rejects.toMatchObject({ code: 'aborted' });

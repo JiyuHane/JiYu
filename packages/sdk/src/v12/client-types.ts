@@ -54,26 +54,54 @@ export function requestDeadline(
 } {
     checkedLimit(timeoutMs, 'timeoutMs', 0);
     const controller = new AbortController();
-    let timedOut = false;
+    const timeoutReason = Symbol('OneBot 12 request timeout');
     const abort = () => controller.abort();
+    let timedOut = false;
+    let listening = false;
+    let combined = controller.signal;
 
-    if (signal?.aborted) {
-        abort();
-    } else {
-        signal?.addEventListener('abort', abort, { once: true });
+    const removeFallback = () => {
+        if (listening) {
+            listening = false;
+            try {
+                signal?.removeEventListener('abort', abort);
+            } catch {
+                // An untrusted signal can throw; never expose its error text.
+            }
+        }
+    };
+
+    try {
+        if (signal !== undefined) {
+            if (typeof AbortSignal.any === 'function') {
+                // Native dependencies are not blocked by source event propagation.
+                combined = AbortSignal.any([signal, controller.signal]);
+            } else if (signal.aborted) {
+                controller.abort();
+            } else {
+                listening = true;
+                signal.addEventListener('abort', abort, { once: true });
+                if (signal.aborted) {
+                    abort();
+                }
+            }
+        }
+    } catch {
+        removeFallback();
+        throw new OneBot12ClientError('invalid_options', 'Invalid OneBot 12 request signal');
     }
 
     const timer =
-        timeoutMs > 0
+        timeoutMs > 0 && !combined.aborted
             ? setTimeout(() => {
-                  if (!controller.signal.aborted) {
+                  if (!combined.aborted) {
                       timedOut = true;
-                      controller.abort();
+                      controller.abort(timeoutReason);
                   }
               }, timeoutMs)
             : undefined;
     return {
-        signal: controller.signal,
+        signal: combined,
         failure: () =>
             timedOut
                 ? new OneBot12ClientError('timeout', 'OneBot 12 request timed out')
@@ -83,7 +111,7 @@ export function requestDeadline(
                 clearTimeout(timer);
             }
 
-            signal?.removeEventListener('abort', abort);
+            removeFallback();
         },
     };
 }

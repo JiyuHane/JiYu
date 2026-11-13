@@ -148,6 +148,20 @@ describe('OneBot 12 WebSocket application client', () => {
         expect(socket.sent).toHaveLength(3);
     });
 
+    it('releases a fake socket request when source propagation is stopped', async () => {
+        const { instance, socket } = await connected({ maxPendingRequests: 1 });
+        const aborter = new AbortController();
+        aborter.signal.addEventListener('abort', (event) => event.stopImmediatePropagation());
+        const pending = instance.request('first', {}, { timeoutMs: 0, signal: aborter.signal });
+        const canceled = expect(pending).rejects.toMatchObject({ code: 'aborted' });
+        aborter.abort();
+        await canceled;
+        const next = instance.request('second', {}, { timeoutMs: 0 });
+        const frame = JSON.parse(socket.sent[1]);
+        socket.frame(response(frame.echo));
+        expect((await next).status).toBe('ok');
+    });
+
     it('rejects too many pending calls and oversized inbound frames without revealing content', async () => {
         const { instance, socket } = await connected({
             maxPendingRequests: 1,
