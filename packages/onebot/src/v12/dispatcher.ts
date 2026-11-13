@@ -10,6 +10,24 @@ import {
     snapshotRequest,
 } from './validation';
 
+type PreparedRequest = {
+    input: Record<string, unknown>;
+    fallbackEcho: string | undefined;
+};
+
+type Preflight =
+    { kind: 'error'; response: V12Response } | { kind: 'ready'; request: PreparedRequest };
+
+type HttpPreflight =
+    | { readonly kind: 'error'; readonly response: V12Response }
+    | { readonly kind: 'ordinary'; readonly token: object }
+    | {
+          readonly kind: 'poll';
+          readonly limit: number;
+          readonly timeoutSeconds: number;
+          readonly echo?: string;
+      };
+
 const ACTIONS = [
     'get_version',
     'get_status',
@@ -36,6 +54,19 @@ function response(
 
 function extraKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
     return Object.keys(value).some((key) => !allowed.includes(key));
+}
+
+/** Only call on an already bounded snapshot, never on caller-owned objects. */
+function freezeSnapshot(value: unknown): void {
+    if (typeof value !== 'object' || value === null) {
+        return;
+    }
+
+    for (const child of Object.values(value)) {
+        freezeSnapshot(child);
+    }
+
+    Object.freeze(value);
 }
 
 /** V11's generic execution failure can cover both platform and internal errors;
@@ -79,71 +110,178 @@ function v11Failure(result: ApiResponse, echo?: string): V12Response | null {
 export class V12Dispatcher {
     private readonly self: V12CoreOptions['self'];
     private readonly version: V12CoreOptions['version'];
+    readonly #preparedOrdinary = new WeakMap<object, PreparedRequest>();
 
     constructor(private readonly options: V12CoreOptions) {
-        if (!isSelf(options.self) || !options.version.impl || !options.version.version) {
+        let self: unknown;
+
+        try {
+            self = snapshotRequest(options.self);
+        } catch {
             throw new Error('invalid V12 core identity or version');
         }
 
-        this.self = { ...options.self };
+        if (!isSelf(self) || !options.version.impl || !options.version.version) {
+            throw new Error('invalid V12 core identity or version');
+        }
+
+        freezeSnapshot(self);
+        this.self = self;
         this.version = { ...options.version };
     }
 
     async handle(input: unknown): Promise<V12Response> {
-        let echo: string | undefined;
+        const checked = this.preflight(input);
+        return checked.kind === 'error' ? checked.response : this.runPrepared(checked.request);
+    }
+
+    /** Internal future HTTP integration seam. It does not register or run a poll. */
+    createInternalHttpPreflight(): Readonly<{ classify(input: unknown): HttpPreflight }> {
+        return Object.freeze({ classify: (input: unknown) => this.classifyHttpRequest(input) });
+    }
+
+    /** Consume only a token issued by this dispatcher's HTTP preflight, at most once. */
+    async handlePreparedOrdinary(token: object): Promise<V12Response> {
+        const request = this.#preparedOrdinary.get(token);
+
+        if (!request) {
+            return response(10001, 'invalid action request');
+        }
+
+        this.#preparedOrdinary.delete(token);
+        return this.runPrepared(request);
+    }
+
+    private classifyHttpRequest(input: unknown): HttpPreflight {
+        const checked = this.preflight(input);
+
+        if (checked.kind === 'error') {
+            return Object.freeze(checked);
+        }
+
+        const { request } = checked;
+        const { action, params, echo } = request.input;
+
+        if (action !== 'get_latest_events') {
+            const token = Object.freeze(Object.create(null) as object);
+            this.#preparedOrdinary.set(token, request);
+            return Object.freeze({ kind: 'ordinary', token });
+        }
+
+        // preflight has already verified params is an object and echo is a string if present.
+        const pollParams = params as Record<string, unknown>;
+        const requestEcho = typeof echo === 'string' ? echo : undefined;
+
+        if (extraKeys(pollParams, ['limit', 'timeout'])) {
+            return Object.freeze({
+                kind: 'error',
+                response: response(10004, 'unsupported parameter', null, requestEcho),
+            });
+        }
+
+        const limit = Object.hasOwn(pollParams, 'limit') ? pollParams.limit : 0;
+        const timeout = Object.hasOwn(pollParams, 'timeout') ? pollParams.timeout : 0;
+
+        if (
+            typeof limit !== 'number' ||
+            !Number.isSafeInteger(limit) ||
+            limit < 0 ||
+            typeof timeout !== 'number' ||
+            !Number.isSafeInteger(timeout) ||
+            timeout < 0 ||
+            timeout > 10
+        ) {
+            return Object.freeze({
+                kind: 'error',
+                response: response(10003, 'invalid poll parameters', null, requestEcho),
+            });
+        }
+
+        return Object.freeze({
+            kind: 'poll',
+            limit,
+            timeoutSeconds: timeout,
+            ...(requestEcho !== undefined ? { echo: requestEcho } : {}),
+        });
+    }
+
+    private preflight(input: unknown): Preflight {
+        let fallbackEcho: string | undefined;
 
         try {
             if (isProxy(input)) {
-                return response(10001, 'invalid action request');
+                return { kind: 'error', response: response(10001, 'invalid action request') };
             }
 
             if (typeof input === 'object' && input !== null) {
                 const descriptor = Object.getOwnPropertyDescriptor(input, 'echo');
 
                 if (descriptor && 'value' in descriptor && typeof descriptor.value === 'string') {
-                    echo = descriptor.value;
+                    fallbackEcho = descriptor.value;
                 }
             }
 
-            return await this.handleSnapshot(snapshotRequest(input));
+            const snapshot = snapshotRequest(input);
+
+            if (!isObject(snapshot)) {
+                return { kind: 'error', response: response(10001, 'invalid action request') };
+            }
+
+            const echo = typeof snapshot.echo === 'string' ? snapshot.echo : undefined;
+
+            if (
+                typeof snapshot.action !== 'string' ||
+                !snapshot.action ||
+                !isObject(snapshot.params) ||
+                (Object.hasOwn(snapshot, 'echo') && typeof snapshot.echo !== 'string') ||
+                (Object.hasOwn(snapshot, 'self') && !isSelf(snapshot.self))
+            ) {
+                return {
+                    kind: 'error',
+                    response: response(10001, 'invalid action request', null, echo),
+                };
+            }
+
+            if (
+                snapshot.self !== undefined &&
+                isSelf(snapshot.self) &&
+                (snapshot.self.platform !== this.self.platform ||
+                    snapshot.self.user_id !== this.self.user_id)
+            ) {
+                return { kind: 'error', response: response(10102, 'unknown self', null, echo) };
+            }
+
+            if (
+                extraKeys(snapshot, ['action', 'params', 'echo', 'self']) ||
+                (isObject(snapshot.self) && extraKeys(snapshot.self, ['platform', 'user_id']))
+            ) {
+                return {
+                    kind: 'error',
+                    response: response(10004, 'unsupported request field', null, echo),
+                };
+            }
+
+            return { kind: 'ready', request: { input: snapshot, fallbackEcho } };
         } catch {
-            return response(10001, 'invalid action request', null, echo);
+            return {
+                kind: 'error',
+                response: response(10001, 'invalid action request', null, fallbackEcho),
+            };
         }
     }
 
-    private async handleSnapshot(input: unknown): Promise<V12Response> {
-        if (!isObject(input)) {
-            return response(10001, 'invalid action request');
+    private async runPrepared(request: PreparedRequest): Promise<V12Response> {
+        try {
+            return await this.handleSnapshot(request.input);
+        } catch {
+            return response(10001, 'invalid action request', null, request.fallbackEcho);
         }
+    }
 
+    private async handleSnapshot(input: Record<string, unknown>): Promise<V12Response> {
         const echo = typeof input.echo === 'string' ? input.echo : undefined;
-
-        if (
-            typeof input.action !== 'string' ||
-            !input.action ||
-            !isObject(input.params) ||
-            (Object.hasOwn(input, 'echo') && typeof input.echo !== 'string') ||
-            (Object.hasOwn(input, 'self') && !isSelf(input.self))
-        ) {
-            return response(10001, 'invalid action request', null, echo);
-        }
-
-        if (
-            input.self !== undefined &&
-            isSelf(input.self) &&
-            (input.self.platform !== this.self.platform || input.self.user_id !== this.self.user_id)
-        ) {
-            return response(10102, 'unknown self', null, echo);
-        }
-
-        if (
-            extraKeys(input, ['action', 'params', 'echo', 'self']) ||
-            (isObject(input.self) && extraKeys(input.self, ['platform', 'user_id']))
-        ) {
-            return response(10004, 'unsupported request field', null, echo);
-        }
-
-        const { action, params } = input;
+        const action = input.action as string;
+        const params = input.params as Record<string, unknown>;
 
         if (!(ACTIONS as readonly string[]).includes(action)) {
             return response(10002, 'unsupported action', null, echo);
