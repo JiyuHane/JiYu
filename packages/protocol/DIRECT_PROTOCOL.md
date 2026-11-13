@@ -365,9 +365,19 @@ receiver and fields of its current object to `0x67252d0`. If the call returns
 normally, it loads a receiver from a different global slot, `0x9177dd0`, and
 indirectly tail-calls that receiver's virtual slot `+0x10` without a local null
 check. The other inspected method, `0x6713c00`, eventually loads the first global
-receiver and tail-calls `0x6725530`. The observed slot addresses differ; their
-runtime object identities and any connection to the signer pair remain unknown.
-The dispatch receiver's `+0x28` and the constructed objects' `+0x30` slots
+receiver and tail-calls `0x6725530`. Another bounded path at `0x6712410`
+first calls virtual slot `+0` on the object in `0x9177dd0` without a local null
+check; normal return and a valid initial object are prerequisites. It then loads
+a receiver from a separate global slot, `0x9177de0`, and re-reads `0x9177dd0`;
+the initial virtual call could have changed either value. If the re-read object
+is non-null, two separate conditional calls to `0x35b6ec0` can produce two local
+pointer/control pairs. Each successful branch separately reads `0x9177dd8` as
+its control pointer. The path passes both pairs, which may be empty, to virtual
+slot `+0` of the `0x9177de0` receiver without a local null check. These are
+static observations conditional on the necessary pointers being valid, not
+observed runtime dispatch. The globals' object identities, helper semantics and
+any connection to the signer pair remain unknown. The dispatch receiver's
+`+0x28` and the constructed objects' `+0x30` slots
 belong to different objects. The inspected candidate paths both access the
 `0x9177e20` receiver's `+0x30` and call `0x6725fb0`;
 the clear path's subsequent pointer/count changes and releases are consistent
