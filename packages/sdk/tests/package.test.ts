@@ -102,13 +102,26 @@ reverse.on('connection', (bot: SnowLumaReverseWebSocketSession) => {
         path.join(consumerRoot, 'browser-types.mts'),
         `
 import { SnowLumaWebSocketClient, text } from '@harehane/sdk';
-import { OneBot12HttpClient, OneBot12WebSocketClient, type OneBot12Event } from '@harehane/sdk/v12';
+import { OneBot12HttpClient, OneBot12WebSocketClient, type OneBot12Event, type OneBot12LatestEventsParams, type OneBot12LatestEventsResponse, type OneBot12PlatformEvent } from '@harehane/sdk/v12';
 new SnowLumaWebSocketClient().onMessage(async (_event, context) => { await context.reply(text('hello')); });
 const http = new OneBot12HttpClient({ baseUrl: 'http://127.0.0.1:3012/' });
 const ws = new OneBot12WebSocketClient({ url: 'ws://127.0.0.1:3012/' });
 const listen = (event: OneBot12Event) => event.type;
 ws.onEvent(listen);
-void http;
+const pollParams: OneBot12LatestEventsParams = { limit: 3, timeout: 5 };
+const poll: Promise<OneBot12LatestEventsResponse> = http.getLatestEvents(pollParams, { timeoutMs: 10000 });
+void poll.then(result => {
+    if (result.status === 'ok') {
+        const event: OneBot12PlatformEvent | undefined = result.data[0];
+        void event;
+    } else {
+        // @ts-expect-error A failed envelope has arbitrary JSON data, not an event array.
+        const events: OneBot12PlatformEvent[] = result.data;
+        void events;
+    }
+});
+// @ts-expect-error Protocol timeout is a number, not a string.
+void http.getLatestEvents({ timeout: '5' });
 // @ts-expect-error Node globals must not leak through the browser entry.
 process.cwd();
 `,

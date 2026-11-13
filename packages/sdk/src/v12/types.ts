@@ -53,3 +53,16 @@ export interface OneBot12PlatformEvent extends OneBot12EventBase {
 }
 
 export type OneBot12Event = OneBot12MetaEvent | OneBot12PlatformEvent;
+
+/** Both fields use the safe integer subset of the protocol's int64. */
+export interface OneBot12LatestEventsParams extends OneBot12JsonObject {
+    /** Maximum event count; 0 or omission means no protocol count limit. */
+    limit?: number;
+    /** Server wait in seconds; 0 or omission requests a short poll. */
+    timeout?: number;
+}
+
+/** Only the common event fields are validated, not detail-specific payloads. */
+export type OneBot12LatestEventsResponse =
+    | (OneBot12ActionResponse & { status: 'ok'; data: OneBot12PlatformEvent[] })
+    | (OneBot12ActionResponse & { status: 'failed' });

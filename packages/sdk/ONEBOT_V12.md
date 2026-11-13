@@ -28,6 +28,39 @@ an implementation serves multiple accounts. The client never automatically
 retries an action. A timeout or disconnected transport does not prove that an
 action's side effects did not occur.
 
+### Polling events on a supporting implementation
+
+`client.getLatestEvents({ limit, timeout }, options)` sends the OneBot 12
+`get_latest_events` action through HTTP. The connected implementation must
+support it; **Jiyu's current v12 HTTP server does not yet implement event
+polling**. The standard requires this action for HTTP, but implementations may
+omit it from `get_supported_actions`. WebSocket clients retain their generic
+`request` interface; the standard does not require this action over WebSocket.
+
+`limit` and `timeout` are optional nonnegative safe integers. They default to
+server-side zero when omitted: `limit: 0` places no protocol count limit and
+`timeout: 0` uses short polling. `timeout` is the server's wait in **seconds**;
+`options.timeoutMs` is the client's total request deadline in **milliseconds**,
+defaulting to 30,000. Use an appropriate client deadline with network margin,
+or set `timeoutMs: 0` to disable that client deadline. When a cancellation
+notification reaches the SDK, it cancels the local wait. Use a trusted
+`AbortSignal`: earlier listeners calling `stopImmediatePropagation()` can
+prevent the existing transport from observing an abort. The SDK does not alter
+either timeout or retry.
+Cancellation or a lost response does not establish server-side cancellation,
+queue rollback, or event delivery; a retry may lose or duplicate observations.
+
+A successful response retains its envelope and extension fields and exposes an
+array of non-meta events after checking only their common event fields. Unknown
+`detail_type`, `sub_type`, and JSON extension fields are preserved, while
+message-specific fields are not validated or typed. A business failure is
+returned unchanged with its original arbitrary JSON `data`; malformed success
+data raises `OneBot12ClientError` with code `invalid_response`. Existing JSON
+size, structure and safe-number policies still apply, including when `limit` is
+zero. Parameter snapshots avoid invoking ordinary getters, but JavaScript proxy
+reflection traps may execute; do not treat the codec as isolation from hostile
+same-process code.
+
 ## Forward WebSocket
 
 ```ts

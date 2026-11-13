@@ -4,7 +4,10 @@ export type {
     OneBot12Event,
     OneBot12JsonObject,
     OneBot12JsonValue,
+    OneBot12LatestEventsParams,
+    OneBot12LatestEventsResponse,
     OneBot12MessageSegment,
+    OneBot12PlatformEvent,
     OneBot12Self,
 } from './types.js';
 export {
