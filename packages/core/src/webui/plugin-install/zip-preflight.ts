@@ -27,6 +27,26 @@ export type ZipPreflightResult =
       }>
     | Readonly<{ ok: false; code: ZipPreflightError }>;
 
+export type ZipManifestResult =
+    | Readonly<{
+          ok: true;
+          sha256: string;
+          manifest: Readonly<{
+              main: 'absent' | 'empty' | 'string' | 'non_string';
+              type: 'absent' | 'module' | 'commonjs' | 'other_string' | 'non_string';
+          }>;
+      }>
+    | Readonly<{
+          ok: false;
+          code:
+              | ZipPreflightError
+              | 'manifest_missing'
+              | 'manifest_too_large'
+              | 'manifest_invalid'
+              | 'manifest_internal';
+      }>;
+
+const MAX_MANIFEST = 65536;
 const MAX_ARCHIVE = 32 * 1024 * 1024;
 const MAX_FILE = 8 * 1024 * 1024;
 const MAX_ENTRIES = 512;
@@ -35,6 +55,7 @@ const typedBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer
 const typedOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get!;
 const typedLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get!;
 const copyBytes = Uint8Array.prototype.set;
+const fillBytes = Uint8Array.prototype.fill;
 
 function fail(code: ZipPreflightError): never {
     throw code;
@@ -222,7 +243,24 @@ interface RecordMetadata {
  * no wall-clock or process RSS bound is promised.
  */
 export function preflightZip(input: unknown): ZipPreflightResult {
+    return parseZip(input, false);
+}
+
+/** Offline classification of a validated root package.json, without returning its contents. */
+export function inspectZipManifest(input: unknown): ZipManifestResult {
+    return parseZip(input, true);
+}
+
+function parseZip(input: unknown, inspectManifest: false): ZipPreflightResult;
+function parseZip(input: unknown, inspectManifest: true): ZipManifestResult;
+
+function parseZip(
+    input: unknown,
+    inspectManifest: boolean,
+): ZipPreflightResult | ZipManifestResult {
     let bytes: Uint8Array;
+    let manifestBytes: Uint8Array | undefined;
+    let manifestCopyFailed = false;
 
     try {
         if (types.isProxy(input) || !types.isUint8Array(input)) {
@@ -538,6 +576,87 @@ export function preflightZip(input: unknown): ZipPreflightResult {
             }
 
             actualTotal += content.length;
+
+            if (
+                inspectManifest &&
+                record.name === 'package.json' &&
+                !record.directory &&
+                record.size <= MAX_MANIFEST
+            ) {
+                try {
+                    manifestBytes = new Uint8Array(content.length);
+                    copyBytes.call(manifestBytes, content);
+                } catch {
+                    manifestCopyFailed = true;
+                }
+            }
+        }
+
+        if (inspectManifest) {
+            const manifest = records.find(
+                (record) => record.name === 'package.json' && !record.directory,
+            );
+
+            if (!manifest) {
+                return Object.freeze({ ok: false, code: 'manifest_missing' });
+            }
+
+            if (manifest.size > MAX_MANIFEST) {
+                return Object.freeze({ ok: false, code: 'manifest_too_large' });
+            }
+
+            if (manifestCopyFailed || !manifestBytes) {
+                return Object.freeze({ ok: false, code: 'manifest_internal' });
+            }
+
+            let text: string;
+
+            try {
+                text = new TextDecoder('utf-8', { fatal: true }).decode(manifestBytes);
+            } catch (error) {
+                return Object.freeze({
+                    ok: false,
+                    code: error instanceof TypeError ? 'manifest_invalid' : 'manifest_internal',
+                });
+            }
+
+            let value: unknown;
+
+            try {
+                value = JSON.parse(text) as unknown;
+            } catch (error) {
+                return Object.freeze({
+                    ok: false,
+                    code: error instanceof SyntaxError ? 'manifest_invalid' : 'manifest_internal',
+                });
+            }
+
+            if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+                return Object.freeze({ ok: false, code: 'manifest_invalid' });
+            }
+
+            const object = value as Record<string, unknown>;
+            const main = !Object.hasOwn(object, 'main')
+                ? 'absent'
+                : typeof object.main !== 'string'
+                  ? 'non_string'
+                  : object.main.length === 0
+                    ? 'empty'
+                    : 'string';
+            const type = !Object.hasOwn(object, 'type')
+                ? 'absent'
+                : typeof object.type !== 'string'
+                  ? 'non_string'
+                  : object.type === 'module'
+                    ? 'module'
+                    : object.type === 'commonjs'
+                      ? 'commonjs'
+                      : 'other_string';
+            return Object.freeze({
+                ok: true,
+                sha256: createHash('sha256').update(bytes).digest('hex'),
+                manifest: Object.freeze({ main, type }),
+            });
         }
 
         const entries = Object.freeze(
@@ -571,5 +690,9 @@ export function preflightZip(input: unknown): ZipPreflightResult {
             ok: false,
             code: codes.includes(error) ? (error as ZipPreflightError) : 'internal',
         });
+    } finally {
+        if (manifestBytes) {
+            fillBytes.call(manifestBytes, 0);
+        }
     }
 }

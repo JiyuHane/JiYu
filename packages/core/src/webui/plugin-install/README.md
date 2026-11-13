@@ -26,6 +26,23 @@ consistency, and SHA-256 identifies inspected bytes: neither authenticates the
 source or establishes licensing rights. Errors use fixed codes without paths or
 underlying exceptions.
 
+`inspectZipManifest` is a separate offline primitive that uses the same private
+ZIP snapshot and validation pipeline. It retains at most 65,536 bytes from an
+exact root `package.json` temporarily; only after the entire archive passes its
+ZIP checks does it decode and classify `main` and `type`. Results contain fixed
+classifications and the snapshot SHA-256, not manifest text, field values or
+entry paths. A declared string is not an entry-point or compatibility check.
+A directory named `package.json/`, a nested file or a differently cased name is
+not a matching root file. Input ZIP errors take priority over manifest errors
+when the necessary allocations and validation complete normally.
+
+Manifest decoding is strict UTF-8; the standard `TextDecoder` removes a UTF-8
+BOM. JSON must be an object, and duplicate names follow `JSON.parse`'s
+last-value behavior. The temporary byte copy is cleared on exit, but decoder,
+JSON, compression-library and runtime-managed copies are not guaranteed to be
+cleared. The same synchronous execution and resource limits apply; this API is
+not wired to the Worker, WebUI, installer or plugin host.
+
 Method 8 runs a small built-in capability probe after structural validation;
 probe failure returns `unsupported` while stored-only archives remain independent.
 It checks fixed examples for completion, trailing bytes, truncation, output cap
