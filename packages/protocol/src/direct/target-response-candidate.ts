@@ -3,6 +3,7 @@ import { transformTargetResponse } from './target-response-transform';
 import { decodeTargetServiceDecryptCandidate } from './target-service-decrypt-candidate';
 import { decodeTargetServiceResponseBasic } from './target-service-response-basic';
 import { selectTargetResponseBusinessSkip } from './target-sso12-lookup';
+import { decodeTargetSso12NumericReserveCandidate } from './target-sso12-numeric-reserve';
 import { decodeTargetSso12ResponseFinal } from './target-sso12-response-final';
 import { decodeTargetSso12ResponseHead } from './target-sso12-response-head';
 
@@ -101,11 +102,17 @@ type Candidate = {
 };
 
 type CandidateWithFinal = Candidate & { finalWord: number; finalWordRead: boolean };
-export type CandidateWithLookup = Candidate & { lookupMatched: boolean; skip: 0 | 4 };
+export type CandidateWithLookup = Candidate & {
+    lookupMatched: boolean;
+    skip: 0 | 4;
+    numericReserveCandidate?: ReturnType<typeof decodeTargetSso12NumericReserveCandidate>;
+};
+export type TargetReserveMode = 'numeric-candidate';
 
 /**
- * Observe the lookup on the private plaintext. Only an empty reserve is accepted:
- * the target's nonempty CPBMessageOpti parsing is not modeled here. The caller
+ * Observe lookup on the private plaintext. By default only empty reserve is accepted;
+ * opt-in numeric-candidate uses the strict local field 9/25 candidate, not the full
+ * target reserve parser. The caller
  * must independently verify and isolate the same frame, key and collection until
  * their respective snapshots; collection is copied only after decryption and head
  * parsing. Lookup proves neither collection origin nor packet authentication or
@@ -118,8 +125,12 @@ export function composeTargetResponseCandidateWithLookup(
     compression: 'reject' | 'node-zlib-strict',
     maxOutputBytes: number,
     key: Uint8Array | undefined,
+    reserveMode?: TargetReserveMode,
 ): CandidateWithLookup {
-    return composeCandidate(frame, 0, compression, maxOutputBytes, key, undefined, { collection });
+    return composeCandidate(frame, 0, compression, maxOutputBytes, key, undefined, {
+        collection,
+        reserveMode,
+    });
 }
 
 /**
@@ -163,7 +174,7 @@ function composeCandidate(
     maxOutputBytes: number,
     key: Uint8Array | undefined,
     final: undefined,
-    lookup: { collection: readonly Uint8Array[] },
+    lookup: { collection: readonly Uint8Array[]; reserveMode?: TargetReserveMode },
 ): CandidateWithLookup;
 
 function composeCandidate(
@@ -173,7 +184,7 @@ function composeCandidate(
     maxOutputBytes: number,
     key: Uint8Array | undefined,
     final: { prior: number } | undefined,
-    lookup?: { collection: readonly Uint8Array[] },
+    lookup?: { collection: readonly Uint8Array[]; reserveMode?: TargetReserveMode },
 ): Candidate | CandidateWithFinal | CandidateWithLookup {
     let snapshot: Uint8Array | undefined;
     let keyCopy: Uint8Array | undefined;
@@ -183,12 +194,15 @@ function composeCandidate(
     let finalResult: ReturnType<typeof decodeTargetSso12ResponseFinal> | undefined;
     let lookupHead: ReturnType<typeof decodeTargetSso12ResponseHead> | undefined;
     let selection: ReturnType<typeof selectTargetResponseBusinessSkip> | undefined;
+    let numericReserveCandidate:
+        ReturnType<typeof decodeTargetSso12NumericReserveCandidate> | undefined;
     let trailing: Uint8Array | undefined;
     let success = false;
 
     try {
         if (
             (skip !== 0 && skip !== 4) ||
+            (lookup?.reserveMode !== undefined && lookup.reserveMode !== 'numeric-candidate') ||
             (compression !== 'reject' && compression !== 'node-zlib-strict') ||
             typeof maxOutputBytes !== 'number' ||
             !Number.isSafeInteger(maxOutputBytes) ||
@@ -252,7 +266,11 @@ function composeCandidate(
         if (lookup) {
             lookupHead = decodeTargetSso12ResponseHead(candidate);
 
-            if (lookupHead.reserve.length !== 0) {
+            if (lookup.reserveMode === 'numeric-candidate') {
+                numericReserveCandidate = decodeTargetSso12NumericReserveCandidate(
+                    lookupHead.reserve,
+                );
+            } else if (lookupHead.reserve.length !== 0) {
                 throw new Error('nonempty reserve');
             }
 
@@ -291,7 +309,12 @@ function composeCandidate(
                   finalWordRead: finalResult.finalWordRead,
               }
             : selection
-              ? { ...result, lookupMatched: selection.matched, skip: selection.skip }
+              ? {
+                    ...result,
+                    lookupMatched: selection.matched,
+                    skip: selection.skip,
+                    ...(numericReserveCandidate === undefined ? {} : { numericReserveCandidate }),
+                }
               : result;
         success = true;
         return complete;

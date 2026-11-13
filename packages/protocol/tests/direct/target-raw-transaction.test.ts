@@ -11,6 +11,8 @@ import {
     type Sso12RawResult,
 } from '../../src/direct/sso12-packet-client';
 import type { CandidateWithLookup } from '../../src/direct/target-response-candidate';
+import * as numericReserve from '../../src/direct/target-sso12-numeric-reserve';
+import * as decryptCandidate from '../../src/direct/target-service-decrypt-candidate';
 import { encodeTargetSso12Reserve } from '../../src/direct/target-sso12-reserve';
 import {
     transactTargetRawOnce,
@@ -60,15 +62,23 @@ function options(): TargetRawTransactionOptions {
     };
 }
 
-function response(hit: boolean, selector = 1, reserve = false): Buffer {
+function response(hit: boolean, selector = 1, reserve: false | true | Uint8Array = false): Buffer {
     const head = Buffer.from(
         '0000002880000001fedcba9800000006ff0000000007ff008000000005420000000000000004dead',
         'hex',
     );
 
     if (reserve) {
-        // Replace empty reserve with one byte and adjust inclusive head length.
-        const changed = Buffer.concat([head.subarray(0, 36), Buffer.from('0000000501dead', 'hex')]);
+        // Synthetic reserve replaces the empty vector in this fixture.
+        const bytes = reserve === true ? Uint8Array.of(1) : reserve;
+        const length = Buffer.alloc(4);
+        length.writeUInt32BE(4 + bytes.length);
+        const changed = Buffer.concat([
+            head.subarray(0, 34),
+            length,
+            bytes,
+            Buffer.from('dead', 'hex'),
+        ]);
         changed.writeUInt32BE(changed.length, 0);
         return frame(changed, hit, selector);
     }
@@ -221,6 +231,133 @@ describe('experimental target raw transaction on synthetic loopback', () => {
         expect(result.value.body).toEqual(Uint8Array.of(0x11, 0x22, 0x33, 0x44));
     });
 
+    it.each([true, false])(
+        'decodes opted-in numeric reserve after verifier on loopback hit=%s',
+        async (hit) => {
+            // Two fields together are a local synthetic case, not a target observation.
+            const reserve = Uint8Array.from(Buffer.from('4800c8018001', 'hex'));
+            const fixture = await setup(response(hit, 1, reserve));
+            const input = options();
+            input.response.reserveMode = 'numeric-candidate';
+
+            if (!hit) {
+                input.response.collection = [];
+            }
+
+            const order: string[] = [];
+            const realDecode = numericReserve.decodeTargetSso12NumericReserveCandidate;
+            const realDecrypt = decryptCandidate.decodeTargetServiceDecryptCandidate;
+            const numericSpy = vi
+                .spyOn(numericReserve, 'decodeTargetSso12NumericReserveCandidate')
+                .mockImplementation((bytes) => {
+                    order.push('numeric');
+                    return realDecode(bytes);
+                });
+            const decrypt = vi
+                .spyOn(decryptCandidate, 'decodeTargetServiceDecryptCandidate')
+                .mockImplementation((...args) => {
+                    order.push('decrypt');
+                    return realDecrypt(...args);
+                });
+
+            input.verifyRaw = () => {
+                order.push('verify');
+                return true;
+            };
+
+            try {
+                const result = await transactTargetRawOnce(fixture.client, input);
+                expect(result.kind).toBe('response');
+
+                if (result.kind !== 'response') {
+                    throw new Error('expected response');
+                }
+
+                expect(result.writeState).toBe('written');
+                expect(result.sequence).toBe(1);
+                expect(result.value.head.sequenceBits).toBe(0x80000001);
+                expect(result.value.lookupMatched).toBe(hit);
+                expect(result.value.skip).toBe(hit ? 4 : 0);
+                expect(result.value.numericReserveCandidate).toEqual({
+                    kind: 'numeric-reserve-candidate',
+                    field9: 0,
+                    field25: 128,
+                });
+                expect(result.value.body).toEqual(Uint8Array.of(0x11, 0x22, 0x33, 0x44));
+                expect(order).toEqual(['verify', 'decrypt', 'numeric']);
+            } finally {
+                numericSpy.mockRestore();
+                decrypt.mockRestore();
+            }
+        },
+    );
+
+    it.each(['reject', 'malformed', 'default'] as const)(
+        'keeps numeric decode and writeState boundaries for %s',
+        async (caseName) => {
+            const reserve = Uint8Array.from(
+                Buffer.from(caseName === 'malformed' ? '4880' : '4800', 'hex'),
+            );
+            const fixture = await setup(response(true, 1, reserve));
+            const input = options();
+
+            if (caseName !== 'default') {
+                input.response.reserveMode = 'numeric-candidate';
+            }
+
+            const numericSpy = vi.spyOn(numericReserve, 'decodeTargetSso12NumericReserveCandidate');
+            const decryptSpy = vi.spyOn(decryptCandidate, 'decodeTargetServiceDecryptCandidate');
+            input.verifyRaw = () => caseName !== 'reject';
+
+            try {
+                expect(await transactTargetRawOnce(fixture.client, input)).toEqual({
+                    kind: 'failure',
+                    code: caseName === 'reject' ? 'raw-rejected' : 'raw-callback-failed',
+                    writeState: 'unknown',
+                });
+                expect(numericSpy).toHaveBeenCalledTimes(caseName === 'malformed' ? 1 : 0);
+                expect(decryptSpy).toHaveBeenCalledTimes(caseName === 'reject' ? 0 : 1);
+            } finally {
+                numericSpy.mockRestore();
+                decryptSpy.mockRestore();
+            }
+        },
+    );
+
+    it('does not publish when business transformation fails after numeric decoding', async () => {
+        const reserve = Uint8Array.of(0x48, 0x80, 1);
+        const fixture = await setup(response(true, 1, reserve));
+        const input = options();
+        input.response.reserveMode = 'numeric-candidate';
+        input.response.maxOutputBytes = 3; // The synthetic business body contains four bytes.
+        const realDecode = numericReserve.decodeTargetSso12NumericReserveCandidate;
+        let reserveCopy: Uint8Array | undefined;
+        const decode = vi
+            .spyOn(numericReserve, 'decodeTargetSso12NumericReserveCandidate')
+            .mockImplementation((bytes) => {
+                reserveCopy = bytes;
+                const result = realDecode(bytes);
+                expect(result.field9).toBe(128);
+                return result;
+            });
+        const verifier = vi.fn(() => true);
+        input.verifyRaw = verifier;
+
+        try {
+            expect(await transactTargetRawOnce(fixture.client, input)).toEqual({
+                kind: 'failure',
+                code: 'raw-callback-failed',
+                writeState: 'unknown',
+            });
+            expect(verifier).toHaveBeenCalledOnce();
+            expect(decode).toHaveBeenCalledOnce();
+            expect(reserveCopy).toBeDefined();
+            expect(reserveCopy!.every((byte) => byte === 0)).toBe(true);
+        } finally {
+            decode.mockRestore();
+        }
+    });
+
     it.each([false, 'truthy', 'throw'] as const)('rejects verifier %s', async (verdict) => {
         const fixture = await setup(response(true));
         const input = options();
@@ -256,8 +393,9 @@ describe('experimental target raw transaction on synthetic loopback', () => {
     });
 
     it('times out while verifier continues and clears the exposed copies', async () => {
-        const fixture = await setup(response(true));
+        const fixture = await setup(response(true, 1, Uint8Array.of(0x48, 0)));
         const input = options();
+        input.response.reserveMode = 'numeric-candidate';
         input.timeoutMs = 50;
         let release!: () => void;
         let exposed: Uint8Array | undefined;
@@ -278,7 +416,7 @@ describe('experimental target raw transaction on synthetic loopback', () => {
     });
 
     it('aborts while the verifier is pending and clears its copies', async () => {
-        const fixture = await setup(response(true));
+        const fixture = await setup(response(true, 1, Uint8Array.of(0x48, 0)));
         const controller = new AbortController();
         let enter!: () => void;
         let release!: () => void;
@@ -291,6 +429,7 @@ describe('experimental target raw transaction on synthetic loopback', () => {
         });
         const input = options();
         input.signal = controller.signal;
+        input.response.reserveMode = 'numeric-candidate';
 
         input.verifyRaw = async ({ responseFrame }) => {
             visible = responseFrame;
@@ -491,6 +630,16 @@ describe('experimental target raw transaction on synthetic loopback', () => {
     it('rejects proxy, getter, hole and shared inputs before network callbacks', async () => {
         const fixture = await setup(response(true));
         const invalid = [
+            (x: TargetRawTransactionOptions) => {
+                x.response.reserveMode = 'invalid' as 'numeric-candidate';
+            },
+            (x: TargetRawTransactionOptions) => {
+                Object.defineProperty(x.response, 'reserveMode', {
+                    get: () => {
+                        throw Error('secret');
+                    },
+                });
+            },
             (x: TargetRawTransactionOptions) => {
                 x.response.collection = new Array(1);
             },

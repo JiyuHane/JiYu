@@ -2,6 +2,8 @@ import { runInNewContext } from 'node:vm';
 import { deflateSync } from 'node:zlib';
 import { describe, expect, it, vi } from 'vitest';
 import { qqTeaEncrypt } from '../../src/direct/qq-tea';
+import * as numericReserve from '../../src/direct/target-sso12-numeric-reserve';
+import * as decryptCandidate from '../../src/direct/target-service-decrypt-candidate';
 import {
     composeTargetResponseCandidate,
     composeTargetResponseCandidateWithFinal,
@@ -129,6 +131,16 @@ describe('lookup on the private candidate', () => {
             expect(result.body).toEqual(new Uint8Array());
             expect(result.head.field2).toEqual(name);
             expect(result.head.reserve).toEqual(new Uint8Array());
+            const explicitUndefined = composeTargetResponseCandidateWithLookup(
+                input,
+                collection,
+                'reject',
+                cap,
+                secret,
+                undefined,
+            );
+            expect(explicitUndefined).toEqual(result);
+            expect(Object.keys(explicitUndefined)).toEqual(Object.keys(result));
             expect(Object.keys(result)).toEqual([
                 'kind',
                 'basic',
@@ -150,6 +162,179 @@ describe('lookup on the private candidate', () => {
             expect(result.head.field2).toEqual(field);
         },
     );
+
+    it.each([
+        ['', null, null],
+        ['4800', 0, null],
+        ['487f', 127, null],
+        ['488001', 128, null],
+        ['48ffffffff0f', 0xffffffff, null],
+        ['c80100', null, 0],
+        ['c8017f', null, 127],
+        ['c8018001', null, 128],
+        ['c801ffffffff0f', null, 0xffffffff],
+        // Both fields and their order are synthetic, beyond the single-field observation.
+        ['4800c8018001', 0, 128],
+        ['c80180014800', 0, 128],
+    ] as const)('opts into numeric reserve %s on hit and miss', (hex, field9, field25) => {
+        const reserve = Uint8Array.from(Buffer.from(hex, 'hex'));
+
+        for (const hit of [false, true]) {
+            const input = frame(
+                lookupPlain(name, hit ? skippedWrapper : emptyWrapper, 0, reserve),
+                1,
+            );
+            const collection = hit ? [name] : [];
+            const result = composeTargetResponseCandidateWithLookup(
+                input,
+                collection,
+                'reject',
+                cap,
+                key,
+                'numeric-candidate',
+            );
+            expect(result.numericReserveCandidate).toEqual({
+                kind: 'numeric-reserve-candidate',
+                field9,
+                field25,
+            });
+            expect(result.lookupMatched).toBe(hit);
+            expect(result.skip).toBe(hit ? 4 : 0);
+            expect(result.head.reserve).toEqual(reserve);
+
+            if (reserve.length) {
+                expect(() =>
+                    composeTargetResponseCandidateWithLookup(input, collection, 'reject', cap, key),
+                ).toThrow(failure);
+            } else {
+                expect(
+                    composeTargetResponseCandidateWithLookup(
+                        input,
+                        collection,
+                        'reject',
+                        cap,
+                        key,
+                        undefined,
+                    ),
+                ).not.toHaveProperty('numericReserveCandidate');
+            }
+        }
+    });
+
+    it.each([0, 2])('decodes numeric reserve with selector %i and strict zlib', (selector) => {
+        const body = Uint8Array.of(1, 0xff, 2, 0);
+        const compressed = Uint8Array.from(deflateSync(body));
+        const after = new Uint8Array(8 + compressed.length);
+        after.set([9, 8, 7, 6]);
+        new DataView(after.buffer).setUint32(4, 4 + compressed.length);
+        after.set(compressed, 8);
+        const reserve = Uint8Array.of(0x48, 0x80, 1);
+        const input = frame(lookupPlain(name, after, 1, reserve), selector);
+        const secret = selector === 0 ? undefined : key;
+        const result = composeTargetResponseCandidateWithLookup(
+            input,
+            [name],
+            'node-zlib-strict',
+            body.length,
+            secret,
+            'numeric-candidate',
+        );
+        expect(result.numericReserveCandidate).toEqual({
+            kind: 'numeric-reserve-candidate',
+            field9: 128,
+            field25: null,
+        });
+        expect(result.skip).toBe(4);
+        expect(result.compression).toBe('node-zlib-strict');
+        expect(result.body).toEqual(body);
+    });
+
+    it('clears owned plaintext and reserve after numeric success followed by transform failure', () => {
+        const reserve = Uint8Array.of(0x48, 0x80, 1);
+        const input = frame(lookupPlain(name, skippedWrapper, 1, reserve), 2);
+        const before = input.slice();
+        const keyBefore = key.slice();
+        const realDecode = numericReserve.decodeTargetSso12NumericReserveCandidate;
+        const realDecrypt = decryptCandidate.decodeTargetServiceDecryptCandidate;
+        let reserveCopy: Uint8Array | undefined;
+        let plaintext: Uint8Array | undefined;
+        const decode = vi
+            .spyOn(numericReserve, 'decodeTargetSso12NumericReserveCandidate')
+            .mockImplementation((bytes) => {
+                reserveCopy = bytes;
+                const result = realDecode(bytes);
+                expect(result.field9).toBe(128);
+                return result;
+            });
+        const decrypt = vi
+            .spyOn(decryptCandidate, 'decodeTargetServiceDecryptCandidate')
+            .mockImplementation((...args) => {
+                const result = realDecrypt(...args);
+                plaintext = result.data;
+                return result;
+            });
+
+        try {
+            expect(() =>
+                composeTargetResponseCandidateWithLookup(
+                    input,
+                    [name],
+                    'reject',
+                    cap,
+                    key,
+                    'numeric-candidate',
+                ),
+            ).toThrow(failure);
+            expect(decode).toHaveBeenCalledOnce();
+            expect(plaintext).toBeDefined();
+            expect(reserveCopy).toBeDefined();
+            expect(plaintext!.every((byte) => byte === 0)).toBe(true);
+            expect(reserveCopy!.every((byte) => byte === 0)).toBe(true);
+            expect(input).toEqual(before);
+            expect(key).toEqual(keyBefore);
+        } finally {
+            decode.mockRestore();
+            decrypt.mockRestore();
+        }
+    });
+
+    it.each([
+        '0801',
+        '48014802',
+        'c80100c80101',
+        '48',
+        'c8',
+        'c80180',
+        '488000',
+        '4a00',
+        '48ffffffff10',
+        '480100',
+    ])('rejects malformed numeric reserve %s after opt-in', (hex) => {
+        const reserve = Uint8Array.from(Buffer.from(hex, 'hex'));
+        expect(() =>
+            composeTargetResponseCandidateWithLookup(
+                frame(lookupPlain(name, skippedWrapper, 0, reserve)),
+                [name],
+                'reject',
+                cap,
+                undefined,
+                'numeric-candidate',
+            ),
+        ).toThrow(failure);
+    });
+
+    it('rejects an invalid reserve mode', () => {
+        expect(() =>
+            composeTargetResponseCandidateWithLookup(
+                frame(lookupPlain(name, emptyWrapper)),
+                [],
+                'reject',
+                cap,
+                undefined,
+                'other' as 'numeric-candidate',
+            ),
+        ).toThrow(failure);
+    });
 
     it('uses the exact 4, 5–7 and 8 remaining-byte boundaries', () => {
         const four = composeTargetResponseCandidateWithLookup(

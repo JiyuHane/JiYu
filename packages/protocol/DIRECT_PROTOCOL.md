@@ -167,7 +167,14 @@ backtrace identifies a direct call at `0x6664434` through thunk `0x66672f0` to
 body pointer and length correspond to `rsp+0xe0` and `rsp+0xe8` at that point.
 In the inspected caller, `0x6664347–0x6664367` obtains a vector-like pair via
 `T = [rbp]` and `V = [T+0x20]`, copies `[V]` into the request body pointer,
-and stores the low 32 bits of `[V+8] - [V]` as its length. A conditional
+and stores the low 32 bits of `[V+8] - [V]` as its length. Independently,
+`0x6663d13` obtains `P` via the `+0x10` vtable slot of `U = [Q+0x10]`;
+`0x6663d2c` then calls its `+0x18` slot with `(U, P)` before the subsequent
+`T = [P]`, `V = [T+0x20]` span access. The concrete implementation of `U` and
+whether that second call modifies `P` remain unknown. A selector at `T+0x28`
+passes through `0x6664830`, yielding `0x0c`, `0x0d`, `0x14` or `0x15` for
+`P+0xc8`; its business meaning and any connection to wt commands are unproved.
+A conditional
 branch also passes the same `T` to classifier `0x6667140`, and another call
 copies it into request `+0x28`. The source object was returned by a prior virtual
 call; its construction, the actual command on this path and the body semantics
@@ -399,8 +406,10 @@ remain to be recovered and independently verified.
   observed update, not a known native default. Rejecting duplicates, unknown
   fields, noncanonical or larger values, and other wire types is a local policy,
   not a claim that the
-  target rejects them. This candidate has not been integrated into the lookup
-  pipeline and does not establish native acceptance or QQ interoperability.
+  target rejects them. Simultaneous fields 9 and 25 in either order are local
+  synthetic cases: target-static evidence covers one new field at a time. Explicit
+  opt-in to the lookup pipeline uses this candidate; it does not establish native
+  acceptance or QQ interoperability.
 - `src/direct/target-sso12-lookup.ts` provides the observed bytewise `field2`
   collection match and the conditional zero-or-four-byte skip decision. The
   caller supplies the collection and the number of bytes after the declared
@@ -436,9 +445,14 @@ remain to be recovered and independently verified.
   observable only in shorter spans handled by the standalone final reader.
   The additive `composeTargetResponseCandidateWithLookup` variant performs the
   caller-supplied collection lookup on the same private decrypted candidate and
-  applies its selected skip before transforming the body. It rejects nonempty
-  reserve vectors because their target parser is not yet implemented; empty
-  reserve is the statically observed successful subset. The collection is
+  applies its selected skip before transforming the body. By default it rejects
+  nonempty reserve vectors and preserves the previous result shape. Passing the
+  final argument `'numeric-candidate'` opts into strict numeric decoding of the
+  reserve from that same private plaintext, returning `numericReserveCandidate`
+  with `kind: 'numeric-reserve-candidate'` and `field9`/`field25` values or null
+  when absent. In the TypeScript API, `numericReserveCandidate` is optional even
+  when a literal opt-in is supplied, so consumers must check it before use. This
+  is not a complete target reserve parser. The collection is
   validated and copied after decryption and head parsing, not at API entry; the
   caller remains responsible for input stability and peer trust. A synthetic
   loopback test composes the original explicit-skip candidate inside
@@ -462,8 +476,14 @@ remain to be recovered and independently verified.
   the target-static head, business and outer frame, uses the raw client's locally
   allocated sequence, and invokes the caller's raw verifier before
   decoding the response. The response selector, key and lookup collection are
-  explicit caller inputs; the lookup path currently accepts only empty reserve.
-  The verifier receives copies and must supply the trust policy. A result is
+  explicit caller inputs; `response.reserveMode: 'numeric-candidate'` explicitly
+  selects the numeric candidate and otherwise only empty reserve is accepted.
+  The verifier receives copies and must supply the trust policy. The built-in raw
+  client passes the same private candidate through verification and consumption;
+  a caller-supplied structural transport must enforce one ordered build, verify,
+  consume; the same frame bytes and identity at verification and consumption; and
+  accurate deadline and write state reporting. The adapter alone does not compare
+  callback frames or identities or establish whether a socket write occurred. A result is
   transferred only after the raw transaction succeeds; failures after writing
   retain an unknown write outcome and are not retried. Synchronous preparation
   counts against the required timeout but cannot be preempted. The head's input

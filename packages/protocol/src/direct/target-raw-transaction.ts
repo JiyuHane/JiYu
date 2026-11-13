@@ -9,6 +9,7 @@ import {
 import {
     composeTargetResponseCandidateWithLookup,
     type CandidateWithLookup,
+    type TargetReserveMode,
 } from './target-response-candidate';
 import type { Sso12RawTransport, Sso12RawResult } from './sso12-packet-client';
 
@@ -29,6 +30,7 @@ export interface TargetRawTransactionOptions {
         collection: readonly Uint8Array[];
         compression: 'reject' | 'node-zlib-strict';
         maxOutputBytes: number;
+        reserveMode?: TargetReserveMode;
     };
     verifyRaw: (info: {
         transportUin: string;
@@ -157,8 +159,8 @@ function clearCandidate(value: CandidateWithLookup | undefined): void {
 /**
  * Experimental single raw transaction on an already-connected client. Caller
  * prepares reserve, trust, endpoint and keys independently; no target peer identity,
- * login or request/response sequence or command binding is established. The raw
- * transport enforces a local inclusive frame length and does not retry. Successful
+ * login or request/response sequence or command binding is established. The built-in
+ * raw client enforces a local inclusive frame length and does not retry. Successful
  * results remain owned by the caller after client.close(). The verifier receives
  * separate copies; an async verifier may continue after timeout and observe those
  * copies zeroed, or retain its own copies and external effects. Wiping is best effort.
@@ -167,6 +169,9 @@ function clearCandidate(value: CandidateWithLookup | undefined): void {
  * after sequence allocation. Their consistency is caller-owned. The local frame
  * length rule is not a verified target rule. Input byte budget is not a peak-memory
  * bound; lookup additionally counts the decoded field2 against its own 16 MiB cap.
+ * A caller-supplied structural transport must enforce one ordered build, verify and
+ * consume, identical frame bytes and identity for verify/consume, and accurate
+ * write state and deadlines. This adapter does not independently bind those callbacks.
  */
 export async function transactTargetRawOnce(
     client: Sso12RawTransport,
@@ -278,6 +283,7 @@ export async function transactTargetRawOnce(
 
         const compression = response.compression;
         const maximum = response.maxOutputBytes;
+        const reserveMode = response.reserveMode;
         const timeout = root.timeoutMs;
         const signal = root.signal;
         const verify = root.verifyRaw;
@@ -292,6 +298,7 @@ export async function transactTargetRawOnce(
                 service.uin,
             ) ||
             (compression !== 'reject' && compression !== 'node-zlib-strict') ||
+            (reserveMode !== undefined && reserveMode !== 'numeric-candidate') ||
             !uint(maximum, MAX_BYTES) ||
             !uint(timeout, 0x7fffffff) ||
             timeout === 0 ||
@@ -395,6 +402,7 @@ export async function transactTargetRawOnce(
                     compression,
                     maximum,
                     key,
+                    reserveMode,
                 );
 
                 if (finished) {
