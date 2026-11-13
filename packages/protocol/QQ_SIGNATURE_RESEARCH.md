@@ -51,9 +51,15 @@ setter, target and actual execution are unknown. The eight-byte slot lies in
 the ELF's allocated `.bss` `SHT_NOBITS` range; this identifies no file-backed
 initial value. In the inspected RELA entries, none has an `r_offset` equal to
 the slot's starting address, but other relocation ranges and runtime writes
-were not excluded. It is therefore only a candidate for a JNI class lookup,
-not proof of one. Inside `0x33e1d4`, one
-conditional state path initializes a local output slot and passes its
+were not excluded. After that indirect call, the inspected path passes the
+same saved object to `0x33e878`. In its bounded state machine, assuming valid
+receiver/vtable pointers and normally returning AAPCS64-conforming callees, it
+calls slot `+0x720`; if the return's low byte is nonzero it calls `+0x88` and
+returns 1, otherwise it returns 0. If the receiver is actually a standard
+`JNIEnv`, these slots correspond to `ExceptionCheck` and `ExceptionClear`.
+Their identity and runtime execution remain unverified, as does the proposed JNI
+class lookup. Inside `0x33e1d4`, one conditional state path initializes a local
+output slot and passes its
 address, a pointer previously read from global `0x9a6a28`, and `0x00010006`
 to an indirect call through that pointer's function table at `+0x30`; the code
 then records whether the return is `-2`. This path also requires the dispatch
