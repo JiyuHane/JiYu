@@ -61,6 +61,103 @@ established; the value `2` alone must not be equated with a zero TEA key. The
 precise protocol fields and runtime reachability remain unknown; this is not
 proof of signing behavior. No key material is recorded here.
 
+Separately, bounded target disassembly associates `0x3453550` with the
+`QRCodeCMD31` body encoder; an inspected caller sets `0x31` before invoking it.
+Under normal-return and valid-memory assumptions, it writes, in order, a BE16
+length followed by bytes from object `+0x38`, BE32 from `+0x50`, BE64 from
+`+0x30`, one byte from `+0x54`, a BE16 length followed by bytes from `+0x58`,
+and BE16 from `+0x80`. Both byte lengths exclude their own prefixes. The target
+helpers write the low 16 bits of a length and then write the length represented
+by their 32-bit input; rejecting spans over 65535 bytes is a stricter local
+policy. The routine then
+traverses nodes rooted at `+0x70`: it uses each node's `+0x20` value in a log,
+and, when the object at `+0x28` is nonnull, calls its virtual `+0x18` method
+with the same writer. The parent itself does not add a tag or length around
+that virtual call; null objects produce no such call. The meaning of `+0x80`,
+child encodings, runtime path and relationship to `wtlogin64.trans_emp` are not
+established by the body encoder alone. Separate bounded tracing of the
+`0x346de60` construction path found that `+0x80` starts at zero and increments
+after each successfully linked new tree node; duplicate keys skip that
+increment. With valid, unmodified tree state and normally returning operations,
+the tree is traversed in ascending unsigned 16-bit key order: the seven observed
+fixed keys are `0x16`, `0x1b`, `0x1d`, `0x33`, `0x35`, `0x66`, `0xd1`, with
+`0x11` added on a separate nonzero condition. The resulting count is conditional
+on those insertions; it is not necessarily the number of child outputs, because
+null children are skipped and child writes may fail. On the selected construction
+path the `0x1d` child has a zero first byte, BE32 `0x7ffc`, another zero word
+and zero array count; this differs from the reference's first-byte value. The
+`0xd1` child invokes the target protobuf writer for nested field 1 with two
+explicit byte-span fields and nested field 4 with field 6 set to one. One static
+inspection also found that the writer retains empty spans; the explicit-empty
+wire vector remains a local candidate, not a runtime packet observation.
+
+On this zero-initialized construction path, `0x3476c30` wraps the QR31 body
+with a 43-byte header starting with `0x02`, a BE16 total-frame length, command
+`0x31`, and a final `0x03` trailer. A 64-bit header field is written as zero on
+this path: copying the body object's `+0x30` value to the corresponding header
+field occurs only after that field has been serialized. Independently inspected
+code under `GetQRCodePicture` then wraps the result as `0x00`, BE16 of inner
+length plus four, BE32 of an explicit context value, BE32 `0x72`, two zero
+bytes, one zero byte, BE32 of another runtime value, and the inner bytes. The
+outer length is not the total outer-buffer length. A separately inspected QR
+picture callback passes that buffer onward with command `wtlogin.trans_emp` and
+code `0x812`; two callback storage variants reach the same handler. That
+handler forwards the command and encoded packet to an unresolved receiver's
+virtual method. Its relationship to `wtlogin64.trans_emp` remains unknown.
+These observations assume normal construction, unmodified inputs and successful
+writes; they do not establish runtime dispatch, signatures or server acceptance.
+Native length fields keep low 16 bits; local encoders may reject overflow
+instead. The target OICQ success path has a separate 25-byte header: an
+explicit version, command, sequence and account word followed by three flag
+bytes, a 32-bit zero-extended client-type field, public-number word and zero
+instance word. It is followed by the entire output of `0x34f9170`, not simply a
+raw ciphertext. This differs from the reference header by two bytes. The
+inspected `0x34f9170` path selects between two key inputs or an empty-payload
+branch according to context bytes, then writes a mode byte, context byte,
+16-byte local value, conditional BE16 fields, a BE16-length optional span and
+payload. The selected QR context and keys remain unknown. In the normal bounded
+path of its `0x8865bb0` helper, two independent static inspections found the
+padding, seven zero trailer bytes, big-endian 16-round TEA and two feedback
+chains structurally consistent with local `qqTeaEncrypt`. The target calls its
+random generator once per byte, whereas the local implementation requests the
+random bytes in one call; their generators, failures and runtime outputs have
+not been shown equivalent. Static reconstruction alone does not establish the
+QR request's selected encryption branch, session keys or compatibility.
+
+A separate bounded inspection of the target's QR31 response decoder at
+`0x3453dc0` finds a BE16-length string, a BE32 word, and a status byte. Status
+bytes `0` and `2` follow the same branch: a BE16-length raw byte span, a BE16
+count, and that many entries with BE16 tag, BE16 value length and value bytes.
+Other status values read another BE16-length string. The string helper consumes
+its declared bytes but assigns only up to the first NUL; the raw span helper
+preserves NUL bytes. In the inspected helpers a zero length returns success
+without assigning the destination, whose prior state remains unknown. Parsing
+entry boundaries does not establish that the target decoder accepts the result:
+it also invokes a tag factory and a child decoder, either of which can fail.
+Status meanings, field semantics, trailing data and actual server behavior
+remain unknown; strict local bounds and exact-slice policies are not target
+acceptance rules.
+
+The target QR12 query construction path at `0x3455b60` supplies a zero-initialized
+object to `0x345c670`. Its body writer emits a BE16-length string, BE32, a
+BE16-length span, BE64, one byte, a second BE16-length span, and a BE16 count
+followed by that many BE16 values. In the inspected caller's normal unmodified
+path, the first string, second span and value array are empty; the BE32, BE64
+and first span are supplied from the caller context. The zero-initialized frame
+uses the same 43-byte structure as QR31 with command `0x12`; the BE64 extension
+is serialized before the later field copy, and so remains zero in this path.
+These are conditional static observations, not a server acceptance claim.
+
+The QR12 response candidate at `0x34536a0` begins with the same string, BE32
+word and status-byte shape, followed on complete input by BE64, BE32, BE16
+count and BE16-tag / BE16-length / value entries. The inspected status-zero
+branch checks the BE64, BE32 and count reads; the nonzero branch does not check
+those three return values and can continue after a short read. Both branches
+still invoke the tag factory and child decoders. A local parser that requires
+all fields is therefore deliberately stricter on truncation, not a model of
+all native acceptance paths. These status bytes and values have no established
+business meaning or peer authenticity.
+
 The protocol-12 factory branch installs a virtual table whose `+0x20` entry
 resolves to `EncodeReqHead` at `0x6669490`. Its bounded disassembly writes a
 length, the request sequence, two caller-context 32-bit fields, then a 12-byte
@@ -501,8 +598,15 @@ point representation, actual peer identity or runtime reachability.
 
 Two bounded static entry paths supply that string-like input. When the selector
 is `1`, `0x34f75e0` constructs a temporary string-like object from embedded
-image data and calls `0x34f7740`; the data itself was not recorded here. A
-separate selector-`1` branch at `0x34f8490` forwards its `rcx` as `rsi` through
+image data and calls `0x34f7740`. Two independent bounded reconstructions found
+98 hexadecimal characters whose decoded point has the 49-byte uncompressed form,
+passes a local secp192k1 point check and equals the reference public point in
+`wt-ecdh.ts`; the point bytes are not reproduced here. The final two characters
+come from an instruction immediate, so this does not conflict with the earlier
+negative search for one contiguous full point. The comparison describes a
+conditional static default, not the peer actually used by a live session or
+proof of service compatibility. A separate selector-`1` branch at `0x34f8490`
+forwards its `rcx` as `rsi` through
 a tail jump. One observed caller, `0x34f8af0`, first reads a caller-supplied
 pointer slot, writes zero to the slot and stores the read value at object
 `+0x48`; on a nonnull path it passes the current stored pointer plus eight to
@@ -514,7 +618,22 @@ state can affect the values. The transferred pointer's construction, the
 embedded string's semantics, peer identity and runtime reachability remain
 unknown.
 
-On another bounded path, `0x34f7a74` calls `0x8d34270` with a stack buffer and
+In another independently checked static path, `0x8d70370` asks `0x8d5beb0` to
+fill a scalar-like value with lower bound 1 and an upper bound obtained from
+`group+0x10`. On the inspected group-initialization branch, that bound comes
+from the sixth public parameter slice previously compared with the secp192k1
+order. The inspected sampler masks candidates and rejects those outside its
+bounds, with at most 99 fills; successful values satisfy `1 <= d < order`
+under the selected initialization, comparison and normal-memory assumptions.
+Its random-source branches and uniformity are not established. The same value is
+stored through `context+0x10` and used both by a group-method `+0x40` path with
+the group point and by the `0x8d34270` group-method `+0x38` path with the
+imported point. A candidate table binds both to the same point-multiply-like
+routine, conditional on that table being active and unchanged. This supports an
+ECDH-like relationship but does not prove the point representation, shared X,
+actual peer identity or live server acceptance.
+
+On this bounded path, `0x34f7a74` calls `0x8d34270` with a stack buffer and
 capacity `0x200`. Its return is tested only for zero; a nonzero return is
 sign-extended and passed with the buffer to `0x8b46000`. On an inspected error
 path, if the call to `0x8d35840` returns normally, `0x8d34270` returns `-1`,
@@ -573,6 +692,86 @@ remain to be recovered and independently verified.
 
 ## Offline components
 
+- `src/direct/target-qr31-body.ts` implements the observed QR31 body skeleton
+  using explicitly supplied offset-named fields and already-encoded child
+  outputs. `field80` is never inferred from child count; the caller supplies
+  actual child encodings in the desired traversal order. The 65535-byte limit
+  applies locally to each prefixed field and each supplied child, including its
+  tag and length bytes, with separate local limits of 4096 children and 16 MiB
+  output. A standalone child encoder's maximum value can consequently exceed
+  the body encoder's child limit. The limits do not bound peak memory or the
+  cost of scanning caller-object metadata. This is a partial body
+  encoder, not a verified QR login, target-session implementation or proof of
+  wire interoperability.
+- `src/direct/target-qr31-tlv.ts` writes individually observed QR31 child
+  encodings for tags `0x11`, `0x16`, `0x1b`, `0x1d`, `0x33`, `0x35` and
+  `0x66`; each output includes its own BE16 tag and value-length prefix. The
+  `0x16` and `0x33` helpers constrain their opaque byte vectors to the inspected
+  16-byte construction path; larger or different paths remain unmodeled. The
+  `0x11` inclusion condition and all unknown field contents are caller-owned.
+  Size rejection is stricter than the observed native low-16-bit behavior.
+- `src/direct/target-qr31-frame.ts` wraps a supplied body using the observed
+  zero-initialized QR31 construction path. Its fixed header, inclusive BE16
+  total length and `0x03` trailer are local encodings of that static path, not
+  proof of a target login session. It rejects frames larger than 65535 bytes;
+  the target writes the low 16 bits. Byte-view prototype chains are limited to
+  256 examined objects as a local resource policy.
+- `src/direct/target-qr31-get-picture.ts` composes the observed new-tree
+  picture-request branch from explicitly supplied context fields and bytes,
+  including the optional `0x11` presence decision, seven fixed child types,
+  their ascending order, and the locally encoded frame and channel wrapper. It
+  assumes successful unique inserts and child writes; it does not connect,
+  choose server keys, sign, create an authenticated session or prove QQ login.
+  The input byte cap does not bound the cost of scanning arbitrary attached
+  object metadata; cleanup of temporary buffers is best effort.
+- `src/direct/target-qr31-channel-wrapper.ts` wraps an explicit inner byte
+  sequence with the observed QR31 picture-request channel envelope. Both
+  caller-context words remain explicit inputs. Its BE16 length is the inner
+  length plus four, not the resulting buffer's length; rejecting a value above
+  65535 is a local policy. Composing it with the local QR31 frame encoder limits
+  the frame body to 65487 bytes, four fewer than the frame encoder's standalone
+  maximum. It does not establish the final SSO command or network authentication.
+- `src/direct/target-qr31-d1.ts` uses the real Proton codec to build the D1
+  nested message and its TLV wrapper from two caller-provided raw byte fields.
+  It explicitly retains both fields when empty. The target's empty-field wire
+  behavior is supported by one static analysis, not independent runtime proof;
+  the older reference string codec omits empty strings and is not substituted.
+- `src/direct/target-qr31-response.ts` strictly extracts the observed QR31
+  response field boundaries from a caller-delimited slice. It keeps raw bytes,
+  numeric status, repeated tags and zero-length values, and distinguishes an
+  unchanged zero-length string destination from a nonzero C-string projection.
+  It does not run the target tag factory or child decoders, infer status meanings,
+  authenticate a peer, or prove the target accepts the extracted result. Its
+  exact-consumption, 16 MiB and 4096-entry restrictions are local policies.
+- `src/direct/target-qr12-body.ts` writes the observed QR12 request-body
+  fields, including the trailing array of BE16 values. Its query helper selects
+  the inspected caller's empty and zero fields and takes the remaining two
+  numbers and opaque span explicitly. Three span limits of 65535 bytes, an
+  array limit of 4096 and a 16 MiB aggregate check are local policies. Under
+  these component limits the largest constructible body is 204818 bytes;
+  metadata enumeration and peak memory are not bounded by the output cap.
+- `src/direct/target-qr12-frame.ts` wraps a supplied body in the inspected
+  zero-initialized QR12 frame structure, reusing the corresponding QR31 frame
+  encoder with a different command. Its inclusive-length overflow rejection is
+  a local policy; it does not authenticate or send the request.
+- `src/direct/target-qr12-query.ts` composes the selected QR12 body, frame and
+  the same observed channel wrapper from an explicit context word, 64-bit word,
+  raw span and runtime word. Its cross-layer span limit of 65466 bytes is a
+  local policy, not a target limit; input metadata enumeration and peak memory
+  are not bounded by the output limit. It does not send or authenticate a query.
+- `src/direct/target-qr12-response.ts` separately extracts the QR12 prefix,
+  status, BE64 and BE32 words, and raw TLV boundaries from an exact slice. It
+  requires complete fields for every status, unlike the inspected target's
+  nonzero-status short-read branch. It does not run tag factories or child
+  decoders, interpret status, verify a peer or establish login.
+- `src/direct/target-wt-encode-data.ts` serializes the observed conditional
+  `0x34f9170` field layout from an explicit precomputed payload. It does not
+  perform encryption or infer which branch a QR session uses; its stricter
+  component and total limits, and its rejection of nonempty data in observed
+  empty branches, are local policies. `src/direct/target-wt-oicq.ts` wraps an
+  explicit opaque result using the target's 25-byte OICQ header, supplied
+  version, command, sequence, account bits and context words. Neither helper
+  obtains keys, signs packets, authenticates a response or opens a connection.
 - `src/direct/target-sso12-reserve.ts` uses Proton to encode a constrained
   subset of the target's statically observed reserve fields. It preserves empty
   values where the observed path has presence flags and returns an empty buffer
@@ -1074,9 +1273,12 @@ and [state declarations](https://github.com/LagrangeDev/Lagrange.Core/blob/fe789
 not the supplied QQ binary's verified behavior. The reference handles the QR
 response ticket via TLVs `0x1e`, `0x19`, and `0x18`; login success subsequently
 provides D2, D2Key, A2, and A1 via another response. A working client also needs
-online registration and heartbeat. The selected binary contains
-`wtlogin64.trans_emp`, not the reference's exact `wtlogin.trans_emp` literal;
-the relationship between these names remains unknown.
+online registration and heartbeat. The selected binary contains a contiguous
+`wtlogin64.trans_emp` literal, while the bounded QR picture-request callback
+constructs `wtlogin.trans_emp` from separate static pieces and passes it to an
+unresolved receiver with a target-encoded `0x812` request. Whether that receiver
+maps the name to the `wtlogin64` literal is unknown. Neither observation proves
+runtime execution or acceptance.
 
 The reference's confirmed QR response supplies temporary `TgtgtKey`, `NoPicSig`
 and A1 values. Its PC `wtlogin.login` then constructs OICQ `0x810` subcommand

@@ -48,6 +48,10 @@
       "types": "./src/target-sso12-reserve.ts",
       "default": "./src/target-sso12-reserve.ts"
     },
+    "./target-qr31-d1": {
+      "types": "./src/target-qr31-d1.ts",
+      "default": "./src/target-qr31-d1.ts"
+    },
     "./element": {
       "types": "./src/element.ts",
       "default": "./src/element.ts"

@@ -4,8 +4,9 @@ const CURVE = 'secp192k1';
 const SCALAR_SIZE = 24;
 const ORDER = Buffer.from('fffffffffffffffffffffffe26f2fc170f69466a74defd8d', 'hex');
 
-// Complete uncompressed server point from the referenced WtLogin implementation.
-// This is a source constant, not an observation of a current client or server.
+// Complete uncompressed point from the referenced WtLogin implementation.
+// The inspected target's conditional static default matches it; live peer use
+// and server compatibility remain unverified.
 const SERVER_PUBLIC_KEY = Buffer.from(
     '04928d8850673088b343264e0c6bacb8496d697799f37211de' +
         'b25bb73906cb089fea9639b4e0260498b51a992d50813da8',
@@ -58,6 +59,7 @@ export function createWtEcdh(privateKey?: Uint8Array): {
         }
 
         const scalar = Buffer.from(privateKey);
+
         if (scalar.equals(Buffer.alloc(SCALAR_SIZE)) || Buffer.compare(scalar, ORDER) >= 0) {
             throw new RangeError('secp192k1 private scalar must be between 1 and n - 1');
         }
@@ -68,6 +70,7 @@ export function createWtEcdh(privateKey?: Uint8Array): {
     function sharedSecret(peerPublicKey: Uint8Array): Uint8Array {
         validatePoint(peerPublicKey);
         const shared = ecdh.computeSecret(peerPublicKey);
+
         if (shared.length !== SCALAR_SIZE) {
             throw new Error('secp192k1 shared X must be exactly 24 bytes');
         }
