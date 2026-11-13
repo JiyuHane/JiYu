@@ -74,6 +74,8 @@ numeric spelling.
 
 Archive downloads, store installation, updates and online rollback are separate
 work; do not interpret catalog browsing or a local compatibility test as their
-completion. The host and index can be tested with synthetic local plugins
-without running QQ. Real plugin and QQ interoperability require separate
-validation.
+completion. An internal [offline ZIP preflight](../core/src/webui/plugin-install/README.md)
+currently checks only a narrow stored-entry subset and is not an installer;
+common compressed releases are unsupported. The host and index can be tested
+with synthetic local plugins without running QQ. Real plugin and QQ
+interoperability require separate validation.
