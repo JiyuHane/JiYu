@@ -41,7 +41,7 @@ configuration writers and backup restores do not share a revision lock.
 ## Supported behavior and limits
 
 The core currently handles `get_version`, `get_status`, `get_supported_actions`,
-`send_message` for private and group text messages, and `delete_message`.
+`get_self_info`, `send_message` for private and group text messages, and `delete_message`.
 Incoming friend/private and normal/group text messages are converted to v12
 message events; unsupported message semantics and media are not silently
 converted. Self-sent events are not yet translated to v12. Unsupported actions,
@@ -53,7 +53,19 @@ A WebSocket connection receives `meta.connect` first and then the current
 account status; network connection alone does not assert that the account is
 online. Every listener is bound to one account, and a supplied `self` must
 match that account's platform and user ID. Existing v11 adapters continue to
-use their own protocol and authentication behavior.
+use their own protocol and authentication behavior. `get_status.good` reflects the
+current online state and Bridge aggregate receive/request health when queried.
+Apart from the initial connection snapshot, `status_update` is triggered by
+online/offline changes; independent health changes do not yet trigger a push.
+
+`get_self_info` returns the validated account ID as a string, the existing v11
+login nickname as `user_name`, and an empty `user_displayname` because no
+separate display name is available. The v11 source may already have substituted
+the UIN for a missing nickname. The core uses fixed 20001 for inconsistent login
+info (including v11 errors 1400 and 1404) and fixed 20002 for other well-formed
+v11 failures or exceptions; the current transport may replace these failure
+messages with its generic side-effect uncertainty warning even for this read-only
+action. This action is an incremental addition, not full v12 support.
 
 `send_message` reports the timestamp already stored by Jiyu. That record may
 come from the QQ response or a local-clock fallback and is not necessarily a

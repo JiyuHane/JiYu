@@ -60,6 +60,7 @@ describe('V12 dispatcher with real v11 ApiHandler', () => {
             'get_version',
             'get_status',
             'get_supported_actions',
+            'get_self_info',
             'send_message',
             'delete_message',
         ]);
