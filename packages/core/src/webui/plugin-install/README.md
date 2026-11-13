@@ -43,3 +43,35 @@ Synchronous inflate and CRC can block the event loop. Do not connect this
 primitive to an online route: production integration requires a separate
 isolation, cancellation and resource-control design. It establishes no filesystem
 safety, authorization or signature. Tests use only synthetic in-memory fixtures.
+
+## Worker lifecycle prototype
+
+`PreflightWorkerTask` is an internal, single-slot controller with an explicitly
+injected Worker factory. It has no default Worker entry and is not connected to
+Core startup, the WebUI or an installer. It validates and copies an input view,
+binds a worker's reported successful result to the copied bytes' SHA-256, and
+validates and freezes the reported metadata. A valid result is a candidate until
+an observed natural exit with code zero; aborts, errors and timeouts are final
+once selected. Once a Worker has been returned, the separate cleanup result is
+`released` only after an exit is observed and required listener cleanup succeeds.
+If cleanup is uncertain because exit was not observed in time, the slot remains
+occupied; a later exit and successful listener cleanup can release it, although
+the already reported cleanup result stays `unknown`. Listener installation or
+removal uncertainty is sticky and keeps the slot occupied, with no cleanup retry.
+A successful outcome does not override uncertain cleanup. If the factory throws
+or returns an invalid handle, the slot remains occupied.
+
+The factory must return a new, exclusively controlled Worker and faithfully map
+its actual events: event registration and removal must be non-throwing and
+non-reentrant, and events must not be emitted synchronously during registration
+or after exit. No other owner may terminate or reuse that Worker. These are
+trusted adapter requirements, not facts established by `instanceof`. The
+controller cannot independently verify a forged exit or a dishonest result.
+SHA-256 binds the report's identifier to the input, not the truth of the
+reported metadata. Worker message validation happens after structured cloning,
+so it does not impose a hard memory bound on a malicious or faulty sender. The
+controller hashes and copies on the parent thread, and its timers depend on
+scheduler and event-loop progress. Workers share process permissions and do not
+provide process isolation or a hard RSS, CPU or wall-clock limit. The existing
+parser creates its own further snapshot. Source-mode synthetic Worker tests are
+not evidence of a production bundle entry or live plugin compatibility.
