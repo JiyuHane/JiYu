@@ -197,10 +197,27 @@ The `0x665d870` path can return a value read from the receiver's `+0x58`, while
 within these paths may change state. The static assignment does not prove the
 receiver still has that vptr at the setter, that either virtual call actually
 uses these entries, or that the `+0x58` value remains equal to the earlier `P`.
-The concrete receiver type, queue producer, business body and actual command
-remain unknown; nearby `AsyncRunLoop` diagnostics do not establish the type.
-A conditional branch also passes the same `T` to classifier `0x6667140`, and another call
-copies it into request `+0x28`. The source object was returned by a prior virtual
+The concrete receiver type, business body and actual command remain unknown;
+nearby `AsyncRunLoop` diagnostics do not establish the type.
+
+Separately, bounded decoding of `0x665cc80` identifies a candidate queue-write
+path. Assuming intervening calls return normally and preserve the relevant
+callee-saved registers under the x86-64 System V ABI, its second argument is a
+pointer slot. At `0x665ccf8–0x665cd06`, an initial slot value `P1` is used to
+read `T1=[P1]`, `V1=[T1+0x20]`, and the 64-bit difference `[V1+8]-[V1]`.
+On one later branch, `0x665ce44–0x665ce55` rereads the slot as `P2`, clears
+the slot, writes `P2` into a segmented queue position derived from receiver
+fields `+0x18`, `+0x30` and `+0x38`, and increments the count at `+0x38`.
+When the capacity branch invokes its helper, those queue fields are reloaded
+before recomputing the position. The intervening calls or aliasing could change
+the slot, so the two reads do not prove `P1 == P2`, nor do they prove either is
+the `P` denoted in the separate `0x6663d13`/`0x6663d2c` path. Pointer validity,
+arithmetic overflow, synchronization, dynamic reachability and the source or
+contents of the body remain unverified.
+
+Returning to the separately inspected `0x6663d13` path, a conditional branch
+also passes its `T` to classifier `0x6667140`, and another call copies it into
+request `+0x28`. The source object was returned by a prior virtual
 call; its construction, the actual command on this path and the body semantics
 remain unknown. The helper reads
 the request object's byte pointer at `+0x80` and 32-bit length at `+0x88`, then
