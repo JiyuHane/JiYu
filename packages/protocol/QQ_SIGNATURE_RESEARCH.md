@@ -42,11 +42,23 @@ window at `0x2b6454` does not establish its cryptographic or signing semantics.
 Separately, `0x2fe5b4–0x2fe5d0` forms the string address for
 `com/tencent/mobileqq/qsec/qseccodec/SecCipher$SecInfo` in `x0` and calls
 `0x33ec58`; its result is stored at `[sp+0x338]`. The helper passes the same
-first argument to `0x33e1d4` in the inspected entry window. These observations
-do not identify either helper, the returned object's type, or a signing call.
-The sites are conditional branches in flattened control flow; subsequent
-comparisons and state selection do not prove that the blocks execute in address
-order.
+first argument to `0x33e1d4` in the inspected entry window. Inside the latter,
+one conditional state path initializes a local output slot and passes its
+address, a pointer previously read from global `0x9a6a28`, and `0x00010006`
+to an indirect call through that pointer's function table at `+0x30`; the code
+then records whether the return is `-2`. This path also requires the dispatch
+register `w11` to retain `0xf5a5c4ad` at the inspected branch. If the pointer
+is a valid `JavaVM` using the JNI Invoke ABI, this resembles `GetEnv` with
+`JNI_VERSION_1_6` and a `JNI_EDETACHED` check. The pointer's identity, prior
+side effects, actual path reachability, returned object's type and signing
+relationship remain unknown. A separate `JNI_OnLoad` window at
+`0x63328–0x6334c` reloads a pointer saved from entry `x0`, initializes an
+output slot to zero, supplies its address and `0x00010006`, then calls that
+pointer's function-table slot `+0x30`. If the entry argument is a valid
+`JavaVM`, the saved register and slot remain unchanged, and this block is
+reached, that call has the same `GetEnv` ABI shape. It is not established that
+this saved pointer is the value in global `0x9a6a28`. Flattened control flow
+also prevents assuming that surrounding blocks execute in address order.
 
 ### AES evidence and limits
 
