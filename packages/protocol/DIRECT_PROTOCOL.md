@@ -293,6 +293,20 @@ container is invoked, that `N` is the `A` independently computed by
 `0x663c050`, or that the transferred value is a protocol body. The `N=0` branch
 chooses other function addresses and is not covered by this nonzero-branch claim.
 
+The `0x663c158` and `0x663c232` call sites both pass `esi=0`, `rcx=0x10`, and
+`r9=0x10` to an indirect target read from the current receiver's `+0x80`; the
+actual target is unknown. In the conditional case where that target is
+`0x663bf10` and the inspected instructions and memory accesses complete
+normally, the zero-index jump-table entry selects its `0x663bf81` branch.
+Both calls to `0x35a6d20` then receive `0x10` as the available-space value and
+`0x90` as the requested size, so both take its unsigned-borrow zero-return
+branch. The second result `N` is therefore zero and the resulting branch writes
+`0x663c4c0`, not `0x663c050`, to the container's `+8` slot at `0x663c024`.
+This conditional observation corrects any inference that those parameters
+select the nonzero-`N` branch; it does not establish the real indirect target,
+final slot contents after later calls or aliases, runtime reachability, or the
+behavior at other call sites.
+
 Returning to the separately inspected `0x6663d13` path, a conditional branch
 also passes its `T` to classifier `0x6667140`, and another call copies it into
 request `+0x28`. The source object was returned by a prior virtual
@@ -389,14 +403,24 @@ bit pattern, not a determination of business signedness. Complete parser
 behavior, repeated values and other wire types remain unverified.
 
 The decrypt caller bypasses `0x666c5a0` for selector 0. Inside that function,
-selector 1 takes a primary 16-byte candidate from one context object's `+0x78`
-and, only after the first decryption fails, may try a second object's `+0x78`;
-an absent primary immediately fails. Selector 2 references the same fixed data
-location as the outbound class-2 branch. Other values fail in the callee. The
-selected decrypt routine checks a minimum 16-byte, eight-byte-aligned input and
-seven trailing zero bytes. These observations neither identify the objects or
-key lifecycle nor prove that outbound classifier and response selector always
-correspond. QQ-TEA framing checks are not server authentication, and static
+selector 1 takes a primary 16-byte candidate from one context object's `+0x78`;
+an absent primary immediately fails. If a secondary candidate exists at another
+object's `+0x78`, the caller retries only when the first decrypt call's return
+low byte is not `1`. The final result check tests for nonzero; the inspected
+success and failure exits of `0x8835ea0` return low bytes `1` and `0`
+respectively. The two calls reuse the same output buffer and length variable:
+`0x8835fcb` can update that length before a later framing or trailer failure,
+and the second call's capacity check uses the retained value. The failed first
+call may also have written part of the buffer; the inspected successful second
+path overwrites every byte in its resulting valid prefix, assuming normal
+non-aliased memory access. The later nonempty-output check is not a retry
+condition: a first call that succeeds with an empty output is rejected by the
+outer caller without a secondary attempt. Selector 2 references the same fixed
+data location as the outbound class-2 branch and has no secondary candidate.
+Other values fail in the callee. The selected decrypt routine checks a minimum
+16-byte, eight-byte-aligned input and seven trailing zero bytes. These observations
+neither identify the objects or key lifecycle nor prove that outbound classifier
+and response selector always correspond. QQ-TEA framing checks are not server authentication, and static
 inspection does not establish runtime response compatibility. The local
 `target-service-decrypt-candidate.ts` accepts one explicitly supplied key for
 selector 1 or 2 and never selects or falls back between keys. Selector 0
@@ -429,13 +453,44 @@ shows the primary decoder receives a pointer from receiver `+0x18`; receiver
 byte `+4` can bypass it, and a fallback calls the same decoder with an embedded
 address at receiver `+7`. The candidate constructor at `0x34f8af0` passes the
 `+0x18` output to mode-dependent routines. One mode reaches `0x34f7740`, where
-`0x2c7` is passed to an unresolved function near a secp192k1 diagnostic. A
+`0x2c7` is passed to `0x8d6f790` near a secp192k1 diagnostic. The latter calls
+`0x8d6a6f0`, whose bounded lookup compares IDs across a five-entry table. A
 separate table initializer, if its intervening calls return without modifying
 the table, writes ID `0x2c7` and a `NIST P-192` label to the first table entry;
-the downstream lookup compares this ID. This observed label conflicts with the
-nearby diagnostic and is not proof of the mathematical parameters, actual
-runtime selection or the login path. Function identity, input provenance and
-key derivation remain unproved. The disassembler automatically displayed an
+the downstream lookup compares this ID. In the bounded initializer, the same
+entry receives a 24-byte element length and parameter-table pointer at ELF VA
+`0x126eae0`, assuming intervening initialization calls return without modifying
+the entry. Independently checked static comparisons found its first three
+24-byte slices, interpreted as big-endian integers, match the public `p`, `a`,
+and `b` of secp192k1 and do not match prime192v1. The next three slices also
+match the standard secp192k1 generator coordinates and order; the generator
+comparison used a locally generated standard point, and the order was compared
+with [SEC 2](https://www.secg.org/sec2-v2.pdf). The observed `0x8d47460`
+import path supports the big-endian interpretation for the imported slices, and
+`0x8d6a89e` passes the first three imported values to a virtual slot. The next
+three slices also follow static point/order construction paths. A separate
+bounded inspection identifies a candidate method that copies the first three
+arguments into group-object fields, conditional on the inspected method table
+being the one actually selected. These comparisons establish matching public
+parameters in the file on this static branch, not the runtime table contents,
+active methods, cofactor, peer point, key derivation or login reachability. The
+`NIST P-192` label conflicts with the observed parameters and is not by itself
+proof of the mathematical group. Function identities and input provenance remain
+unproved.
+
+On another bounded path, `0x34f7a74` calls `0x8d34270` with a stack buffer and
+capacity `0x200`. Its return is tested only for zero; a nonzero return is
+sign-extended and passed with the buffer to `0x8b46000`. An inspected error
+path in `0x8d34270` returns `-1`, which that test does not exclude; this static
+observation does not establish that the error path reaches the call at runtime
+or predict its consequences. `0x8b46000` produces 16 bytes using an update and
+finalization path. Independent bounded inspection found its initial state,
+64 compression constants and 64 rotation counts match public MD5 values, with
+MD5-like padding and 64-byte block processing. It is therefore a strong MD5
+candidate, not a fully verified byte-equivalent implementation: message-word
+indices and complete state flow were not exhaustively checked. The input to this
+candidate is not established as an ECDH shared X coordinate, and its key or
+peer-point provenance remains unknown. The disassembler automatically displayed an
 annotation that may contain a hardcoded public-key string; its value was not
 retained in this record.
 The fixed public reference's server point and verification key were not found as
