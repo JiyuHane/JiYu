@@ -13,6 +13,40 @@ class Ticket {
         this.#online = online;
     }
 
+    static compare(a: unknown, b: unknown): 'same' | 'different' | 'invalid' {
+        try {
+            if (
+                typeof a !== 'object' ||
+                a === null ||
+                !(#binding in a) ||
+                !(#online in a) ||
+                typeof b !== 'object' ||
+                b === null ||
+                !(#binding in b) ||
+                !(#online in b)
+            ) {
+                return 'invalid';
+            }
+
+            return a.#binding === b.#binding && a.#online === b.#online ? 'same' : 'different';
+        } catch {
+            return 'invalid';
+        }
+    }
+
+    static hasBinding(source: unknown, binding: object): boolean {
+        try {
+            return (
+                typeof source === 'object' &&
+                source !== null &&
+                #binding in source &&
+                source.#binding === binding
+            );
+        } catch {
+            return false;
+        }
+    }
+
     static matches(source: unknown, binding: object, online: object): boolean {
         try {
             return (
@@ -30,6 +64,15 @@ class Ticket {
 }
 
 export type V12Source = Ticket;
+
+/** Private generation identity, not authentication against same-process code. */
+export function sameSourceEpoch(a: unknown, b: unknown): 'same' | 'different' | 'invalid' {
+    return Ticket.compare(a, b);
+}
+
+export function sourceHasBinding(source: unknown, binding: object): boolean {
+    return Ticket.hasBinding(source, binding);
+}
 
 /** Tracks only the OneBot admission boundary, not earlier protocol processing. */
 export class SourceGeneration {

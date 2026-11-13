@@ -67,6 +67,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
         registerPollHost(
             this,
             {
+                self: this.self,
                 captureBinding: () => this[captureBinding](),
                 captureSource: () => this.options.captureCurrentSource?.(),
                 verify: (source) => this[verifySource](source),
