@@ -9,6 +9,8 @@ import {
 import { ExternalLink, RefreshCw } from 'lucide-react';
 import { SkeletonSwap } from '@/components/interior/skeleton-swap';
 import { ConfirmDialog } from '@/components/confirm-dialog';
+import { Modal } from '@/components/interior/modal';
+import { Textarea } from '@/components/ui/textarea';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -17,8 +19,20 @@ import { useAppState } from '@/contexts/AppStateContext';
 import { Input } from '@/components/ui/input';
 import { actionErrorMessage, useActionFeedback } from '@/contexts/ActionFeedbackContext';
 import { useApi } from '@/lib/api';
-import { ApiError, type CommunityIndexResult, type LocalPluginsResult } from '@/lib/api/types';
-import { filterPlugins, safePluginHomepage } from '@/lib/plugin-index';
+import {
+    ApiError,
+    type CommunityIndexResult,
+    type LocalPluginsResult,
+    type PluginConfigField,
+    type PluginConfigValue,
+} from '@/lib/api/types';
+import {
+    filterPlugins,
+    safePluginHomepage,
+    parseConfigFields,
+    parseConfigValue,
+    parseConfigNumber,
+} from '@/lib/plugin-index';
 
 const INDEX_REPOSITORY = 'https://github.com/HolyFoxTeam/napcat-plugin-community-index';
 const ERROR_LABELS: Record<NonNullable<CommunityIndexResult['error']>, string> = {
@@ -134,8 +148,10 @@ export function PluginsPanel() {
     );
 }
 
+type TrackedOperation = 'pending' | 'unknown' | 'unknown-running';
+
 export function createLocalOperationTracker() {
-    let states: Readonly<Record<string, 'pending' | 'unknown'>> = Object.freeze({});
+    let states: Readonly<Record<string, TrackedOperation>> = Object.freeze({});
     const listeners = new Set<() => void>();
     const publish = () => listeners.forEach((listener) => listener());
     return {
@@ -156,10 +172,20 @@ export function createLocalOperationTracker() {
             publish();
             return true;
         },
-        finish(uin: string, unknown: boolean) {
+        detach(uin: string) {
             if (states[uin] !== 'pending') {
                 return;
             }
+
+            states = Object.freeze({ ...states, [uin]: 'unknown-running' });
+            publish();
+        },
+        finish(uin: string, unknown: boolean) {
+            if (states[uin] !== 'pending' && states[uin] !== 'unknown-running') {
+                return;
+            }
+
+            unknown = unknown || states[uin] === 'unknown-running';
 
             const next = { ...states };
 
@@ -187,14 +213,54 @@ export function createLocalOperationTracker() {
 
 export function hasCurrentUnknownCheck(
     uin: string,
-    current: Readonly<Record<string, 'pending' | 'unknown'>>,
-    checked: Readonly<Record<string, 'pending' | 'unknown'>> | null,
+    current: Readonly<Record<string, TrackedOperation>>,
+    checked: Readonly<Record<string, TrackedOperation>> | null,
 ): boolean {
     return current[uin] === 'unknown' && checked === current;
 }
 
 // The store outlives a settings-panel mount, but not a browser reload or another tab.
 const localOperationTracker = createLocalOperationTracker();
+let invalidateConfigView: (() => void) | null = null;
+
+/** A closed view never applies late results or clears an uncertain operation. */
+export function createConfigViewGuard(
+    tracker: ReturnType<typeof createLocalOperationTracker>,
+    uin: string,
+) {
+    let active = true;
+    let pending = false;
+    return {
+        begin() {
+            if (!active || pending || !tracker.begin(uin)) {
+                return false;
+            }
+
+            pending = true;
+            return true;
+        },
+        finish(unknown: boolean) {
+            if (!pending) {
+                return false;
+            }
+
+            pending = false;
+            tracker.finish(uin, unknown);
+            return active;
+        },
+        close() {
+            active = false;
+
+            if (pending) {
+                tracker.detach(uin);
+            }
+        },
+        activate: () => {
+            active = true;
+        },
+        isActive: () => active,
+    };
+}
 
 function LocalPluginsPanel() {
     const { qqList, resources, selectedUin, setSelectedUin } = useAppState();
@@ -266,7 +332,13 @@ function LocalPluginsPanel() {
                                     label: `${account.nickname || account.uin} (${account.uin})`,
                                 })),
                             ]}
-                            onChange={(uin) => setSelectedUin(uin || null)}
+                            onChange={(uin) => {
+                                if ((uin || null) !== selected) {
+                                    invalidateConfigView?.();
+                                }
+
+                                setSelectedUin(uin || null);
+                            }}
                         />
                         {selected ? (
                             <LocalAccountPlugins
@@ -338,8 +410,8 @@ function LocalAccountPlugins({
     clearUnknown,
 }: {
     uin: string;
-    operationState: 'pending' | 'unknown' | null;
-    operationsSnapshot: Readonly<Record<string, 'pending' | 'unknown'>>;
+    operationState: TrackedOperation | null;
+    operationsSnapshot: Readonly<Record<string, TrackedOperation>>;
     change: (uin: string, id: string, operation: LocalOperation) => Promise<void>;
     clearUnknown: () => void;
 }) {
@@ -348,13 +420,14 @@ function LocalAccountPlugins({
     const [error, setError] = useState('');
     const [loading, setLoading] = useState(true);
     const [confirm, setConfirm] = useState<{ id: string; operation: LocalOperation } | null>(null);
+    const [configId, setConfigId] = useState<string | null>(null);
     const [scope] = useState(createPluginRequestScope);
     const [checkedSnapshot, setCheckedSnapshot] = useState<Readonly<
-        Record<string, 'pending' | 'unknown'>
+        Record<string, TrackedOperation>
     > | null>(null);
     const mounted = useRef(false);
     const load = useCallback(
-        async (manualSnapshot?: Readonly<Record<string, 'pending' | 'unknown'>>) => {
+        async (manualSnapshot?: Readonly<Record<string, TrackedOperation>>) => {
             const request = scope.start();
             setLoading(true);
             setError('');
@@ -406,9 +479,11 @@ function LocalAccountPlugins({
                     <RefreshCw className="size-4" /> {loading ? '读取中…' : '刷新本地状态'}
                 </Button>
             </div>
-            {operationState === 'pending' && (
+            {(operationState === 'pending' || operationState === 'unknown-running') && (
                 <p role="status" className="text-sm text-muted-foreground">
-                    此账号的操作正在进行；切换账号不会取消已提交操作。
+                    {operationState === 'unknown-running'
+                        ? '配置窗口已关闭，操作仍在进行且结果未知；请等待后主动核对。'
+                        : '此账号的操作正在进行；切换账号不会取消已提交操作。'}
                 </p>
             )}
             {operationState === 'unknown' && (
@@ -426,6 +501,7 @@ function LocalAccountPlugins({
                             loading ||
                             !!error ||
                             !data ||
+                            data.pendingOperations.length > 0 ||
                             !hasCurrentUnknownCheck(uin, operationsSnapshot, checkedSnapshot)
                         }
                         onClick={clearUnknown}
@@ -446,9 +522,29 @@ function LocalAccountPlugins({
                         data={data}
                         blocked={loading || !!error || operationState !== null}
                         onChoose={(id, operation) => setConfirm({ id, operation })}
+                        onConfig={(id) => setConfigId(id)}
                     />
                 )}
             </PluginIndexSwap>
+            {configId && (
+                <PluginConfigDialog
+                    key={configId}
+                    uin={uin}
+                    id={configId}
+                    canExecute={
+                        !!data &&
+                        !loading &&
+                        !error &&
+                        operationState === null &&
+                        data.accountOnline &&
+                        data.runtime?.some(
+                            (item) => item.id === configId && item.state === 'active',
+                        ) === true &&
+                        !data.pendingOperations.some((item) => item.id === configId)
+                    }
+                    onClose={() => setConfigId(null)}
+                />
+            )}
             <ConfirmDialog
                 open={confirm !== null}
                 onOpenChange={(open) => {
@@ -490,10 +586,12 @@ export function LocalPluginList({
     data,
     blocked,
     onChoose,
+    onConfig,
 }: {
     data: LocalPluginsResult;
     blocked: boolean;
     onChoose: (id: string, operation: LocalOperation) => void;
+    onConfig?: (id: string) => void;
 }) {
     const ids = [
         ...new Set([
@@ -525,7 +623,7 @@ export function LocalPluginList({
                 ids.map((id) => {
                     const runtime = data.runtime?.find((item) => item.id === id);
                     const action = data.actions.find((item) => item.id === id);
-                    const pending = data.pendingOperations.find((item) => item.id === id);
+                    const pending = data.pendingOperations.filter((item) => item.id === id);
                     const unavailable = blocked || !data.accountOnline || data.runtime === null;
                     const reason = (code: string | null | undefined) =>
                         code ? (LOCAL_REASONS[code] ?? `服务状态：${code}`) : '动作能力未知';
@@ -559,14 +657,28 @@ export function LocalPluginList({
                                     {runtime.pendingActions}
                                 </p>
                             )}
-                            {pending && (
-                                <p className="mt-1 text-xs text-warning-foreground">
-                                    启用处理中：
-                                    {pending.phase === 'resolving' ? '解析目录' : '宿主执行'}
-                                    {pending.cancelled ? '，取消中' : ''}
-                                    {pending.currentInstance ? '' : '（旧实例）'}
+                            {pending.map((item) => (
+                                <p
+                                    key={`${item.operation}-${item.phase}`}
+                                    className="mt-1 text-xs text-warning-foreground"
+                                >
+                                    {item.operation === 'enable'
+                                        ? '启用'
+                                        : item.operation === 'disable'
+                                          ? '停用'
+                                          : '配置'}
+                                    处理中：
+                                    {item.phase === 'resolving'
+                                        ? '解析目录'
+                                        : item.phase === 'reading'
+                                          ? '读取请求'
+                                          : item.phase === 'draining'
+                                            ? '排空操作'
+                                            : '宿主执行'}
+                                    {item.cancelled ? '，取消中' : ''}
+                                    {item.currentInstance ? '' : '（旧实例）'}
                                 </p>
-                            )}
+                            ))}
                             <div className="mt-3 flex flex-wrap gap-2">
                                 <Button
                                     size="sm"
@@ -584,6 +696,20 @@ export function LocalPluginList({
                                 >
                                     停用
                                 </Button>
+                                {onConfig && (
+                                    <Button
+                                        size="sm"
+                                        variant="outline"
+                                        disabled={
+                                            unavailable ||
+                                            runtime?.state !== 'active' ||
+                                            pending.length > 0
+                                        }
+                                        onClick={() => onConfig(id)}
+                                    >
+                                        配置（支持情况未知）
+                                    </Button>
+                                )}
                             </div>
                             {(!action?.canEnable || !action?.canDisable) && (
                                 <p className="mt-2 text-xs text-muted-foreground">
@@ -600,6 +726,380 @@ export function LocalPluginList({
                 })
             )}
         </div>
+    );
+}
+
+type ConfigOperation = 'schema' | 'read' | 'write';
+type ConfigDraft = Record<string, string | boolean>;
+
+export function configDraftToValue(
+    fields: PluginConfigField[],
+    draft: ConfigDraft,
+): PluginConfigValue {
+    if (fields.length === 0 || Object.keys(draft).length !== fields.length) {
+        throw new Error('配置字段格式无效');
+    }
+
+    const values: PluginConfigValue = Object.create(null);
+
+    for (const field of fields) {
+        if (!Object.hasOwn(draft, field.key)) {
+            throw new Error('配置字段格式无效');
+        }
+
+        const value = draft[field.key];
+
+        if (field.type === 'number') {
+            const number = typeof value === 'string' ? parseConfigNumber(value) : null;
+
+            if (number === null) {
+                throw new Error('数字字段格式无效');
+            }
+
+            values[field.key] = number;
+        } else if (field.type === 'boolean') {
+            if (typeof value !== 'boolean') {
+                throw new Error('配置字段格式无效');
+            }
+
+            values[field.key] = value;
+        } else {
+            if (typeof value !== 'string') {
+                throw new Error('配置字段格式无效');
+            }
+
+            values[field.key] = value;
+        }
+    }
+
+    return parseConfigValue(fields, values);
+}
+
+export function configErrorText(caught: unknown): string {
+    const code = caught instanceof ApiError ? caught.code : undefined;
+    const fixed: Record<string, string> = {
+        CONFIG_UNSUPPORTED: '插件未提供该配置接口。',
+        CONFIG_INVALID: '配置格式不受支持。',
+        CONFIG_UI_UNSUPPORTED: '配置格式或字段不受支持。',
+        CONFIG_QUEUE_FULL: '配置队列已满。',
+        PLUGIN_INACTIVE: '插件当前未运行。',
+        REQUEST_TIMEOUT: '请求超时，结果未知。',
+        CONFIG_GENERATION_REQUIRED: '插件实例标识缺失，请重新读取字段和配置。',
+        CONFIG_GENERATION_CHANGED: '插件实例已更替，请重新读取字段和配置。',
+    };
+    return code && Object.hasOwn(fixed, code) ? fixed[code] : '配置操作未确认，结果可能未知。';
+}
+
+function PluginConfigDialog({
+    uin,
+    id,
+    canExecute,
+    onClose,
+}: {
+    uin: string;
+    id: string;
+    canExecute: boolean;
+    onClose: () => void;
+}) {
+    const api = useApi();
+    const [guard] = useState(() => createConfigViewGuard(localOperationTracker, uin));
+    const [fields, setFields] = useState<PluginConfigField[] | null>(null);
+    const [generation, setGeneration] = useState<string | null>(null);
+    const [schemaSource, setSchemaSource] = useState<'schema' | 'ui' | 'none' | null>(null);
+    const [draft, setDraft] = useState<ConfigDraft | null>(null);
+    const [error, setError] = useState('');
+    const [notice, setNotice] = useState('');
+    const [busy, setBusy] = useState(false);
+    const [confirm, setConfirm] = useState<ConfigOperation | null>(null);
+    useEffect(() => {
+        guard.activate();
+        const invalidate = () => guard.close();
+        invalidateConfigView = invalidate;
+
+        return () => {
+            invalidate();
+
+            if (invalidateConfigView === invalidate) {
+                invalidateConfigView = null;
+            }
+        };
+    }, [guard]);
+
+    const close = () => {
+        guard.close();
+        onClose();
+    };
+
+    const run = async (operation: ConfigOperation) => {
+        if (!guard.isActive() || !canExecute || !guard.begin()) {
+            return;
+        }
+
+        setBusy(true);
+        setError('');
+        setNotice('');
+
+        if (operation === 'schema') {
+            setGeneration(null);
+            setFields(null);
+            setDraft(null);
+        }
+
+        try {
+            if (operation === 'schema') {
+                const result = await api.plugins.configSchema(uin, id);
+
+                if (!guard.finish(false)) {
+                    return;
+                }
+
+                setSchemaSource(result.source);
+                setGeneration(result.generation);
+                setDraft(null);
+
+                if (result.source === 'none') {
+                    setFields(null);
+                    setError('插件未声明静态字段，暂不支持编辑。');
+                } else {
+                    try {
+                        const parsed = parseConfigFields(result.fields);
+                        setFields(parsed);
+
+                        if (parsed.length === 0) {
+                            setError('插件字段为空，暂不支持编辑。');
+                        }
+                    } catch {
+                        setFields(null);
+                        setError('插件字段包含不支持的描述，暂不支持编辑。');
+                    }
+                }
+            } else if (operation === 'read') {
+                if (!generation) {
+                    throw new ApiError(400, '请重新读取字段', 'CONFIG_GENERATION_REQUIRED');
+                }
+
+                const result = await api.plugins.configRead(uin, id, generation);
+
+                if (!guard.finish(false)) {
+                    return;
+                }
+
+                if (!fields) {
+                    setError('请先读取受支持的字段。');
+                    return;
+                }
+
+                try {
+                    const values = parseConfigValue(fields, result.value);
+                    const next: ConfigDraft = Object.create(null);
+
+                    for (const field of fields) {
+                        const value = values[field.key];
+                        next[field.key] = typeof value === 'boolean' ? value : String(value);
+                    }
+
+                    setDraft(next);
+                } catch {
+                    setDraft(null);
+                    setError('配置键或值与字段不匹配，暂不支持编辑。');
+                }
+            } else {
+                if (!fields || !draft) {
+                    guard.finish(false);
+                    setError('请先读取配置。');
+                    return;
+                }
+
+                const value = configDraftToValue(fields, draft);
+
+                if (!generation) {
+                    throw new ApiError(400, '请重新读取字段', 'CONFIG_GENERATION_REQUIRED');
+                }
+
+                await api.plugins.configWrite(uin, id, generation, value);
+
+                if (!guard.finish(false)) {
+                    return;
+                }
+
+                setNotice('插件已处理配置，是否持久化由插件决定；进程资源状态未知。');
+            }
+        } catch (caught) {
+            if (!guard.finish(true)) {
+                return;
+            }
+
+            // Discard stale drafts on any unconfirmed operation, without logging values.
+            setGeneration(null);
+            setFields(null);
+            setDraft(null);
+            setSchemaSource(null);
+            setError(configErrorText(caught));
+        } finally {
+            if (guard.isActive()) {
+                setBusy(false);
+            }
+        }
+    };
+
+    return (
+        <Modal
+            open
+            onClose={close}
+            title="插件配置"
+            description={`账号 ${uin} · 插件 ${id}`}
+            closeLabel="关闭配置"
+            maxWidth={560}
+        >
+            <div className="flex flex-col gap-4">
+                <p className="text-sm text-muted-foreground">
+                    配置操作可能执行插件代码，插件拥有霁羽进程完整权限。操作需逐次确认，不会自动重试；配置由插件管理，持久化未知。数字按
+                    JavaScript Number 处理，不保证任意十进制精确；读取后原 JSON
+                    数字写法及已下溢为零的极小非零值无法恢复。
+                </p>
+                <p className="text-xs text-muted-foreground">
+                    关闭或切换账号后已发送操作的结果未知。当前页面操作锁不跨标签页或页面刷新。
+                </p>
+                <div className="flex flex-wrap gap-2">
+                    <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={busy || !canExecute}
+                        onClick={() => setConfirm('schema')}
+                    >
+                        读取字段描述
+                    </Button>
+                    <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={busy || !canExecute || !fields?.length}
+                        onClick={() => setConfirm('read')}
+                    >
+                        读取配置
+                    </Button>
+                </div>
+                {schemaSource && (
+                    <p className="text-xs text-muted-foreground">
+                        字段来源：
+                        {schemaSource === 'schema'
+                            ? '插件静态 schema'
+                            : schemaSource === 'ui'
+                              ? '插件静态 UI 描述'
+                              : '未声明'}
+                    </p>
+                )}
+                {error && (
+                    <p role="alert" className="text-sm text-destructive">
+                        {error}
+                    </p>
+                )}
+                {notice && (
+                    <p role="status" className="text-sm text-muted-foreground">
+                        {notice}
+                    </p>
+                )}
+                {draft && fields && (
+                    <div className="flex flex-col gap-4">
+                        {fields.map((field) => (
+                            <label key={field.key} className="flex flex-col gap-1 text-sm">
+                                <span>{field.label}</span>
+                                {field.description && (
+                                    <span className="text-xs text-muted-foreground">
+                                        {field.description}
+                                    </span>
+                                )}
+                                {field.default !== undefined && (
+                                    <span className="text-xs text-muted-foreground">
+                                        声明的默认值：{String(field.default)}（不会自动填入）
+                                    </span>
+                                )}
+                                {field.type === 'boolean' ? (
+                                    <input
+                                        type="checkbox"
+                                        checked={draft[field.key] === true}
+                                        onChange={(event) =>
+                                            setDraft({
+                                                ...draft,
+                                                [field.key]: event.target.checked,
+                                            })
+                                        }
+                                    />
+                                ) : field.type === 'text' ? (
+                                    <Textarea
+                                        value={String(draft[field.key])}
+                                        maxLength={16384}
+                                        onChange={(event) =>
+                                            setDraft({ ...draft, [field.key]: event.target.value })
+                                        }
+                                    />
+                                ) : (
+                                    <Input
+                                        type="text"
+                                        inputMode={field.type === 'number' ? 'decimal' : undefined}
+                                        autoComplete="off"
+                                        value={String(draft[field.key])}
+                                        maxLength={16384}
+                                        onChange={(event) =>
+                                            setDraft({ ...draft, [field.key]: event.target.value })
+                                        }
+                                    />
+                                )}
+                            </label>
+                        ))}
+                    </div>
+                )}
+                {draft && (
+                    <Button
+                        size="sm"
+                        disabled={busy || !canExecute}
+                        onClick={() => {
+                            try {
+                                if (!fields) {
+                                    throw new Error();
+                                }
+
+                                configDraftToValue(fields, draft);
+                                setConfirm('write');
+                            } catch {
+                                setError('请检查配置字段和数字格式。');
+                            }
+                        }}
+                    >
+                        提交配置
+                    </Button>
+                )}
+                <ConfirmDialog
+                    open={confirm !== null}
+                    onOpenChange={(open) => {
+                        if (!open) {
+                            setConfirm(null);
+                        }
+                    }}
+                    title={
+                        confirm === 'schema'
+                            ? '确认读取字段描述'
+                            : confirm === 'read'
+                              ? '确认读取配置'
+                              : '确认提交配置'
+                    }
+                    description={`账号 ${uin} · 插件 ${id}`}
+                    content={
+                        <p className="text-sm">
+                            {confirm === 'write'
+                                ? '将整体提交当前配置，可能覆盖插件或后台的并发修改；持久化由插件决定。'
+                                : '此操作可能执行插件代码；插件拥有当前进程完整权限。'}{' '}
+                            不会自动重试。
+                        </p>
+                    }
+                    confirmText="确认执行"
+                    onConfirm={() => {
+                        if (confirm) {
+                            void run(confirm);
+                        }
+                    }}
+                />
+            </div>
+        </Modal>
     );
 }
 

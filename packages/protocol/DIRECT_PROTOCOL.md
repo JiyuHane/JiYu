@@ -235,7 +235,14 @@ nodes or a unique-node count: inspected duplicate-key branches have separate
 count behavior. The resulting nonempty producer output is captured in a heap
 closure whose wrapper targets `0x34ffbe0`; its callback conditionally passes the
 captured container to `0x34f6610` with `wtlogin.login` and command `0x810`.
-On a candidate sender-construction path through `0x34a9e00`, `0x34f05e0`,
+In its inspected branch, `0x34f6610` uses a per-entry 16-bit sequence, calls
+`0x34f9170` with a captured byte span, and later conditionally dispatches via a
+receiver's virtual slot `+0x20`. Its preserved nonzero intermediate result can
+also be returned when the receiver is absent or the later `channel+0x40`
+control-block promotion fails; an earlier weak-reference failure instead
+unwinds. The two inspected callers do not branch on the return. Neither the
+return value nor this static path establishes a network send or a connection
+to `GetSignInfo`. On a candidate sender-construction path through `0x34a9e00`, `0x34f05e0`,
 `0x34f4e70` and `0x34f63e0`, the value ultimately assigned to sender `+0x38`
 is the address-adjusted subobject `X+0x10` when `X = [H+0x90]` is non-null.
 The guarded send then calls that receiver's virtual slot `+0x20`. The dynamic
@@ -243,9 +250,19 @@ subobject type and slot target, and any bridge from it to `GetSignInfo`, are
 not established; the same-offset sender constructions are not proof of the
 same runtime instance. A separately inspected `0x34b9130` construction zeros
 `H+0x90/+0x98` and installs a vtable connected to an
-`onUnusualDeviceNeedVerify` candidate thunk. That does not establish its
-identity with the QR-success instance. In the inspected normal path,
-`0x34bafd0` reads and copies that pair into a new control-block-backed object;
+`onUnusualDeviceNeedVerify` candidate thunk. The same candidate address point
+has an ELF `R_X86_64_RELATIVE` relocation at offset `+0x28` to `0x349f1f0`,
+the method in the observed `J+0x60` copy path; additional slots point to
+methods that inspect a `+0x90` member. These are static vtable associations,
+conditional on relocation and the address point remaining installed, not proof
+that the methods operate on the same runtime instance. In particular, the
+method's owner and its separate `J` argument have not been identified with
+`H` or the QR-success instance. A bounded search in `0x349f000–0x34c0000`
+for selected direct-call and indirect `+0x28` forms did not identify a caller
+with a proven receiver type or construct `J`'s origin. That search excludes
+other instruction forms and address ranges, so it does not establish that no
+caller exists. In the inspected normal path, `0x34bafd0` reads and copies that
+pair into a new control-block-backed object;
 no direct write back to the input pair was observed, subject to pointer-alias
 and indirect-call limitations. Other inspected factory calls pass the address
 of this pair into newly constructed objects, but do not establish its nonzero

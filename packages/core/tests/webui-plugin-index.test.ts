@@ -80,7 +80,36 @@ describe('community plugin index route', () => {
                 }),
             );
             expect(deniedEnable.status).toBe(401);
+            expect(deniedEnable.headers.get('cache-control')).toBe('no-store');
+
+            for (const url of [
+                'http://127.0.0.1/api/plugins/local/10001/fixture/config/read',
+                'http://127.0.0.1/api/plugins/%6cocal/10001/fixture/config/write',
+                'http://127.0.0.1/api/%70lugins/local/10001/fixture/config/schema',
+            ]) {
+                const deniedConfig = await fetch(new Request(url, { method: 'POST' }));
+                expect(deniedConfig.status).toBe(401);
+                expect(deniedConfig.headers.get('cache-control')).toBe('no-store');
+            }
+
             expect(state.get).not.toHaveBeenCalled();
+
+            let bodyCancelled = false;
+            const unread = new ReadableStream<Uint8Array>({
+                cancel() {
+                    bodyCancelled = true;
+                },
+            });
+            const deniedStream = await fetch(
+                new Request('http://127.0.0.1/api/plugins/local/10001/fixture/config/write', {
+                    method: 'POST',
+                    body: unread,
+                    duplex: 'half',
+                } as RequestInit & { duplex: 'half' }),
+            );
+            expect(deniedStream.status).toBe(401);
+            expect(deniedStream.headers.get('cache-control')).toBe('no-store');
+            await vi.waitFor(() => expect(bodyCancelled).toBe(true));
 
             const login = await fetch(
                 new Request('http://127.0.0.1/api/login', {
@@ -140,6 +169,7 @@ describe('community plugin index route', () => {
             );
             const { token } = (await login.json()) as { token: string };
             const marker = 'fixture-private-body-marker';
+
             for (const target of [
                 'http://127.0.0.1/api/plugins/local/10001/fixture/enable',
                 'http://127.0.0.1/api/plugins/%6cocal/10001/fixture/enable',
@@ -159,6 +189,7 @@ describe('community plugin index route', () => {
                 // local plugin fixture is reported after the middleware.
                 expect(response.status).toBe(404);
             }
+
             const rendered = logs.map((entry) => entry.message).join('\n');
             expect(rendered).not.toContain(token);
             expect(rendered).not.toContain(marker);

@@ -38,7 +38,12 @@ async function fixture(source: string): Promise<{ root: string; plugin: string }
     return { root, plugin };
 }
 
-function makeHost(root: string, accountId = '123', maxPendingEvents = 2) {
+function makeHost(
+    root: string,
+    accountId = '123',
+    maxPendingEvents = 2,
+    configOptions: Partial<PluginHostOptions> = {},
+) {
     const handler = new ApiHandler({
         getLoginInfo: () => ({ userId: Number(accountId), nickname: 'fixture' }),
     } as ApiActionContext);
@@ -51,6 +56,7 @@ function makeHost(root: string, accountId = '123', maxPendingEvents = 2) {
         isStreamAction: (name) => handler.isStreamAction(name),
         logger,
         maxPendingEvents,
+        ...configOptions,
     });
     return { host, logger };
 }
@@ -869,6 +875,584 @@ describe('independent account plugin host', () => {
 
         const { host } = makeHost(root);
         await expect(host.enable('demo', plugin)).rejects.toMatchObject({ code: 'PATH_ESCAPE' });
+        await host.shutdown();
+    });
+
+    it('gives each active slot a distinct opaque configuration generation', async () => {
+        const { root, plugin } = await fixture(`
+            export async function plugin_init() { globalThis.__jiyuProbe.initStarted(); await globalThis.__jiyuProbe.initGate; }
+            export async function plugin_onevent() { globalThis.__jiyuProbe.eventStarted(); await globalThis.__jiyuProbe.eventGate; }
+        `);
+        let initStarted!: () => void;
+        let releaseInit!: () => void;
+        let eventStarted!: () => void;
+        let releaseEvent!: () => void;
+        const initReady = new Promise<void>((resolve) => {
+            initStarted = resolve;
+        });
+        const eventReady = new Promise<void>((resolve) => {
+            eventStarted = resolve;
+        });
+        const probe = {
+            initStarted,
+            initGate: new Promise<void>((resolve) => {
+                releaseInit = resolve;
+            }),
+            eventStarted,
+            eventGate: new Promise<void>((resolve) => {
+                releaseEvent = resolve;
+            }),
+        };
+        (globalThis as Record<string, unknown>).__jiyuProbe = probe;
+        const first = makeHost(root, '123').host;
+        const second = makeHost(root, '123').host;
+        const opening = first.enable('demo', plugin);
+        await initReady;
+        expect(first.getConfigGeneration('demo')).toBeNull();
+        releaseInit();
+        await opening;
+        await second.enable('demo', plugin);
+        const generation = first.getConfigGeneration('demo');
+        expect(generation).toMatch(/^[0-9a-f-]{36}$/);
+        expect(second.getConfigGeneration('demo')).toMatch(/^[0-9a-f-]{36}$/);
+        expect(second.getConfigGeneration('demo')).not.toBe(generation);
+        expect(first.getConfigGeneration('missing')).toBeNull();
+        let coerced = false;
+        const invalid = {
+            toString: () => {
+                coerced = true;
+                throw Error('PRIVATE');
+            },
+        };
+        expect(first.getConfigGeneration(invalid as unknown as string)).toBeNull();
+        expect(first.getConfigGeneration('../invalid')).toBeNull();
+        expect(coerced).toBe(false);
+        first.dispatch({ n: 1 });
+        await eventReady;
+        const stopping = first.disable('demo');
+        expect(first.getConfigGeneration('demo')).toBeNull();
+        releaseEvent();
+        await stopping;
+        expect(first.getConfigGeneration('demo')).toBeNull();
+        await first.enable('demo', plugin);
+        const next = first.getConfigGeneration('demo');
+        expect(next).toMatch(/^[0-9a-f-]{36}$/);
+        expect(next).not.toBe(generation);
+        expect(next).not.toBe(second.getConfigGeneration('demo'));
+        const closing = first.shutdown();
+        expect(first.getConfigGeneration('demo')).toBeNull();
+        await Promise.all([closing, second.shutdown()]);
+    });
+
+    it('exposes explicit account-scoped configuration hooks and static schema only', async () => {
+        const { root, plugin } = await fixture(`
+            let value = { initial: true };
+            export function plugin_init() { globalThis.__jiyuProbe.init++; }
+            export const plugin_config_schema = [{ name: 'setting' }];
+            export const plugin_config_ui = [{ name: 'ignored' }];
+            export function plugin_get_config() { globalThis.__jiyuProbe.get++; return value; }
+            export function plugin_set_config(c, v) { globalThis.__jiyuProbe.set++; value = v; }
+        `);
+        const probe = { init: 0, get: 0, set: 0 };
+        (globalThis as Record<string, unknown>).__jiyuProbe = probe;
+        const a = makeHost(root, '123').host;
+        const b = makeHost(root, '456').host;
+        await Promise.all([a.enable('demo', plugin), b.enable('demo', plugin)]);
+        expect(probe).toEqual({ init: 2, get: 0, set: 0 });
+        const schema = await a.getConfigSchema('demo');
+        expect(schema).toEqual({ fields: [{ name: 'setting' }], source: 'schema' });
+        (schema.fields![0] as Record<string, unknown>).name = 'mutated';
+        expect(await a.getConfigSchema('demo')).toEqual({
+            fields: [{ name: 'setting' }],
+            source: 'schema',
+        });
+        const input = { nested: { x: 1 } };
+        const setting = a.setConfig('demo', input);
+        input.nested.x = 99;
+        expect(await setting).toEqual({ persistence: 'plugin-managed' });
+        const result = await a.getConfig('demo');
+        expect(result).toEqual({ value: { nested: { x: 1 } }, source: 'plugin' });
+        (result.value.nested as Record<string, unknown>).x = 7;
+        expect((await a.getConfig('demo')).value).toEqual({ nested: { x: 1 } });
+        expect((await b.getConfig('demo')).value).toEqual({ initial: true });
+        await Promise.all([a.shutdown(), b.shutdown()]);
+        await expect(a.getConfig('demo')).rejects.toMatchObject({ code: 'PLUGIN_INACTIVE' });
+    });
+
+    it('treats schema and hooks independently and never calls schema functions', async () => {
+        const { root, plugin } = await fixture(`
+            export function plugin_init() {}
+            export const plugin_config_ui = [{ key: 'ui' }];
+        `);
+        const host = makeHost(root).host;
+        await host.enable('demo', plugin);
+        expect(await host.getConfigSchema('demo')).toEqual({
+            fields: [{ key: 'ui' }],
+            source: 'ui',
+        });
+        await expect(host.getConfig('demo')).rejects.toMatchObject({ code: 'CONFIG_UNSUPPORTED' });
+        await expect(host.setConfig('demo', {})).rejects.toMatchObject({
+            code: 'CONFIG_UNSUPPORTED',
+        });
+        await host.disable('demo');
+        await writeFile(
+            path.join(plugin, 'index.mjs'),
+            `
+            export function plugin_init() {}
+            export function plugin_config_schema() { globalThis.__jiyuProbe.executed = true; return []; }
+            export const plugin_config_ui = [];
+        `,
+        );
+        const probe = { executed: false };
+        (globalThis as Record<string, unknown>).__jiyuProbe = probe;
+        await host.enable('demo', plugin);
+        await expect(host.getConfigSchema('demo')).rejects.toMatchObject({
+            code: 'CONFIG_INVALID',
+        });
+        expect(probe.executed).toBe(false);
+        await host.disable('demo');
+        await writeFile(path.join(plugin, 'index.mjs'), 'export function plugin_init() {}');
+        await host.enable('demo', plugin);
+        expect(await host.getConfigSchema('demo')).toEqual({ fields: null, source: 'none' });
+        await host.shutdown();
+    });
+
+    it('orders events and config FIFO, bounds admission, and drains a stuck config hook', async () => {
+        const { root, plugin } = await fixture(`
+            export function plugin_init() {}
+            export async function plugin_onevent(c,e) { globalThis.__jiyuProbe.log.push('event:' + e.n); }
+            export async function plugin_set_config(c,v) {
+                const p = globalThis.__jiyuProbe; p.log.push('set:' + v.n); p.started(); await p.gate;
+            }
+            export function plugin_get_config() { globalThis.__jiyuProbe.log.push('get'); return {}; }
+            export function plugin_cleanup() { globalThis.__jiyuProbe.log.push('cleanup'); }
+        `);
+        let release!: () => void;
+        let started!: () => void;
+        const ready = new Promise<void>((resolve) => {
+            started = resolve;
+        });
+        const probe = {
+            log: [] as string[],
+            started,
+            gate: new Promise<void>((resolve) => {
+                release = resolve;
+            }),
+        };
+        (globalThis as Record<string, unknown>).__jiyuProbe = probe;
+        const host = makeHost(root, '123', 2, {
+            maxPendingConfig: 2,
+            maxPendingConfigBytes: 14,
+        }).host;
+        await host.enable('demo', plugin);
+        host.dispatch({ n: 1 });
+        const first = host.setConfig('demo', { n: 1 });
+        await expect(host.setConfig('demo', { n: 222222 })).rejects.toMatchObject({
+            code: 'CONFIG_QUEUE_FULL',
+        });
+        host.dispatch({ n: 2 });
+        const second = host.getConfig('demo');
+        await expect(host.getConfig('demo')).rejects.toMatchObject({ code: 'CONFIG_QUEUE_FULL' });
+        await ready;
+        let stopped = false;
+        const disable = host.disable('demo').then(() => {
+            stopped = true;
+        });
+        await expect(host.getConfig('demo')).rejects.toMatchObject({ code: 'PLUGIN_INACTIVE' });
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(stopped).toBe(false);
+        expect(probe.log).toEqual(['event:1', 'set:1']);
+        release();
+        await Promise.all([first, second, disable]);
+        expect(probe.log).toEqual(['event:1', 'set:1', 'event:2', 'get', 'cleanup']);
+        await host.shutdown();
+    });
+
+    it('bounds config bytes and rejects malformed JSON without accessing proxies or getters', async () => {
+        const { root, plugin } = await fixture(`
+            export function plugin_init() {}
+            export function plugin_set_config() { globalThis.__jiyuProbe++; }
+        `);
+        (globalThis as Record<string, unknown>).__jiyuProbe = 0;
+        const host = makeHost(root, '123', 2, { maxPendingConfigBytes: 20 }).host;
+        await host.enable('demo', plugin);
+        let trapped = 0;
+        const proxy = new Proxy(
+            {},
+            {
+                ownKeys() {
+                    trapped++;
+                    throw Error('PRIVATE');
+                },
+            },
+        );
+        const getter = Object.defineProperty({}, 'x', {
+            enumerable: true,
+            get() {
+                trapped++;
+                throw Error('PRIVATE');
+            },
+        });
+        const cycle: any = {};
+        cycle.self = cycle;
+        const sparse = Array(1);
+        const deep: any = {};
+        let cursor = deep;
+
+        for (let i = 0; i < 33; i++) {
+            cursor.x = {};
+            cursor = cursor.x;
+        }
+
+        for (const value of [
+            proxy,
+            getter,
+            cycle,
+            { x: sparse },
+            { x: NaN },
+            { x: 1n },
+            { x: () => {} },
+            JSON.parse('{"__proto__":1}'),
+            deep,
+        ]) {
+            await expect(host.setConfig('demo', value as any)).rejects.toMatchObject({
+                code: 'CONFIG_INVALID',
+            });
+        }
+
+        await expect(host.setConfig('demo', { x: 'a'.repeat(30) })).rejects.toMatchObject({
+            code: 'CONFIG_QUEUE_FULL',
+        });
+        await expect(host.setConfig('demo', { x: 'a'.repeat(256 * 1024) })).rejects.toMatchObject({
+            code: 'CONFIG_INVALID',
+        });
+        expect(trapped).toBe(0);
+        expect((globalThis as Record<string, unknown>).__jiyuProbe).toBe(0);
+        await host.shutdown();
+    });
+
+    it('bounds schema and returned values without invoking accessors or proxy traps', async () => {
+        const { root, plugin } = await fixture(`
+            export function plugin_init() {}
+            export let plugin_config_schema = [];
+            export function plugin_get_config() { return globalThis.__jiyuProbe.value; }
+            globalThis.__jiyuProbe.schema = value => { plugin_config_schema = value; };
+        `);
+        let trapped = 0;
+        const probe: { value: unknown; schema?: (value: unknown) => void } = { value: {} };
+        (globalThis as Record<string, unknown>).__jiyuProbe = probe;
+        const host = makeHost(root).host;
+        await host.enable('demo', plugin);
+        const proxy = new Proxy(
+            {},
+            {
+                ownKeys() {
+                    trapped++;
+                    throw Error('PRIVATE');
+                },
+            },
+        );
+        const getter = Object.defineProperty({}, 'secret', {
+            enumerable: true,
+            get() {
+                trapped++;
+                throw Error('PRIVATE');
+            },
+        });
+
+        for (const value of [proxy, getter, { n: Infinity }, { x: Array(1) }, 'not-object']) {
+            probe.value = value;
+            await expect(host.getConfig('demo')).rejects.toMatchObject({
+                code: 'CONFIG_OUTCOME_UNKNOWN',
+            });
+        }
+
+        for (const value of [
+            [proxy],
+            [getter],
+            ['x'.repeat(64 * 1024)],
+            new Proxy([], {
+                ownKeys() {
+                    trapped++;
+                    return [];
+                },
+            }),
+        ]) {
+            probe.schema!(value);
+            await expect(host.getConfigSchema('demo')).rejects.toMatchObject({
+                code: 'CONFIG_INVALID',
+            });
+        }
+
+        let deep: any = 'leaf';
+
+        for (let i = 0; i < 17; i++) {
+            deep = [deep];
+        }
+
+        probe.schema!(deep);
+        await expect(host.getConfigSchema('demo')).rejects.toMatchObject({
+            code: 'CONFIG_INVALID',
+        });
+        probe.schema!(['x'.repeat(65532)]);
+        await expect(host.getConfigSchema('demo')).resolves.toMatchObject({ source: 'schema' });
+        probe.schema!(['x'.repeat(65533)]);
+        await expect(host.getConfigSchema('demo')).rejects.toMatchObject({
+            code: 'CONFIG_INVALID',
+        });
+        expect(trapped).toBe(0);
+        await host.shutdown();
+    });
+
+    it('rejects same-slot lifecycle reentrancy while preserving external and other-host management', async () => {
+        const { root, plugin } = await fixture(`
+            export function plugin_init() {}
+            export async function plugin_onevent() { await globalThis.__jiyuProbe.event(); }
+            export async function plugin_get_config() { await globalThis.__jiyuProbe.config(); return { ok: true }; }
+            export function plugin_cleanup() { globalThis.__jiyuProbe.cleanups++; }
+        `);
+        const host = makeHost(root, '123').host;
+        const other = makeHost(root, '456').host;
+        const errors: Array<{ code: string; stack: string; cause?: unknown }> = [];
+        let eventFinished!: () => void;
+        const ready = new Promise<void>((resolve) => {
+            eventFinished = resolve;
+        });
+        const probe = {
+            cleanups: 0,
+            event: async () => {
+                errors.push(await host.disable('demo').catch((error) => error));
+                errors.push(
+                    await Promise.resolve()
+                        .then(() => host.shutdown())
+                        .catch((error) => error),
+                );
+                await other.shutdown();
+                eventFinished();
+            },
+            config: async () => {
+                errors.push(
+                    await Promise.resolve()
+                        .then(() => host.disable('demo'))
+                        .catch((error) => error),
+                );
+                errors.push(await host.shutdown().catch((error) => error));
+            },
+        };
+        (globalThis as Record<string, unknown>).__jiyuProbe = probe;
+        await host.enable('demo', plugin);
+        await other.enable('demo', plugin);
+        expect(host.dispatch({ n: 1 }).accepted).toBe(1);
+        await ready;
+        expect(host.listStatuses()).toMatchObject([{ id: 'demo', state: 'active' }]);
+        expect(await host.getConfig('demo')).toEqual({ value: { ok: true }, source: 'plugin' });
+        expect(errors).toHaveLength(4);
+
+        for (const error of errors) {
+            expect(error.code).toBe('CONFIG_REENTRANT');
+            expect(error.stack).toBe('PluginHostError: Plugin host: CONFIG_REENTRANT');
+            expect(error.cause).toBeUndefined();
+        }
+
+        expect(host.listStatuses()).toMatchObject([{ id: 'demo', state: 'active' }]);
+        await host.disable('demo');
+        await host.shutdown();
+        expect(probe.cleanups).toBe(2);
+    });
+
+    it('rejects same-host lifecycle hook reentrancy and expires detached lifecycle tokens', async () => {
+        const { root, plugin } = await fixture(`
+            export async function plugin_init() { await globalThis.__jiyuProbe.init(); }
+            export async function plugin_cleanup() { await globalThis.__jiyuProbe.cleanup(); }
+        `);
+        const otherFixture = await fixture('export function plugin_init() {}');
+        const host = makeHost(root, '123').host;
+        const other = makeHost(root, '456').host;
+        const errors: Array<{ code: string; stack: string }> = [];
+        let releaseInit!: () => void;
+        let releaseCleanup!: () => void;
+        let releaseShutdown!: () => void;
+        const initGate = new Promise<void>((resolve) => {
+            releaseInit = resolve;
+        });
+        const cleanupGate = new Promise<void>((resolve) => {
+            releaseCleanup = resolve;
+        });
+        const shutdownGate = new Promise<void>((resolve) => {
+            releaseShutdown = resolve;
+        });
+        let initDetached!: Promise<void>;
+        let cleanupDetached!: Promise<void>;
+        let shutdownDetached!: Promise<void>;
+
+        const inspect = async () => {
+            errors.push(await host.enable('later', otherFixture.plugin).catch((e) => e));
+            errors.push(
+                await Promise.resolve()
+                    .then(() => host.disable('different'))
+                    .catch((e) => e),
+            );
+            errors.push(await host.shutdown().catch((e) => e));
+        };
+
+        const probe = {
+            init: async () => {
+                await inspect();
+                await other.enable('independent', otherFixture.plugin);
+                initDetached = initGate.then(() => host.enable('later', otherFixture.plugin));
+            },
+            cleanup: async () => {
+                await inspect();
+                cleanupDetached = cleanupGate.then(async () => {
+                    await host.enable('after', otherFixture.plugin);
+                    await host.disable('later');
+                });
+                shutdownDetached = shutdownGate.then(() => host.shutdown());
+            },
+        };
+        (globalThis as Record<string, unknown>).__jiyuProbe = probe;
+        await host.enable('demo', plugin);
+        expect(host.listStatuses()).toMatchObject([{ id: 'demo', state: 'active' }]);
+        releaseInit();
+        await initDetached;
+        await host.disable('demo');
+        releaseCleanup();
+        await cleanupDetached;
+        expect(host.listStatuses().map((item) => item.id)).toEqual(['after']);
+        expect(errors).toHaveLength(6);
+
+        for (const error of errors) {
+            expect(error).toMatchObject({
+                code: 'CONFIG_REENTRANT',
+                stack: 'PluginHostError: Plugin host: CONFIG_REENTRANT',
+            });
+        }
+
+        releaseShutdown();
+        await Promise.all([shutdownDetached, other.shutdown()]);
+    });
+
+    it('rejects cleanup reentrancy before returning an existing shutdown task', async () => {
+        const { root, plugin } = await fixture(`
+            export function plugin_init() {}
+            export async function plugin_cleanup() {
+                globalThis.__jiyuProbe.error = await globalThis.__jiyuProbe.host.shutdown().catch(e => e);
+            }
+        `);
+        const host = makeHost(root).host;
+        const probe: { host: PluginHost; error?: Error & { code?: string } } = { host };
+        (globalThis as Record<string, unknown>).__jiyuProbe = probe;
+        await host.enable('demo', plugin);
+        await host.shutdown();
+        expect(probe.error).toMatchObject({
+            code: 'CONFIG_REENTRANT',
+            stack: 'PluginHostError: Plugin host: CONFIG_REENTRANT',
+        });
+    });
+
+    it('expires a detached event token after its hook finishes', async () => {
+        const { root, plugin } = await fixture(`
+            export function plugin_init() {}
+            export function plugin_onevent() { globalThis.__jiyuProbe.schedule(); }
+            export function plugin_get_config() { return { ok: true }; }
+        `);
+        const host = makeHost(root).host;
+        let release!: () => void;
+        let scheduled!: () => void;
+        const ready = new Promise<void>((resolve) => {
+            scheduled = resolve;
+        });
+        const gate = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        let detached!: Promise<unknown>;
+        (globalThis as Record<string, unknown>).__jiyuProbe = {
+            schedule: () => {
+                detached = gate.then(() => host.getConfig('demo'));
+                scheduled();
+            },
+        };
+        await host.enable('demo', plugin);
+        host.dispatch({ n: 1 });
+        await ready;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        release();
+        await expect(detached).resolves.toEqual({ value: { ok: true }, source: 'plugin' });
+        await host.disable('demo');
+        await host.shutdown();
+    });
+
+    it('rejects a hook shutdown even when an external shutdown already waits for it', async () => {
+        const { root, plugin } = await fixture(`
+            export function plugin_init() {}
+            export async function plugin_onevent() {
+                const p = globalThis.__jiyuProbe; p.started(); await p.gate;
+                p.error = await p.host.shutdown().catch(e => e);
+                p.finished = true;
+            }
+        `);
+        let started!: () => void;
+        let release!: () => void;
+        const ready = new Promise<void>((resolve) => {
+            started = resolve;
+        });
+        const host = makeHost(root).host;
+        const probe: {
+            host: PluginHost;
+            started: () => void;
+            gate: Promise<void>;
+            error?: Error & { code?: string };
+            finished: boolean;
+        } = {
+            host,
+            started,
+            gate: new Promise<void>((resolve) => {
+                release = resolve;
+            }),
+            finished: false,
+        };
+        (globalThis as Record<string, unknown>).__jiyuProbe = probe;
+        await host.enable('demo', plugin);
+        host.dispatch({ n: 1 });
+        await ready;
+        const closing = host.shutdown();
+        release();
+        await closing;
+        expect(probe.finished).toBe(true);
+        expect(probe.error).toMatchObject({
+            code: 'CONFIG_REENTRANT',
+            stack: 'PluginHostError: Plugin host: CONFIG_REENTRANT',
+        });
+    });
+
+    it('sanitizes hook failures and rejects same-slot reentrant config operations', async () => {
+        const { root, plugin } = await fixture(`
+            export function plugin_init() {}
+            export async function plugin_onevent() { globalThis.__jiyuProbe.reentrant = await globalThis.__jiyuProbe.host.getConfig('demo').catch(e => e.code); }
+            export function plugin_get_config() { throw Error('SECRET_VALUE /private/path'); }
+            export function plugin_set_config() { throw Error('SECRET_VALUE /private/path'); }
+        `);
+        const probe: { host?: PluginHost; reentrant?: string } = {};
+        (globalThis as Record<string, unknown>).__jiyuProbe = probe;
+        const host = makeHost(root).host;
+        probe.host = host;
+        await host.enable('demo', plugin);
+
+        for (const promise of [
+            host.getConfig('demo'),
+            host.setConfig('demo', { secret: 'PRIVATE_INPUT' }),
+        ]) {
+            const error = await promise.catch((e) => e);
+            expect(error).toMatchObject({ code: 'CONFIG_OUTCOME_UNKNOWN' });
+            expect(String(error)).not.toMatch(/SECRET_VALUE|private\/path|PRIVATE_INPUT/);
+            expect(error.stack).toBe('PluginHostError: Plugin host: CONFIG_OUTCOME_UNKNOWN');
+            expect(error.cause).toBeUndefined();
+        }
+
+        host.dispatch({ n: 1 });
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        await host.disable('demo');
+        expect(probe.reentrant).toBe('CONFIG_REENTRANT');
         await host.shutdown();
     });
 

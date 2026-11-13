@@ -776,6 +776,25 @@ export async function initWebUI(
         return c.body('User-agent: *\nDisallow: /\n');
     });
 
+    // Cover authentication and consent failures too: an early response must
+    // not be cached merely because the plugin routes were never reached.
+    app.use('/api/plugins/local/*', async (c, next) => {
+        await next();
+        c.res.headers.set('Cache-Control', 'no-store');
+
+        // Authentication or consent can reject before any body is read. Do not
+        // wait for a possibly non-settling stream cancellation on that path.
+        const request = c.req.raw;
+
+        if ((c.res.status === 401 || c.res.status === 403) && request.body && !request.bodyUsed) {
+            try {
+                void request.body.cancel().catch(() => {});
+            } catch {
+                // Stream cleanup is best effort; keep the original response.
+            }
+        }
+    });
+
     // ─── Auth middleware ─────────────────────────────────────────────────────
     app.use('/api/*', async (c, next) => {
         const reqPath = c.req.path;

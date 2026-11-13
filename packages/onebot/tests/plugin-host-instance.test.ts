@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BridgeEventBus } from '@snowluma/protocol/event-bus';
@@ -26,8 +26,7 @@ async function plugin(source: string): Promise<string> {
     return directory;
 }
 
-async function instance() {
-    const uin = String(nextAccount++);
+async function instance(uin = String(nextAccount++)) {
     const bridge = {
         events: new BridgeEventBus(),
         identity: { initialization: Promise.resolve(), nickname: `user-${uin}`, groups: [] },
@@ -57,6 +56,239 @@ afterEach(async () => {
 });
 
 describe('OneBot account plugin integration', () => {
+    it('does not create a host or plugin state for configuration access without enable', async () => {
+        const oldCwd = process.cwd();
+        const workspace = await mkdtemp(path.join(oldCwd, 'isolated-workspace-'));
+        const probe = { evaluated: 0 };
+        setProbe(probe);
+        await plugin(
+            `globalThis.__instancePluginProbe.evaluated++; export function plugin_init() {}`,
+        );
+        process.chdir(workspace);
+
+        try {
+            const account = await instance();
+            for (const operation of [
+                () => account.getPluginConfigSchema('demo'),
+                () => account.getPluginConfig('demo'),
+                () => account.setPluginConfig('demo', { enabled: true }),
+            ]) {
+                await expect(operation()).rejects.toMatchObject({
+                    name: 'PluginHostError',
+                    code: 'PLUGIN_INACTIVE',
+                    message: 'Plugin host: PLUGIN_INACTIVE',
+                });
+            }
+
+            expect(probe.evaluated).toBe(0);
+            expect(account.listPlugins()).toEqual([]);
+            expect(account.getPluginConfigGeneration('demo')).toBeNull();
+            await expect(access(path.join(workspace, 'data', 'plugins'))).rejects.toMatchObject({
+                code: 'ENOENT',
+            });
+            await account.dispose();
+        } finally {
+            process.chdir(oldCwd);
+        }
+    });
+
+    it('routes configuration only to the explicitly enabled account and preserves host errors', async () => {
+        const probe = { evaluated: 0, configs: new Map<string, unknown>() };
+        setProbe(probe);
+        const directory = await plugin(`
+            globalThis.__instancePluginProbe.evaluated++;
+            export function plugin_init(c) { globalThis.__instancePluginProbe.configs.set(c.dataPath, {}); }
+            export const plugin_config_schema = [{ key: 'label', type: 'string' }];
+            export function plugin_get_config(c) { return globalThis.__instancePluginProbe.configs.get(c.dataPath); }
+            export function plugin_set_config(c, value) { globalThis.__instancePluginProbe.configs.set(c.dataPath, value); }
+        `);
+        const a = await instance();
+        const b = await instance();
+        await a.enablePlugin('demo', directory);
+        await expect(b.getPluginConfig('demo')).rejects.toMatchObject({ code: 'PLUGIN_INACTIVE' });
+        expect(probe.evaluated).toBe(1);
+        await b.enablePlugin('demo', directory);
+        await expect(a.getPluginConfigSchema('demo')).resolves.toEqual({
+            fields: [{ key: 'label', type: 'string' }],
+            source: 'schema',
+        });
+        await expect(a.setPluginConfig('demo', { label: 'account A' })).resolves.toEqual({
+            persistence: 'plugin-managed',
+        });
+        await expect(b.setPluginConfig('demo', { label: 'account B' })).resolves.toEqual({
+            persistence: 'plugin-managed',
+        });
+        await expect(a.getPluginConfig('demo')).resolves.toEqual({
+            value: { label: 'account A' },
+            source: 'plugin',
+        });
+        await expect(b.getPluginConfig('demo')).resolves.toEqual({
+            value: { label: 'account B' },
+            source: 'plugin',
+        });
+        await expect(a.setPluginConfig('demo', null)).rejects.toMatchObject({
+            name: 'PluginHostError',
+            code: 'CONFIG_INVALID',
+            message: 'Plugin host: CONFIG_INVALID',
+        });
+        await expect(a.getPluginConfig('missing-secret-id')).rejects.toMatchObject({
+            name: 'PluginHostError',
+            code: 'PLUGIN_INACTIVE',
+            message: 'Plugin host: PLUGIN_INACTIVE',
+        });
+    });
+
+    it('changes opaque slot generations across accounts, re-enables and account restarts', async () => {
+        const probe = { initialized: 0, configCalls: 0 };
+        setProbe(probe);
+        const directory = await plugin(`
+            export function plugin_init() { globalThis.__instancePluginProbe.initialized++; }
+            export function plugin_get_config() { globalThis.__instancePluginProbe.configCalls++; return {}; }
+        `);
+        const a = await instance();
+        const b = await instance();
+        expect(a.getPluginConfigGeneration('demo')).toBeNull();
+        await Promise.all([a.enablePlugin('demo', directory), b.enablePlugin('demo', directory)]);
+        const first = a.getPluginConfigGeneration('demo');
+        const other = b.getPluginConfigGeneration('demo');
+        expect(typeof first).toBe('string');
+        expect(first).toBeTruthy();
+        expect(typeof other).toBe('string');
+        expect(other).toBeTruthy();
+        expect(first).not.toBe(other);
+        expect(first).not.toBe(a.uin);
+        expect(first).not.toContain(directory);
+        expect(a.getPluginConfigGeneration('demo')).toBe(first);
+        expect(a.getPluginConfigGeneration('missing')).toBeNull();
+        expect(probe.configCalls).toBe(0);
+        await a.disablePlugin('demo');
+        expect(a.getPluginConfigGeneration('demo')).toBeNull();
+        await a.enablePlugin('demo', directory);
+        const restartedSlot = a.getPluginConfigGeneration('demo');
+        expect(restartedSlot).toBeTruthy();
+        expect(restartedSlot).not.toBe(first);
+        expect(restartedSlot).not.toBe(other);
+        a.quiesce();
+        expect(a.getPluginConfigGeneration('demo')).toBeNull();
+        await a.dispose();
+        const replacement = await instance(a.uin);
+        expect(replacement.getPluginConfigGeneration('demo')).toBeNull();
+        await replacement.enablePlugin('demo', directory);
+        const replacementSlot = replacement.getPluginConfigGeneration('demo');
+        expect(replacementSlot).toBeTruthy();
+        expect(replacementSlot).not.toBe(first);
+        expect(replacementSlot).not.toBe(restartedSlot);
+        expect(replacementSlot).not.toBe(other);
+        expect(probe.initialized).toBe(4);
+        expect(probe.configCalls).toBe(0);
+        replacement.quiesce();
+        expect(replacement.getPluginConfigGeneration('demo')).toBeNull();
+    });
+
+    it('drains accepted configuration and events in order on disposal without admitting new hooks', async () => {
+        const gate = deferred();
+        const probe = { gate: gate.promise, calls: [] as string[] };
+        setProbe(probe);
+        const directory = await plugin(`
+            export function plugin_init() {}
+            export async function plugin_get_config() {
+                const p = globalThis.__instancePluginProbe;
+                p.calls.push('get:start');
+                await p.gate;
+                p.calls.push('get:end');
+                return { label: 'fixture' };
+            }
+            export const plugin_config_schema = [{ key: 'label', type: 'string' }];
+            export function plugin_set_config() { globalThis.__instancePluginProbe.calls.push('set'); }
+            export function plugin_onevent() { globalThis.__instancePluginProbe.calls.push('event'); }
+            export function plugin_onmessage() { globalThis.__instancePluginProbe.calls.push('message'); }
+            export function plugin_cleanup() { globalThis.__instancePluginProbe.calls.push('cleanup'); }
+        `);
+        const account = await instance();
+        await account.enablePlugin('demo', directory);
+        const getting = account.getPluginConfig('demo');
+        await vi.waitFor(() => expect(probe.calls).toEqual(['get:start']));
+        const dispatch = (
+            account as unknown as {
+                dispatchEvent(event: JsonObject, source: 'send'): Promise<void>;
+            }
+        ).dispatchEvent.bind(account);
+        await dispatch({ post_type: 'message_sent', message_type: 'private' }, 'send');
+        const setting = account.setPluginConfig('demo', { label: 'new' });
+        const schema = account.getPluginConfigSchema('demo');
+        const closing = account.dispose();
+        let closed = false;
+        void closing.then(() => {
+            closed = true;
+        });
+
+        try {
+            for (const operation of [
+                () => account.getPluginConfigSchema('demo'),
+                () => account.getPluginConfig('demo'),
+                () => account.setPluginConfig('demo', {}),
+            ]) {
+                await expect(operation()).rejects.toMatchObject({
+                    name: 'PluginHostError',
+                    code: 'CLOSED',
+                    message: 'Plugin host: CLOSED',
+                });
+            }
+
+            await account.emitBotStatus('offline');
+            expect(closed).toBe(false);
+            expect(probe.calls).toEqual(['get:start']);
+        } finally {
+            gate.resolve();
+        }
+        await expect(getting).resolves.toEqual({ value: { label: 'fixture' }, source: 'plugin' });
+        await expect(setting).resolves.toEqual({ persistence: 'plugin-managed' });
+        await expect(schema).resolves.toEqual({
+            fields: [{ key: 'label', type: 'string' }],
+            source: 'schema',
+        });
+        await closing;
+        expect(probe.calls).toEqual(['get:start', 'get:end', 'event', 'message', 'set', 'cleanup']);
+    });
+
+    it('preserves absent schema and unsupported hook results from the host', async () => {
+        const directory = await plugin(`export function plugin_init() {}`);
+        const account = await instance();
+        await account.enablePlugin('demo', directory);
+        await expect(account.getPluginConfigSchema('demo')).resolves.toEqual({
+            fields: null,
+            source: 'none',
+        });
+        await expect(account.getPluginConfig('demo')).rejects.toMatchObject({
+            name: 'PluginHostError',
+            code: 'CONFIG_UNSUPPORTED',
+            message: 'Plugin host: CONFIG_UNSUPPORTED',
+        });
+        await expect(account.setPluginConfig('demo', {})).rejects.toMatchObject({
+            name: 'PluginHostError',
+            code: 'CONFIG_UNSUPPORTED',
+            message: 'Plugin host: CONFIG_UNSUPPORTED',
+        });
+        await account.disablePlugin('demo');
+        await expect(account.getPluginConfigSchema('demo')).rejects.toMatchObject({
+            code: 'PLUGIN_INACTIVE',
+            message: 'Plugin host: PLUGIN_INACTIVE',
+        });
+    });
+
+    it('keeps plugin hook exceptions behind the fixed host error', async () => {
+        const directory = await plugin(`
+            export function plugin_init() {}
+            export function plugin_get_config() { throw Error('secret-account-and-path'); }
+        `);
+        const account = await instance();
+        await account.enablePlugin('demo', directory);
+        await expect(account.getPluginConfig('demo')).rejects.toMatchObject({
+            name: 'PluginHostError',
+            code: 'CONFIG_OUTCOME_UNKNOWN',
+            message: 'Plugin host: CONFIG_OUTCOME_UNKNOWN',
+        });
+    });
     it('defaults off; explicitly invokes the real account handler and keeps credentials out of context', async () => {
         const directory = await plugin(`
             globalThis.__instancePluginProbe.evaluated++;

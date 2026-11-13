@@ -30,7 +30,13 @@ import type {
 } from '@/types';
 import type { PasswordRule } from '@/components/pages/change-password-form';
 import { normalizeOneBotConfig } from '@/lib/onebot-config';
-import { parsePluginIndex, parseLocalPlugins, parseLocalPluginMutation } from '@/lib/plugin-index';
+import {
+    parsePluginIndex,
+    parseLocalPlugins,
+    parseLocalPluginMutation,
+    parseConfigEnvelope,
+    isPluginGeneration,
+} from '@/lib/plugin-index';
 import {
     type AgreementsPayload,
     ApiError,
@@ -139,6 +145,54 @@ class HttpApiClient implements ApiClient {
                         signal,
                     ),
                 ),
+            configSchema: async (uin, id) =>
+                parseConfigEnvelope(
+                    await this.fetchPluginJson(
+                        `/api/plugins/local/${encodeURIComponent(uin)}/${encodeURIComponent(id)}/config/schema`,
+                        { method: 'POST', cache: 'no-store' },
+                    ),
+                    'schema',
+                ) as Awaited<ReturnType<ApiClient['plugins']['configSchema']>>,
+            configRead: async (uin, id, generation) => {
+                if (!isPluginGeneration(generation)) {
+                    throw new ApiError(400, '请重新读取字段', 'CONFIG_GENERATION_REQUIRED');
+                }
+
+                return parseConfigEnvelope(
+                    await this.fetchPluginJson(
+                        `/api/plugins/local/${encodeURIComponent(uin)}/${encodeURIComponent(id)}/config/read`,
+                        {
+                            method: 'POST',
+                            cache: 'no-store',
+                            headers: { 'X-Jiyu-Plugin-Generation': generation },
+                        },
+                    ),
+                    'read',
+                    generation,
+                ) as Awaited<ReturnType<ApiClient['plugins']['configRead']>>;
+            },
+            configWrite: async (uin, id, generation, value) => {
+                if (!isPluginGeneration(generation)) {
+                    throw new ApiError(400, '请重新读取字段', 'CONFIG_GENERATION_REQUIRED');
+                }
+
+                return parseConfigEnvelope(
+                    await this.fetchPluginJson(
+                        `/api/plugins/local/${encodeURIComponent(uin)}/${encodeURIComponent(id)}/config/write`,
+                        {
+                            method: 'POST',
+                            cache: 'no-store',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'X-Jiyu-Plugin-Generation': generation,
+                            },
+                            body: JSON.stringify(value),
+                        },
+                    ),
+                    'write',
+                    generation,
+                ) as Awaited<ReturnType<ApiClient['plugins']['configWrite']>>;
+            },
             change: async (uin, id, operation) =>
                 parseLocalPluginMutation(
                     await this.fetchPluginJson(

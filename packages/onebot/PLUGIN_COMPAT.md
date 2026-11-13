@@ -18,10 +18,11 @@ license and attribution independently.
 
 The first compatibility subset uses OneBot v11 actions and events. It supports
 selected lifecycle callbacks and a limited account-scoped `actions.call`
-bridge; it does not recreate the NapCat internal `core`, `oneBot`, `router`,
-`NapCatConfig`, complete plugin manager, configuration UI or cross-plugin
-exports. Plugins that require those interfaces may fail explicitly. A plugin
-that appears in the index is not necessarily usable in Jiyu. The supported
+bridge, static JSON configuration schema, and explicit configuration hooks; it
+does not recreate the NapCat internal `core`, `oneBot`, `router`,
+`NapCatConfig`, complete plugin manager, dynamic configuration controllers or
+cross-plugin exports. Plugins that require those interfaces may fail explicitly.
+A plugin that appears in the index is not necessarily usable in Jiyu. The supported
 hooks, entry-point rules, action behavior and queue limits are described in the
 [host implementation notes](./src/plugin-host/README.md).
 
@@ -48,8 +49,21 @@ Only an explicit enable for a running account executes the selected local ESM
 entry. Stopping a plugin is not an uninstall. Jiyu checks the selected paths,
 but filesystem replacement between checks and loading remains possible.
 
-Archive downloads, store installation, updates, online rollback and plugin
-configuration UI are separate work; do not interpret catalog browsing or a
-local compatibility test as their completion. The host and index can be tested
-with synthetic local plugins without running QQ. Real plugin and QQ
-interoperability require separate validation.
+The configuration panel calls static schema and optional get/set hooks only
+on explicit user actions. Its editor supports a narrow subset of fields and
+requires the returned object to match that schema; unsupported schemas are not
+silently rewritten. A successful set means the plugin's hook returned, not
+that data was durably stored. There is no host-managed configuration-file
+fallback, version check, merge guarantee, dynamic controller or HTML editor.
+Hooks run with the same process privileges as the plugin, and a request failure
+can leave its effects unknown. Schema and later configuration operations are
+bound to the same active plugin generation; a restart or re-enable requires a
+new explicit read. The editor checks a narrow numeric subset, while the
+underlying JSON/JavaScript number model can still lose precision or original
+numeric spelling.
+
+Archive downloads, store installation, updates and online rollback are separate
+work; do not interpret catalog browsing or a local compatibility test as their
+completion. The host and index can be tested with synthetic local plugins
+without running QQ. Real plugin and QQ interoperability require separate
+validation.

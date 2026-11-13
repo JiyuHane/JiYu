@@ -5,6 +5,8 @@ import {
     type LocalPluginStatus,
     type LocalPluginsResult,
     type LocalPluginMutationResult,
+    type PluginConfigField,
+    type PluginConfigValue,
 } from '@/lib/api/types';
 
 function invalid(): never {
@@ -129,8 +131,13 @@ export function parseLocalPlugins(value: unknown): LocalPluginsResult {
             (pending: unknown) =>
                 isRecord(pending) &&
                 isLocalPluginId(pending.id) &&
-                pending.operation === 'enable' &&
-                (pending.phase === 'resolving' || pending.phase === 'invoked') &&
+                ((pending.operation === 'enable' &&
+                    (pending.phase === 'resolving' || pending.phase === 'invoked')) ||
+                    (['config-schema', 'config-read', 'config-write'].includes(
+                        String(pending.operation),
+                    ) &&
+                        (pending.phase === 'reading' || pending.phase === 'invoked')) ||
+                    (pending.operation === 'disable' && pending.phase === 'draining')) &&
                 typeof pending.cancelled === 'boolean' &&
                 typeof pending.currentInstance === 'boolean',
         )
@@ -160,6 +167,193 @@ export function parseLocalPluginMutation(
     }
 
     return value as unknown as LocalPluginMutationResult;
+}
+
+const DANGEROUS_CONFIG_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
+
+function isPlainConfigRecord(value: unknown): value is Record<string, unknown> {
+    if (!isRecord(value)) {
+        return false;
+    }
+
+    const prototype = Object.getPrototypeOf(value);
+
+    if (prototype !== Object.prototype && prototype !== null) {
+        return false;
+    }
+
+    if (Object.getOwnPropertySymbols(value).length) {
+        return false;
+    }
+
+    return Object.values(Object.getOwnPropertyDescriptors(value)).every(
+        (item) => item.enumerable && 'value' in item,
+    );
+}
+
+function unsupportedConfig(): never {
+    throw new ApiError(502, '插件配置格式或字段暂不支持', 'CONFIG_UI_UNSUPPORTED');
+}
+
+/** Reject unsupported schema semantics instead of silently dropping fields. */
+export function parseConfigFields(fields: unknown): PluginConfigField[] {
+    if (!Array.isArray(fields) || fields.length > 64) {
+        return unsupportedConfig();
+    }
+
+    const seen = new Set<string>();
+    const accepted: PluginConfigField[] = [];
+
+    for (const field of fields) {
+        if (
+            !isPlainConfigRecord(field) ||
+            Object.keys(field).some(
+                (key) => !['key', 'label', 'type', 'default', 'description'].includes(key),
+            ) ||
+            typeof field.key !== 'string' ||
+            !field.key.trim() ||
+            field.key.length > 128 ||
+            [...field.key].some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127) ||
+            DANGEROUS_CONFIG_KEYS.has(field.key) ||
+            seen.has(field.key) ||
+            typeof field.label !== 'string' ||
+            !field.label.trim() ||
+            field.label.length > 256 ||
+            typeof field.type !== 'string' ||
+            !['string', 'text', 'number', 'boolean'].includes(field.type) ||
+            (field.description !== undefined &&
+                (typeof field.description !== 'string' || field.description.length > 1024))
+        ) {
+            return unsupportedConfig();
+        }
+
+        if (Object.hasOwn(field, 'default') && !isConfigScalar(field.type, field.default)) {
+            return unsupportedConfig();
+        }
+
+        seen.add(field.key);
+        accepted.push(field as unknown as PluginConfigField);
+    }
+
+    return accepted;
+}
+
+function isSafeConfigNumber(value: number): boolean {
+    return (
+        Number.isFinite(value) &&
+        !Object.is(value, -0) &&
+        (!Number.isInteger(value) || Number.isSafeInteger(value))
+    );
+}
+
+function isConfigScalar(type: string, value: unknown): value is string | number | boolean {
+    if (type === 'string' || type === 'text') {
+        return typeof value === 'string' && value.length <= 16384;
+    }
+
+    if (type === 'boolean') {
+        return typeof value === 'boolean';
+    }
+
+    return type === 'number' && typeof value === 'number' && isSafeConfigNumber(value);
+}
+
+export function parseConfigValue(fields: PluginConfigField[], value: unknown): PluginConfigValue {
+    if (!isPlainConfigRecord(value) || Object.keys(value).length !== fields.length) {
+        return unsupportedConfig();
+    }
+
+    const result: PluginConfigValue = Object.create(null);
+
+    for (const field of fields) {
+        if (!Object.hasOwn(value, field.key) || !isConfigScalar(field.type, value[field.key])) {
+            return unsupportedConfig();
+        }
+
+        result[field.key] = value[field.key] as string | number | boolean;
+    }
+
+    return result;
+}
+
+export function parseConfigNumber(text: string): number | null {
+    const trimmed = text.trim();
+
+    if (!trimmed || !/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(trimmed)) {
+        return null;
+    }
+
+    const value = Number(trimmed);
+
+    if (!isSafeConfigNumber(value)) {
+        return null;
+    }
+
+    const [mantissa, exponentText] = trimmed.split(/[eE]/);
+    const unsigned = mantissa.replace(/^[+-]/, '');
+    const [whole, fractional = ''] = unsigned.split('.');
+    const digits = `${whole}${fractional}`;
+
+    if (value === 0 && /[1-9]/.test(digits)) {
+        return null;
+    }
+
+    if (Number.isInteger(value) && value !== 0) {
+        const scale = fractional.length - Number(exponentText ?? '0');
+
+        if (scale > 0 && /[1-9]/.test(digits.slice(-scale))) {
+            return null;
+        }
+    }
+
+    return value;
+}
+
+export function isPluginGeneration(value: unknown): value is string {
+    return (
+        typeof value === 'string' &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
+    );
+}
+
+export function parseConfigEnvelope(
+    value: unknown,
+    operation: 'schema' | 'read' | 'write',
+    expectedGeneration?: string,
+): unknown {
+    if (!isRecord(value) || value.status !== 'ok' || value.processResources !== 'unknown') {
+        return unsupportedConfig();
+    }
+
+    if (
+        !isPluginGeneration(value.generation) ||
+        (operation !== 'schema' &&
+            (!isPluginGeneration(expectedGeneration) || value.generation !== expectedGeneration))
+    ) {
+        throw new ApiError(
+            409,
+            '插件实例已更替，请重新读取字段和配置',
+            'CONFIG_GENERATION_CHANGED',
+        );
+    }
+
+    if (
+        operation === 'schema' &&
+        (value.source === 'schema' || value.source === 'ui' || value.source === 'none') &&
+        (value.source === 'none' ? value.fields === null : Array.isArray(value.fields))
+    ) {
+        return { source: value.source, fields: value.fields, generation: value.generation };
+    }
+
+    if (operation === 'read' && value.source === 'plugin' && isRecord(value.value)) {
+        return { source: value.source, value: value.value, generation: value.generation };
+    }
+
+    if (operation === 'write' && value.persistence === 'plugin-managed') {
+        return { persistence: value.persistence, generation: value.generation };
+    }
+
+    return unsupportedConfig();
 }
 
 /** The index homepage remains visible as supplied, but only HTTPS links are navigable. */

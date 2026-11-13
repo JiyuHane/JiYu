@@ -3,6 +3,8 @@ import { constants } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { types } from 'node:util';
 import type { ApiResponse, JsonObject, JsonValue } from '../types';
 
 /** Independently implemented subset of the NapCat plugin interface.
@@ -31,6 +33,10 @@ interface PluginModule {
     plugin_cleanup?: LifecycleHook;
     plugin_onevent?: Hook;
     plugin_onmessage?: Hook;
+    plugin_config_schema?: unknown;
+    plugin_config_ui?: unknown;
+    plugin_get_config?: (context: PluginContext) => unknown;
+    plugin_set_config?: (context: PluginContext, value: JsonObject) => unknown;
 }
 
 export interface PluginContext {
@@ -74,6 +80,9 @@ export interface PluginHostOptions {
     ) => void | PromiseLike<void>;
     /** Counts running plus queued events per plugin. */
     maxPendingEvents?: number;
+    /** Separate per-plugin count and retained input byte limits for configuration calls. */
+    maxPendingConfig?: number;
+    maxPendingConfigBytes?: number;
 }
 
 export interface PluginStatus {
@@ -86,6 +95,7 @@ export interface PluginStatus {
 }
 
 interface Slot {
+    readonly configGeneration: string;
     readonly module: PluginModule;
     readonly context: PluginContext;
     accepting: boolean;
@@ -94,6 +104,8 @@ interface Slot {
     cleanupFailed: boolean;
     initializationFailed: boolean;
     pending: number;
+    pendingConfig: number;
+    pendingConfigBytes: number;
     readonly actionsInFlight: Set<Promise<void>>;
     tail: Promise<void>;
 }
@@ -123,6 +135,187 @@ async function childRealPath(root: string, candidate: string): Promise<string> {
 }
 
 const MANIFEST_LIMIT = 64 * 1024;
+const SCHEMA_LIMIT = 64 * 1024;
+const CONFIG_LIMIT = 256 * 1024;
+const JSON_NODE_LIMIT = 10000;
+
+function configError(code: string): PluginHostError {
+    const error = new PluginHostError(code);
+    error.stack = `${error.name}: ${error.message}`;
+    return error;
+}
+
+const activeSlot = new AsyncLocalStorage<{ slot: Slot; active: boolean }>();
+const activeLifecycle = new AsyncLocalStorage<{ host: PluginHost; active: boolean }>();
+
+async function runSlot<T>(slot: Slot, run: () => Promise<T>): Promise<T> {
+    const context = { slot, active: true };
+
+    try {
+        return await activeSlot.run(context, run);
+    } finally {
+        context.active = false;
+    }
+}
+
+async function runLifecycleHook<T>(host: PluginHost, run: () => T | Promise<T>): Promise<T> {
+    const context = { host, active: true };
+
+    try {
+        return await activeLifecycle.run(context, run);
+    } finally {
+        context.active = false;
+    }
+}
+
+/** Copy without invoking accessors or proxy traps, while measuring JSON UTF-8 bytes. */
+function copyJson(
+    input: unknown,
+    limit: number,
+    maxDepth: number,
+): { value: JsonValue; bytes: number } {
+    let bytes = 0;
+    let nodes = 0;
+    const ancestors = new Set<object>();
+
+    const add = (n: number) => {
+        bytes += n;
+
+        if (bytes > limit) {
+            throw configError('CONFIG_INVALID');
+        }
+    };
+
+    const text = (value: string) => {
+        if (value.length > limit) {
+            throw configError('CONFIG_INVALID');
+        }
+
+        add(Buffer.byteLength(JSON.stringify(value), 'utf8'));
+    };
+
+    const visit = (value: unknown, depth: number): JsonValue => {
+        if (++nodes > JSON_NODE_LIMIT || depth > maxDepth || types.isProxy(value)) {
+            throw configError('CONFIG_INVALID');
+        }
+
+        if (value === null || typeof value === 'boolean') {
+            add(value === null ? 4 : value ? 4 : 5);
+            return value;
+        }
+
+        if (typeof value === 'string') {
+            text(value);
+            return value;
+        }
+
+        if (typeof value === 'number' && Number.isFinite(value)) {
+            add(Buffer.byteLength(JSON.stringify(value), 'utf8'));
+            return value;
+        }
+
+        if (typeof value !== 'object' || value === null || ancestors.has(value)) {
+            throw configError('CONFIG_INVALID');
+        }
+
+        const array = Array.isArray(value);
+        const prototype = Object.getPrototypeOf(value);
+
+        if (
+            array
+                ? prototype !== Array.prototype
+                : prototype !== Object.prototype && prototype !== null
+        ) {
+            throw configError('CONFIG_INVALID');
+        }
+
+        ancestors.add(value);
+
+        try {
+            const keys = Reflect.ownKeys(value);
+
+            if (keys.length > JSON_NODE_LIMIT + (array ? 1 : 0)) {
+                throw configError('CONFIG_INVALID');
+            }
+
+            add(2);
+
+            if (array) {
+                const length = Object.getOwnPropertyDescriptor(value, 'length')?.value as number;
+
+                if (
+                    !Number.isSafeInteger(length) ||
+                    length > JSON_NODE_LIMIT ||
+                    keys.length !== length + 1
+                ) {
+                    throw configError('CONFIG_INVALID');
+                }
+
+                const result: JsonValue[] = [];
+
+                for (let index = 0; index < length; index++) {
+                    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+
+                    if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) {
+                        throw configError('CONFIG_INVALID');
+                    }
+
+                    if (index) {
+                        add(1);
+                    }
+
+                    result.push(visit(descriptor.value, depth + 1));
+                }
+
+                return result;
+            }
+
+            const result: JsonObject = {};
+            let count = 0;
+
+            for (const key of keys) {
+                if (
+                    typeof key !== 'string' ||
+                    key === '__proto__' ||
+                    key === 'prototype' ||
+                    key === 'constructor'
+                ) {
+                    throw configError('CONFIG_INVALID');
+                }
+
+                const descriptor = Object.getOwnPropertyDescriptor(value, key);
+
+                if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) {
+                    throw configError('CONFIG_INVALID');
+                }
+
+                if (count++) {
+                    add(1);
+                }
+
+                text(key);
+                add(1);
+                result[key] = visit(descriptor.value, depth + 1);
+            }
+
+            return result;
+        } finally {
+            ancestors.delete(value);
+        }
+    };
+
+    return { value: visit(input, 0), bytes };
+}
+
+function copyConfig(input: unknown): { value: JsonObject; bytes: number } {
+    const copy = copyJson(input, CONFIG_LIMIT, 32);
+
+    if (copy.value === null || typeof copy.value !== 'object' || Array.isArray(copy.value)) {
+        throw configError('CONFIG_INVALID');
+    }
+
+    return { value: copy.value, bytes: copy.bytes };
+}
 
 async function readManifest(file: string): Promise<unknown> {
     const before = await stat(file);
@@ -181,6 +374,8 @@ export class PluginHost {
     private closing = false;
     private shutdownTask: Promise<void> | undefined;
     private readonly maxPending: number;
+    private readonly maxPendingConfig: number;
+    private readonly maxPendingConfigBytes: number;
     private readonly options: PluginHostOptions;
 
     constructor(options: PluginHostOptions) {
@@ -192,6 +387,8 @@ export class PluginHost {
             isStreamAction,
             logger,
             maxPendingEvents,
+            maxPendingConfig,
+            maxPendingConfigBytes,
         } = options;
         this.options = Object.freeze({
             accountId,
@@ -201,6 +398,8 @@ export class PluginHost {
             isStreamAction,
             logger,
             maxPendingEvents,
+            maxPendingConfig,
+            maxPendingConfigBytes,
         });
 
         if (!/^[1-9]\d{0,31}$/.test(accountId)) {
@@ -208,6 +407,19 @@ export class PluginHost {
         }
 
         this.maxPending = maxPendingEvents ?? 64;
+        this.maxPendingConfig = maxPendingConfig ?? 32;
+        this.maxPendingConfigBytes = maxPendingConfigBytes ?? 1024 * 1024;
+
+        if (
+            !Number.isSafeInteger(this.maxPendingConfig) ||
+            this.maxPendingConfig < 1 ||
+            this.maxPendingConfig > 10000 ||
+            !Number.isSafeInteger(this.maxPendingConfigBytes) ||
+            this.maxPendingConfigBytes < 1 ||
+            this.maxPendingConfigBytes > 16 * 1024 * 1024
+        ) {
+            throw new PluginHostError('INVALID_QUEUE_LIMIT');
+        }
 
         if (
             !Number.isSafeInteger(this.maxPending) ||
@@ -225,6 +437,16 @@ export class PluginHost {
             () => undefined,
         );
         return result;
+    }
+
+    /** Opaque identity of the current accepting slot, not a process-isolation guarantee. */
+    getConfigGeneration(id: string): string | null {
+        if (typeof id !== 'string' || !validId(id) || this.closing) {
+            return null;
+        }
+
+        const slot = this.slots.get(id);
+        return slot?.accepting && slot.state === 'active' ? slot.configGeneration : null;
     }
 
     /** Snapshot only; absent IDs are not proof that process resources are gone. */
@@ -258,6 +480,12 @@ export class PluginHost {
 
     /** Explicitly selects and executes a user-provided ESM plugin directory. */
     enable(id: string, directory: string): Promise<void> {
+        const lifecycle = activeLifecycle.getStore();
+
+        if (lifecycle?.active && lifecycle.host === this) {
+            return Promise.reject(configError('CONFIG_REENTRANT'));
+        }
+
         if (this.closing) {
             return Promise.reject(new PluginHostError('CLOSED'));
         }
@@ -426,6 +654,7 @@ export class PluginHost {
 
                 const module = mod as unknown as PluginModule;
                 slot = {
+                    configGeneration: randomUUID(),
                     module,
                     context: undefined as unknown as PluginContext,
                     accepting: false,
@@ -434,6 +663,8 @@ export class PluginHost {
                     cleanupFailed: false,
                     initializationFailed: false,
                     pending: 0,
+                    pendingConfig: 0,
+                    pendingConfigBytes: 0,
                     actionsInFlight: new Set(),
                     tail: Promise.resolve(),
                 };
@@ -559,7 +790,7 @@ export class PluginHost {
                 initialized = true;
 
                 try {
-                    await module.plugin_init(context);
+                    await runLifecycleHook(this, () => module.plugin_init(context));
                 } catch {
                     throw new PluginHostError('ENABLE_FAILED');
                 }
@@ -611,6 +842,146 @@ export class PluginHost {
         });
     }
 
+    private admitConfig<T>(
+        id: string,
+        input: unknown,
+        hasInput: boolean,
+        run: (slot: Slot, value?: JsonObject) => Promise<T>,
+    ): Promise<T> {
+        try {
+            if (typeof id !== 'string' || !validId(id)) {
+                throw configError('PLUGIN_INACTIVE');
+            }
+
+            const slot = this.slots.get(id);
+
+            if (this.closing || !slot || !slot.accepting || slot.state !== 'active') {
+                throw configError('PLUGIN_INACTIVE');
+            }
+
+            const execution = activeSlot.getStore();
+
+            if (execution?.active && execution.slot === slot) {
+                throw configError('CONFIG_REENTRANT');
+            }
+
+            if (slot.pendingConfig >= this.maxPendingConfig) {
+                throw configError('CONFIG_QUEUE_FULL');
+            }
+
+            const copy = hasInput ? copyConfig(input) : undefined;
+            const bytes = copy?.bytes ?? 0;
+
+            if (slot.pendingConfigBytes + bytes > this.maxPendingConfigBytes) {
+                throw configError('CONFIG_QUEUE_FULL');
+            }
+
+            slot.pendingConfig++;
+            slot.pendingConfigBytes += bytes;
+            const result = slot.tail.then(() => runSlot(slot, () => run(slot, copy?.value)));
+            slot.tail = result.then(
+                () => {
+                    slot.pendingConfig--;
+                    slot.pendingConfigBytes -= bytes;
+                },
+                () => {
+                    slot.pendingConfig--;
+                    slot.pendingConfigBytes -= bytes;
+                },
+            );
+            return result;
+        } catch (error) {
+            return Promise.reject(
+                error instanceof PluginHostError ? error : configError('CONFIG_INVALID'),
+            );
+        }
+    }
+
+    getConfigSchema(
+        id: string,
+    ): Promise<{ fields: JsonValue[] | null; source: 'schema' | 'ui' | 'none' }> {
+        return this.admitConfig(id, undefined, false, async (slot) => {
+            try {
+                const schema = slot.module.plugin_config_schema;
+                const source =
+                    schema !== undefined
+                        ? 'schema'
+                        : slot.module.plugin_config_ui !== undefined
+                          ? 'ui'
+                          : 'none';
+
+                if (source === 'none') {
+                    return { fields: null, source };
+                }
+
+                const value = source === 'schema' ? schema : slot.module.plugin_config_ui;
+
+                if (types.isProxy(value) || !Array.isArray(value)) {
+                    throw configError('CONFIG_INVALID');
+                }
+
+                const copy = copyJson(value, SCHEMA_LIMIT, 16);
+                return { fields: copy.value as JsonValue[], source };
+            } catch {
+                throw configError('CONFIG_INVALID');
+            }
+        });
+    }
+
+    getConfig(id: string): Promise<{ value: JsonObject; source: 'plugin' }> {
+        return this.admitConfig(id, undefined, false, async (slot) => {
+            let hook: PluginModule['plugin_get_config'];
+
+            try {
+                hook = slot.module.plugin_get_config;
+            } catch {
+                throw configError('CONFIG_INVALID');
+            }
+
+            if (hook === undefined) {
+                throw configError('CONFIG_UNSUPPORTED');
+            }
+
+            if (types.isProxy(hook) || typeof hook !== 'function') {
+                throw configError('CONFIG_INVALID');
+            }
+
+            try {
+                const value = await hook(slot.context);
+                return { value: copyConfig(value).value, source: 'plugin' };
+            } catch {
+                throw configError('CONFIG_OUTCOME_UNKNOWN');
+            }
+        });
+    }
+
+    setConfig(id: string, value: unknown): Promise<{ persistence: 'plugin-managed' }> {
+        return this.admitConfig(id, value, true, async (slot, copy) => {
+            let hook: PluginModule['plugin_set_config'];
+
+            try {
+                hook = slot.module.plugin_set_config;
+            } catch {
+                throw configError('CONFIG_INVALID');
+            }
+
+            if (hook === undefined) {
+                throw configError('CONFIG_UNSUPPORTED');
+            }
+
+            if (types.isProxy(hook) || typeof hook !== 'function') {
+                throw configError('CONFIG_INVALID');
+            }
+
+            try {
+                await hook(slot.context, copy!);
+                return { persistence: 'plugin-managed' };
+            } catch {
+                throw configError('CONFIG_OUTCOME_UNKNOWN');
+            }
+        });
+    }
+
     /** Admission is synchronous; each plugin owns an independent bounded FIFO. */
     dispatch(event: JsonObject): { accepted: number; dropped: number } {
         let accepted = 0;
@@ -646,11 +1017,13 @@ export class PluginHost {
             slot.pending++;
             slot.tail = slot.tail.then(async () => {
                 try {
-                    await slot.module.plugin_onevent?.(slot.context, copy);
+                    await runSlot(slot, async () => {
+                        await slot.module.plugin_onevent?.(slot.context, copy);
 
-                    if (isMessage) {
-                        await slot.module.plugin_onmessage?.(slot.context, copy);
-                    }
+                        if (isMessage) {
+                            await slot.module.plugin_onmessage?.(slot.context, copy);
+                        }
+                    });
                 } catch {
                     this.report(id, 'event');
                 } finally {
@@ -663,12 +1036,25 @@ export class PluginHost {
     }
 
     disable(id: string): Promise<void> {
+        const lifecycle = activeLifecycle.getStore();
+
+        if (lifecycle?.active && lifecycle.host === this) {
+            return Promise.reject(configError('CONFIG_REENTRANT'));
+        }
+
         if (!validId(id)) {
             return Promise.reject(new PluginHostError('INVALID_PLUGIN_SELECTION'));
         }
 
-        this.generations.set(id, (this.generations.get(id) ?? 0) + 1);
         const current = this.slots.get(id);
+
+        const execution = activeSlot.getStore();
+
+        if (current && execution?.active && execution.slot === current) {
+            return Promise.reject(configError('CONFIG_REENTRANT'));
+        }
+
+        this.generations.set(id, (this.generations.get(id) ?? 0) + 1);
 
         if (current) {
             current.accepting = false;
@@ -690,6 +1076,18 @@ export class PluginHost {
     }
 
     shutdown(): Promise<void> {
+        const lifecycle = activeLifecycle.getStore();
+
+        if (lifecycle?.active && lifecycle.host === this) {
+            return Promise.reject(configError('CONFIG_REENTRANT'));
+        }
+
+        const execution = activeSlot.getStore();
+
+        if (execution?.active && Array.from(this.slots.values()).includes(execution.slot)) {
+            return Promise.reject(configError('CONFIG_REENTRANT'));
+        }
+
         if (this.shutdownTask) {
             return this.shutdownTask;
         }
@@ -740,7 +1138,7 @@ export class PluginHost {
         let failed = false;
 
         try {
-            await slot.module.plugin_cleanup?.(slot.context);
+            await runLifecycleHook(this, () => slot.module.plugin_cleanup?.(slot.context));
         } catch {
             failed = true;
         } finally {

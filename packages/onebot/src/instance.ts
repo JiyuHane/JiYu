@@ -41,7 +41,7 @@ import {
     type NetworkReconcileResult,
     type NetworkShutdownResult,
 } from './network';
-import { PluginHost, type PluginStatus } from './plugin-host';
+import { PluginHost, PluginHostError, type PluginStatus } from './plugin-host';
 import { ReactionStore } from './reaction-store';
 import { sameSelfSentMessage, selfSentEventKey, SELF_SENT_ECHO_WINDOW_MS } from './self-sent-event';
 import type { ApiResponse, JsonObject, JsonValue, MessageMeta, OneBotConfig } from './types';
@@ -158,6 +158,54 @@ export class OneBotInstance {
 
     getPluginStatus(id: string): PluginStatus | null {
         return this.listPlugins().find((status) => status.id === id) ?? null;
+    }
+
+    /** Opaque identity of the current active plugin slot, without creating a host. */
+    getPluginConfigGeneration(id: string): string | null {
+        if (this.disposeRequested) {
+            return null;
+        }
+
+        return this.pluginHost?.getConfigGeneration(id) ?? null;
+    }
+
+    /** Configuration is available only to explicitly enabled plugins. */
+    getPluginConfigSchema(
+        id: string,
+    ): Promise<{ fields: JsonValue[] | null; source: 'schema' | 'ui' | 'none' }> {
+        if (this.disposeRequested) {
+            return Promise.reject(new PluginHostError('CLOSED'));
+        }
+
+        if (!this.pluginHost) {
+            return Promise.reject(new PluginHostError('PLUGIN_INACTIVE'));
+        }
+
+        return this.pluginHost.getConfigSchema(id);
+    }
+
+    getPluginConfig(id: string): Promise<{ value: JsonObject; source: 'plugin' }> {
+        if (this.disposeRequested) {
+            return Promise.reject(new PluginHostError('CLOSED'));
+        }
+
+        if (!this.pluginHost) {
+            return Promise.reject(new PluginHostError('PLUGIN_INACTIVE'));
+        }
+
+        return this.pluginHost.getConfig(id);
+    }
+
+    setPluginConfig(id: string, value: unknown): Promise<{ persistence: 'plugin-managed' }> {
+        if (this.disposeRequested) {
+            return Promise.reject(new PluginHostError('CLOSED'));
+        }
+
+        if (!this.pluginHost) {
+            return Promise.reject(new PluginHostError('PLUGIN_INACTIVE'));
+        }
+
+        return this.pluginHost.setConfig(id, value);
     }
 
     private preparePluginStateRoot(): string {

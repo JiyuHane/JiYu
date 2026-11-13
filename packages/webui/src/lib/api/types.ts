@@ -178,13 +178,14 @@ export interface LocalPluginsResult {
     candidates: string[];
     runtime: LocalPluginStatus[] | null;
     actions: LocalPluginAction[];
-    pendingOperations: {
-        id: string;
-        operation: 'enable';
-        phase: 'resolving' | 'invoked';
-        cancelled: boolean;
-        currentInstance: boolean;
-    }[];
+    pendingOperations: ({ id: string; cancelled: boolean; currentInstance: boolean } & (
+        | { operation: 'enable'; phase: 'resolving' | 'invoked' }
+        | {
+              operation: 'config-schema' | 'config-read' | 'config-write';
+              phase: 'reading' | 'invoked';
+          }
+        | { operation: 'disable'; phase: 'draining' }
+    ))[];
     processResources: 'unknown';
 }
 
@@ -196,10 +197,34 @@ export interface LocalPluginMutationResult {
     processResources: 'unknown';
 }
 
+export type PluginConfigScalar = string | number | boolean;
+export type PluginConfigValue = Record<string, PluginConfigScalar>;
+export interface PluginConfigField {
+    key: string;
+    label: string;
+    type: 'string' | 'text' | 'number' | 'boolean';
+    description?: string;
+    default?: PluginConfigScalar;
+}
 export interface ApiClient {
     plugins: {
         index(refresh?: boolean, signal?: AbortSignal): Promise<CommunityIndexResult>;
         local(uin: string, signal?: AbortSignal): Promise<LocalPluginsResult>;
+        configSchema(
+            uin: string,
+            id: string,
+        ): Promise<{ fields: unknown; source: 'schema' | 'ui' | 'none'; generation: string }>;
+        configRead(
+            uin: string,
+            id: string,
+            generation: string,
+        ): Promise<{ value: unknown; source: 'plugin'; generation: string }>;
+        configWrite(
+            uin: string,
+            id: string,
+            generation: string,
+            value: PluginConfigValue,
+        ): Promise<{ persistence: 'plugin-managed'; generation: string }>;
         change(
             uin: string,
             id: string,

@@ -2,6 +2,9 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
     createLocalOperationTracker,
+    createConfigViewGuard,
+    configDraftToValue,
+    configErrorText,
     createPluginRequestScope,
     hasCurrentUnknownCheck,
     LocalPluginList,
@@ -11,12 +14,16 @@ import {
     withPluginIndexLoading,
 } from '../src/components/settings/plugins-panel';
 import { createApiClient } from '../src/lib/api/client';
-import type { CommunityIndexResult, LocalPluginsResult } from '../src/lib/api/types';
+import { ApiError, type CommunityIndexResult, type LocalPluginsResult } from '../src/lib/api/types';
 import {
     filterPlugins,
     parsePluginIndex,
     parseLocalPlugins,
     parseLocalPluginMutation,
+    parseConfigFields,
+    parseConfigValue,
+    parseConfigNumber,
+    parseConfigEnvelope,
     safePluginHomepage,
 } from '../src/lib/plugin-index';
 import { SETTINGS_TABS, settingsRoute } from '../src/router';
@@ -36,6 +43,8 @@ vi.mock('@/contexts/ActionFeedbackContext', () => ({
     useActionFeedback: () => ({ startAction: vi.fn() }),
 }));
 const tokenStore = { load: () => 'token', save: () => undefined };
+const generation = '123e4567-e89b-42d3-a456-426614174000';
+const otherGeneration = '123e4567-e89b-42d3-a456-426614174001';
 const plugin = {
     id: 'napcat-plugin-test',
     name: '测试',
@@ -636,6 +645,335 @@ describe('community plugin index', () => {
         await rejected;
         expect(cancel).toHaveBeenCalledOnce();
         expect(releaseLock).toHaveBeenCalledOnce();
+    });
+    it('accepts only supported static schema and exact config keys without injecting defaults', () => {
+        const fields = parseConfigFields([
+            { key: 'message', label: '描述', type: 'text', default: '默认' },
+            { key: 'enabled', label: '开关', type: 'boolean' },
+            { key: 'count', label: '数量', type: 'number' },
+        ]);
+        expect(parseConfigValue(fields, { message: '', enabled: false, count: 0 })).toEqual({
+            message: '',
+            enabled: false,
+            count: 0,
+        });
+        expect(configDraftToValue(fields, { message: '', enabled: false, count: '0' })).toEqual({
+            message: '',
+            enabled: false,
+            count: 0,
+        });
+
+        for (const invalid of [
+            { enabled: false, count: 0 },
+            { message: '', enabled: false, count: 0, secret: 1 },
+            { message: '', enabled: false, count: '' },
+            { message: '', enabled: false, count: Infinity },
+        ]) {
+            expect(() => parseConfigValue(fields, invalid)).toThrow();
+        }
+
+        expect(() =>
+            configDraftToValue(fields, { message: '', enabled: false, count: ' ' }),
+        ).toThrow();
+        expect(parseConfigNumber('')).toBeNull();
+        expect(parseConfigNumber('  ')).toBeNull();
+        expect(parseConfigNumber('1e999')).toBeNull();
+        expect(parseConfigNumber(' 1.5 ')).toBe(1.5);
+        expect(() => configDraftToValue([], {})).toThrow();
+    });
+    it('rejects numeric precision loss, negative zero and nonzero underflow before posting', () => {
+        const fields = parseConfigFields([{ key: 'n', label: '数字', type: 'number' }]);
+        const send = vi.fn();
+
+        for (const text of [
+            '9007199254740993',
+            '9007199254740992',
+            '-9007199254740992',
+            '1e-9999',
+            '0.0001e-9999',
+            '-0',
+            '-0e10',
+            '9007199254740991.1',
+            '1.0000000000000001',
+        ]) {
+            expect(parseConfigNumber(text)).toBeNull();
+
+            try {
+                send(configDraftToValue(fields, { n: text }));
+            } catch {
+                // The form's preflight blocks the POST.
+            }
+        }
+
+        expect(send).not.toHaveBeenCalled();
+        expect(parseConfigNumber('9007199254740991')).toBe(Number.MAX_SAFE_INTEGER);
+        expect(parseConfigNumber('-9007199254740991')).toBe(Number.MIN_SAFE_INTEGER);
+        expect(parseConfigNumber('1.2e1')).toBe(12);
+        expect(parseConfigNumber('0e10')).toBe(0);
+        expect(parseConfigNumber('5e-324')).toBe(Number.MIN_VALUE);
+        expect(parseConfigNumber('0.1')).toBe(0.1);
+        expect(() => parseConfigValue(fields, { n: 9007199254740992 })).toThrow();
+        expect(() => parseConfigValue(fields, { n: -0 })).toThrow();
+        expect(() =>
+            parseConfigFields([
+                { key: 'n', label: '数字', type: 'number', default: 9007199254740992 },
+            ]),
+        ).toThrow();
+        expect(() =>
+            parseConfigFields([{ key: 'n', label: '数字', type: 'number', default: -0 }]),
+        ).toThrow();
+    });
+    it('rejects dynamic, HTML, prototype, duplicate, nested and unknown schema fields', () => {
+        const field = { key: 'x', label: 'X', type: 'string' };
+        const bad = [
+            [{ ...field, html: '<img>' }],
+            [{ ...field, type: 'html' }],
+            [field, field],
+            [{ ...field, key: '__proto__' }],
+            [{ ...field, default: {} }],
+            [{ ...field, description: {} }],
+            [Object.assign(Object.create({ inherited: true }), field)],
+            [null],
+        ];
+
+        for (const item of bad) {
+            expect(() => parseConfigFields(item)).toThrow();
+        }
+
+        expect(() =>
+            parseConfigEnvelope(
+                {
+                    status: 'ok',
+                    source: 'none',
+                    fields: [],
+                    processResources: 'unknown',
+                    generation,
+                },
+                'schema',
+            ),
+        ).toThrow();
+        expect(
+            parseConfigEnvelope(
+                {
+                    status: 'ok',
+                    source: 'none',
+                    fields: null,
+                    processResources: 'unknown',
+                    generation,
+                },
+                'schema',
+            ),
+        ).toEqual({ source: 'none', fields: null, generation });
+    });
+    it('keeps a closed config request unknown after late success and blocks same-account operations', () => {
+        const tracker = createLocalOperationTracker();
+        const viewA = createConfigViewGuard(tracker, '12345');
+        expect(viewA.begin()).toBe(true);
+        expect(tracker.begin('12345')).toBe(false);
+        viewA.close();
+        expect(tracker.snapshot()['12345']).toBe('unknown-running');
+        tracker.clearUnknown('12345');
+        expect(tracker.snapshot()['12345']).toBe('unknown-running');
+        expect(viewA.finish(false)).toBe(false);
+        expect(tracker.snapshot()['12345']).toBe('unknown');
+        const viewB = createConfigViewGuard(tracker, '67890');
+        expect(viewB.begin()).toBe(true);
+        expect(viewB.finish(false)).toBe(true);
+        expect(viewA.begin()).toBe(false);
+    });
+    it('keeps closed account A detached through A→B→A and never exposes service error text', () => {
+        const tracker = createLocalOperationTracker();
+        const a = createConfigViewGuard(tracker, '12345');
+        expect(a.begin()).toBe(true);
+        a.close();
+        const b = createConfigViewGuard(tracker, '67890');
+        expect(b.begin()).toBe(true);
+        const a2 = createConfigViewGuard(tracker, '12345');
+        expect(a2.begin()).toBe(false);
+        expect(a.finish(false)).toBe(false);
+        expect(a2.begin()).toBe(false);
+        expect(b.finish(false)).toBe(true);
+        expect(tracker.snapshot()).toEqual({ '12345': 'unknown' });
+        expect(
+            configErrorText(new ApiError(500, 'private secret value', 'toString')),
+        ).not.toContain('private');
+        expect(configErrorText(new Error('private secret value'))).not.toContain('private');
+        expect(
+            configErrorText(new ApiError(409, 'private secret value', 'CONFIG_UNSUPPORTED')),
+        ).toBe('插件未提供该配置接口。');
+    });
+    it('renders all config and disable pending operations for the same plugin', () => {
+        const value: LocalPluginsResult = {
+            ...localFixture,
+            pendingOperations: [
+                {
+                    id: 'example',
+                    operation: 'config-write',
+                    phase: 'invoked',
+                    cancelled: false,
+                    currentInstance: true,
+                },
+                {
+                    id: 'example',
+                    operation: 'disable',
+                    phase: 'draining',
+                    cancelled: false,
+                    currentInstance: true,
+                },
+            ],
+        };
+        const html = renderToStaticMarkup(
+            <LocalPluginList
+                data={value}
+                blocked={false}
+                onChoose={() => undefined}
+                onConfig={() => undefined}
+            />,
+        );
+        expect(html).toMatch(/disabled=""[^>]*>配置（支持情况未知）/);
+        expect(html).toContain('配置');
+        expect(html).toContain('停用');
+        expect(html).toContain('排空操作');
+        expect(html).toContain('宿主执行');
+    });
+    it('accepts backend config and disable pending phases without claiming configuration support', () => {
+        for (const pending of [
+            {
+                id: 'example',
+                operation: 'config-schema',
+                phase: 'reading',
+                cancelled: false,
+                currentInstance: true,
+            },
+            {
+                id: 'example',
+                operation: 'config-read',
+                phase: 'invoked',
+                cancelled: false,
+                currentInstance: true,
+            },
+            {
+                id: 'example',
+                operation: 'config-write',
+                phase: 'invoked',
+                cancelled: false,
+                currentInstance: false,
+            },
+            {
+                id: 'example',
+                operation: 'disable',
+                phase: 'draining',
+                cancelled: false,
+                currentInstance: true,
+            },
+        ]) {
+            expect(
+                parseLocalPlugins({ ...localFixture, pendingOperations: [pending] })
+                    .pendingOperations,
+            ).toEqual([pending]);
+        }
+    });
+    it('makes configuration calls only explicitly and writes the direct object without retry', async () => {
+        const fetchMock = vi
+            .fn()
+            .mockResolvedValueOnce(
+                Response.json({
+                    status: 'ok',
+                    fields: [],
+                    source: 'schema',
+                    processResources: 'unknown',
+                    generation,
+                }),
+            )
+            .mockResolvedValueOnce(
+                Response.json({
+                    status: 'ok',
+                    value: { value: 'private' },
+                    source: 'plugin',
+                    processResources: 'unknown',
+                    generation,
+                }),
+            )
+            .mockResolvedValueOnce(
+                Response.json({
+                    status: 'ok',
+                    persistence: 'plugin-managed',
+                    processResources: 'unknown',
+                    generation,
+                }),
+            );
+        vi.stubGlobal('fetch', fetchMock);
+        const client = createApiClient({ tokenStore });
+        expect(fetchMock).not.toHaveBeenCalled();
+        await client.plugins.configSchema('12345', 'example');
+        await client.plugins.configRead('12345', 'example', generation);
+        await client.plugins.configWrite('12345', 'example', generation, { value: 'private' });
+        expect(fetchMock).toHaveBeenCalledTimes(3);
+        expect(fetchMock.mock.calls[0][0]).toBe('/api/plugins/local/12345/example/config/schema');
+        expect(fetchMock.mock.calls[1][0]).toBe('/api/plugins/local/12345/example/config/read');
+        expect(fetchMock.mock.calls[2][0]).toBe('/api/plugins/local/12345/example/config/write');
+        expect(fetchMock.mock.calls[2][1].body).toBe('{"value":"private"}');
+        expect(fetchMock.mock.calls[2][1].method).toBe('POST');
+        expect(
+            new Headers(fetchMock.mock.calls[0][1].headers).get('X-Jiyu-Plugin-Generation'),
+        ).toBeNull();
+        expect(
+            new Headers(fetchMock.mock.calls[1][1].headers).get('X-Jiyu-Plugin-Generation'),
+        ).toBe(generation);
+        expect(
+            new Headers(fetchMock.mock.calls[2][1].headers).get('X-Jiyu-Plugin-Generation'),
+        ).toBe(generation);
+        expect(new Headers(fetchMock.mock.calls[2][1].headers).get('X-SnowLuma-Token')).toBe(
+            'token',
+        );
+    });
+    it('rejects missing, invalid or changed slot generations without exposing tokens', async () => {
+        const fetchMock = vi
+            .fn()
+            .mockResolvedValueOnce(
+                Response.json({
+                    status: 'ok',
+                    value: { n: 7 },
+                    source: 'plugin',
+                    generation: otherGeneration,
+                    processResources: 'unknown',
+                }),
+            )
+            .mockResolvedValueOnce(
+                Response.json({
+                    status: 'ok',
+                    persistence: 'plugin-managed',
+                    generation: otherGeneration,
+                    processResources: 'unknown',
+                }),
+            )
+            .mockResolvedValueOnce(
+                Response.json({
+                    status: 'ok',
+                    fields: [],
+                    source: 'schema',
+                    processResources: 'unknown',
+                }),
+            );
+        vi.stubGlobal('fetch', fetchMock);
+        const client = createApiClient({ tokenStore });
+        await expect(
+            client.plugins.configRead('12345', 'example', 'invalid'),
+        ).rejects.toMatchObject({ code: 'CONFIG_GENERATION_REQUIRED' });
+        expect(fetchMock).not.toHaveBeenCalled();
+        await expect(
+            client.plugins.configRead('12345', 'example', generation),
+        ).rejects.toMatchObject({ code: 'CONFIG_GENERATION_CHANGED' });
+        await expect(
+            client.plugins.configWrite('12345', 'example', generation, { n: 7 }),
+        ).rejects.toMatchObject({ code: 'CONFIG_GENERATION_CHANGED' });
+        await expect(client.plugins.configSchema('12345', 'example')).rejects.toMatchObject({
+            code: 'CONFIG_GENERATION_CHANGED',
+        });
+        expect(fetchMock).toHaveBeenCalledTimes(3);
+        expect(fetchMock.mock.calls.every((call) => !String(call[0]).includes(generation))).toBe(
+            true,
+        );
     });
     it('uses the session header and explicit refresh query', async () => {
         const fetchMock = vi.fn(async () => new Response(JSON.stringify(result), { status: 200 }));
