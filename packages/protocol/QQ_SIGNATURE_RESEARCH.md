@@ -118,6 +118,17 @@ been changed to `T`. This conditional path assumes valid memory, preserved
 state and normally returning AAPCS64 calls. It establishes no function return,
 actual execution, or relationship to signing or AES.
 
+In the conditionally reached continuation at `0x2b7c04`, the 32-bit value read
+from `[x23]` is compared as signed. A positive value dispatches to an allocation
+of `0x40` bytes at `0x2b7c24–0x2b7c28`. A non-positive value can instead store
+one at `[x23+0x18]`, copy that length from a static address to `x21`, re-read a
+saved length and write a zero byte at `x21+length`, before reaching the same
+allocation. The re-read length equals the copied length only if the saved slot
+is unchanged. This interpretation also requires valid, non-overlapping memory,
+normal AAPCS64 calls and stable state without harmful aliasing or concurrency.
+The preceding 32-bit write does not identify the full `[x23]` slot as `Q` or
+`T`; the path remains unproven at runtime and is not linked to signing or AES.
+
 Separately, `0x2fe5b4–0x2fe5d0` forms the string address for
 `com/tencent/mobileqq/qsec/qseccodec/SecCipher$SecInfo` in `x0` and calls
 `0x33ec58`; its result is stored at `[sp+0x338]`. The helper passes the same
