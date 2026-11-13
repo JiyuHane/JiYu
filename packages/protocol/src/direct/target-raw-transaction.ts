@@ -137,25 +137,6 @@ function uint(value: unknown, max: number): value is number {
     return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= max;
 }
 
-function clearCandidate(value: CandidateWithLookup | undefined): void {
-    if (!value) {
-        return;
-    }
-
-    for (const bytes of [
-        value.basic.opaque,
-        value.head.field1,
-        value.head.field2,
-        value.head.field3,
-        value.head.reserve,
-        value.head.tail,
-        value.body,
-        value.trailing,
-    ]) {
-        clear(bytes);
-    }
-}
-
 /**
  * Experimental single raw transaction on an already-connected client. Caller
  * prepares reserve, trust, endpoint and keys independently; no target peer identity,
@@ -169,9 +150,8 @@ function clearCandidate(value: CandidateWithLookup | undefined): void {
  * after sequence allocation. Their consistency is caller-owned. The local frame
  * length rule is not a verified target rule. Input byte budget is not a peak-memory
  * bound; lookup additionally counts the decoded field2 against its own 16 MiB cap.
- * A caller-supplied structural transport must enforce one ordered build, verify and
- * consume, identical frame bytes and identity for verify/consume, and accurate
- * write state and deadlines. This adapter does not independently bind those callbacks.
+ * Callback order, identity and verified bytes are checked locally. The caller still
+ * must trust its transport's actual writes, deadlines and write-state reporting.
  */
 export async function transactTargetRawOnce(
     client: Sso12RawTransport,
@@ -180,10 +160,70 @@ export async function transactTargetRawOnce(
     const started = performance.now();
     const owned: Uint8Array[] = [];
     let staged: CandidateWithLookup | undefined;
+    let stagedBuffers: Uint8Array[] = [];
+    const token = Object.freeze({});
+    let candidateObserved = false;
     let rawStarted = false;
     let finished = false;
-    let verified = false;
-    let consumed = false;
+    let settled = false;
+    type Phase =
+        | 'NEW'
+        | 'BUILDING'
+        | 'BUILT'
+        | 'VERIFYING'
+        | 'VERIFIED'
+        | 'CONSUMING'
+        | 'CONSUMED'
+        | 'COMMITTED'
+        | 'FAILED';
+    let phase: Phase = 'NEW';
+    let violation = false;
+    let identitySnapshot: { uin: string; sequence: number } | undefined;
+    let verifiedFrame: Uint8Array | undefined;
+
+    const fail = (): never => {
+        violation = true;
+        phase = 'FAILED';
+        throw new Error('invalid raw transaction');
+    };
+
+    const enter = (expected: Phase, next: Phase): void => {
+        if (finished || settled || phase !== expected) {
+            fail();
+        }
+
+        phase = next;
+    };
+
+    const snapshotIdentity = (identity: { uin: string; sequence: number }) => {
+        // Read once each, including inherited getters, as permitted by the raw API.
+        try {
+            const uin: unknown = identity.uin;
+            const sequence: unknown = identity.sequence;
+
+            if (typeof uin !== 'string' || !uint(sequence, 0xffffffff)) {
+                fail();
+            }
+
+            return { uin: uin as string, sequence: sequence as number };
+        } catch {
+            return fail();
+        }
+    };
+
+    const checkIdentity = (identity: { uin: string; sequence: number }, current: Phase): void => {
+        const snapshot = snapshotIdentity(identity);
+
+        if (
+            finished ||
+            phase !== current ||
+            !identitySnapshot ||
+            snapshot.uin !== identitySnapshot.uin ||
+            snapshot.sequence !== identitySnapshot.sequence
+        ) {
+            fail();
+        }
+    };
 
     try {
         const root = record(options);
@@ -337,91 +377,164 @@ export async function transactTargetRawOnce(
             timeoutMs: remaining,
             signal,
             buildRequest: (identity) => {
-                if (finished) {
-                    throw new Error('transaction finished');
-                }
-
-                const patched = copy(head, owned);
-                new DataView(patched.buffer, patched.byteOffset, patched.byteLength).setUint32(
-                    4,
-                    identity.sequence,
-                    false,
-                );
-                const frame = encodeTargetServiceRequest({
-                    sourceCommand,
-                    virtualProtocol,
-                    basicBranch,
-                    requestObjectByte,
-                    uin: targetUin,
-                    head: patched,
-                    busi,
-                    targetTeaKey: teaKey,
-                });
-                owned.push(frame);
-                requestFrame = copy(frame, owned);
-                return { frame, context: null };
-            },
-            verifyCandidate: async (candidate, _context, identity) => {
-                if (finished) {
-                    throw new Error('transaction finished');
-                }
-
-                const requestCopy = copy(requestFrame, owned);
-                const responseCopy = copy(candidate, owned);
+                enter('NEW', 'BUILDING');
 
                 try {
-                    const accepted =
-                        (await (verify as TargetRawTransactionOptions['verifyRaw'])({
-                            transportUin: identity.uin,
-                            targetUin,
-                            sequence: identity.sequence,
-                            requestFrame: requestCopy,
-                            responseFrame: responseCopy,
-                        })) === true;
-                    verified = !finished && accepted;
-                    return verified;
+                    identitySnapshot = snapshotIdentity(identity);
+
+                    if (finished || phase !== 'BUILDING') {
+                        fail();
+                    }
+
+                    const patched = copy(head, owned);
+                    new DataView(patched.buffer, patched.byteOffset, patched.byteLength).setUint32(
+                        4,
+                        identitySnapshot.sequence,
+                        false,
+                    );
+                    const frame = encodeTargetServiceRequest({
+                        sourceCommand,
+                        virtualProtocol,
+                        basicBranch,
+                        requestObjectByte,
+                        uin: targetUin,
+                        head: patched,
+                        busi,
+                        targetTeaKey: teaKey,
+                    });
+                    owned.push(frame);
+                    requestFrame = copy(frame, owned);
+                    enter('BUILDING', 'BUILT');
+                    return { frame, context: null };
+                } catch (error) {
+                    phase = 'FAILED';
+                    throw error;
+                }
+            },
+            verifyCandidate: async (candidate, _context, identity) => {
+                enter('BUILT', 'VERIFYING');
+                candidateObserved = true;
+                let requestCopy: Uint8Array | undefined;
+                let responseCopy: Uint8Array | undefined;
+
+                try {
+                    checkIdentity(identity, 'VERIFYING');
+                    verifiedFrame = copy(candidate, owned);
+                    requestCopy = copy(requestFrame, owned);
+                    responseCopy = copy(verifiedFrame, owned);
+                    const accepted = await (verify as TargetRawTransactionOptions['verifyRaw'])({
+                        transportUin: identitySnapshot!.uin,
+                        targetUin,
+                        sequence: identitySnapshot!.sequence,
+                        requestFrame: requestCopy,
+                        responseFrame: responseCopy,
+                    });
+
+                    if (finished) {
+                        return false;
+                    }
+
+                    if (phase !== 'VERIFYING') {
+                        fail();
+                    }
+
+                    if (accepted !== true) {
+                        phase = 'FAILED';
+                        return false;
+                    }
+
+                    phase = 'VERIFIED';
+                    return true;
+                } catch (error) {
+                    phase = 'FAILED';
+                    throw error;
                 } finally {
                     clear(requestCopy);
                     clear(responseCopy);
                 }
             },
-            consumeCandidate: (candidate) => {
-                if (finished || !verified || consumed) {
-                    throw new Error('transaction not active');
+            consumeCandidate: (candidate, _context, identity) => {
+                enter('VERIFIED', 'CONSUMING');
+
+                try {
+                    checkIdentity(identity, 'CONSUMING');
+                    const frame = copy(candidate, owned);
+
+                    if (
+                        !verifiedFrame ||
+                        frame.length !== verifiedFrame.length ||
+                        !frame.every((byte, index) => byte === verifiedFrame![index])
+                    ) {
+                        fail();
+                    }
+
+                    if (frame[8] !== selector) {
+                        throw new Error('selector mismatch');
+                    }
+
+                    staged = composeTargetResponseCandidateWithLookup(
+                        frame,
+                        collection,
+                        compression,
+                        maximum,
+                        key,
+                        reserveMode,
+                    );
+                    stagedBuffers = [
+                        staged.basic.opaque,
+                        staged.head.field1,
+                        staged.head.field2,
+                        staged.head.field3,
+                        staged.head.reserve,
+                        staged.head.tail,
+                        staged.body,
+                        staged.trailing,
+                    ];
+                    enter('CONSUMING', 'CONSUMED');
+                    return token;
+                } catch (error) {
+                    phase = 'FAILED';
+                    throw error;
                 }
-
-                consumed = true;
-
-                if (candidate[8] !== selector) {
-                    throw new Error('selector mismatch');
-                }
-
-                staged = composeTargetResponseCandidateWithLookup(
-                    candidate,
-                    collection,
-                    compression,
-                    maximum,
-                    key,
-                    reserveMode,
-                );
-
-                if (finished) {
-                    clearCandidate(staged);
-                    staged = undefined;
-                    throw new Error('transaction finished');
-                }
-
-                return staged;
             },
         });
 
-        if (result.kind === 'response' && staged !== undefined && result.value === staged) {
-            staged = undefined;
-            return result;
+        settled = true;
+        const resultKind = result.kind;
+
+        if (!violation && resultKind === 'failure') {
+            const code = result.code;
+            const writeState = result.writeState;
+
+            if (
+                !violation &&
+                typeof code === 'string' &&
+                (writeState === 'unknown' || (writeState === 'not-written' && !candidateObserved))
+            ) {
+                return { kind: 'failure', code, writeState };
+            }
         }
 
-        if (result.kind === 'failure') {
-            return result;
+        const isConsumed = (): boolean => phase === 'CONSUMED';
+
+        if (!violation && resultKind === 'response' && isConsumed() && staged !== undefined) {
+            const value = result.value;
+            const sequence = result.sequence;
+            const writeState = result.writeState;
+
+            if (
+                !violation &&
+                isConsumed() &&
+                value === token &&
+                sequence === identitySnapshot?.sequence &&
+                writeState === 'written'
+            ) {
+                phase = 'COMMITTED';
+                const candidate = staged;
+                staged = undefined;
+                stagedBuffers = [];
+                return { kind: 'response', value: candidate, sequence, writeState };
+            }
         }
 
         return { kind: 'failure', code: 'target-transaction-failed', writeState: 'unknown' };
@@ -431,7 +544,10 @@ export async function transactTargetRawOnce(
             : { kind: 'failure', code: 'target-input-invalid', writeState: 'not-written' };
     } finally {
         finished = true;
-        clearCandidate(staged);
+
+        for (const bytes of stagedBuffers) {
+            clear(bytes);
+        }
 
         for (const bytes of owned) {
             clear(bytes);

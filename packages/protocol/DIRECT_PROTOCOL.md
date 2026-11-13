@@ -174,8 +174,13 @@ and stores the low 32 bits of `[V+8] - [V]` as its length. Independently,
 whether that second call modifies `P` remain unknown. A selector at `T+0x28`
 passes through `0x6664830`, yielding `0x0c`, `0x0d`, `0x14` or `0x15` for
 `P+0xc8`; its business meaning and any connection to wt commands are unproved.
-A conditional
-branch also passes the same `T` to classifier `0x6667140`, and another call
+Separately, `0x6662f70` stores its second argument at `[rdi+0x10]` and, when
+that argument is nonzero, transfers control to `0x6662f80`. If `rdi` is `Q`,
+this assigns `U`; the actual caller, `U`'s concrete type and its construction
+remain unverified.
+Nearby `AsyncRunLoop` diagnostics alone do not establish that type. Raw rel32
+matches were not checked as instruction boundaries and are not treated as calls.
+A conditional branch also passes the same `T` to classifier `0x6667140`, and another call
 copies it into request `+0x28`. The source object was returned by a prior virtual
 call; its construction, the actual command on this path and the body semantics
 remain unknown. The helper reads
@@ -478,14 +483,27 @@ remain to be recovered and independently verified.
   decoding the response. The response selector, key and lookup collection are
   explicit caller inputs; `response.reserveMode: 'numeric-candidate'` explicitly
   selects the numeric candidate and otherwise only empty reserve is accepted.
-  The verifier receives copies and must supply the trust policy. The built-in raw
-  client passes the same private candidate through verification and consumption;
-  a caller-supplied structural transport must enforce one ordered build, verify,
-  consume; the same frame bytes and identity at verification and consumption; and
-  accurate deadline and write state reporting. The adapter alone does not compare
-  callback frames or identities or establish whether a socket write occurred. A result is
-  transferred only after the raw transaction succeeds; failures after writing
-  retain an unknown write outcome and are not retried. Synchronous preparation
+  The verifier receives independent copies and must supply the trust policy. The
+  adapter enforces one ordered build, verify and consume, compares raw UIN and
+  uint32 sequence values across callbacks and the returned local sequence, and
+  parses a private copy only after bytewise comparison with the private verified
+  frame. Equal identity values in distinct objects, including inherited getters,
+  remain accepted; each field is read once per callback. Repeated, concurrent or
+  out-of-order callbacks poison the transaction even if the transport catches the
+  error. Frame snapshots have a 16 MiB per-frame limit and increase peak memory;
+  wiping owned snapshots is best effort. These local checks do not prove what an
+  untrusted transport actually wrote, establish server authentication, or bind the
+  target response sequence to the request. The caller must trust its transport's
+  actual writes, deadlines and write-state reporting. A result is transferred only
+  after the raw transaction succeeds; inconsistencies yield unknown write outcome
+  and no automatic retry. The raw consumer now hands the transport an opaque
+  frozen token rather than the parsed candidate; the final successful result still
+  returns the candidate to the caller. Generic transports that pass their consumer
+  value through unchanged, including the built-in client, remain compatible;
+  custom transports that inspect or mutate that intermediate value must change.
+  After the adapter observes transport settlement, late callbacks fail closed;
+  promise settlement itself and its continuation are not an atomic boundary.
+  Synchronous preparation
   counts against the required timeout but cannot be preempted. The head's input
   sequence is a placeholder replaced by the raw client's local sequence, while
   reserved/signing bytes are prepared beforehand; this adapter cannot itself

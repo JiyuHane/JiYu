@@ -11,6 +11,7 @@ import {
     type Sso12RawResult,
 } from '../../src/direct/sso12-packet-client';
 import type { CandidateWithLookup } from '../../src/direct/target-response-candidate';
+import * as responseCandidate from '../../src/direct/target-response-candidate';
 import * as numericReserve from '../../src/direct/target-sso12-numeric-reserve';
 import * as decryptCandidate from '../../src/direct/target-service-decrypt-candidate';
 import { encodeTargetSso12Reserve } from '../../src/direct/target-sso12-reserve';
@@ -536,12 +537,20 @@ describe('experimental target raw transaction on synthetic loopback', () => {
 
     it('wipes all staged arrays when raw fails after synchronous consume', async () => {
         let staged: CandidateWithLookup | undefined;
+        let exposed: unknown;
+        const real = responseCandidate.composeTargetResponseCandidateWithLookup;
+        const spy = vi
+            .spyOn(responseCandidate, 'composeTargetResponseCandidateWithLookup')
+            .mockImplementation((...args) => {
+                staged = real(...args);
+                return staged;
+            });
         const fake = {
-            transactRaw: async (raw: Sso12RawOptions<null, CandidateWithLookup>) => {
+            transactRaw: async (raw: Sso12RawOptions<null, unknown>) => {
                 const identity = { uin: '123456', sequence: 1 };
                 await raw.buildRequest(identity);
                 await raw.verifyCandidate(Uint8Array.from(response(true)), null, identity);
-                staged = await raw.consumeCandidate(
+                exposed = await raw.consumeCandidate(
                     Uint8Array.from(response(true)),
                     null,
                     identity,
@@ -549,11 +558,20 @@ describe('experimental target raw transaction on synthetic loopback', () => {
                 return { kind: 'failure', code: 'raw-extra-data', writeState: 'unknown' };
             },
         } as unknown as Sso12RawTransport;
-        expect(await transactTargetRawOnce(fake, options())).toEqual({
-            kind: 'failure',
-            code: 'raw-extra-data',
-            writeState: 'unknown',
-        });
+
+        try {
+            expect(await transactTargetRawOnce(fake, options())).toEqual({
+                kind: 'failure',
+                code: 'raw-extra-data',
+                writeState: 'unknown',
+            });
+        } finally {
+            spy.mockRestore();
+        }
+
+        expect(exposed).toEqual({});
+        expect(Object.isFrozen(exposed)).toBe(true);
+        expect(exposed).not.toBe(staged);
 
         if (!staged) {
             throw new Error('consumer was not called');
@@ -571,6 +589,32 @@ describe('experimental target raw transaction on synthetic loopback', () => {
         ];
         expect(arrays).toHaveLength(8);
         expect(arrays.every((bytes) => bytes.every((byte) => byte === 0))).toBe(true);
+    });
+
+    it.each(['not-written', 'wrong-token'] as const)('discards staged data on %s', async (mode) => {
+        const answer = response(true);
+        const identity = { uin: '123456', sequence: 1 };
+        const fake = {
+            async transactRaw(raw: Sso12RawOptions<null, unknown>) {
+                await raw.buildRequest(identity);
+                await raw.verifyCandidate(answer, null, identity);
+                const token = await raw.consumeCandidate(answer, null, identity);
+                expect(token).toEqual({});
+                expect(Object.isFrozen(token)).toBe(true);
+                answer.fill(0);
+
+                if (mode === 'not-written') {
+                    return { kind: 'failure', code: 'fixture', writeState: 'not-written' };
+                }
+
+                return { kind: 'response', value: {}, sequence: 1, writeState: 'written' };
+            },
+        } as unknown as Sso12RawTransport;
+        expect(await transactTargetRawOnce(fake, options())).toEqual({
+            kind: 'failure',
+            code: 'target-transaction-failed',
+            writeState: 'unknown',
+        });
     });
 
     it('returns cancelled or expired preflight before calling raw', async () => {
@@ -626,6 +670,265 @@ describe('experimental target raw transaction on synthetic loopback', () => {
         expect(hostile).not.toHaveBeenCalled();
         expect(callerBytes).toEqual(original);
     });
+
+    it.each([
+        'frame',
+        'verify-uin',
+        'verify-sequence',
+        'consume-uin',
+        'consume-sequence',
+        'result-sequence',
+    ] as const)('fails closed for structural transport mismatch %s', async (variant) => {
+        const original = response(true);
+        const changed = Buffer.from(original);
+        changed.writeUInt32BE((changed.readUInt32BE(4) ^ 1) >>> 0, 4); // basic.word4 only
+        const normal = { uin: '123456', sequence: 1 };
+        const mismatch = variant.endsWith('uin')
+            ? { ...normal, uin: 'other' }
+            : { ...normal, sequence: 2 };
+        const fake = {
+            async transactRaw(raw: Sso12RawOptions<null, CandidateWithLookup>) {
+                await raw.buildRequest(normal);
+
+                try {
+                    await raw.verifyCandidate(
+                        original,
+                        null,
+                        variant.startsWith('verify-') ? mismatch : normal,
+                    );
+                    const value = await raw.consumeCandidate(
+                        variant === 'frame' ? changed : original,
+                        null,
+                        variant.startsWith('consume-') ? mismatch : normal,
+                    );
+                    return {
+                        kind: 'response',
+                        value,
+                        sequence: variant === 'result-sequence' ? 2 : 1,
+                        writeState: 'written',
+                    };
+                } catch {
+                    return { kind: 'failure', code: 'fake-caught', writeState: 'not-written' };
+                }
+            },
+        } as unknown as Sso12RawTransport;
+        expect(await transactTargetRawOnce(fake, options())).toEqual({
+            kind: 'failure',
+            code: 'target-transaction-failed',
+            writeState: 'unknown',
+        });
+    });
+
+    it('accepts distinct equal identities, inherited getters and independent verifier mutation', async () => {
+        const answer = response(true);
+        const reads = { uin: 0, sequence: 0 };
+        const identity = () =>
+            Object.create({
+                get uin() {
+                    reads.uin++;
+                    return '123456';
+                },
+                get sequence() {
+                    reads.sequence++;
+                    return 1;
+                },
+            }) as { uin: string; sequence: number };
+        const input = options();
+
+        input.verifyRaw = ({ requestFrame, responseFrame }) => {
+            requestFrame.fill(0);
+            responseFrame.fill(0);
+            return true;
+        };
+
+        const fake = {
+            async transactRaw(raw: Sso12RawOptions<null, CandidateWithLookup>) {
+                await raw.buildRequest(identity());
+                await raw.verifyCandidate(answer, null, identity());
+                const value = await raw.consumeCandidate(Uint8Array.from(answer), null, identity());
+                return { kind: 'response', value, sequence: 1, writeState: 'written' };
+            },
+        } as unknown as Sso12RawTransport;
+        const result = await transactTargetRawOnce(fake, input);
+        expect(result.kind).toBe('response');
+        expect(reads).toEqual({ uin: 3, sequence: 3 });
+
+        if (result.kind === 'response') {
+            expect(result.value.basic.word4).toBe(0x87654321);
+        }
+    });
+
+    it.each(['throw', 'reenter'] as const)(
+        'poisons identity getter %s even when a fake transport catches errors',
+        async (mode) => {
+            const normal = { uin: '123456', sequence: 1 };
+            const fake = {
+                async transactRaw(raw: Sso12RawOptions<null, CandidateWithLookup>) {
+                    const identity = {
+                        get uin() {
+                            if (mode === 'throw') {
+                                throw new Error('fixture');
+                            }
+
+                            try {
+                                raw.buildRequest(normal);
+                            } catch {
+                                /* swallowed reentry */
+                            }
+
+                            return normal.uin;
+                        },
+                        sequence: 1,
+                    };
+
+                    try {
+                        await raw.buildRequest(identity);
+                    } catch {
+                        /* swallowed failure */
+                    }
+
+                    return { kind: 'failure', code: 'fake-caught', writeState: 'not-written' };
+                },
+            } as unknown as Sso12RawTransport;
+            expect(await transactTargetRawOnce(fake, options())).toEqual({
+                kind: 'failure',
+                code: 'target-transaction-failed',
+                writeState: 'unknown',
+            });
+        },
+    );
+
+    it('snapshots a structural transport failure instead of returning its changing object', async () => {
+        let reads = 0;
+        const fake = {
+            async transactRaw() {
+                return {
+                    get kind() {
+                        return ++reads === 1 ? 'failure' : 'response';
+                    },
+                    code: 'fixture',
+                    writeState: 'not-written',
+                };
+            },
+        } as unknown as Sso12RawTransport;
+        expect(await transactTargetRawOnce(fake, options())).toEqual({
+            kind: 'failure',
+            code: 'fixture',
+            writeState: 'not-written',
+        });
+        expect(reads).toBe(1);
+    });
+
+    it('rejects callbacks reentered from a failure result getter', async () => {
+        const fake = {
+            async transactRaw(raw: Sso12RawOptions<null, CandidateWithLookup>) {
+                return {
+                    kind: 'failure',
+                    get code() {
+                        try {
+                            raw.buildRequest({ uin: '123456', sequence: 1 });
+                        } catch {
+                            /* swallowed */
+                        }
+
+                        return 'fixture';
+                    },
+                    writeState: 'not-written',
+                };
+            },
+        } as unknown as Sso12RawTransport;
+        expect(await transactTargetRawOnce(fake, options())).toEqual({
+            kind: 'failure',
+            code: 'target-transaction-failed',
+            writeState: 'unknown',
+        });
+    });
+
+    it.each(['build', 'verify', 'consume'] as const)(
+        'poisons a staged result after a caught repeated %s',
+        async (repeated) => {
+            const answer = response(true);
+            const identity = { uin: '123456', sequence: 1 };
+            const fake = {
+                async transactRaw(raw: Sso12RawOptions<null, CandidateWithLookup>) {
+                    await raw.buildRequest(identity);
+                    await raw.verifyCandidate(answer, null, identity);
+                    const value = await raw.consumeCandidate(answer, null, identity);
+
+                    try {
+                        if (repeated === 'build') {
+                            await raw.buildRequest(identity);
+                        }
+
+                        if (repeated === 'verify') {
+                            await raw.verifyCandidate(answer, null, identity);
+                        }
+
+                        if (repeated === 'consume') {
+                            await raw.consumeCandidate(answer, null, identity);
+                        }
+                    } catch {
+                        /* fake transport swallows callback failure */
+                    }
+
+                    return { kind: 'response', value, sequence: 1, writeState: 'written' };
+                },
+            } as unknown as Sso12RawTransport;
+            expect(await transactTargetRawOnce(fake, options())).toEqual({
+                kind: 'failure',
+                code: 'target-transaction-failed',
+                writeState: 'unknown',
+            });
+        },
+    );
+
+    it.each(['consume', 'verify'] as const)(
+        'poisons concurrent %s while verifier is pending and ignores late acceptance',
+        async (attempt) => {
+            const answer = response(true);
+            const identity = { uin: '123456', sequence: 1 };
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => {
+                release = resolve;
+            });
+            const input = options();
+            let count = 0;
+
+            input.verifyRaw = async () => {
+                count++;
+                await gate;
+                return true;
+            };
+
+            let late: Promise<boolean> | undefined;
+            const fake = {
+                async transactRaw(raw: Sso12RawOptions<null, CandidateWithLookup>) {
+                    await raw.buildRequest(identity);
+                    late = Promise.resolve(raw.verifyCandidate(answer, null, identity));
+
+                    try {
+                        if (attempt === 'consume') {
+                            await raw.consumeCandidate(answer, null, identity);
+                        } else {
+                            await raw.verifyCandidate(answer, null, identity);
+                        }
+                    } catch {
+                        /* fake transport swallows callback failure */
+                    }
+
+                    return { kind: 'failure', code: 'fake-caught', writeState: 'not-written' };
+                },
+            } as unknown as Sso12RawTransport;
+            expect(await transactTargetRawOnce(fake, input)).toEqual({
+                kind: 'failure',
+                code: 'target-transaction-failed',
+                writeState: 'unknown',
+            });
+            release();
+            expect(await late).toBe(false);
+            expect(count).toBe(1);
+        },
+    );
 
     it('rejects proxy, getter, hole and shared inputs before network callbacks', async () => {
         const fixture = await setup(response(true));
