@@ -48,8 +48,16 @@ unsupported message semantics and media are not silently converted. The
 conversion preserves the v11 field, not an independently verified QQ mention:
 the upstream decoder can normalize an unresolved mention UIN to zero, which
 the v11 converter represents as `all`. The v12 `alt_message` renders mentions
-as `@<user_id>` or `@全体成员`, without reconstructing platform display names. Self-sent events are not yet translated to v12. Unsupported actions,
-parameters and message segments return explicit errors. File APIs, HTTP event
+as `@<user_id>` or `@全体成员`, without reconstructing platform display names.
+
+A valid v11 `group_recall` maps to `notice.group_message_delete` after account,
+time, field and identifier validation. It uses `recall` when sender and operator match;
+otherwise the subtype is empty rather than asserting an administrator action.
+The message ID is the value exposed by v11, not proof that it identifies a QQ
+history entry: the existing upstream resolver may hash a missing sequence.
+Unresolved or zero sender/operator IDs are rejected. Other notices, requests and
+self-sent events are not yet translated to v12. Unsupported actions, parameters
+and message segments return explicit errors. File APIs, HTTP event
 polling and HTTP Webhook are not implemented by this listener. Capability and
 error details remain authoritative at runtime.
 

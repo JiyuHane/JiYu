@@ -48,3 +48,18 @@ export interface V12MessageEvent {
     user_id: string;
     group_id?: string;
 }
+
+export interface V12GroupMessageDeleteEvent {
+    id: string;
+    time: number;
+    type: 'notice';
+    detail_type: 'group_message_delete';
+    sub_type: 'recall' | '';
+    self: V12Self;
+    group_id: string;
+    message_id: string;
+    user_id: string;
+    operator_id: string;
+}
+
+export type V12ConvertedEvent = V12MessageEvent | V12GroupMessageDeleteEvent;

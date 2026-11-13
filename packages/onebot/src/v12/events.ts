@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { V12MessageEvent, V12Self } from './types';
+import type { V12ConvertedEvent, V12MessageEvent, V12Self } from './types';
 import { fromV11AccountId, fromV11MessageId, isObject, isSelf } from './validation';
 
 /** Distinguishes unsupported self-sent semantics from malformed V11 input. */
@@ -13,7 +13,7 @@ export class V12UnsupportedEventError extends Error {
 }
 
 /** A known but unsupported V11 event returns null; malformed input throws. */
-export function convertV11Event(input: unknown, self: V12Self): V12MessageEvent | null {
+export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEvent | null {
     if (!isSelf(self) || !isObject(input) || typeof input.post_type !== 'string') {
         throw new Error('invalid V11 event or V12 account identity');
     }
@@ -24,11 +24,59 @@ export function convertV11Event(input: unknown, self: V12Self): V12MessageEvent 
         throw new Error('V11 event account does not match V12 account');
     }
 
-    if (
-        input.post_type === 'meta_event' ||
-        input.post_type === 'notice' ||
-        input.post_type === 'request'
-    ) {
+    if (input.post_type === 'notice') {
+        if (input.notice_type !== 'group_recall') {
+            return null;
+        }
+
+        // The internal v11 converter emits no subtype or extension fields here.
+        // Unknown additions may carry semantics this mapping cannot preserve.
+        const fields = [
+            'time',
+            'self_id',
+            'post_type',
+            'notice_type',
+            'group_id',
+            'operator_id',
+            'user_id',
+            'message_id',
+        ];
+        const groupId = fromV11AccountId(input.group_id);
+        const operatorId = fromV11AccountId(input.operator_id);
+        const userId = fromV11AccountId(input.user_id);
+        const messageId = fromV11MessageId(input.message_id);
+
+        if (
+            Reflect.ownKeys(input).some(
+                (key) => typeof key !== 'string' || !fields.includes(key),
+            ) ||
+            groupId === null ||
+            operatorId === null ||
+            userId === null ||
+            messageId === null ||
+            typeof input.time !== 'number' ||
+            !Number.isFinite(input.time) ||
+            input.time < 0
+        ) {
+            throw new Error('invalid or unsupported V11 group recall event');
+        }
+
+        return {
+            id: randomUUID(),
+            time: input.time,
+            type: 'notice',
+            detail_type: 'group_message_delete',
+            // A different operator does not establish that they are an administrator.
+            sub_type: operatorId === userId ? 'recall' : '',
+            self: { ...self },
+            group_id: groupId,
+            message_id: messageId,
+            user_id: userId,
+            operator_id: operatorId,
+        };
+    }
+
+    if (input.post_type === 'meta_event' || input.post_type === 'request') {
         return null;
     }
 

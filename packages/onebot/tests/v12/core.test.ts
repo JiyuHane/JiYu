@@ -572,10 +572,11 @@ describe('V12 message and lifecycle event conversion', () => {
         });
         expect(result.id).toBeTruthy();
         expect(convertV11Event(event, self)!.id).not.toBe(result.id);
-        expect(
-            convertV11Event({ ...event, message: text('[x]'), raw_message: '&#91;x&#93;' }, self)
-                ?.alt_message,
-        ).toBe('[x]');
+        const escaped = convertV11Event(
+            { ...event, message: text('[x]'), raw_message: '&#91;x&#93;' },
+            self,
+        );
+        expect(escaped?.type === 'message' ? escaped.alt_message : undefined).toBe('[x]');
         expect(
             convertV11Event(
                 { ...event, message_type: 'group', sub_type: 'normal', group_id: 43 },
