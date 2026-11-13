@@ -108,6 +108,10 @@ describe('community plugin index', () => {
         expect(html).toContain('暂无可选择的账号');
         expect(html).toContain('社区索引仅供浏览');
         expect(html).toContain('插件以霁羽进程完整权限执行');
+        expect(html).toContain('第三方插件由其作者或提供方独立开发、维护和运营');
+        expect(html).toContain('霁羽与其无从属或合作关系');
+        expect(html).toContain('霁羽不对第三方插件的代码、数据处理、运行结果及相关损失承担责任');
+        expect(html).toContain('相关问题请联系对应插件作者或提供方');
         expect(html).toContain('https://github.com/HolyFoxTeam/napcat-plugin-community-index');
         expect(html).not.toContain('安装成功');
         expect(html).not.toContain('启用插件');

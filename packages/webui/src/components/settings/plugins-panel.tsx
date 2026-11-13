@@ -35,6 +35,8 @@ import {
 } from '@/lib/plugin-index';
 
 const INDEX_REPOSITORY = 'https://github.com/HolyFoxTeam/napcat-plugin-community-index';
+const THIRD_PARTY_NOTICE =
+    '第三方插件由其作者或提供方独立开发、维护和运营，霁羽与其无从属或合作关系，展示不代表背书。霁羽不对第三方插件的代码、数据处理、运行结果及相关损失承担责任；相关问题请联系对应插件作者或提供方。';
 const ERROR_LABELS: Record<NonNullable<CommunityIndexResult['error']>, string> = {
     timeout: '请求超时',
     network: '网络请求失败',
@@ -108,7 +110,7 @@ export function PluginsPanel() {
                 <CardHeader>
                     <CardTitle>社区插件索引</CardTitle>
                     <CardDescription>
-                        社区索引仅供浏览，不提供从索引安装；本地候选插件可在上方按账号管理。收录不代表霁羽兼容或已验证。
+                        社区索引仅供浏览，不提供从索引安装；本地候选插件可在上方按账号管理。收录不代表霁羽兼容或已验证。第三方插件独立运营，霁羽不承担插件责任，详见上方声明。
                     </CardDescription>
                 </CardHeader>
                 <CardContent className="flex flex-col gap-4">
@@ -307,6 +309,7 @@ function LocalPluginsPanel() {
                 <CardDescription>
                     手动放置在本机插件目录中的候选项，不由社区索引自动安装。插件以霁羽进程完整权限执行，与霁羽的兼容性未知。
                 </CardDescription>
+                <p className="text-xs text-muted-foreground">{THIRD_PARTY_NOTICE}</p>
             </CardHeader>
             <CardContent className="flex flex-col gap-4">
                 <p className="text-xs text-muted-foreground">
@@ -556,9 +559,12 @@ function LocalAccountPlugins({
                 description={confirm ? `账号 ${uin} · 插件 ${confirm.id}` : undefined}
                 content={
                     confirm?.operation === 'enable' ? (
-                        <p className="text-sm">
-                            插件以霁羽进程完整权限执行，可访问该进程可访问的文件、网络和账号；兼容性未知。请确认启用。
-                        </p>
+                        <div className="space-y-2 text-sm">
+                            <p>
+                                插件以霁羽进程完整权限执行，可访问该进程可访问的文件、网络和账号；兼容性未知。请确认启用。
+                            </p>
+                            <p>{THIRD_PARTY_NOTICE}</p>
+                        </div>
                     ) : (
                         <p className="text-sm">
                             停用不等于卸载；进程资源和清理结果以实际状态为准。

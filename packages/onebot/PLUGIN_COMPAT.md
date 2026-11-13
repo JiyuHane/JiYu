@@ -14,6 +14,16 @@ plugin's author, source authenticity, license, safety, or compatibility with
 Jiyu. Its `minVersion` describes NapCat, not Jiyu. Treat each plugin's own
 license and attribution independently.
 
+## Third-party plugin responsibility
+
+Third-party plugins are independently developed, maintained and operated by
+their respective authors or providers. Jiyu has no affiliation or partnership
+with those third parties; displaying a plugin or implementing a compatible
+interface does not endorse it. Jiyu does not assume responsibility for
+third-party plugin code, data handling, operation, results or resulting losses.
+Questions or issues concerning a plugin should be directed to its author or
+provider.
+
 ## Current boundary
 
 The first compatibility subset uses OneBot v11 actions and events. It supports
