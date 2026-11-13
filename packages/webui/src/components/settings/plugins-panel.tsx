@@ -23,6 +23,7 @@ import {
     ApiError,
     type CommunityIndexResult,
     type LocalPluginsResult,
+    type LocalPluginManifest,
     type PluginConfigField,
     type PluginConfigValue,
 } from '@/lib/api/types';
@@ -523,6 +524,7 @@ function LocalAccountPlugins({
                 {data && (
                     <LocalPluginList
                         data={data}
+                        uin={uin}
                         blocked={loading || !!error || operationState !== null}
                         onChoose={(id, operation) => setConfirm({ id, operation })}
                         onConfig={(id) => setConfigId(id)}
@@ -590,11 +592,13 @@ function LocalAccountPlugins({
 
 export function LocalPluginList({
     data,
+    uin,
     blocked,
     onChoose,
     onConfig,
 }: {
     data: LocalPluginsResult;
+    uin?: string;
     blocked: boolean;
     onChoose: (id: string, operation: LocalOperation) => void;
     onConfig?: (id: string) => void;
@@ -717,6 +721,9 @@ export function LocalPluginList({
                                     </Button>
                                 )}
                             </div>
+                            {uin && data.candidates.includes(id) && (
+                                <LocalManifestControl key={`${uin}:${id}`} uin={uin} id={id} />
+                            )}
                             {(!action?.canEnable || !action?.canDisable) && (
                                 <p className="mt-2 text-xs text-muted-foreground">
                                     {!action?.canEnable
@@ -731,6 +738,119 @@ export function LocalPluginList({
                     );
                 })
             )}
+        </div>
+    );
+}
+
+export function ManifestDetails({ manifest }: { manifest: LocalPluginManifest }) {
+    return (
+        <div className="mt-2 flex flex-col gap-1 text-xs text-muted-foreground">
+            <p>
+                本地声明、未经核验；不代表来源/许可/兼容或入口可用；文件可能变化，启用会重新检查。
+            </p>
+            <p className="break-all">
+                main：{manifest.declarations.main === null ? '未声明' : manifest.declarations.main}
+            </p>
+            <p className="break-all">
+                type：{manifest.declarations.type === null ? '未声明' : manifest.declarations.type}
+            </p>
+            <p>
+                无效字段：{manifest.invalidFields.length ? manifest.invalidFields.join('、') : '无'}
+            </p>
+        </div>
+    );
+}
+
+function LocalManifestControl({ uin, id }: { uin: string; id: string }) {
+    const api = useApi();
+    const [scope] = useState(createPluginRequestScope);
+    const [visible, setVisible] = useState(false);
+    const [loading, setLoading] = useState(false);
+    const [manifest, setManifest] = useState<LocalPluginManifest | null>(null);
+    const [error, setError] = useState(false);
+    const busy = useRef(false);
+    useEffect(() => () => scope.cancel(), [scope]);
+
+    const toggle = () => {
+        if (visible || busy.current) {
+            scope.cancel();
+            busy.current = false;
+            setVisible(false);
+            setLoading(false);
+            setManifest(null);
+            setError(false);
+            return;
+        }
+
+        const request = scope.start();
+        busy.current = true;
+        setVisible(true);
+        setLoading(true);
+        setError(false);
+        void api.plugins
+            .manifest(uin, id, request.signal)
+            .then(
+                (value) => {
+                    if (request.isCurrent()) {
+                        setManifest(value);
+                    }
+                },
+                () => {
+                    if (request.isCurrent()) {
+                        setError(true);
+                    }
+                },
+            )
+            .finally(() => {
+                if (request.isCurrent()) {
+                    busy.current = false;
+                    setLoading(false);
+                }
+
+                request.finish();
+            });
+    };
+
+    return (
+        <ManifestView
+            visible={visible}
+            loading={loading}
+            error={error}
+            manifest={manifest}
+            onToggle={toggle}
+        />
+    );
+}
+
+export function ManifestView({
+    visible,
+    loading,
+    error,
+    manifest,
+    onToggle,
+}: {
+    visible: boolean;
+    loading: boolean;
+    error: boolean;
+    manifest: LocalPluginManifest | null;
+    onToggle: () => void;
+}) {
+    return (
+        <div className="mt-3">
+            <Button size="sm" variant="outline" onClick={onToggle} aria-expanded={visible}>
+                {visible ? '隐藏包声明' : '查看包声明'}
+            </Button>
+            {visible && loading && (
+                <p role="status" className="mt-2 text-xs text-muted-foreground">
+                    正在读取包声明…
+                </p>
+            )}
+            {visible && error && (
+                <p role="alert" className="mt-2 text-xs text-destructive">
+                    包声明读取失败。
+                </p>
+            )}
+            {visible && manifest && <ManifestDetails manifest={manifest} />}
         </div>
     );
 }

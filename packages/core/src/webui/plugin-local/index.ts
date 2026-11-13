@@ -1,8 +1,12 @@
 import fs from 'node:fs/promises';
+import { constants, type BigIntStats } from 'node:fs';
 import path from 'node:path';
 
 const MAX_DIRECTORY_ENTRIES = 2048;
 const MAX_PLUGINS = 512;
+const MAX_MANIFEST_BYTES = 64 * 1024;
+const MAX_MANIFEST_READS = 16;
+let activeManifestReads = 0;
 const ID = /^[a-z0-9][a-z0-9_-]{0,79}$/;
 const WINDOWS_DEVICE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 const SYSTEM_CODES = new Set([
@@ -21,7 +25,15 @@ const SYSTEM_CODES = new Set([
 ]);
 
 export type LocalPluginCatalogErrorCode =
-    'invalid_id' | 'not_found' | 'unsafe_path' | 'limit_exceeded' | 'io_error';
+    | 'invalid_id'
+    | 'not_found'
+    | 'unsafe_path'
+    | 'limit_exceeded'
+    | 'io_error'
+    | 'manifest_missing'
+    | 'manifest_invalid'
+    | 'manifest_too_large'
+    | 'manifest_busy';
 
 /** Stable, path-free errors for a caller to map to its own authenticated API. */
 export class LocalPluginCatalogError extends Error {
@@ -156,11 +168,32 @@ async function scanDirectory(base: string): Promise<{ ids: string[]; excluded: S
     return { ids, excluded };
 }
 
+export interface LocalManifestPreview {
+    declarations: { main: string | null; type: string | null };
+    invalidFields: Array<'main' | 'type'>;
+}
+
+function sameIdentity(a: BigIntStats, b: BigIntStats): boolean {
+    // An unavailable inode cannot establish that a path still names the open object.
+    return a.ino !== 0n && b.ino !== 0n && a.dev === b.dev && a.ino === b.ino;
+}
+
+function sameFile(a: BigIntStats, b: BigIntStats): boolean {
+    return (
+        sameIdentity(a, b) &&
+        a.size === b.size &&
+        a.mtimeNs === b.mtimeNs &&
+        a.ctimeNs === b.ctimeNs
+    );
+}
+
 export interface LocalPluginCatalog {
     /** Sorted, bounded IDs only. Missing catalog means no entries. */
     list(): Promise<string[]>;
     /** Validates a single existing direct child; never loads it. */
     resolve(id: string): Promise<string>;
+    /** Optional for legacy catalog implementations; never executes plugin code. */
+    previewManifest?(id: string): Promise<LocalManifestPreview>;
 }
 
 /**
@@ -186,7 +219,7 @@ export function createLocalPluginCatalog(
         throw new LocalPluginCatalogError('unsafe_path');
     }
 
-    return {
+    const catalog: LocalPluginCatalog = {
         async list(): Promise<string[]> {
             try {
                 try {
@@ -250,5 +283,180 @@ export function createLocalPluginCatalog(
                 return wrap(error);
             }
         },
+        async previewManifest(id: string): Promise<LocalManifestPreview> {
+            if (!isId(id)) {
+                throw new LocalPluginCatalogError('invalid_id');
+            }
+
+            if (activeManifestReads >= MAX_MANIFEST_READS) {
+                throw new LocalPluginCatalogError('manifest_busy');
+            }
+
+            activeManifestReads++;
+            let releaseSlot = true;
+
+            try {
+                const expectedDirectory = path.join(base, id);
+                await checkedDirectory(expectedDirectory);
+                const parentBefore = await fs.lstat(expectedDirectory, { bigint: true });
+                const directory = await catalog.resolve(id);
+                const parentResolved = await fs.lstat(directory, { bigint: true });
+
+                if (
+                    !samePath(directory, expectedDirectory) ||
+                    !sameIdentity(parentBefore, parentResolved) ||
+                    !parentBefore.isDirectory() ||
+                    parentBefore.isSymbolicLink() ||
+                    parentBefore.ino === 0n ||
+                    !parentResolved.isDirectory() ||
+                    parentResolved.isSymbolicLink()
+                ) {
+                    throw new LocalPluginCatalogError('unsafe_path');
+                }
+
+                const manifest = path.join(directory, 'package.json');
+                let before: BigIntStats;
+
+                try {
+                    before = await fs.lstat(manifest, { bigint: true });
+                } catch (error) {
+                    if (systemCode(error) === 'ENOENT') {
+                        throw new LocalPluginCatalogError('manifest_missing');
+                    }
+
+                    throw error;
+                }
+
+                if (before.isSymbolicLink() || !before.isFile() || before.ino === 0n) {
+                    throw new LocalPluginCatalogError('unsafe_path');
+                }
+
+                if (before.size > BigInt(MAX_MANIFEST_BYTES)) {
+                    throw new LocalPluginCatalogError('manifest_too_large');
+                }
+
+                if (!samePath(await fs.realpath(manifest), manifest)) {
+                    throw new LocalPluginCatalogError('unsafe_path');
+                }
+
+                const checked = await fs.lstat(manifest, { bigint: true });
+
+                if (checked.isSymbolicLink() || !checked.isFile() || !sameFile(before, checked)) {
+                    throw new LocalPluginCatalogError('unsafe_path');
+                }
+
+                const handle = await fs.open(
+                    manifest,
+                    constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+                );
+                releaseSlot = false;
+
+                try {
+                    const opened = await handle.stat({ bigint: true });
+
+                    if (!opened.isFile() || !sameFile(before, opened)) {
+                        throw new LocalPluginCatalogError('unsafe_path');
+                    }
+
+                    const bytes = Buffer.alloc(MAX_MANIFEST_BYTES + 1);
+                    let size = 0;
+
+                    while (size < bytes.length) {
+                        const part = await handle.read(bytes, size, bytes.length - size, size);
+
+                        if (part.bytesRead === 0) {
+                            break;
+                        }
+
+                        size += part.bytesRead;
+                    }
+
+                    if (size > MAX_MANIFEST_BYTES) {
+                        throw new LocalPluginCatalogError('manifest_too_large');
+                    }
+
+                    const after = await handle.stat({ bigint: true });
+                    const finalPath = await fs.lstat(manifest, { bigint: true });
+                    await checkedDirectory(directory, false);
+                    const parentAfter = await fs.lstat(directory, { bigint: true });
+
+                    if (
+                        !sameFile(opened, after) ||
+                        BigInt(size) !== after.size ||
+                        finalPath.isSymbolicLink() ||
+                        !finalPath.isFile() ||
+                        !sameFile(after, finalPath) ||
+                        !samePath(await fs.realpath(manifest), manifest) ||
+                        !parentAfter.isDirectory() ||
+                        parentAfter.isSymbolicLink() ||
+                        !sameIdentity(parentBefore, parentAfter)
+                    ) {
+                        throw new LocalPluginCatalogError('unsafe_path');
+                    }
+
+                    let value: unknown;
+
+                    try {
+                        value = JSON.parse(
+                            new TextDecoder('utf-8', { fatal: true }).decode(
+                                bytes.subarray(0, size),
+                            ),
+                        );
+                    } catch {
+                        throw new LocalPluginCatalogError('manifest_invalid');
+                    }
+
+                    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+                        throw new LocalPluginCatalogError('manifest_invalid');
+                    }
+
+                    const declarations: LocalManifestPreview['declarations'] = {
+                        main: null,
+                        type: null,
+                    };
+                    const invalidFields: LocalManifestPreview['invalidFields'] = [];
+
+                    for (const field of ['main', 'type'] as const) {
+                        if (!Object.hasOwn(value, field)) {
+                            continue;
+                        }
+
+                        const entry = (value as Record<string, unknown>)[field];
+
+                        if (
+                            typeof entry !== 'string' ||
+                            entry.length > 512 ||
+                            path.posix.isAbsolute(entry.trimStart()) ||
+                            path.win32.isAbsolute(entry.trimStart()) ||
+                            Array.from(entry).some((character) => {
+                                const code = character.charCodeAt(0);
+                                return code < 32 || (code >= 127 && code <= 159);
+                            })
+                        ) {
+                            invalidFields.push(field);
+                        } else {
+                            declarations[field] = entry;
+                        }
+                    }
+
+                    return { declarations, invalidFields };
+                } finally {
+                    await handle.close();
+                    releaseSlot = true;
+                }
+            } catch (error) {
+                if (systemCode(error) === 'ELOOP') {
+                    throw new LocalPluginCatalogError('unsafe_path');
+                }
+
+                return wrap(error);
+            } finally {
+                // A failed or unresolved close leaves the handle's fate unknown.
+                if (releaseSlot) {
+                    activeManifestReads--;
+                }
+            }
+        },
     };
+    return catalog;
 }

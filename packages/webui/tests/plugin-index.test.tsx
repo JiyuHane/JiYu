@@ -8,12 +8,14 @@ import {
     createPluginRequestScope,
     hasCurrentUnknownCheck,
     LocalPluginList,
+    ManifestDetails,
+    ManifestView,
     PluginIndexContent,
     PluginIndexSwap,
     PluginsPanel,
     withPluginIndexLoading,
 } from '../src/components/settings/plugins-panel';
-import { createApiClient } from '../src/lib/api/client';
+import { createApiClient, parseLocalPluginManifest } from '../src/lib/api/client';
 import { ApiError, type CommunityIndexResult, type LocalPluginsResult } from '../src/lib/api/types';
 import {
     filterPlugins,
@@ -90,6 +92,207 @@ afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
     indexRequest.mockClear();
+});
+
+describe('local manifest declarations', () => {
+    const manifest = {
+        status: 'ok' as const,
+        id: 'example',
+        declarations: { main: '<img src=x onerror=alert(1)>', type: null },
+        invalidFields: ['type' as const],
+        source: 'local-unverified' as const,
+    };
+
+    it('shows only candidate controls, including offline, with no request on render', () => {
+        const fetchMock = vi.fn();
+        vi.stubGlobal('fetch', fetchMock);
+        const html = renderToStaticMarkup(
+            <LocalPluginList
+                uin="12345"
+                data={{
+                    ...localFixture,
+                    accountOnline: false,
+                    runtime: null,
+                    pendingOperations: [
+                        {
+                            id: 'other',
+                            operation: 'enable',
+                            phase: 'resolving',
+                            cancelled: false,
+                            currentInstance: false,
+                        },
+                    ],
+                }}
+                blocked
+                onChoose={() => undefined}
+            />,
+        );
+        expect(html.match(/查看包声明/g)).toHaveLength(1);
+        expect(html).toContain('aria-expanded="false"');
+        expect(html).not.toContain('隐藏包声明');
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('renders declarations as text and labels their unverified status', () => {
+        const html = renderToStaticMarkup(<ManifestDetails manifest={manifest} />);
+        expect(html).toContain('&lt;img src=x onerror=alert(1)&gt;');
+        expect(html).not.toContain('<img');
+        expect(html).toContain('本地声明、未经核验');
+        expect(html).toContain('无效字段：type');
+        expect(html).not.toContain('href=');
+    });
+
+    it('renders visible and hidden states and uses a fixed error message', () => {
+        const props = { loading: false, error: false, manifest, onToggle: () => undefined };
+        const hidden = renderToStaticMarkup(<ManifestView {...props} visible={false} />);
+        const shown = renderToStaticMarkup(<ManifestView {...props} visible />);
+        const failed = renderToStaticMarkup(
+            <ManifestView {...props} visible error manifest={null} />,
+        );
+        expect(hidden).toContain('查看包声明');
+        expect(hidden).not.toContain('&lt;img');
+        expect(shown).toContain('隐藏包声明');
+        expect(shown).toContain('&lt;img');
+        expect(failed).toContain('包声明读取失败。');
+    });
+
+    it('validates identity, source, field size, controls and malformed values', () => {
+        expect(parseLocalPluginManifest(manifest, 'example')).toEqual(manifest);
+
+        for (const invalid of [
+            { ...manifest, id: 'other' },
+            { ...manifest, source: 'verified' },
+            { ...manifest, declarations: { main: 'a'.repeat(513), type: null } },
+            { ...manifest, declarations: { main: 'x\u0000', type: null } },
+            { ...manifest, declarations: { main: {}, type: null } },
+            { ...manifest, invalidFields: ['type', 'type'] },
+            { ...manifest, invalidFields: ['__proto__'] },
+            { status: 'failed', code: 'sensitive-path' },
+        ]) {
+            expect(() => parseLocalPluginManifest(invalid, 'example')).toThrow('包声明读取失败');
+        }
+    });
+
+    it('rejects absolute and rooted main values from an untrusted response', async () => {
+        for (const main of [
+            '/private/package.js',
+            'C:\\private\\package.js',
+            'c:/private/package.js',
+            '\\\\server\\share\\package.js',
+            '\\\\?\\C:\\private\\package.js',
+            '\\\\.\\device',
+            '\\rooted\\package.js',
+            '   /private/package.js',
+        ]) {
+            const response = { ...manifest, declarations: { main, type: null } };
+            expect(() => parseLocalPluginManifest(response, 'example')).toThrow('包声明读取失败');
+        }
+
+        for (const main of ['', './index.js', 'lib\\index.js']) {
+            const response = { ...manifest, declarations: { main, type: null } };
+            expect(parseLocalPluginManifest(response, 'example').declarations.main).toBe(main);
+        }
+
+        const fetchMock = vi.fn().mockResolvedValue(
+            Response.json({
+                ...manifest,
+                declarations: { main: '/private/package.js', type: null },
+            }),
+        );
+        vi.stubGlobal('fetch', fetchMock);
+        await expect(
+            createApiClient({ tokenStore }).plugins.manifest('12345', 'example'),
+        ).rejects.toMatchObject({ message: '包声明读取失败', code: 'INVALID_RESPONSE' });
+        expect(fetchMock).toHaveBeenCalledOnce();
+    });
+
+    it('rejects absolute type values while accepting backend invalid-field results', async () => {
+        for (const type of [
+            '/private/package.js',
+            'C:\\private\\package.js',
+            'd:/private/package.js',
+            '\\\\server\\share\\package.js',
+            '\\\\?\\C:\\private\\package.js',
+            '\u3000\u00a0/private/package.js',
+        ]) {
+            const response = {
+                ...manifest,
+                declarations: { main: 'index.js', type },
+                invalidFields: [],
+            };
+            expect(() => parseLocalPluginManifest(response, 'example')).toThrow('包声明读取失败');
+        }
+
+        const response = { ...manifest, declarations: { main: 'index.js', type: null } };
+        expect(parseLocalPluginManifest(response, 'example')).toEqual(response);
+        const fetchMock = vi.fn().mockResolvedValue(
+            Response.json({
+                ...manifest,
+                declarations: { main: 'index.js', type: '\u3000/private/package.js' },
+                invalidFields: [],
+            }),
+        );
+        vi.stubGlobal('fetch', fetchMock);
+        await expect(
+            createApiClient({ tokenStore }).plugins.manifest('12345', 'example'),
+        ).rejects.toMatchObject({ message: '包声明读取失败', code: 'INVALID_RESPONSE' });
+        expect(fetchMock).toHaveBeenCalledOnce();
+    });
+
+    it('makes one authenticated, non-cached GET only when invoked', async () => {
+        const fetchMock = vi.fn().mockResolvedValue(Response.json(manifest));
+        vi.stubGlobal('fetch', fetchMock);
+        const client = createApiClient({ tokenStore });
+        expect(fetchMock).not.toHaveBeenCalled();
+        await expect(client.plugins.manifest('12345', 'example')).resolves.toEqual(manifest);
+        expect(fetchMock).toHaveBeenCalledOnce();
+        expect(fetchMock).toHaveBeenCalledWith(
+            '/api/plugins/local/12345/example/manifest',
+            expect.objectContaining({ method: 'GET', cache: 'no-store' }),
+        );
+    });
+
+    it('does not retry failed responses or render their codes and messages', async () => {
+        const fetchMock = vi
+            .fn()
+            .mockResolvedValue(
+                Response.json(
+                    { status: 'failed', code: 'secret-path', message: 'secret-token' },
+                    { status: 500 },
+                ),
+            );
+        vi.stubGlobal('fetch', fetchMock);
+        await expect(
+            createApiClient({ tokenStore }).plugins.manifest('12345', 'example'),
+        ).rejects.toBeInstanceOf(ApiError);
+        expect(fetchMock).toHaveBeenCalledOnce();
+        const html = renderToStaticMarkup(
+            <ManifestView
+                visible
+                loading={false}
+                error
+                manifest={null}
+                onToggle={() => undefined}
+            />,
+        );
+        expect(html).toContain('包声明读取失败。');
+        expect(html).not.toContain('secret-path');
+        expect(html).not.toContain('secret-token');
+    });
+
+    it('invalidates old requests on account switch, hide and unmount', () => {
+        const accountA = createPluginRequestScope();
+        const requestA = accountA.start();
+        accountA.cancel();
+        const accountB = createPluginRequestScope();
+        const requestB = accountB.start();
+        expect(requestA.isCurrent()).toBe(false);
+        expect(requestA.signal.aborted).toBe(true);
+        expect(requestB.isCurrent()).toBe(true);
+        accountB.cancel();
+        expect(requestB.isCurrent()).toBe(false);
+        expect(requestB.signal.aborted).toBe(true);
+    });
 });
 
 describe('community plugin index', () => {

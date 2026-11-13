@@ -46,6 +46,7 @@ import {
     type CreateApiClientOptions,
     type LoginResult,
     type LogsStreamOptions,
+    type LocalPluginManifest,
     type ProcessActionResult,
     type StateStreamEvent,
     type StateStreamOptions,
@@ -96,6 +97,63 @@ function extractErrorMessage(payload: ErrorPayload, fallback: string): string {
     return payload.message || payload.error || fallback;
 }
 
+export function parseLocalPluginManifest(value: unknown, id: string): LocalPluginManifest {
+    const invalid = () => new ApiError(502, '包声明读取失败', 'INVALID_RESPONSE');
+
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw invalid();
+    }
+
+    const envelope = value as Record<string, unknown>;
+    const declarations = envelope.declarations;
+
+    if (
+        envelope.status !== 'ok' ||
+        envelope.id !== id ||
+        envelope.source !== 'local-unverified' ||
+        !declarations ||
+        typeof declarations !== 'object' ||
+        Array.isArray(declarations) ||
+        !Array.isArray(envelope.invalidFields) ||
+        envelope.invalidFields.length > 2
+    ) {
+        throw invalid();
+    }
+
+    const fields = declarations as Record<string, unknown>;
+    const validValue = (item: unknown): item is string | null =>
+        item === null ||
+        (typeof item === 'string' &&
+            item.length <= 512 &&
+            !Array.from(item).some((char) => {
+                const code = char.charCodeAt(0);
+                return code < 32 || (code >= 127 && code <= 159);
+            }));
+    const invalidFields = envelope.invalidFields;
+    const absolutePath = (item: unknown) =>
+        typeof item === 'string' && /^(?:[\\/]|[a-z]:[\\/])/i.test(item.trimStart());
+
+    if (
+        !validValue(fields.main) ||
+        absolutePath(fields.main) ||
+        !validValue(fields.type) ||
+        absolutePath(fields.type) ||
+        invalidFields.some((item) => item !== 'main' && item !== 'type') ||
+        new Set(invalidFields).size !== invalidFields.length ||
+        invalidFields.some((item) => fields[item as 'main' | 'type'] !== null)
+    ) {
+        throw invalid();
+    }
+
+    return {
+        status: 'ok',
+        id,
+        declarations: { main: fields.main, type: fields.type },
+        invalidFields: invalidFields as ('main' | 'type')[],
+        source: 'local-unverified',
+    };
+}
+
 class HttpApiClient implements ApiClient {
     private tokenStore: TokenStore;
     private currentToken: string | null;
@@ -144,6 +202,15 @@ class HttpApiClient implements ApiClient {
                         {},
                         signal,
                     ),
+                ),
+            manifest: async (uin, id, signal) =>
+                parseLocalPluginManifest(
+                    await this.fetchPluginJson(
+                        `/api/plugins/local/${encodeURIComponent(uin)}/${encodeURIComponent(id)}/manifest`,
+                        { method: 'GET', cache: 'no-store' },
+                        signal,
+                    ),
+                    id,
                 ),
             configSchema: async (uin, id) =>
                 parseConfigEnvelope(

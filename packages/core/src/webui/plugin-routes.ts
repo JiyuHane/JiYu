@@ -285,6 +285,69 @@ export function registerLocalPluginRoutes(
         });
     });
 
+    app.get('/api/plugins/local/:uin/:id/manifest', async (c) => {
+        const { uin, id } = c.req.param();
+
+        if (!UIN.test(uin) || !PLUGIN_ID.test(id)) {
+            return c.json({ status: 'failed', code: 'INVALID_SELECTION' }, 400);
+        }
+
+        const instance = manager.getInstance(uin);
+
+        if (!catalog.previewManifest) {
+            return c.json({ status: 'failed', code: 'LOCAL_MANIFEST_UNAVAILABLE' }, 503);
+        }
+
+        try {
+            const preview = await catalog.previewManifest(id);
+
+            if (manager.getInstance(uin) !== instance) {
+                return c.json({ status: 'failed', code: 'INSTANCE_CHANGED' }, 409);
+            }
+
+            return c.json({
+                status: 'ok',
+                id,
+                declarations: { main: preview.declarations.main, type: preview.declarations.type },
+                invalidFields: preview.invalidFields,
+                source: 'local-unverified' as const,
+            });
+        } catch (error) {
+            if (manager.getInstance(uin) !== instance) {
+                return c.json({ status: 'failed', code: 'INSTANCE_CHANGED' }, 409);
+            }
+
+            if (error instanceof LocalPluginCatalogError) {
+                if (error.code === 'not_found' || error.code === 'manifest_missing') {
+                    return c.json({ status: 'failed', code: 'LOCAL_MANIFEST_NOT_FOUND' }, 404);
+                }
+
+                if (error.code === 'invalid_id') {
+                    return c.json({ status: 'failed', code: 'INVALID_SELECTION' }, 400);
+                }
+
+                if (error.code === 'unsafe_path') {
+                    return c.json({ status: 'failed', code: 'LOCAL_MANIFEST_CHANGED' }, 409);
+                }
+
+                if (error.code === 'manifest_invalid' || error.code === 'manifest_too_large') {
+                    return c.json(
+                        {
+                            status: 'failed',
+                            code:
+                                error.code === 'manifest_invalid'
+                                    ? 'LOCAL_MANIFEST_INVALID'
+                                    : 'LOCAL_MANIFEST_TOO_LARGE',
+                        },
+                        409,
+                    );
+                }
+            }
+
+            return c.json({ status: 'failed', code: 'LOCAL_MANIFEST_UNAVAILABLE' }, 503);
+        }
+    });
+
     for (const action of ['schema', 'read', 'write'] as const) {
         app.post(`/api/plugins/local/:uin/:id/config/${action}`, async (c) => {
             const { uin, id } = c.req.param();

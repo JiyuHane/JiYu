@@ -189,6 +189,14 @@ export interface LocalPluginsResult {
     processResources: 'unknown';
 }
 
+export interface LocalPluginManifest {
+    status: 'ok';
+    id: string;
+    declarations: { main: string | null; type: string | null };
+    invalidFields: ('main' | 'type')[];
+    source: 'local-unverified';
+}
+
 export interface LocalPluginMutationResult {
     status: 'ok';
     operation: 'enable' | 'disable';
@@ -210,6 +218,7 @@ export interface ApiClient {
     plugins: {
         index(refresh?: boolean, signal?: AbortSignal): Promise<CommunityIndexResult>;
         local(uin: string, signal?: AbortSignal): Promise<LocalPluginsResult>;
+        manifest(uin: string, id: string, signal?: AbortSignal): Promise<LocalPluginManifest>;
         configSchema(
             uin: string,
             id: string,

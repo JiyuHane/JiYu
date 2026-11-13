@@ -59,6 +59,13 @@ Only an explicit enable for a running account executes the selected local ESM
 entry. Stopping a plugin is not an uninstall. Jiyu checks the selected paths,
 but filesystem replacement between checks and loading remains possible.
 
+The local list can explicitly preview a candidate's `package.json` `main` and
+`type` declarations without importing the plugin. These are unverified local
+strings, not proof that an entry exists, is compatible, is licensed, or comes
+from the claimed author. Invalid or unavailable declarations are reported rather
+than treated as a successful preview. Files can change after preview; enabling
+continues to perform its own checks.
+
 The configuration panel calls static schema and optional get/set hooks only
 on explicit user actions. Its editor supports a narrow subset of fields and
 requires the returned object to match that schema; unsupported schemas are not
