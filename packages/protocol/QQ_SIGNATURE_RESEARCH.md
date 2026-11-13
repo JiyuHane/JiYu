@@ -233,6 +233,32 @@ changes. The compared buffers and source bytes were not examined. Their
 meaning, the reachability of this path and any connection to a signing entry
 remain unknown.
 
+A separate bounded trace exposes another candidate stateful generator without
+establishing a call path to signing. Under its inspected dispatcher path,
+`0x2f30e4` calls `steady_clock::now`, and its returned low word is subsequently
+used at `0x2f31f8–0x2f3220` to initialize 624 eight-byte slots. The loop uses a
+32-bit recurrence with multiplier `0x6c078965`, followed by a call at
+`0x2f3230` to `0x2f91c8` using `x19+0x4a0` as its base. That callee uses
+indices corresponding conditionally to `(i+1) mod 624` and `(i+397) mod 624`,
+updates a slot, and applies bit operations involving `0x9908b0df`,
+`0x9d2c5680` and `0xefc60000` before returning a value; the first constant is
+multiplied by a low bit, while the latter two are used as AND masks. These constants and the
+624-slot recurrence resemble MT19937, but the observed eight-byte slots and
+64-bit operations prevent a claim of standard equivalence without additional
+proof. A bounded caller path stores the first return value and writes four
+low-order bytes into a pointer-based buffer. Another inspected dispatcher path
+can use bytes from that buffer in a four-iteration, bytewise XOR with two other
+object-relative regions, writing each result back to one of those regions. This
+association depends on the two separately stored buffer pointers still being
+equal and the relevant index and data slots remaining stable; the inputs and
+subsequent use of the XOR result remain unknown. Both this path and the
+conditional copy above use syntactically identical `x19`-relative locations;
+the evidence does not establish
+they concern the same live object or connect either path to signing. These
+observations assume the reported paths and calls complete normally, registers and
+slots remain stable, indices and memory ranges are valid, and there is no harmful
+aliasing or concurrent mutation. No target code was executed; the static source data bytes were not inspected.
+
 A further bounded radare2 instruction trace provides **conditional** evidence
 for the rotated inputs. At `0x2f39bc–0x2f39fc`, a 32-bit `j` from
 `[x19+0x288]` selects four bytes at `A + ((4*j-k) mod 2^32)` for `k=4,3,2,1`,
