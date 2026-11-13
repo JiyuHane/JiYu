@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { types } from 'node:util';
+import { inflateRawSync } from 'node:zlib';
 
 export type ZipPreflightError =
     | 'malformed'
@@ -51,6 +52,87 @@ function crc32(data: Uint8Array, start: number, length: number): number {
     }
 
     return (crc ^ 0xffffffff) >>> 0;
+}
+
+type InflateSnapshot = { buffer: Buffer; bytesWritten: number };
+
+// Some Node type declarations omit the documented info:true return overload.
+function inflateInfo(data: Uint8Array, cap: number): unknown {
+    return inflateRawSync(data, { info: true, maxOutputLength: cap });
+}
+
+function snapshotInflateInfo(value: unknown): InflateSnapshot | null {
+    if (
+        typeof value !== 'object' ||
+        value === null ||
+        !('buffer' in value) ||
+        !('engine' in value)
+    ) {
+        return null;
+    }
+
+    const buffer = value.buffer;
+    const engine = value.engine;
+
+    if (
+        !Buffer.isBuffer(buffer) ||
+        typeof engine !== 'object' ||
+        engine === null ||
+        !('bytesWritten' in engine)
+    ) {
+        return null;
+    }
+
+    const bytesWritten = engine.bytesWritten;
+
+    if (
+        typeof bytesWritten !== 'number' ||
+        !Number.isSafeInteger(bytesWritten) ||
+        bytesWritten < 0
+    ) {
+        return null;
+    }
+
+    return { buffer, bytesWritten };
+}
+
+// Probe only the fixed samples below, not every stream or future zlib version.
+// Run per invocation so a failed probe affects method 8 only and remains testable.
+function supportsRawInflate(): boolean {
+    const single = Buffer.from([0x73, 0x04, 0x00]); // "A"
+    const double = Buffer.from([0x73, 0x74, 0x04, 0x00]); // "AA"
+    const empty = Buffer.from([0x03, 0x00]);
+    const run = (data: Buffer, cap: number) => inflateInfo(data, cap);
+
+    const rejectedWith = (data: Buffer, cap: number, codes: string[]): boolean => {
+        try {
+            run(data, cap);
+            return false;
+        } catch (error) {
+            return codes.includes((error as NodeJS.ErrnoException)?.code ?? '');
+        }
+    };
+
+    try {
+        const complete = snapshotInflateInfo(run(single, 2));
+        const trailing = snapshotInflateInfo(run(Buffer.concat([single, Buffer.from([0])]), 2));
+        const blank = snapshotInflateInfo(run(empty, 1));
+        return (
+            complete !== null &&
+            complete.buffer.equals(Buffer.from('A')) &&
+            complete.bytesWritten === single.length &&
+            trailing !== null &&
+            trailing.buffer.equals(Buffer.from('A')) &&
+            trailing.bytesWritten === single.length &&
+            rejectedWith(single.subarray(0, -1), 2, ['Z_BUF_ERROR', 'Z_DATA_ERROR']) &&
+            rejectedWith(double, 1, ['ERR_BUFFER_TOO_LARGE']) &&
+            blank !== null &&
+            blank.buffer.length === 0 &&
+            blank.bytesWritten === empty.length
+        );
+    } catch {
+        return false;
+    }
 }
 
 type Tree = { spelling: string; explicit: boolean; file: boolean; children: Map<string, Tree> };
@@ -126,13 +208,14 @@ interface RecordMetadata {
     compressed: number;
     size: number;
     offset: number;
+    dataStart: number;
     directory: boolean;
 }
 
 /**
- * Synchronous preflight of a strict ZIP32 stored-only subset, suited to synthetic
- * fixtures. An archive with no file entries is malformed in this subset.
- * Common archives using DEFLATE or extra fields are unsupported. The
+ * Synchronous preflight of a strict ZIP32 stored/raw-DEFLATE subset, suited to
+ * synthetic fixtures. An archive with no file entries is malformed. Common
+ * archives using extra fields or data descriptors remain unsupported. The
  * result establishes neither plugin compatibility, provenance, permission nor
  * filesystem safety; this function performs no extraction or installation.
  * Work is bounded by one input snapshot, entry count and declared output limits;
@@ -254,8 +337,9 @@ export function preflightZip(input: unknown): ZipPreflightResult {
                 comment !== 0 ||
                 internal !== 0 ||
                 (flags & ~0x800) !== 0 ||
-                method !== 0 ||
+                (method !== 0 && method !== 8) ||
                 (version !== 10 && version !== 20) ||
+                (method === 8 && version !== 20) ||
                 ((made & 0xff) !== 10 && (made & 0xff) !== 20)
             ) {
                 fail('unsupported');
@@ -299,6 +383,10 @@ export function preflightZip(input: unknown): ZipPreflightResult {
                 fail('unsupported');
             }
 
+            if (directory && method !== 0) {
+                fail('unsupported');
+            }
+
             if (directory && (compressed !== 0 || size !== 0 || crc !== 0)) {
                 fail('malformed');
             }
@@ -315,6 +403,7 @@ export function preflightZip(input: unknown): ZipPreflightResult {
                 compressed,
                 size,
                 offset,
+                dataStart: 0,
                 directory,
             });
             cursor += 46 + nameLength;
@@ -369,18 +458,86 @@ export function preflightZip(input: unknown): ZipPreflightResult {
             const dataStart = localCursor + 30 + nameLength;
             bound(dataStart, record.compressed, centralStart);
 
-            if (
-                record.compressed !== record.size ||
-                crc32(bytes, dataStart, record.compressed) !== record.crc
-            ) {
-                fail('integrity');
-            }
-
+            record.dataStart = dataStart;
             localCursor = dataStart + record.compressed;
         }
 
         if (localCursor !== centralStart || !records.some((record) => !record.directory)) {
             fail('malformed');
+        }
+
+        // Stored size equality is a header invariant, checked before any payload or probe.
+        if (records.some((record) => record.method === 0 && record.compressed !== record.size)) {
+            fail('integrity');
+        }
+
+        // Structural validation of every record finishes before any payload or probe.
+        if (records.some((record) => record.method === 8) && !supportsRawInflate()) {
+            fail('unsupported');
+        }
+
+        let actualTotal = 0;
+
+        for (const record of records) {
+            let content: Uint8Array;
+
+            if (record.method === 0) {
+                content = bytes.subarray(record.dataStart, record.dataStart + record.compressed);
+            } else {
+                const remaining = MAX_ARCHIVE - actualTotal;
+                const cap = Math.max(1, Math.min(MAX_FILE, remaining));
+                let result: unknown;
+
+                try {
+                    result = inflateInfo(
+                        bytes.subarray(record.dataStart, record.dataStart + record.compressed),
+                        cap,
+                    );
+                } catch (error) {
+                    const code = (error as NodeJS.ErrnoException)?.code;
+
+                    if (code === 'ERR_BUFFER_TOO_LARGE') {
+                        fail('limit');
+                    }
+
+                    if (code === 'Z_DATA_ERROR' || code === 'Z_BUF_ERROR') {
+                        fail('integrity');
+                    }
+
+                    fail('internal');
+                }
+
+                let snapshot: InflateSnapshot | null;
+
+                try {
+                    snapshot = snapshotInflateInfo(result);
+                } catch {
+                    fail('internal');
+                }
+
+                if (!snapshot || snapshot.bytesWritten > record.compressed) {
+                    fail('internal');
+                }
+
+                if (snapshot.bytesWritten !== record.compressed) {
+                    fail('integrity');
+                }
+
+                content = snapshot.buffer;
+
+                if (content.length > MAX_FILE || content.length > remaining) {
+                    fail('limit');
+                }
+            }
+
+            if (
+                content.length !== record.size ||
+                crc32(content, 0, content.length) !== record.crc
+            ) {
+                fail('integrity');
+            }
+
+            actualTotal += content.length;
         }
 
         const entries = Object.freeze(

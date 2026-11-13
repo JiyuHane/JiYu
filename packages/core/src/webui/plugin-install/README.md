@@ -8,25 +8,38 @@ license, compatibility, or safe use on a particular filesystem. In particular,
 filesystem links, reparse points, short-name aliases, concurrent replacements,
 permissions and crash recovery require separate platform-specific handling.
 
-The current profile accepts only stored entries with portable ASCII paths and
-recognized DOS or Unix regular-file/directory declarations. It rejects empty
-archives and archives containing only directories, DEFLATE, data descriptors,
-ZIP64, encryption, extra fields, comments, unsupported creator metadata,
-path and case collisions, and non-contiguous record layouts. Many legitimate
-ZIP archives, including common plugin releases, may therefore be rejected.
-Unrecognized features are rejected rather than silently skipped.
+The limited ZIP32 profile accepts stored (method 0) and raw DEFLATE (method 8)
+regular files, portable ASCII paths and recognized DOS or Unix declarations.
+Directories must be stored and empty; method 8 requires version-needed 20. It
+rejects empty archives and directory-only archives, data descriptors, ZIP64,
+encryption, extra fields, comments, unsupported creator metadata, path and case
+collisions, and non-contiguous record layouts. This is not general compatibility
+with common community ZIPs; many legitimate releases are rejected.
 
-The primitive validates a private snapshot, local and central records, stored
-sizes and CRC-32, then returns frozen metadata and the SHA-256 of that snapshot;
-it does not return extracted bytes. CRC-32 checks data consistency, and
-SHA-256 identifies the inspected bytes: neither authenticates the source or
-establishes licensing rights. Errors use fixed codes without returning paths or
-underlying exception messages.
+The primitive validates a private snapshot and all local and central records
+before processing any archive content, then decompresses in memory for inspection
+and checks actual sizes, byte-level DEFLATE consumption and CRC-32. There is no
+filesystem extraction. It returns only frozen metadata and the
+SHA-256 of that snapshot, never decompressed bytes. Byte consumption does not
+establish canonical unused padding bits in the final byte. CRC-32 checks data
+consistency, and SHA-256 identifies inspected bytes: neither authenticates the
+source or establishes licensing rights. Errors use fixed codes without paths or
+underlying exceptions.
 
-Limits are 32 MiB per archive, 512 entries, 8 MiB per file, 32 MiB cumulative
-file size, 512 bytes per path, 100 bytes per component, and 16 components.
-These bound the inspected data and returned metadata, not total process memory
-or execution time. A synchronous scan can block the event loop; production
-integration needs a separate isolation, cancellation and resource-control
-design. No actual community plugin or QQ client is required for the synthetic
-fixture tests.
+Method 8 runs a small built-in capability probe after structural validation;
+probe failure returns `unsupported` while stored-only archives remain independent.
+It checks fixed examples for completion, trailing bytes, truncation, output cap
+and empty output, not all inputs or future zlib versions. Node 24.22.1 was tested
+locally; Node 26.12.1 and later were not tested here. Unexpected inflate errors
+or malformed engine information return `internal`, rather than success.
+
+Limits are 32 MiB per archive, 512 entries, 8 MiB each for both compressed
+and decompressed file data, and 32 MiB cumulative declared and actual output;
+paths are limited to 512 bytes, 100 bytes per component, and 16 components.
+Even a valid file compressed to more than 8 MiB is rejected as a conservative
+compatibility limit. There is no compression-ratio threshold: these output
+budgets do not limit CPU, wall-clock time, process RSS or guarantee cancellation.
+Synchronous inflate and CRC can block the event loop. Do not connect this
+primitive to an online route: production integration requires a separate
+isolation, cancellation and resource-control design. It establishes no filesystem
+safety, authorization or signature. Tests use only synthetic in-memory fixtures.
