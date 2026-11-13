@@ -41,7 +41,14 @@ class InvalidConfigBody extends Error {
 }
 
 // The content length is advisory only: the stream is always measured independently.
-async function readConfigBody(request: Request): Promise<unknown> {
+async function readConfigBody(
+    request: Request,
+    registerReader: (cancel: () => void) => void,
+    unregisterReader: (cancel: () => void) => void,
+    cancelReader: (reader: ReadableStreamDefaultReader<Uint8Array>) => void,
+    markCleanupUncertain: () => void,
+    isCancelled: () => boolean,
+): Promise<unknown> {
     const header = request.headers.get('content-length');
 
     if (header !== null && !/^\d+$/.test(header)) {
@@ -62,19 +69,24 @@ async function readConfigBody(request: Request): Promise<unknown> {
         throw new InvalidConfigBody();
     }
 
-    const reader = request.body.getReader();
-
-    const cancel = () => {
-        cancelBestEffort(() => reader.cancel());
-    };
-
-    request.signal.addEventListener('abort', cancel, { once: true });
-    const bytes = new Uint8Array(MAX_CONFIG_BYTES);
-    let size = 0;
-    let chunks = 0;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    let cancel: (() => void) | undefined;
+    let streamDone = false;
+    let cleanupFailed = false;
+    let failure: InvalidConfigBody | undefined;
+    let value: unknown;
 
     try {
-        if (request.signal.aborted) {
+        reader = request.body.getReader();
+        const acquired = reader;
+        cancel = () => cancelReader(acquired);
+        registerReader(cancel);
+        request.signal.addEventListener('abort', cancel, { once: true });
+        const bytes = new Uint8Array(MAX_CONFIG_BYTES);
+        let size = 0;
+        let chunks = 0;
+
+        if (request.signal.aborted || isCancelled()) {
             cancel();
             throw new InvalidConfigBody();
         }
@@ -82,12 +94,20 @@ async function readConfigBody(request: Request): Promise<unknown> {
         for (;;) {
             const part = await reader.read();
 
-            if (request.signal.aborted) {
+            if (part.done) {
+                streamDone = true;
+            }
+
+            if (request.signal.aborted || isCancelled()) {
                 throw new InvalidConfigBody();
             }
 
             if (part.done) {
                 break;
+            }
+
+            if (!types.isUint8Array(part.value)) {
+                throw new InvalidConfigBody();
             }
 
             chunks++;
@@ -105,25 +125,64 @@ async function readConfigBody(request: Request): Promise<unknown> {
             throw new InvalidConfigBody();
         }
 
-        const value: unknown = JSON.parse(
+        value = JSON.parse(
             new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, size)),
         );
 
         if (value === null || typeof value !== 'object' || Array.isArray(value)) {
             throw new InvalidConfigBody();
         }
-
-        return value;
     } catch (error) {
-        if (error instanceof InvalidConfigBody) {
-            throw error;
+        // Until the reader reports done, an exception does not establish that
+        // the underlying source stopped. Cancellation is idempotently tracked.
+        if (reader && !streamDone) {
+            try {
+                cancelReader(reader);
+            } catch {
+                markCleanupUncertain();
+            }
+        } else if (!reader) {
+            cancelUnreadBody(request);
         }
 
-        throw new InvalidConfigBody();
+        failure = error instanceof InvalidConfigBody ? error : new InvalidConfigBody();
     } finally {
-        request.signal.removeEventListener('abort', cancel);
-        reader.releaseLock();
+        if (cancel) {
+            try {
+                request.signal.removeEventListener('abort', cancel);
+            } catch {
+                cleanupFailed = true;
+            }
+
+            try {
+                unregisterReader(cancel);
+            } catch {
+                cleanupFailed = true;
+            }
+        }
+
+        if (reader) {
+            try {
+                reader.releaseLock();
+            } catch {
+                cleanupFailed = true;
+            }
+        }
+
+        if (cleanupFailed) {
+            markCleanupUncertain();
+        }
     }
+
+    if (cleanupFailed) {
+        throw new InvalidConfigBody();
+    }
+
+    if (failure) {
+        throw failure;
+    }
+
+    return value;
 }
 
 type AccountManager = Pick<OneBotManager, 'getInstance'>;
@@ -145,11 +204,26 @@ export function registerLocalPluginRoutes(
         operation: 'config-schema' | 'config-read' | 'config-write';
         phase: 'reading' | 'invoked';
         cancelled: boolean;
+        cancelRead?: () => void;
+        cleanup?: 'pending' | 'uncertain' | 'settled';
+        cleanupFailed?: boolean;
+        handlerFinished?: boolean;
     };
     const pendingEnables = new Map<string, PendingEnable>();
     const pendingConfigs = new Map<string, PendingConfig>();
-    const pendingDisables = new Map<string, Instance>();
+    const pendingDisables = new Map<string, { instance: Instance }>();
     const keyFor = (uin: string, id: string) => `${uin}:${id}`;
+
+    const releaseFinishedConfig = (key: string, pending: PendingConfig) => {
+        if (
+            pending.handlerFinished &&
+            !pending.cleanupFailed &&
+            (pending.cleanup === undefined || pending.cleanup === 'settled') &&
+            pendingConfigs.get(key) === pending
+        ) {
+            pendingConfigs.delete(key);
+        }
+    };
 
     // Count unique account/plugin keys, not map entries. An accepted enable or
     // config reserves its own future disable, even when capacity is exhausted.
@@ -205,6 +279,11 @@ export function registerLocalPluginRoutes(
                 operation: pending.operation,
                 phase: pending.phase,
                 cancelled: pending.cancelled,
+                ...(pending.cleanupFailed ||
+                pending.cleanup === 'pending' ||
+                pending.cleanup === 'uncertain'
+                    ? { cleanup: 'cleanup_uncertain' as const }
+                    : {}),
                 instance: pending.instance,
             })),
             ...[...pendingDisables.entries()].map(([key, owner]) => ({
@@ -212,7 +291,7 @@ export function registerLocalPluginRoutes(
                 operation: 'disable' as const,
                 phase: 'draining' as const,
                 cancelled: false,
-                instance: owner,
+                instance: owner.instance,
             })),
         ]
             .filter(({ key }) => key.startsWith(`${uin}:`))
@@ -398,6 +477,26 @@ export function registerLocalPluginRoutes(
                 return failure('INSTANCE_QUIESCED', 'not_started', 409);
             }
 
+            // The host observation above may synchronously admit another request.
+            // Read identity before the final map checks so reentry cannot overwrite it.
+            const sameInstance = manager.getInstance(uin) === instance;
+
+            if (!sameInstance) {
+                return failure(
+                    action === 'schema' ? 'INSTANCE_CHANGED' : 'CONFIG_GENERATION_CHANGED',
+                    'not_started',
+                    409,
+                );
+            }
+
+            if (c.req.raw.signal.aborted) {
+                return failure('OPERATION_CANCELLED', 'not_started', 409);
+            }
+
+            if (pendingEnables.has(key) || pendingConfigs.has(key) || pendingDisables.has(key)) {
+                return failure('OPERATION_PENDING', 'not_started', 409);
+            }
+
             if (atPendingLimit(uin)) {
                 return failure('CONFIG_QUEUE_FULL', 'not_started', 429);
             }
@@ -414,10 +513,95 @@ export function registerLocalPluginRoutes(
                 let value: unknown;
 
                 if (action === 'write') {
+                    let initialGeneration: string | null;
+
+                    try {
+                        initialGeneration = instance.getPluginConfigGeneration(id);
+                    } catch {
+                        return failure('CONFIG_GENERATION_CHANGED', 'not_started', 409);
+                    }
+
+                    if (
+                        manager.getInstance(uin) !== instance ||
+                        pending.cancelled ||
+                        pendingDisables.has(key) ||
+                        pendingConfigs.get(key) !== pending ||
+                        !initialGeneration ||
+                        !GENERATION.test(initialGeneration) ||
+                        initialGeneration !== suppliedGeneration
+                    ) {
+                        return failure('CONFIG_GENERATION_CHANGED', 'not_started', 409);
+                    }
+
+                    if (c.req.raw.signal.aborted) {
+                        return failure('OPERATION_CANCELLED', 'not_started', 409);
+                    }
+
+                    if (!instance.canEnablePlugins()) {
+                        return failure('INSTANCE_QUIESCED', 'not_started', 409);
+                    }
+
+                    // Host methods may synchronously reenter management routes.
+                    if (
+                        manager.getInstance(uin) !== instance ||
+                        pending.cancelled ||
+                        pendingDisables.has(key) ||
+                        pendingConfigs.get(key) !== pending
+                    ) {
+                        return failure('CONFIG_GENERATION_CHANGED', 'not_started', 409);
+                    }
+
+                    if (c.req.raw.signal.aborted) {
+                        return failure('OPERATION_CANCELLED', 'not_started', 409);
+                    }
+
                     bodyHandled = true;
 
                     try {
-                        value = await readConfigBody(c.req.raw);
+                        value = await readConfigBody(
+                            c.req.raw,
+                            (cancel) => {
+                                pending.cancelRead = cancel;
+                            },
+                            (cancel) => {
+                                if (pending.cancelRead === cancel) {
+                                    pending.cancelRead = undefined;
+                                }
+                            },
+                            (reader) => {
+                                try {
+                                    if (c.req.raw.signal.aborted) {
+                                        pending.cancelled = true;
+                                    }
+                                } catch {
+                                    pending.cleanupFailed = true;
+                                }
+
+                                if (pending.cleanup !== undefined) {
+                                    return;
+                                }
+
+                                pending.cleanup = 'pending';
+
+                                try {
+                                    void reader.cancel().then(
+                                        () => {
+                                            pending.cleanup = 'settled';
+                                            releaseFinishedConfig(key, pending);
+                                        },
+                                        () => {
+                                            pending.cleanup = 'uncertain';
+                                        },
+                                    );
+                                } catch {
+                                    pending.cleanup = 'uncertain';
+                                }
+                            },
+                            () => {
+                                pending.cleanupFailed = true;
+                            },
+                            () => pending.cancelled,
+                        );
                     } catch (error) {
                         if (manager.getInstance(uin) !== instance) {
                             return failure('CONFIG_GENERATION_CHANGED', 'not_started', 409);
@@ -499,6 +683,27 @@ export function registerLocalPluginRoutes(
                     return failure('CONFIG_GENERATION_CHANGED', 'not_started', 409);
                 }
 
+                // Host observations can synchronously reenter disable or replace
+                // the account. Recheck internal ownership after the last such calls.
+                if (!instance.canEnablePlugins()) {
+                    return failure('INSTANCE_QUIESCED', 'not_started', 409);
+                }
+
+                const sameInstance = manager.getInstance(uin) === instance;
+
+                if (c.req.raw.signal.aborted) {
+                    return failure('OPERATION_CANCELLED', 'not_started', 409);
+                }
+
+                if (
+                    !sameInstance ||
+                    pending.cancelled ||
+                    pendingDisables.has(key) ||
+                    pendingConfigs.get(key) !== pending
+                ) {
+                    return failure('CONFIG_GENERATION_CHANGED', 'not_started', 409);
+                }
+
                 pending.phase = 'invoked';
 
                 try {
@@ -560,9 +765,8 @@ export function registerLocalPluginRoutes(
                     return failure(code, 'unknown', 409);
                 }
             } finally {
-                if (pendingConfigs.get(key) === pending) {
-                    pendingConfigs.delete(key);
-                }
+                pending.handlerFinished = true;
+                releaseFinishedConfig(key, pending);
             }
         });
     }
@@ -650,7 +854,8 @@ export function registerLocalPluginRoutes(
 
                 if (
                     (config && config.instance !== instance) ||
-                    (disabling && disabling !== instance)
+                    (pending && pending.instance !== instance) ||
+                    (disabling && disabling.instance !== instance)
                 ) {
                     return c.json({ status: 'failed', code: 'OLD_INSTANCE_PENDING' }, 409);
                 }
@@ -663,41 +868,51 @@ export function registerLocalPluginRoutes(
                     return c.json({ status: 'failed', code: 'DISABLE_BUSY' }, 429);
                 }
 
-                if (config?.phase === 'reading') {
-                    config.cancelled = true;
-                }
-
-                if (pending && pending.instance !== instance) {
-                    return c.json({ status: 'failed', code: 'OLD_INSTANCE_PENDING' }, 409);
-                }
-
-                const sameInstance = pending;
-
-                if (sameInstance?.phase === 'resolving') {
-                    // Keep this entry until resolution actually settles; deleting
-                    // it early would allow unbounded abandoned filesystem work.
-                    sameInstance.cancelled = true;
-                    return c.json({
-                        status: 'ok',
-                        operation: 'disable',
-                        outcome: 'cancelled_before_execution',
-                        runtime: instance.getPluginStatus(id),
-                        processResources: 'unknown',
-                    });
-                }
-
-                if (sameInstance) {
-                    sameInstance.cancelled = true;
-                } else if (!config && !instance.getPluginStatus(id)) {
-                    return c.json({ status: 'failed', code: 'PLUGIN_NOT_ACTIVE' }, 409);
-                }
-
-                pendingDisables.set(key, instance);
+                // Claim a unique owner before stream cancellation or any host
+                // observation: either can synchronously reenter this route.
+                const owner = { instance };
+                pendingDisables.set(key, owner);
 
                 try {
+                    if (manager.getInstance(uin) !== instance) {
+                        return c.json(
+                            { status: 'failed', code: 'INSTANCE_CHANGED', outcome: 'unknown' },
+                            409,
+                        );
+                    }
+
+                    if (config?.phase === 'reading') {
+                        config.cancelled = true;
+                        config.cancelRead?.();
+                    }
+
+                    if (pending?.phase === 'resolving') {
+                        pending.cancelled = true;
+                        return c.json({
+                            status: 'ok',
+                            operation: 'disable',
+                            outcome: 'cancelled_before_execution',
+                            runtime: instance.getPluginStatus(id),
+                            processResources: 'unknown',
+                        });
+                    }
+
+                    if (pending) {
+                        pending.cancelled = true;
+                    } else if (!config && !instance.getPluginStatus(id)) {
+                        return c.json({ status: 'failed', code: 'PLUGIN_NOT_ACTIVE' }, 409);
+                    }
+
+                    if (manager.getInstance(uin) !== instance) {
+                        return c.json(
+                            { status: 'failed', code: 'INSTANCE_CHANGED', outcome: 'unknown' },
+                            409,
+                        );
+                    }
+
                     await instance.disablePlugin(id);
                 } finally {
-                    if (pendingDisables.get(key) === instance) {
+                    if (pendingDisables.get(key) === owner) {
                         pendingDisables.delete(key);
                     }
                 }

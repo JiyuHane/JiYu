@@ -799,10 +799,10 @@ describe('explicit plugin configuration routes', () => {
     it('cancels a still-reading write before hook invocation when disable starts', async () => {
         const { app, request, instance } = fixture();
         await request(`${base}/enable`, 'POST');
-        let controller!: ReadableStreamDefaultController<Uint8Array>;
+        let cancelled = false;
         const stream = new ReadableStream<Uint8Array>({
-            start(c) {
-                controller = c;
+            cancel() {
+                cancelled = true;
             },
         });
         const req = new Request(`http://localhost${base}/config/write`, {
@@ -825,13 +825,892 @@ describe('explicit plugin configuration routes', () => {
             ).toMatchObject([{ phase: 'reading' }]),
         );
         expect((await request(`${base}/disable`, 'POST')).status).toBe(200);
-        controller.enqueue(new TextEncoder().encode('{}'));
-        controller.close();
+        expect(cancelled).toBe(true);
         expect(await (await writing).json()).toMatchObject({
             code: 'CONFIG_GENERATION_CHANGED',
             outcome: 'not_started',
         });
         expect(instance.setPluginConfig).not.toHaveBeenCalled();
+    });
+
+    it('actively cancels a stalled write when the same instance is disabled', async () => {
+        const { app, request, instance } = fixture();
+        await request(`${base}/enable`, 'POST');
+        let controller!: ReadableStreamDefaultController<Uint8Array>;
+        let cancelled = false;
+        const stream = new ReadableStream<Uint8Array>({
+            start(c) {
+                controller = c;
+            },
+            cancel() {
+                cancelled = true;
+            },
+        });
+        const req = new Request(`http://localhost${base}/config/write`, {
+            method: 'POST',
+            headers: {
+                authorization: 'Bearer test-session',
+                'x-jiyu-plugin-generation': GENERATION_A,
+            },
+            body: stream,
+            duplex: 'half',
+        } as RequestInit & { duplex: 'half' });
+        const writing = app.request(req);
+        await vi.waitFor(async () =>
+            expect(await (await request('/api/plugins/local/10001')).json()).toMatchObject({
+                pendingOperations: [{ id: 'fixture', phase: 'reading', cancelled: false }],
+            }),
+        );
+        expect((await request(`${base}/disable`, 'POST')).status).toBe(200);
+        const observed = await Promise.race([
+            writing.then(() => 'settled' as const),
+            new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), 25)),
+        ]);
+        const state = await (await request('/api/plugins/local/10001')).json();
+        const cancelledBeforeCleanup = cancelled;
+
+        if (!cancelled) {
+            controller.close();
+        }
+
+        const response = await writing;
+        expect(await response.json()).toMatchObject({ outcome: 'not_started' });
+        expect(instance.setPluginConfig).not.toHaveBeenCalled();
+        expect({ observed, cancelled: cancelledBeforeCleanup, state }).toMatchObject({
+            observed: 'settled',
+            cancelled: true,
+            state: { pendingOperations: [] },
+        });
+    });
+
+    it('rejects an inactive plugin generation before waiting for its request body', async () => {
+        const { app, request, instance } = fixture();
+        instance.getPluginConfigGeneration.mockImplementation((id) =>
+            id.startsWith('missing') ? null : GENERATION_A,
+        );
+        let controller!: ReadableStreamDefaultController<Uint8Array>;
+        let cancelled = false;
+        const stream = new ReadableStream<Uint8Array>({
+            start(c) {
+                controller = c;
+            },
+            cancel() {
+                cancelled = true;
+            },
+        });
+        const req = new Request('http://localhost/api/plugins/local/10001/missing/config/write', {
+            method: 'POST',
+            headers: {
+                authorization: 'Bearer test-session',
+                'x-jiyu-plugin-generation': GENERATION_A,
+            },
+            body: stream,
+            duplex: 'half',
+        } as RequestInit & { duplex: 'half' });
+        const writing = app.request(req);
+        const observed = await Promise.race([
+            writing.then(() => 'settled' as const),
+            new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), 25)),
+        ]);
+        const extraControllers: ReadableStreamDefaultController<Uint8Array>[] = [];
+        const extraCancelled = Array<boolean>(15).fill(false);
+        const extraWrites = Array.from({ length: 15 }, (_, index) => {
+            const body = new ReadableStream<Uint8Array>({
+                start(c) {
+                    extraControllers[index] = c;
+                },
+                cancel() {
+                    extraCancelled[index] = true;
+                },
+            });
+            return app.request(
+                new Request(
+                    `http://localhost/api/plugins/local/10001/missing${index}/config/write`,
+                    {
+                        method: 'POST',
+                        headers: {
+                            authorization: 'Bearer test-session',
+                            'x-jiyu-plugin-generation': GENERATION_A,
+                        },
+                        body,
+                        duplex: 'half',
+                    } as RequestInit & { duplex: 'half' },
+                ),
+            );
+        });
+        const state = await (await request('/api/plugins/local/10001')).json();
+        const quotaResponse = await app.request(`http://localhost${base}/config/write`, {
+            method: 'POST',
+            headers: {
+                authorization: 'Bearer test-session',
+                'x-jiyu-plugin-generation': GENERATION_A,
+            },
+            body: '{}',
+        });
+        const quotaStatus = quotaResponse.status;
+        const cancelledBeforeCleanup = cancelled;
+
+        if (!cancelled) {
+            controller.close();
+        }
+
+        for (let i = 0; i < extraControllers.length; i++) {
+            if (!extraCancelled[i]) {
+                extraControllers[i].close();
+            }
+        }
+
+        const response = await writing;
+        await Promise.all(extraWrites);
+        expect(await response.json()).toMatchObject({ outcome: 'not_started' });
+        expect({ observed, cancelled: cancelledBeforeCleanup, state, quotaStatus }).toMatchObject({
+            observed: 'settled',
+            cancelled: true,
+            state: { pendingOperations: [] },
+            quotaStatus: 200,
+        });
+    });
+
+    it('keeps reservation ownership across a reentrant generation check and replacement', async () => {
+        const { app, request, configRequest, instance, setCurrent } = fixture();
+        await request(`${base}/enable`, 'POST');
+        let nested!: Promise<Response>;
+        let disabling!: Promise<Response>;
+        let cancelled = false;
+        instance.getPluginConfigGeneration.mockImplementationOnce(() => {
+            nested = configRequest('write', { body: '{}' });
+            disabling = request(`${base}/disable`, 'POST');
+            return GENERATION_A;
+        });
+        const writing = app.request(
+            new Request(`http://localhost${base}/config/write`, {
+                method: 'POST',
+                headers: {
+                    authorization: 'Bearer test-session',
+                    'x-jiyu-plugin-generation': GENERATION_A,
+                },
+                body: new ReadableStream<Uint8Array>({
+                    cancel() {
+                        cancelled = true;
+                    },
+                }),
+                duplex: 'half',
+            } as RequestInit & { duplex: 'half' }),
+        );
+        expect(await (await nested).json()).toMatchObject({
+            code: 'OPERATION_PENDING',
+            outcome: 'not_started',
+        });
+        expect((await disabling).status).toBe(200);
+        expect(await (await writing).json()).toMatchObject({
+            code: 'CONFIG_GENERATION_CHANGED',
+            outcome: 'not_started',
+        });
+        expect(cancelled).toBe(true);
+        expect(instance.setPluginConfig).not.toHaveBeenCalled();
+
+        const gate = deferred<{ value: { enabled: boolean }; source: 'plugin' }>();
+        const replacement = {
+            ...instance,
+            getPluginConfig: vi.fn(() => gate.promise),
+        };
+        setCurrent(replacement);
+        const read = configRequest('read');
+        await vi.waitFor(() => expect(replacement.getPluginConfig).toHaveBeenCalledOnce());
+        expect(await (await request('/api/plugins/local/10001')).json()).toMatchObject({
+            pendingOperations: [
+                {
+                    id: 'fixture',
+                    operation: 'config-read',
+                    phase: 'invoked',
+                    currentInstance: true,
+                },
+            ],
+        });
+        expect(await (await configRequest('write', { body: '{}' })).json()).toMatchObject({
+            code: 'OPERATION_PENDING',
+            outcome: 'not_started',
+        });
+        gate.resolve({ value: { enabled: true }, source: 'plugin' });
+        expect((await read).status).toBe(200);
+    });
+
+    it('rechecks final generation getter reentrancy after releasing the reader', async () => {
+        for (const change of ['disable', 'instance', 'abort'] as const) {
+            const { app, request, instance, setCurrent } = fixture();
+            await request(`${base}/enable`, 'POST');
+            const abort = new AbortController();
+            let disabled: Promise<Response> | undefined;
+            let cancelled = false;
+            instance.getPluginConfigGeneration
+                .mockReturnValueOnce(GENERATION_A)
+                .mockImplementationOnce(() => {
+                    if (change === 'disable') {
+                        disabled = request(`${base}/disable`, 'POST');
+                    } else if (change === 'instance') {
+                        setCurrent({ ...instance });
+                    } else {
+                        abort.abort();
+                    }
+
+                    return GENERATION_A;
+                });
+            const response = await app.request(
+                new Request(`http://localhost${base}/config/write`, {
+                    method: 'POST',
+                    headers: {
+                        authorization: 'Bearer test-session',
+                        'x-jiyu-plugin-generation': GENERATION_A,
+                    },
+                    body: new ReadableStream<Uint8Array>({
+                        start(controller) {
+                            controller.enqueue(new TextEncoder().encode('{}'));
+                            controller.close();
+                        },
+                        cancel() {
+                            cancelled = true;
+                        },
+                    }),
+                    signal: abort.signal,
+                    duplex: 'half',
+                } as RequestInit & { duplex: 'half' }),
+            );
+            expect(await response.json()).toMatchObject({
+                code: change === 'abort' ? 'OPERATION_CANCELLED' : 'CONFIG_GENERATION_CHANGED',
+                outcome: 'not_started',
+            });
+
+            if (disabled) {
+                expect((await disabled).status).toBe(200);
+            }
+
+            expect(cancelled).toBe(false);
+            expect(instance.setPluginConfig).not.toHaveBeenCalled();
+            expect(await (await request('/api/plugins/local/10001')).json()).toMatchObject({
+                pendingOperations: [],
+            });
+        }
+    });
+
+    it('rechecks ownership after the final canEnablePlugins observation reenters', async () => {
+        for (const change of ['disable', 'instance', 'abort'] as const) {
+            const { app, request, instance, setCurrent } = fixture();
+            await request(`${base}/enable`, 'POST');
+            const abort = new AbortController();
+            let disabled: Promise<Response> | undefined;
+            instance.getPluginConfigGeneration
+                .mockReturnValueOnce(GENERATION_A)
+                .mockImplementationOnce(() => {
+                    instance.canEnablePlugins.mockImplementationOnce(() => {
+                        if (change === 'disable') {
+                            disabled = request(`${base}/disable`, 'POST');
+                        } else if (change === 'instance') {
+                            setCurrent({ ...instance });
+                        } else {
+                            abort.abort();
+                        }
+
+                        return true;
+                    });
+                    return GENERATION_A;
+                });
+            const response = await app.request(
+                new Request(`http://localhost${base}/config/write`, {
+                    method: 'POST',
+                    headers: {
+                        authorization: 'Bearer test-session',
+                        'x-jiyu-plugin-generation': GENERATION_A,
+                    },
+                    body: '{}',
+                    signal: abort.signal,
+                }),
+            );
+            expect(await response.json()).toMatchObject({
+                code: change === 'abort' ? 'OPERATION_CANCELLED' : 'CONFIG_GENERATION_CHANGED',
+                outcome: 'not_started',
+            });
+
+            if (disabled) {
+                expect((await disabled).status).toBe(200);
+            }
+
+            expect(instance.setPluginConfig).not.toHaveBeenCalled();
+        }
+    });
+
+    it('checks write generation before malformed and oversized bodies', async () => {
+        const { configRequest, instance } = fixture();
+        instance.getPluginConfigGeneration.mockReturnValue(null);
+
+        for (const init of [
+            { body: '{' },
+            { body: '{}', headers: { 'content-length': '999999' } },
+        ]) {
+            const response = await configRequest('write', init);
+            expect(response.status).toBe(409);
+            expect(await response.json()).toMatchObject({
+                code: 'CONFIG_GENERATION_CHANGED',
+                outcome: 'not_started',
+            });
+        }
+
+        expect(instance.setPluginConfig).not.toHaveBeenCalled();
+    });
+
+    it('accounts for a cancelled reader until cancellation succeeds, including rejection', async () => {
+        for (const outcome of ['resolve', 'reject'] as const) {
+            const { app, request, instance } = fixture();
+            await request(`${base}/enable`, 'POST');
+            let finishCancel!: () => void;
+            let failCancel!: (error: Error) => void;
+            let calls = 0;
+            const cancellation = new Promise<void>((resolve, reject) => {
+                finishCancel = resolve;
+                failCancel = reject;
+            });
+            const stream = new ReadableStream<Uint8Array>({
+                cancel() {
+                    calls++;
+                    return cancellation;
+                },
+            });
+            const abort = new AbortController();
+            const writing = app.request(
+                new Request(`http://localhost${base}/config/write`, {
+                    method: 'POST',
+                    headers: {
+                        authorization: 'Bearer test-session',
+                        'x-jiyu-plugin-generation': GENERATION_A,
+                    },
+                    body: stream,
+                    signal: abort.signal,
+                    duplex: 'half',
+                } as RequestInit & { duplex: 'half' }),
+            );
+            await vi.waitFor(async () =>
+                expect(await (await request('/api/plugins/local/10001')).json()).toMatchObject({
+                    pendingOperations: [{ id: 'fixture', phase: 'reading' }],
+                }),
+            );
+            abort.abort();
+            expect(await (await writing).json()).toMatchObject({
+                code: 'OPERATION_CANCELLED',
+                outcome: 'not_started',
+            });
+            expect((await request(`${base}/disable`, 'POST')).status).toBe(200);
+            expect(calls).toBe(1);
+            expect((await request(`${base}/enable`, 'POST')).status).toBe(409);
+            expect(await (await request('/api/plugins/local/10001')).json()).toMatchObject({
+                pendingOperations: [
+                    {
+                        id: 'fixture',
+                        phase: 'reading',
+                        cancelled: true,
+                        cleanup: 'cleanup_uncertain',
+                    },
+                ],
+            });
+            expect(instance.setPluginConfig).not.toHaveBeenCalled();
+
+            if (outcome === 'resolve') {
+                finishCancel();
+                await vi.waitFor(async () =>
+                    expect(await (await request('/api/plugins/local/10001')).json()).toMatchObject({
+                        pendingOperations: [],
+                    }),
+                );
+                expect((await request(`${base}/enable`, 'POST')).status).toBe(200);
+            } else {
+                failCancel(new Error('PRIVATE_CANCEL_ERROR'));
+                await Promise.resolve();
+                await Promise.resolve();
+                const state = await (await request('/api/plugins/local/10001')).text();
+                expect(state).not.toContain('PRIVATE_CANCEL_ERROR');
+                expect(JSON.parse(state)).toMatchObject({
+                    pendingOperations: [{ id: 'fixture', cleanup: 'cleanup_uncertain' }],
+                });
+                expect((await request(`${base}/enable`, 'POST')).status).toBe(409);
+            }
+        }
+    });
+
+    it('accounts for cancellation after an invalid chunk while the stream is still open', async () => {
+        for (const outcome of ['resolve', 'reject'] as const) {
+            const { app, request, instance } = fixture();
+            let resolveCancel!: () => void;
+            let rejectCancel!: (error: Error) => void;
+            let cancelCalls = 0;
+            const cancellation = new Promise<void>((resolve, reject) => {
+                resolveCancel = resolve;
+                rejectCancel = reject;
+            });
+            const body = new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(null as unknown as Uint8Array);
+                },
+                cancel() {
+                    cancelCalls++;
+                    return cancellation;
+                },
+            });
+            const response = await app.request(
+                new Request(`http://localhost${base}/config/write`, {
+                    method: 'POST',
+                    headers: {
+                        authorization: 'Bearer test-session',
+                        'x-jiyu-plugin-generation': GENERATION_A,
+                    },
+                    body,
+                    duplex: 'half',
+                } as RequestInit & { duplex: 'half' }),
+            );
+            const text = await response.text();
+            const stateBeforeSettlement = await (await request('/api/plugins/local/10001')).json();
+            const blocked = await request(`${base}/enable`, 'POST');
+
+            if (outcome === 'resolve') {
+                resolveCancel();
+            } else {
+                rejectCancel(new Error('PRIVATE_INVALID_CHUNK_CANCEL'));
+            }
+
+            // Avoid an unhandled rejection in the pre-fix regression run.
+            await cancellation.catch(() => {});
+            expect(text).not.toContain('PRIVATE_INVALID_CHUNK_CANCEL');
+            expect(JSON.parse(text)).toMatchObject({
+                code: 'CONFIG_INVALID',
+                outcome: 'not_started',
+            });
+            expect(cancelCalls).toBe(1);
+            expect(blocked.status).toBe(409);
+            expect(stateBeforeSettlement).toMatchObject({
+                pendingOperations: [{ id: 'fixture', cleanup: 'cleanup_uncertain' }],
+            });
+            expect(instance.setPluginConfig).not.toHaveBeenCalled();
+
+            if (outcome === 'resolve') {
+                await vi.waitFor(async () =>
+                    expect(await (await request('/api/plugins/local/10001')).json()).toMatchObject({
+                        pendingOperations: [],
+                    }),
+                );
+            } else {
+                const state = await (await request('/api/plugins/local/10001')).text();
+                expect(state).not.toContain('PRIVATE_INVALID_CHUNK_CANCEL');
+                expect(JSON.parse(state)).toMatchObject({
+                    pendingOperations: [{ id: 'fixture', cleanup: 'cleanup_uncertain' }],
+                });
+            }
+        }
+    });
+
+    it('does not cancel a reader after done when JSON or UTF-8 decoding fails', async () => {
+        for (const bytes of [new TextEncoder().encode('{'), new Uint8Array([0xc3, 0x28])]) {
+            const { app, request, instance } = fixture();
+            let cancelCalls = 0;
+            const body = new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(bytes);
+                    controller.close();
+                },
+            });
+            const req = new Request(`http://localhost${base}/config/write`, {
+                method: 'POST',
+                headers: {
+                    authorization: 'Bearer test-session',
+                    'x-jiyu-plugin-generation': GENERATION_A,
+                },
+                body,
+                duplex: 'half',
+            } as RequestInit & { duplex: 'half' });
+            const getReader = req.body!.getReader.bind(req.body);
+            Object.defineProperty(req.body!, 'getReader', {
+                value: () => {
+                    const reader = getReader();
+                    const cancel = reader.cancel.bind(reader);
+                    Object.defineProperty(reader, 'cancel', {
+                        value: () => {
+                            cancelCalls++;
+                            return cancel();
+                        },
+                    });
+                    return reader;
+                },
+            });
+            const response = await app.request(req);
+            expect(await response.json()).toMatchObject({
+                code: 'CONFIG_INVALID',
+                outcome: 'not_started',
+            });
+            expect(cancelCalls).toBe(0);
+            expect(req.body?.locked).toBe(false);
+            expect(instance.setPluginConfig).not.toHaveBeenCalled();
+            expect(await (await request('/api/plugins/local/10001')).json()).toMatchObject({
+                pendingOperations: [],
+            });
+        }
+    });
+
+    it('retains an oversized reader when its cancellation rejects', async () => {
+        const { app, request, instance } = fixture();
+        const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(new Uint8Array(256 * 1024 + 1));
+            },
+            cancel() {
+                return Promise.reject(new Error('PRIVATE_SIZE_CANCEL'));
+            },
+        });
+        const response = await app.request(
+            new Request(`http://localhost${base}/config/write`, {
+                method: 'POST',
+                headers: {
+                    authorization: 'Bearer test-session',
+                    'x-jiyu-plugin-generation': GENERATION_A,
+                },
+                body,
+                duplex: 'half',
+            } as RequestInit & { duplex: 'half' }),
+        );
+        expect(response.status).toBe(413);
+        expect(await response.json()).toMatchObject({
+            code: 'CONFIG_INVALID',
+            outcome: 'not_started',
+        });
+        const state = await (await request('/api/plugins/local/10001')).text();
+        expect(state).not.toContain('PRIVATE_SIZE_CANCEL');
+        expect(JSON.parse(state)).toMatchObject({
+            pendingOperations: [{ id: 'fixture', cleanup: 'cleanup_uncertain' }],
+        });
+        expect((await request(`${base}/enable`, 'POST')).status).toBe(409);
+        expect(instance.setPluginConfig).not.toHaveBeenCalled();
+    });
+
+    it('retains cancelled reader keys against the account limit until cancellation succeeds', async () => {
+        const { app, request, instance } = fixture();
+        const releases: Array<() => void> = [];
+        const writes: Promise<Response>[] = [];
+
+        for (let i = 0; i < 16; i++) {
+            const abort = new AbortController();
+            const body = new ReadableStream<Uint8Array>({
+                cancel() {
+                    return new Promise<void>((resolve) => {
+                        releases[i] = resolve;
+                    });
+                },
+            });
+            writes.push(
+                app.request(
+                    new Request(`http://localhost/api/plugins/local/10001/p${i}/config/write`, {
+                        method: 'POST',
+                        headers: {
+                            authorization: 'Bearer test-session',
+                            'x-jiyu-plugin-generation': GENERATION_A,
+                        },
+                        body,
+                        signal: abort.signal,
+                        duplex: 'half',
+                    } as RequestInit & { duplex: 'half' }),
+                ),
+            );
+            await vi.waitFor(async () => {
+                const state = (await (await request('/api/plugins/local/10001')).json()) as {
+                    pendingOperations: Array<{ id: string }>;
+                };
+                expect(state.pendingOperations.some((pending) => pending.id === `p${i}`)).toBe(
+                    true,
+                );
+            });
+            abort.abort();
+        }
+
+        await Promise.all(writes);
+        const state = (await (await request('/api/plugins/local/10001')).json()) as {
+            pendingOperations: Array<{ cleanup?: string }>;
+        };
+        expect(state.pendingOperations).toHaveLength(16);
+        expect(
+            state.pendingOperations.every((pending) => pending.cleanup === 'cleanup_uncertain'),
+        ).toBe(true);
+        const post = () =>
+            app.request(`http://localhost${base}/config/write`, {
+                method: 'POST',
+                headers: {
+                    authorization: 'Bearer test-session',
+                    'x-jiyu-plugin-generation': GENERATION_A,
+                },
+                body: '{}',
+            });
+        expect((await post()).status).toBe(429);
+        releases[0]();
+        await vi.waitFor(async () => {
+            const next = (await (await request('/api/plugins/local/10001')).json()) as {
+                pendingOperations: unknown[];
+            };
+            expect(next.pendingOperations).toHaveLength(15);
+        });
+        expect((await post()).status).toBe(200);
+
+        for (const release of releases.slice(1)) {
+            release();
+        }
+
+        expect(instance.setPluginConfig).toHaveBeenCalledTimes(1);
+    });
+
+    it('reserves one disable owner before a stream cancel reenters disable', async () => {
+        for (const replace of [false, true]) {
+            const { app, request, instance, setCurrent } = fixture();
+            await request(`${base}/enable`, 'POST');
+            const gate = deferred<void>();
+            instance.disablePlugin.mockImplementationOnce(() => gate.promise);
+            let nested!: Promise<Response>;
+            let cancellations = 0;
+            const body = new ReadableStream<Uint8Array>({
+                cancel() {
+                    cancellations++;
+
+                    if (replace) {
+                        setCurrent({ ...instance });
+                    }
+
+                    nested = request(`${base}/disable`, 'POST');
+
+                    if (replace) {
+                        setCurrent(instance);
+                    }
+                },
+            });
+            const writing = app.request(
+                new Request(`http://localhost${base}/config/write`, {
+                    method: 'POST',
+                    headers: {
+                        authorization: 'Bearer test-session',
+                        'x-jiyu-plugin-generation': GENERATION_A,
+                    },
+                    body,
+                    duplex: 'half',
+                } as RequestInit & { duplex: 'half' }),
+            );
+            await vi.waitFor(async () =>
+                expect(await (await request('/api/plugins/local/10001')).json()).toMatchObject({
+                    pendingOperations: [{ id: 'fixture', phase: 'reading' }],
+                }),
+            );
+            const disabling = request(`${base}/disable`, 'POST');
+            expect(await (await nested).json()).toMatchObject({
+                code: replace ? 'OLD_INSTANCE_PENDING' : 'CLEANUP_IN_PROGRESS',
+            });
+            expect(await (await writing).json()).toMatchObject({ outcome: 'not_started' });
+            expect(cancellations).toBe(1);
+            expect(instance.disablePlugin).toHaveBeenCalledTimes(1);
+            expect(await (await request(`${base}/disable`, 'POST')).json()).toMatchObject({
+                code: 'CLEANUP_IN_PROGRESS',
+            });
+            expect(await (await request('/api/plugins/local/10001')).json()).toMatchObject({
+                pendingOperations: [{ id: 'fixture', operation: 'disable', phase: 'draining' }],
+            });
+            gate.resolve();
+            expect((await disabling).status).toBe(200);
+        }
+    });
+
+    it('does not overwrite a hook admitted by a reentrant canEnablePlugins observation', async () => {
+        const { configRequest, request, instance } = fixture();
+        const gate = deferred<{ value: { enabled: boolean }; source: 'plugin' }>();
+        instance.getPluginConfig.mockImplementationOnce(() => gate.promise);
+        let nested!: Promise<Response>;
+        instance.canEnablePlugins.mockImplementationOnce(() => {
+            nested = configRequest('read');
+            return true;
+        });
+        const outer = configRequest('write', { body: '{}' });
+        expect(await (await outer).json()).toMatchObject({
+            code: 'OPERATION_PENDING',
+            outcome: 'not_started',
+        });
+        expect(instance.getPluginConfig).toHaveBeenCalledTimes(1);
+        expect(instance.setPluginConfig).not.toHaveBeenCalled();
+        expect(await (await configRequest('write', { body: '{}' })).json()).toMatchObject({
+            code: 'OPERATION_PENDING',
+            outcome: 'not_started',
+        });
+        expect(await (await request('/api/plugins/local/10001')).json()).toMatchObject({
+            pendingOperations: [{ id: 'fixture', operation: 'config-read', phase: 'invoked' }],
+        });
+        gate.resolve({ value: { enabled: true }, source: 'plugin' });
+        expect((await nested).status).toBe(200);
+    });
+
+    it('cancels an acquired reader if listener setup throws and tracks settlement', async () => {
+        const { app, request, instance } = fixture();
+        const gate = deferred<void>();
+        let cancelled = 0;
+        const body = new ReadableStream<Uint8Array>({
+            cancel() {
+                cancelled++;
+                return gate.promise;
+            },
+        });
+        const req = new Request(`http://localhost${base}/config/write`, {
+            method: 'POST',
+            headers: {
+                authorization: 'Bearer test-session',
+                'x-jiyu-plugin-generation': GENERATION_A,
+            },
+            body,
+            duplex: 'half',
+        } as RequestInit & { duplex: 'half' });
+        Object.defineProperty(req.signal, 'addEventListener', {
+            value: () => {
+                throw new Error('PRIVATE_SETUP');
+            },
+        });
+        const response = await app.request(req);
+        const text = await response.text();
+        expect(text).not.toContain('PRIVATE_SETUP');
+        expect(JSON.parse(text)).toMatchObject({ code: 'CONFIG_INVALID', outcome: 'not_started' });
+        expect(cancelled).toBe(1);
+        expect(req.body?.locked).toBe(false);
+        expect(instance.setPluginConfig).not.toHaveBeenCalled();
+        expect(await (await request('/api/plugins/local/10001')).json()).toMatchObject({
+            pendingOperations: [{ id: 'fixture', cleanup: 'cleanup_uncertain' }],
+        });
+        gate.resolve();
+        await vi.waitFor(async () =>
+            expect(await (await request('/api/plugins/local/10001')).json()).toMatchObject({
+                pendingOperations: [],
+            }),
+        );
+    });
+
+    it('releases the reader and retains uncertainty if listener removal throws', async () => {
+        const { app, request, instance } = fixture();
+        const req = new Request(`http://localhost${base}/config/write`, {
+            method: 'POST',
+            headers: {
+                authorization: 'Bearer test-session',
+                'x-jiyu-plugin-generation': GENERATION_A,
+            },
+            body: '{}',
+        });
+        Object.defineProperty(req.signal, 'removeEventListener', {
+            value: () => {
+                throw new Error('PRIVATE_LISTENER_REMOVAL');
+            },
+        });
+        const response = await app.request(req);
+        const text = await response.text();
+        expect(text).not.toContain('PRIVATE_LISTENER_REMOVAL');
+        expect(JSON.parse(text)).toMatchObject({ code: 'CONFIG_INVALID', outcome: 'not_started' });
+        expect(req.body?.locked).toBe(false);
+        expect(instance.setPluginConfig).not.toHaveBeenCalled();
+        expect(await (await request('/api/plugins/local/10001')).json()).toMatchObject({
+            pendingOperations: [{ id: 'fixture', cleanup: 'cleanup_uncertain' }],
+        });
+    });
+
+    it('retains cleanup failure after pending cancellation settles and preserves error precedence', async () => {
+        const { app, request, instance } = fixture();
+        const gate = deferred<void>();
+        let cancelCalls = 0;
+        let releaseCalls = 0;
+        let realRelease!: () => void;
+        const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(new Uint8Array(256 * 1024 + 1));
+            },
+            cancel() {
+                cancelCalls++;
+                return gate.promise;
+            },
+        });
+        const req = new Request(`http://localhost${base}/config/write`, {
+            method: 'POST',
+            headers: {
+                authorization: 'Bearer test-session',
+                'x-jiyu-plugin-generation': GENERATION_A,
+            },
+            body,
+            duplex: 'half',
+        } as RequestInit & { duplex: 'half' });
+        const getReader = req.body!.getReader.bind(req.body);
+        Object.defineProperty(req.body!, 'getReader', {
+            value: () => {
+                const reader = getReader();
+                realRelease = reader.releaseLock.bind(reader);
+                Object.defineProperty(reader, 'releaseLock', {
+                    value: () => {
+                        releaseCalls++;
+                        throw new Error('PRIVATE_RELEASE_AFTER_SIZE_ERROR');
+                    },
+                });
+                return reader;
+            },
+        });
+        const response = await app.request(req);
+        const text = await response.text();
+        expect(response.status).toBe(400);
+        expect(text).not.toContain('PRIVATE_RELEASE_AFTER_SIZE_ERROR');
+        expect(JSON.parse(text)).toMatchObject({ code: 'CONFIG_INVALID', outcome: 'not_started' });
+        expect(cancelCalls).toBe(1);
+        expect(releaseCalls).toBe(1);
+        expect(instance.setPluginConfig).not.toHaveBeenCalled();
+        expect(await (await request('/api/plugins/local/10001')).json()).toMatchObject({
+            pendingOperations: [{ id: 'fixture', cleanup: 'cleanup_uncertain' }],
+        });
+        gate.resolve();
+        await gate.promise;
+        await Promise.resolve();
+        expect(await (await request('/api/plugins/local/10001')).json()).toMatchObject({
+            pendingOperations: [{ id: 'fixture', cleanup: 'cleanup_uncertain' }],
+        });
+        expect((await request(`${base}/enable`, 'POST')).status).toBe(409);
+        realRelease();
+    });
+
+    it('retains uncertainty if releasing an acquired reader throws', async () => {
+        const { app, request, instance } = fixture();
+        let realRelease!: () => void;
+        const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(new TextEncoder().encode('{}'));
+                controller.close();
+            },
+        });
+        const req = new Request(`http://localhost${base}/config/write`, {
+            method: 'POST',
+            headers: {
+                authorization: 'Bearer test-session',
+                'x-jiyu-plugin-generation': GENERATION_A,
+            },
+            body,
+            duplex: 'half',
+        } as RequestInit & { duplex: 'half' });
+        const originalGetReader = req.body!.getReader.bind(req.body);
+        Object.defineProperty(req.body!, 'getReader', {
+            value: () => {
+                const reader = originalGetReader();
+                realRelease = reader.releaseLock.bind(reader);
+                Object.defineProperty(reader, 'releaseLock', {
+                    value: () => {
+                        throw new Error('PRIVATE_RELEASE');
+                    },
+                });
+                return reader;
+            },
+        });
+        const response = await app.request(req);
+        const text = await response.text();
+        expect(text).not.toContain('PRIVATE_RELEASE');
+        expect(JSON.parse(text)).toMatchObject({ code: 'CONFIG_INVALID', outcome: 'not_started' });
+        expect(instance.setPluginConfig).not.toHaveBeenCalled();
+        expect(await (await request('/api/plugins/local/10001')).json()).toMatchObject({
+            pendingOperations: [{ id: 'fixture', cleanup: 'cleanup_uncertain' }],
+        });
+        realRelease();
+        expect((await request(`${base}/enable`, 'POST')).status).toBe(409);
     });
 
     it('bounds never-settling config calls and leaves GET status observable', async () => {

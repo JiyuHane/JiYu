@@ -77,7 +77,21 @@ can leave its effects unknown. Schema and later configuration operations are
 bound to the same active plugin generation; a restart or re-enable requires a
 new explicit read. The editor checks a narrow numeric subset, while the
 underlying JSON/JavaScript number model can still lose precision or original
-numeric spelling.
+numeric spelling. A write checks the active plugin generation before reading its
+body; an inactive or stale generation therefore takes precedence over malformed
+or oversized body errors. Disable or request abort cancels a write that is still
+reading, but an already invoked hook remains reserved until its promise settles.
+For a reader already acquired by the route, an abnormal read before the stream
+reports completion also triggers cancellation. Cancellation that is pending or
+rejected remains visible as `cleanup_uncertain` and continues to count against
+the pending-operation limits; it does not establish that underlying resources
+have stopped. A cancellation that never settles, or rejects without establishing
+cleanup, retains its reservation indefinitely for the life of the route owner.
+Bodies rejected before a reader is acquired are cancelled on a
+best-effort basis without that accounting, and their underlying resource state
+also remains unknown. The final admission checks rely on the instance's
+synchronous state observations being truthful; arbitrary in-process code retains
+the privileges described above and can interfere with those observations.
 
 Archive downloads, store installation, updates and online rollback are separate
 work; do not interpret catalog browsing or a local compatibility test as their
