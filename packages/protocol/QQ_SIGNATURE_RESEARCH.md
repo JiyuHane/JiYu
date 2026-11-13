@@ -212,6 +212,27 @@ observed dispatch-register value is sufficient for the inspected branch but is
 not established as its runtime value, and these reads need not be equal. The
 32-bit address arithmetic can wrap, including when an index is below four.
 
+Another bounded instruction trace identifies a **conditional initialization**
+of the same local area. At `0x2f33f0–0x2f33fc`, two pointers loaded from
+`[x19+0x1c8]` and `[x19+0x140]` are passed to `memcmp` with length `0x23`.
+Under the inspected dispatcher states, a zero comparison can reach a block
+that initializes a local index to zero. The loop at `0x2f3a4c–0x2f3a6c`,
+`0x2f3abc–0x2f3afc` and `0x2f3b00–0x2f3b2c` can then copy four groups of
+four bytes from the address `0x908eb0` into `A = x19+0x4a0`; a later
+conditional block sets the word index to four and enters the candidate
+word-generation loop. An earlier bounded path includes a `malloc(0x23)`, a
+store of the result in `[x19+0x1c8]`, and a dispatcher-selected block that
+re-reads that slot and writes 35 zero bytes there. If allocation succeeds,
+those particular paths are reached, the pointer slot remains unchanged and
+`memcmp` returns zero normally under its ABI, then its other compared 35-byte
+range is all zero at the time of comparison. A different inspected instruction
+also partially writes the pointer slot, so its stability is a condition, not an
+observed fact. These deductions additionally assume stable registers and local
+slots, valid source and destination ranges, and no harmful aliasing or concurrent
+changes. The compared buffers and source bytes were not examined. Their
+meaning, the reachability of this path and any connection to a signing entry
+remain unknown.
+
 A further bounded radare2 instruction trace provides **conditional** evidence
 for the rotated inputs. At `0x2f39bc–0x2f39fc`, a 32-bit `j` from
 `[x19+0x288]` selects four bytes at `A + ((4*j-k) mod 2^32)` for `k=4,3,2,1`,
