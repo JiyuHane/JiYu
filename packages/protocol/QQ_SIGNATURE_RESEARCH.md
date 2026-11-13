@@ -42,8 +42,18 @@ window at `0x2b6454` does not establish its cryptographic or signing semantics.
 Separately, `0x2fe5b4–0x2fe5d0` forms the string address for
 `com/tencent/mobileqq/qsec/qseccodec/SecCipher$SecInfo` in `x0` and calls
 `0x33ec58`; its result is stored at `[sp+0x338]`. The helper passes the same
-first argument to `0x33e1d4` in the inspected entry window. Inside the latter,
-one conditional state path initializes a local output slot and passes its
+first argument to `0x33e1d4` in the inspected entry window. On another
+conditional path in `0x33ec58`, the code reads a function pointer from global
+`0x9a6a30` and calls it with the saved `0x33e1d4` result and saved class-name
+pointer as its first two arguments. This local path depends on preserved stack
+and register values, including two dispatch-state constants; the slot's
+setter, target and actual execution are unknown. The eight-byte slot lies in
+the ELF's allocated `.bss` `SHT_NOBITS` range; this identifies no file-backed
+initial value. In the inspected RELA entries, none has an `r_offset` equal to
+the slot's starting address, but other relocation ranges and runtime writes
+were not excluded. It is therefore only a candidate for a JNI class lookup,
+not proof of one. Inside `0x33e1d4`, one
+conditional state path initializes a local output slot and passes its
 address, a pointer previously read from global `0x9a6a28`, and `0x00010006`
 to an indirect call through that pointer's function table at `+0x30`; the code
 then records whether the return is `-2`. This path also requires the dispatch
