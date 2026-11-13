@@ -63,13 +63,17 @@ safety, authorization or signature. Tests use only synthetic in-memory fixtures.
 
 ## Worker lifecycle prototype
 
-`PreflightWorkerTask` is an internal, single-slot controller with an explicitly
-injected Worker factory. It has no default Worker entry and is not connected to
-Core startup, the WebUI or an installer. It validates and copies an input view,
-binds a worker's reported successful result to the copied bytes' SHA-256, and
-validates and freezes the reported metadata. A valid result is a candidate until
-an observed natural exit with code zero; aborts, errors and timeouts are final
-once selected. Once a Worker has been returned, the separate cleanup result is
+`PreflightWorkerTask` and `ManifestPreflightWorkerTask` are internal controllers
+with explicitly injected Worker factories. Each instance has its own single
+slot; separate instances do not enforce a global concurrency limit. Neither has
+a default Worker entry or is connected to Core startup, the WebUI or an installer.
+Both validate and copy an input view before calling the factory. The ZIP v1
+controller binds a reported successful result to that snapshot's SHA-256; the
+manifest v2 controller checks its separate envelope against the snapshot hash
+for both success and failure. Both validate and freeze reported metadata. A
+valid result is a candidate until an observed natural exit with code zero;
+aborts, errors and timeouts are final once selected. Once a Worker has been
+returned, the separate cleanup result is
 `released` only after an exit is observed and required listener cleanup succeeds.
 If cleanup is uncertain because exit was not observed in time, the slot remains
 occupied; a later exit and successful listener cleanup can release it, although
@@ -121,22 +125,22 @@ with a caller-supplied expected digest, validates the allowed result and creates
 frozen copies. Version 1 does not accept version 2 envelopes, including failures
 whose underlying ZIP error codes overlap. A reported digest ties the reported
 identifier to the expected value; it does not establish a trustworthy Worker,
-classification, source, license or compatibility. The failure envelope also contains the archive fingerprint; keep
-it within the trusted channel rather than treating it as public diagnostic data.
-ZIP request bytes themselves can include plaintext manifest content. Result
-validation occurs after structured
-cloning and does not impose a bound on a malicious sender's pre-validation
-allocation.
+classification, source, license or compatibility. The failure envelope also
+contains the archive fingerprint; keep it within the trusted channel rather than
+treating it as public diagnostic data. ZIP request bytes themselves can include
+plaintext manifest content. Result validation occurs after structured cloning
+and does not impose a bound on a malicious sender's pre-validation allocation.
 
-This manifest handler and validator are protocol prototypes, not a parent Worker
-controller. Validation does not observe a Worker exit, detect a later duplicate
-message, or establish successful cleanup. No production Worker entry or factory
-is provided; the version 1 controller is not a version 2 controller. The
-synchronous port wrapper must be trusted and exclusive, and Worker-side send or
-close errors must escape the Worker entry. Independent wrappers of the same
-endpoint, other copies of input bytes and runtime-managed memory remain outside
-the handler's proof. Tests use synthetic archives and synthetic Worker entries;
-they do not run or install plugins.
+The pure manifest validator alone is not a parent Worker controller: by itself
+it does not observe exit, detect a later duplicate message, or establish cleanup.
+`ManifestPreflightWorkerTask` supplies those lifecycle checks through the same
+internal state machine as v1, returning the validated manifest result only after
+an observed natural exit of zero. Both remain prototypes: no production Worker
+entry or factory is provided. The synchronous port wrapper must be trusted and
+exclusive, and Worker-side send or close errors must escape the Worker entry.
+Independent wrappers of the same endpoint, other copies of input bytes and
+runtime-managed memory remain outside the handler's proof. Tests use synthetic
+archives and synthetic Worker entries; they do not run or install plugins.
 
 The existing Core entry is not a preflight Worker bootstrap: its static application
 imports are evaluated before the entry-point branch, and Worker data not recognized

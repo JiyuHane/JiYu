@@ -1151,6 +1151,106 @@ describe('injected worker task', () => {
     });
 });
 
+describe('v1 facade compatibility', () => {
+    it('preserves its own start descriptor, function lengths, and original receiver', async () => {
+        expect(Object.hasOwn(PreflightWorkerTask.prototype, 'start')).toBe(true);
+        expect(PreflightWorkerTask.length).toBe(1);
+        expect(PreflightWorkerTask.prototype.start.length).toBe(2);
+        expect(Object.getPrototypeOf(PreflightWorkerTask.prototype)).toBe(Object.prototype);
+        const worker = new FakeWorker();
+        let clockCalls = 0;
+        let factoryCalls = 0;
+        let controller: PreflightWorkerTask;
+        controller = new PreflightWorkerTask(
+            function (this: PreflightWorkerTask) {
+                expect(this).toBe(controller);
+                factoryCalls++;
+                return worker;
+            },
+            30,
+            function (this: PreflightWorkerTask) {
+                expect(this).toBe(controller);
+                clockCalls++;
+                return 0;
+            },
+        );
+        const task = controller.start(input, { timeoutMs: 100 });
+        worker.emit('message', message());
+        worker.emit('exit', 0);
+        expect((await task.outcome).kind).toBe('result');
+        expect(await task.cleanup).toBe('released');
+        expect(factoryCalls).toBe(1);
+        expect(clockCalls).toBeGreaterThan(1);
+    });
+
+    it('preserves dynamic callback reads and duck-typed borrowed receiver', async () => {
+        const worker = new FakeWorker();
+        const receivers: unknown[] = [];
+        let clockCalls = 0;
+        let replacementClockCalls = 0;
+        const owner = {
+            busy: false,
+            cleanupTimeoutMs: 30,
+            workerFactory(this: unknown) {
+                receivers.push(this);
+                return worker;
+            },
+            clock(this: unknown) {
+                receivers.push(this);
+                clockCalls++;
+                return 0;
+            },
+        };
+        const task = PreflightWorkerTask.prototype.start.call(
+            owner as unknown as PreflightWorkerTask,
+            input,
+            { timeoutMs: 100 },
+        );
+
+        owner.clock = function (this: unknown) {
+            receivers.push(this);
+            replacementClockCalls++;
+            return 0;
+        };
+
+        worker.emit('message', message());
+        worker.emit('exit', 0);
+        expect((await task.outcome).kind).toBe('result');
+        expect(await task.cleanup).toBe('released');
+        expect(clockCalls).toBeGreaterThan(0);
+        expect(replacementClockCalls).toBeGreaterThan(0);
+        expect(receivers.every((receiver) => receiver === owner)).toBe(true);
+        expect(owner.busy).toBe(false);
+    });
+
+    it('does not load ZIP or worker protocol when the v1 task module is imported', async () => {
+        vi.doMock('../src/webui/plugin-install/zip-preflight.ts', () => {
+            throw Error('zip runtime import');
+        });
+        vi.doMock('../src/webui/plugin-install/preflight-worker-protocol.ts', () => {
+            throw Error('protocol runtime import');
+        });
+        vi.doMock('node:zlib', () => {
+            throw Error('zlib runtime import');
+        });
+        vi.doMock('node:worker_threads', () => {
+            throw Error('worker_threads runtime import');
+        });
+
+        try {
+            vi.resetModules();
+            const task = await import('../src/webui/plugin-install/preflight-worker-task');
+            expect(typeof task.PreflightWorkerTask).toBe('function');
+        } finally {
+            vi.doUnmock('../src/webui/plugin-install/zip-preflight.ts');
+            vi.doUnmock('../src/webui/plugin-install/preflight-worker-protocol.ts');
+            vi.doUnmock('node:zlib');
+            vi.doUnmock('node:worker_threads');
+            vi.resetModules();
+        }
+    });
+});
+
 describe('synthetic real Node workers', () => {
     it('runs the independent ZIP parser on a synthetic stored archive', async () => {
         const name = Buffer.from('x');
