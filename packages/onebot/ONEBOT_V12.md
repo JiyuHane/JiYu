@@ -55,8 +55,13 @@ time, field and identifier validation. It uses `recall` when sender and operator
 otherwise the subtype is empty rather than asserting an administrator action.
 The message ID is the value exposed by v11, not proof that it identifies a QQ
 history entry: the existing upstream resolver may hash a missing sequence.
-Unresolved or zero sender/operator IDs are rejected. Other notices, requests and
-self-sent events are not yet translated to v12. Unsupported actions, parameters
+Unresolved or zero sender/operator IDs are rejected. A valid v11
+`group_decrease` with subtype `leave` also maps to `notice.group_member_decrease`,
+with an empty subtype because the upstream event may be a decoder fallback or a
+locally synthesized result of leaving. The upstream actor can likewise be
+synthesized; the mapping only preserves the v11 fields, not proof of a QQ-side
+event or its time. Other notices, requests and self-sent events are not yet
+translated to v12. Unsupported actions, parameters
 and message segments return explicit errors. File APIs, HTTP event
 polling and HTTP Webhook are not implemented by this listener. Capability and
 error details remain authoritative at runtime.

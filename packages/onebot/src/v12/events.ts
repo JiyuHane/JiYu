@@ -25,6 +25,54 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
     }
 
     if (input.post_type === 'notice') {
+        if (input.notice_type === 'group_decrease') {
+            // V11 leave can be a decoder default or a locally synthesized event;
+            // the original reason and operator provenance are no longer available.
+            if (input.sub_type !== 'leave') {
+                return null;
+            }
+
+            const fields = [
+                'time',
+                'self_id',
+                'post_type',
+                'notice_type',
+                'sub_type',
+                'group_id',
+                'operator_id',
+                'user_id',
+            ];
+            const groupId = fromV11AccountId(input.group_id);
+            const operatorId = fromV11AccountId(input.operator_id);
+            const userId = fromV11AccountId(input.user_id);
+
+            if (
+                Reflect.ownKeys(input).some(
+                    (key) => typeof key !== 'string' || !fields.includes(key),
+                ) ||
+                groupId === null ||
+                operatorId === null ||
+                userId === null ||
+                typeof input.time !== 'number' ||
+                !Number.isFinite(input.time) ||
+                input.time < 0
+            ) {
+                throw new Error('invalid or unsupported V11 group decrease event');
+            }
+
+            return {
+                id: randomUUID(),
+                time: input.time,
+                type: 'notice',
+                detail_type: 'group_member_decrease',
+                sub_type: '',
+                self: { ...self },
+                group_id: groupId,
+                user_id: userId,
+                operator_id: operatorId,
+            };
+        }
+
         if (input.notice_type !== 'group_recall') {
             return null;
         }

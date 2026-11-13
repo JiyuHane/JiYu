@@ -62,4 +62,18 @@ export interface V12GroupMessageDeleteEvent {
     operator_id: string;
 }
 
-export type V12ConvertedEvent = V12MessageEvent | V12GroupMessageDeleteEvent;
+export interface V12GroupMemberDecreaseEvent {
+    id: string;
+    time: number;
+    type: 'notice';
+    detail_type: 'group_member_decrease';
+    /** V11 does not retain enough provenance to determine the underlying reason. */
+    sub_type: '';
+    self: V12Self;
+    group_id: string;
+    user_id: string;
+    operator_id: string;
+}
+
+export type V12ConvertedEvent =
+    V12MessageEvent | V12GroupMessageDeleteEvent | V12GroupMemberDecreaseEvent;
