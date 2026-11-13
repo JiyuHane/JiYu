@@ -18,6 +18,13 @@ import {
     type V12Source,
 } from './source-generation';
 import type { DispatchPayload } from '../event-filter';
+import {
+    enqueuePollEvent,
+    invalidatePollOwner,
+    invalidateStalePollOwner,
+    registerPollHost,
+    type PollGate,
+} from './poll-owner';
 
 /** A v12 listener participates in the same network manager FIFO as v11. */
 export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
@@ -26,6 +33,11 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     private readonly dispatcher: V12Dispatcher;
     private readonly subscribers = new Set<(event: unknown) => void>();
     private readonly subscriberGenerations = new Map<(event: unknown) => void, object>();
+    readonly #sourceScopes: Array<{
+        event: JsonObject;
+        payload: DispatchPayload;
+        source: V12Source;
+    }> = [];
     private statusEmitting = false;
     private statusPending = false;
     private statusImmediate: ReturnType<typeof setImmediate> | null = null;
@@ -46,10 +58,21 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             trackAction: <T>(label: string, start: () => Promise<T>) => Promise<T>;
             canAccept: () => boolean;
             isSourceCurrent?: (source: V12Source | undefined, binding: object | null) => boolean;
+            captureCurrentSource?: () => V12Source | undefined;
+            pollGate?: PollGate;
         },
     ) {
         super(V12_ADAPTER_NAME, config, ctx);
         this.self = { platform: 'qq', user_id: ctx.uin };
+        registerPollHost(
+            this,
+            {
+                captureBinding: () => this[captureBinding](),
+                captureSource: () => this.options.captureCurrentSource?.(),
+                verify: (source) => this[verifySource](source),
+            },
+            options.pollGate,
+        );
         this.dispatcher = new V12Dispatcher({
             self: this.self,
             version: this.version,
@@ -91,6 +114,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                 subscribe: (listener) => this.subscribeStatus(listener),
                 onError: (error) => {
                     if (this.sourceAttempt === sourceAttempt) {
+                        this.revokePoll();
                         this.sourceAttempt = null;
                         this.sourceBinding = null;
                     }
@@ -196,6 +220,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     }
 
     async close(): Promise<void> {
+        this.revokePoll();
         const transport = this.transport;
         const token = this.currentStatusTransportToken;
         const previousOpeningOwner = this.openingOwner;
@@ -255,6 +280,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     }
 
     quiesce(): void {
+        this.revokePoll();
         this.closeRevision = {};
         this.openingOwner = null;
         this.sourceAttempt = null;
@@ -265,6 +291,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     }
 
     override forceClose(): void {
+        this.revokePoll();
         this.closeRevision = {};
         this.openingOwner = null;
         this.sourceAttempt = null;
@@ -295,21 +322,38 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     override [receiveSourceEvent](
         event: JsonObject,
         payload: DispatchPayload,
-        _source: V12Source,
-    ): void {
-        // Metadata is carried separately; today's WS broadcast is unchanged.
-        this.onEvent(event, payload);
+        source: V12Source,
+    ): void | Promise<void> {
+        this.#sourceScopes.push({ event, payload, source });
+
+        try {
+            return this.onEvent(event, payload);
+        } finally {
+            this.#sourceScopes.pop();
+        }
     }
 
-    onEvent(event: JsonObject, _payload?: DispatchPayload): void {
+    onEvent(event: JsonObject, payload?: DispatchPayload): void | Promise<void> {
         if (!this.isEnabled || !this.accepting) {
             return;
         }
+
+        const scope = this.#sourceScopes.at(-1);
+        const source =
+            scope?.event === event && scope.payload === payload ? scope.source : undefined;
 
         try {
             const converted = convertV11Event(event, this.self);
 
             if (converted) {
+                try {
+                    // This FIFO is conversion/enqueue completion order, not source
+                    // admission order or verified OneBot oldest-to-newest order.
+                    enqueuePollEvent(this, converted, source);
+                } catch {
+                    // The optional poll path must never suppress existing fanout.
+                }
+
                 this.publish(converted);
             }
         } catch (error) {
@@ -322,6 +366,12 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     }
 
     statusUpdate(): void {
+        try {
+            invalidateStalePollOwner(this);
+        } catch {
+            // Poll cleanup is independent of the established status path.
+        }
+
         if (!this.isEnabled || !this.accepting) {
             return;
         }
@@ -472,6 +522,14 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             } catch {
                 // Both diagnostic channels failed; retain delivery semantics.
             }
+        }
+    }
+
+    private revokePoll(): void {
+        try {
+            invalidatePollOwner(this);
+        } catch {
+            // Poll cleanup must not change the transport lifecycle contract.
         }
     }
 

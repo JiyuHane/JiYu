@@ -46,6 +46,7 @@ import { ReactionStore } from './reaction-store';
 import { sameSelfSentMessage, selfSentEventKey, SELF_SENT_ECHO_WINDOW_MS } from './self-sent-event';
 import type { ApiResponse, JsonObject, JsonValue, MessageMeta, OneBotConfig } from './types';
 import { V12Runtime } from './v12-runtime/runtime';
+import { createPollGate, invalidatePollOwner } from './v12-runtime/poll-owner';
 import { V12_ADAPTER_NAME } from './v12-runtime/identity';
 import {
     captureBinding,
@@ -103,6 +104,7 @@ export class OneBotInstance {
     // V12 reports the explicit account-session edge, not listener connectivity.
     private v12Online = false;
     private readonly sourceGeneration = new SourceGeneration();
+    private readonly v12PollGate = createPollGate();
     private v12Adapter: V12Runtime | null = null;
     private heartbeatTimer: NodeJS.Timeout | null = null;
     private static readonly HEARTBEAT_INTERVAL = 30000;
@@ -833,12 +835,23 @@ export class OneBotInstance {
                         (await this.messageStore.findMeta(id))?.timestamp ?? null,
                     trackAction: (label, start) => this.trackAction(label, start),
                     canAccept: () => !this.disposeRequested,
+                    captureCurrentSource: () => this.captureEventSource(),
+                    pollGate: this.v12PollGate,
                     isSourceCurrent: (source, binding) =>
                         !this.disposeRequested &&
                         this.v12Adapter === adapter &&
                         this.networkManager.get(V12_ADAPTER_NAME) === adapter &&
                         (this.sourceGeneration?.isCurrent(source, binding) ?? false),
                 });
+
+                try {
+                    if (this.v12Adapter) {
+                        invalidatePollOwner(this.v12Adapter);
+                    }
+                } catch {
+                    // Revoke poll ownership without changing adapter replacement.
+                }
+
                 this.v12Adapter = adapter;
                 return adapter;
             }
