@@ -373,11 +373,18 @@ the initial virtual call could have changed either value. If the re-read object
 is non-null, two separate conditional calls to `0x35b6ec0` can produce two local
 pointer/control pairs. Each successful branch separately reads `0x9177dd8` as
 its control pointer. The path passes both pairs, which may be empty, to virtual
-slot `+0` of the `0x9177de0` receiver without a local null check. These are
-static observations conditional on the necessary pointers being valid, not
-observed runtime dispatch. The globals' object identities, helper semantics and
-any connection to the signer pair remain unknown. The dispatch receiver's
-`+0x28` and the constructed objects' `+0x30` slots
+slot `+0` of the `0x9177de0` receiver without a local null check. A different
+bounded window at `0x670d682` calls `0x67116e0` with a stack output. On the
+inspected normal-return path, that helper allocates `0x278` bytes at `B`, calls
+`0x673f160` with `B+0x18`, and writes the pair `(B+0x18, B)` to that output.
+The caller loads the pair, clears the stack source, saves the old control pointer,
+and writes 16 bytes to global `0x9177dd0/8` with one `movups` instruction.
+If the old control pointer is non-null, a subsequent `lock xadd -1` tests its
+old count; old zero enters its virtual cleanup and release path. This is not a
+claim that the 16-byte write is atomic. These are static observations conditional
+on normal returns, valid pointers and no intervening changes, not observed runtime
+dispatch. The globals' business meanings and any connection to the signer pair
+remain unknown. The dispatch receiver's `+0x28` and the constructed objects' `+0x30` slots
 belong to different objects. The inspected candidate paths both access the
 `0x9177e20` receiver's `+0x30` and call `0x6725fb0`;
 the clear path's subsequent pointer/count changes and releases are consistent
