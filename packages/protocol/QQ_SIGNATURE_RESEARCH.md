@@ -53,8 +53,13 @@ inverse table by index. A radare2 `pdc` view of a manually bounded block at
 signature and return in that view are not evidence of real function boundaries
 or return values. These are static instructions, not observed execution.
 They do not establish a complete AES operation, mode, keys, or a connection to
-a signing path. These are file-backed static virtual addresses, not live process
-addresses. No keys were extracted or recorded.
+a signing path. A separate scan of aligned direct `BL` encodings in the 16 KiB
+window beginning at the candidate `0x2b6454` found only six library PLT targets;
+it did not find a direct call to the selected table-reference locations. This
+window is not an established function boundary and excludes indirect calls and
+other paths, so it does not establish the absence of a connection. These are
+file-backed static virtual addresses, not live process addresses. No keys were
+extracted or recorded.
 
 ## Public protocol reference
 
