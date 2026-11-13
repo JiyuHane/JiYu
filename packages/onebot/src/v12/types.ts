@@ -29,6 +29,12 @@ export interface V12CoreOptions {
     getSentMessageTime(messageId: number): number | null | Promise<number | null>;
 }
 
+export type V12TextSegment = { type: 'text'; data: { text: string } };
+export type V12MessageSegment =
+    | V12TextSegment
+    | { type: 'mention'; data: { user_id: string } }
+    | { type: 'mention_all'; data: Record<string, never> };
+
 export interface V12MessageEvent {
     id: string;
     time: number;
@@ -37,7 +43,7 @@ export interface V12MessageEvent {
     sub_type: string;
     self: V12Self;
     message_id: string;
-    message: Array<{ type: 'text'; data: { text: string } }>;
+    message: V12MessageSegment[];
     alt_message: string;
     user_id: string;
     group_id?: string;

@@ -42,9 +42,13 @@ configuration writers and backup restores do not share a revision lock.
 
 The core currently handles `get_version`, `get_status`, `get_supported_actions`,
 `get_self_info`, `send_message` for private and group text messages, and `delete_message`.
-Incoming friend/private and normal/group text messages are converted to v12
-message events; unsupported message semantics and media are not silently
-converted. Self-sent events are not yet translated to v12. Unsupported actions,
+Incoming friend/private and normal/group messages with text and v11 `at`
+segments are converted to v12 `text`, `mention` and `mention_all` segments;
+unsupported message semantics and media are not silently converted. The
+conversion preserves the v11 field, not an independently verified QQ mention:
+the upstream decoder can normalize an unresolved mention UIN to zero, which
+the v11 converter represents as `all`. The v12 `alt_message` renders mentions
+as `@<user_id>` or `@全体成员`, without reconstructing platform display names. Self-sent events are not yet translated to v12. Unsupported actions,
 parameters and message segments return explicit errors. File APIs, HTTP event
 polling and HTTP Webhook are not implemented by this listener. Capability and
 error details remain authoritative at runtime.

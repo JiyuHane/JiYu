@@ -70,25 +70,48 @@ export function convertV11Event(input: unknown, self: V12Self): V12MessageEvent 
     }
 
     const message: V12MessageEvent['message'] = [];
+    const alt: string[] = [];
 
     for (const segment of input.message) {
         if (
             !isObject(segment) ||
-            segment.type !== 'text' ||
+            (segment.type !== 'text' && segment.type !== 'at') ||
             !isObject(segment.data) ||
-            typeof segment.data.text !== 'string'
+            (segment.type === 'text' && typeof segment.data.text !== 'string')
         ) {
             throw new Error('unsupported or invalid V11 message segment');
         }
 
         if (
             Object.keys(segment).some((key) => key !== 'type' && key !== 'data') ||
-            Object.keys(segment.data).some((key) => key !== 'text')
+            Object.keys(segment.data).some(
+                (key) => key !== (segment.type === 'text' ? 'text' : 'qq'),
+            )
         ) {
             throw new Error('unsupported V11 message segment field');
         }
 
-        message.push({ type: 'text', data: { text: segment.data.text } });
+        if (segment.type === 'text') {
+            // The earlier guard narrows this field at runtime, not across the segment type.
+            if (typeof segment.data.text !== 'string') {
+                throw new Error('unsupported or invalid V11 message segment');
+            }
+
+            message.push({ type: 'text', data: { text: segment.data.text } });
+            alt.push(segment.data.text);
+        } else if (segment.data.qq === 'all') {
+            message.push({ type: 'mention_all', data: {} });
+            alt.push('@全体成员');
+        } else {
+            const mentionedUser = fromV11AccountId(segment.data.qq);
+
+            if (mentionedUser === null) {
+                throw new Error('unsupported or invalid V11 message segment');
+            }
+
+            message.push({ type: 'mention', data: { user_id: mentionedUser } });
+            alt.push(`@${mentionedUser}`);
+        }
     }
 
     return {
@@ -100,8 +123,9 @@ export function convertV11Event(input: unknown, self: V12Self): V12MessageEvent 
         self: { ...self },
         message_id: messageId,
         message,
-        // V11 raw_message is CQ-escaped, not a plain-text alternative.
-        alt_message: message.map((segment) => segment.data.text).join(''),
+        // V11 raw_message is CQ-escaped. These mention labels are local plain-text
+        // alternatives, not original platform display names or protocol-mandated spellings.
+        alt_message: alt.join(''),
         user_id: userId,
         ...(groupId === null ? {} : { group_id: groupId }),
     };
