@@ -22,7 +22,9 @@ pnpm --filter @jiyu/docs build
 pnpm --filter @jiyu/docs preview
 ```
 
-默认按站点根路径构建。若部署在子路径，在构建时将 `JIYU_DOCS_BASE` 设为以 `/` 开始和结束的路径，例如 `/Jiyu/`；各段仅使用英文字母、数字、`.`、`_`、`~` 或 `-`，且不能为 `.` 或 `..`。站点面向支持现代 JavaScript 的浏览器。部署配置由维护者决定；文档站构建不会修改现有部署流程。
+文档站的目标地址为 [docs.harehane.dev](https://docs.harehane.dev/)；部署完成后仍需通过 GitHub Pages 和实际访问验收。仓库的 Jiyu Docs 工作流在推送 `dev` 时构建并部署，也支持手动触发；面向 `dev` 的 PR 仅构建。工作流使用 `JIYU_DOCS_BASE=/`，通过 GitHub Pages Actions 发布，不生成 CNAME 文件；自定义域名由仓库 Pages 设置管理。
+
+默认按站点根路径构建。若部署在子路径，在构建时将 `JIYU_DOCS_BASE` 设为以 `/` 开始和结束的路径，例如 `/Jiyu/`；各段仅使用英文字母、数字、`.`、`_`、`~` 或 `-`，且不能为 `.` 或 `..`。站点面向支持现代 JavaScript 的浏览器。
 
 ## 参与项目
 

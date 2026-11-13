@@ -98,7 +98,7 @@ pnpm test
 
 | 内容 | 入口 |
 | --- | --- |
-| 霁羽文档站 | [文档首页](packages/docs/index.md) · [本地构建说明](packages/docs/guide/development.md) |
+| 霁羽文档站 | [在线文档](https://docs.harehane.dev/) · [文档源](packages/docs/index.md) · [本地构建说明](packages/docs/guide/development.md) |
 | OneBot v11 | [OneBot v11 规范](https://github.com/botuniverse/onebot-11) |
 | WebUI | [WebUI 文档](packages/webui/README.md) |
 | TypeScript SDK | [SDK 文档](packages/sdk/README.md) |
