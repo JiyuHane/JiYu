@@ -75,3 +75,26 @@ scheduler and event-loop progress. Workers share process permissions and do not
 provide process isolation or a hard RSS, CPU or wall-clock limit. The existing
 parser creates its own further snapshot. Source-mode synthetic Worker tests are
 not evidence of a production bundle entry or live plugin compatibility.
+
+The separate `preflight-worker-protocol.ts` implements a one-shot handler for
+`{ kind: 'zip-preflight', version: 1, bytes: ArrayBuffer }` using an explicitly
+supplied, trusted synchronous port wrapper. It validates the request, transfers
+its Worker-local buffer before inspection, sends at most one controller-compatible
+result and closes the port. Invalid requests or parser exceptions produce no
+result; a genuine Worker entering this handler must allow fixed send/close errors
+to escape rather than turning them into a successful exit. Its data helper makes
+an additional copy of a caller's view. Using that helper after the controller's
+snapshot therefore adds another parent-side copy; neither transfer nor SHA-256
+proves where other copies came from or whether the Worker reports honestly.
+The handler has no built-in Worker factory, package extraction or production
+entry and uses no plugin code. Its buffer capability behavior is tested on Node
+24.22.1; Node 26 and future runtime behavior remain unverified.
+
+The existing Core entry is not a preflight Worker bootstrap: its static application
+imports are evaluated before the entry-point branch, and Worker data not recognized
+as the existing migration task can enter the application or supervisor path.
+Production integration needs a separately verified dispatcher that distinguishes
+main-thread startup, recognized Worker kinds and unknown Worker data without
+starting application services. It must also preserve the single-bundle release
+layout and existing migration behavior. A dynamic import in source alone does
+not prove that the final bundled dependency graph defers application side effects.
