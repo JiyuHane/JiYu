@@ -198,24 +198,44 @@ particular path is taken and the slot remains unchanged. The substitution block
 sets a dispatch state and branches to `0x2f3830`; the following block is not
 necessarily the linear instruction successor.
 
-If the dispatcher selects `0x2f3880`, the code re-reads the index slot twice.
-Let `A = x19+0x4a0`, `i0` be the earlier index used for the second table,
-`i1` and `i2` the two later values, and `b1 = (4*i1) mod 2^32` and
-`b2 = (4*i2) mod 2^32`. Subject to valid memory and absent harmful aliasing,
-the four output bytes at `A[b1+j]`, for `j=0..3`, each XOR a substitution
-result with `A[(b2-16+j) mod 2^32]`; the first result also includes the byte
-from the second table. The index is re-read yet again afterward. A particular
+If the dispatcher selects `0x2f3880`, it reads the **32-bit** slot
+`[x19+0x288]` twice (`0x2f3880` and `0x2f3884`). This is the same slot read at
+`0x2f3a80` for the second-table index, not the distinct **64-bit** S-box index
+slot `[x19+0x380]` read at `0x2f3a70`. Let `A = x19+0x4a0`, `i0` be the
+32-bit value used earlier for the second table, `i1` and `i2` the two later
+values, and `b1 = (4*i1) mod 2^32` and `b2 = (4*i2) mod 2^32`. Subject to
+valid memory and absent harmful aliasing, the four output bytes at `A[b1+j]`,
+for `j=0..3`, each XOR a substitution result with
+`A[(b2-16+j) mod 2^32]`; the first result also includes the byte from the
+second table. The 32-bit slot is re-read yet again afterward. A particular
 observed dispatch-register value is sufficient for the inspected branch but is
 not established as its runtime value, and these reads need not be equal. The
 32-bit address arithmetic can wrap, including when an index is below four.
 
+A further bounded radare2 instruction trace provides **conditional** evidence
+for the rotated inputs. At `0x2f39bc–0x2f39fc`, a 32-bit `j` from
+`[x19+0x288]` selects four bytes at `A + ((4*j-k) mod 2^32)` for `k=4,3,2,1`,
+using zero-extended 32-bit offsets; the code stores them in `[x19+0x2f0]`,
+`[x19+0x2f8]`, `[x19+0x300]` and `[x20]`, respectively. Without arithmetic
+wrap, these are the four bytes preceding `A + 4*j`. At `0x2f3a00–0x2f3a24`, another read of `j` selects a dispatcher
+state based on `j & 3`. With the inspected dispatcher register equal to
+`0x17da7ce7`, the zero branch selects `0x2f3a28`, which zero-extends the second
+saved byte into `[x19+0x380]`; the dispatcher then selects `0x2f3a70`. Under
+stable registers and slots, valid memory and no harmful aliasing, that path
+substitutes the saved bytes in order 1, 2, 3, 0. The nonzero branch can select
+`0x2f3880` directly using the unrotated bytes. After the write window,
+`0x2f38ec–0x2f38f8` reads `j` again and computes `j+1`; a dispatcher-selected
+block at `0x2f3998–0x2f39b4` stores it and compares the re-read value with 44.
+A separate conditional block supplies an initial value of 4. These are static
+path deductions, not evidence that those states occur or that repeated reads
+are stable at runtime; 32-bit index arithmetic can wrap.
+
 For comparison, the [NIST AES standard](https://csrc.nist.gov/pubs/fips/197/final)
-describes a key-expansion step involving substitution and XOR with a word four
-positions earlier. The local native pattern has a similar shape, but identifying
-it as that step would additionally require evidence for the rotated input bytes,
-the round-constant table and index, consistent index reads, valid bounds and an
-actually reachable path. None of those facts or a signing connection is
-established by this window.
+describes AES-128 key expansion using rotated and substituted words and XOR
+with the word four positions earlier. The inspected path resembles part of
+that recurrence, but the extra table contents, valid bounds, initial data,
+complete algorithm, function boundary, reachability and signing connection
+remain unestablished. The match does not establish a real key schedule.
 
 These are static instructions, not observed execution. They do not establish a
 complete AES operation, mode, keys, or a connection to a signing path. A separate scan of aligned direct `BL` encodings in the 16 KiB
