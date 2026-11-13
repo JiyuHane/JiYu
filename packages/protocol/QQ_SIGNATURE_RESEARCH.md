@@ -186,6 +186,37 @@ three dispatch-state values to be distinct and stable, valid memory and no
 harmful aliasing; other states need not follow this path. The adjacent S-box
 and rotation windows are selected by flattened control flow, so their linear
 ordering does not establish their execution order or an AES key schedule.
+
+A separate conditional window at `0x2f3a70–0x2f3ab8` reads four values
+through the verified forward S-box at `0x90bf88`. One index is loaded as a
+64-bit value from `[x19+0x380]`; the other three are loaded as bytes. It XORs
+the first substitution with one byte from a second base `0x90c088`, indexed
+by a 32-bit value shifted right by two. The content and bounds of this second
+table were not examined. A separately inspected preceding block writes a
+zero-extended byte to the 64-bit index slot; this only bounds the index if that
+particular path is taken and the slot remains unchanged. The substitution block
+sets a dispatch state and branches to `0x2f3830`; the following block is not
+necessarily the linear instruction successor.
+
+If the dispatcher selects `0x2f3880`, the code re-reads the index slot twice.
+Let `A = x19+0x4a0`, `i0` be the earlier index used for the second table,
+`i1` and `i2` the two later values, and `b1 = (4*i1) mod 2^32` and
+`b2 = (4*i2) mod 2^32`. Subject to valid memory and absent harmful aliasing,
+the four output bytes at `A[b1+j]`, for `j=0..3`, each XOR a substitution
+result with `A[(b2-16+j) mod 2^32]`; the first result also includes the byte
+from the second table. The index is re-read yet again afterward. A particular
+observed dispatch-register value is sufficient for the inspected branch but is
+not established as its runtime value, and these reads need not be equal. The
+32-bit address arithmetic can wrap, including when an index is below four.
+
+For comparison, the [NIST AES standard](https://csrc.nist.gov/pubs/fips/197/final)
+describes a key-expansion step involving substitution and XOR with a word four
+positions earlier. The local native pattern has a similar shape, but identifying
+it as that step would additionally require evidence for the rotated input bytes,
+the round-constant table and index, consistent index reads, valid bounds and an
+actually reachable path. None of those facts or a signing connection is
+established by this window.
+
 These are static instructions, not observed execution. They do not establish a
 complete AES operation, mode, keys, or a connection to a signing path. A separate scan of aligned direct `BL` encodings in the 16 KiB
 window beginning at the candidate `0x2b6454` found only six library PLT targets;

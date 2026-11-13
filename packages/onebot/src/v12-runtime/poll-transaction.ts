@@ -16,6 +16,10 @@ import type { PollOptions, PollResult } from './event-poll-buffer';
  * writing state. The host owns error handling before and after this transaction and
  * for late sink errors. Local finish is not evidence of remote receipt. Real transport
  * needs its own authentication, source provenance, admission and effect accounting.
+ * The offline policy writes [] for empty or timeout, with a local outcome reason.
+ * Timeout says only this consumer did not reserve events before its wait expired;
+ * other waiters or reservations may exist. This mapping still needs transport and
+ * fairness review; it does not establish delivery, global emptiness or event order.
  */
 export interface PollQueue {
     reserve(options: PollOptions): Promise<PollResult>;
@@ -42,6 +46,11 @@ export interface PollRequest {
 
 type PollCoreOutcome =
     | { readonly kind: 'local_finish'; readonly response: 'events' | 'fallback' }
+    | {
+          readonly kind: 'local_finish';
+          readonly response: 'empty';
+          readonly reason: 'empty' | 'timeout';
+      }
     | { readonly kind: 'unknown'; readonly committed: boolean }
     | { readonly kind: 'committed_unsent' }
     | { readonly kind: 'commit_unknown' }
@@ -54,7 +63,7 @@ type PollCoreOutcome =
           readonly kind:
               'aborted' | 'cancelled' | 'closed' | 'deadline' | 'epoch_invalid' | 'clock_error';
       }
-    | { readonly kind: 'empty' | 'timeout' | 'blocked' | 'invalid' | 'busy' | 'contended' };
+    | { readonly kind: 'blocked' | 'invalid' | 'busy' | 'contended' };
 
 export type PollOutcome =
     | PollCoreOutcome
@@ -66,6 +75,9 @@ export type PollOutcome =
 
 type Stop = 'aborted' | 'cancelled' | 'closed' | 'deadline' | 'epoch_invalid' | 'clock_error';
 type State = 'initial' | 'waiting' | 'prepared' | 'committing' | 'writing' | 'terminal';
+type WriteKind =
+    | { readonly response: 'events' | 'fallback' }
+    | { readonly response: 'empty'; readonly reason: 'empty' | 'timeout' };
 
 const prefix = '{"status":"ok","retcode":0,"data":';
 const unknownMessage =
@@ -137,6 +149,7 @@ export class PollTransaction {
     private sinkListening = false;
     private writerResolve: ((outcome: PollCoreOutcome) => void) | undefined;
     private writeOutcome: PollCoreOutcome | undefined;
+    private writeKind: WriteKind | undefined;
     private cleanupUncertain = false;
     private endStarted = false;
     private endReturned = false;
@@ -233,12 +246,21 @@ export class PollTransaction {
         if (!this.endStarted) {
             this.finishWrite({ kind: 'unknown', committed: this.committed });
         } else if (this.endReturned && !this.check(false)) {
-            this.finishWrite({
-                kind: 'local_finish',
-                response: this.committed ? 'events' : 'fallback',
-            });
+            this.finishLocalWrite();
         }
     };
+
+    private finishLocalWrite(): void {
+        const kind = this.writeKind;
+
+        if (!kind) {
+            this.finishWrite({ kind: 'unknown', committed: this.committed });
+        } else if (kind.response === 'empty') {
+            this.finishWrite({ kind: 'local_finish', response: 'empty', reason: kind.reason });
+        } else {
+            this.finishWrite({ kind: 'local_finish', response: kind.response });
+        }
+    }
 
     private finishWrite(outcome: PollCoreOutcome): void {
         if (this.writeOutcome) {
@@ -329,13 +351,14 @@ export class PollTransaction {
         }
     }
 
-    private async write(body: string): Promise<PollCoreOutcome> {
+    private async write(body: string, kind: WriteKind): Promise<PollCoreOutcome> {
         const stop = this.check();
 
         if (stop) {
             return this.committed ? { kind: 'committed_unsent' } : { kind: stop };
         }
 
+        this.writeKind = kind;
         this.state = 'writing';
         const completed = new Promise<PollCoreOutcome>((resolve) => {
             this.writerResolve = resolve;
@@ -356,10 +379,7 @@ export class PollTransaction {
                 this.check(false);
 
                 if (this.finishSeen && !this.writeOutcome && !this.stopReason) {
-                    this.finishWrite({
-                        kind: 'local_finish',
-                        response: this.committed ? 'events' : 'fallback',
-                    });
+                    this.finishLocalWrite();
                 }
             }
         } catch {
@@ -389,7 +409,7 @@ export class PollTransaction {
                 return { kind: 'fatal_budget' };
             }
 
-            return await this.write(body);
+            return await this.write(body, { response: 'fallback' });
         } catch {
             const stop = this.check();
             return stop ? { kind: stop } : { kind: 'fatal_budget' };
@@ -474,7 +494,14 @@ export class PollTransaction {
                 return { kind: stopped };
             }
 
-            const suffix = `,"message":""${echo === undefined ? '' : `,"echo":${JSON.stringify(echo)}`}}`;
+            let suffix: string;
+
+            try {
+                suffix = `,"message":""${echo === undefined ? '' : `,"echo":${JSON.stringify(echo)}`}}`;
+            } catch {
+                return await this.fallback(echo);
+            }
+
             const overhead = Buffer.byteLength(prefix, 'utf8') + Buffer.byteLength(suffix, 'utf8');
             const budget = Math.min(maxOutputBytes - overhead, this.maxQueueBytes);
 
@@ -511,6 +538,16 @@ export class PollTransaction {
             }
 
             if (result.status !== 'reserved') {
+                if (result.status === 'empty' || result.status === 'timeout') {
+                    const body = `${prefix}[]${suffix}`;
+
+                    if (Buffer.byteLength(body, 'utf8') > maxOutputBytes) {
+                        return await this.fallback(echo);
+                    }
+
+                    return await this.write(body, { response: 'empty', reason: result.status });
+                }
+
                 if (result.status === 'aborted') {
                     return { kind: 'aborted' };
                 }
@@ -587,7 +624,7 @@ export class PollTransaction {
             }
 
             // No await between the post-commit check and beginning the first write.
-            return await this.write(body);
+            return await this.write(body, { response: 'events' });
         } catch {
             if (tokenOwned && token) {
                 tokenOwned = false;

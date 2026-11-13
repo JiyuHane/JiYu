@@ -188,10 +188,15 @@ describe('offline poll transaction', () => {
         },
     );
 
-    it('keeps queue status distinct and does not write an empty response', async () => {
+    it('writes guarded empty responses and keeps contention distinct', async () => {
         vi.useFakeTimers();
         const t = setup();
-        expect(await t.coordinator.create(t.request, t.sink).run()).toEqual({ kind: 'empty' });
+        expect(await t.coordinator.create(t.request, t.sink).run()).toEqual({
+            kind: 'local_finish',
+            response: 'empty',
+            reason: 'empty',
+        });
+        expect(JSON.parse(t.sink.body!).data).toEqual([]);
         const pending = t.q.reserve({ timeoutMs: 50 });
         const short = new FakeSink();
         expect(await t.coordinator.create(t.request, short).run()).toEqual({ kind: 'contended' });
@@ -200,9 +205,331 @@ describe('offline poll transaction', () => {
         const long = new FakeSink();
         const p = t.coordinator.create({ ...t.request, timeoutMs: 20 }, long).run();
         await vi.advanceTimersByTimeAsync(20);
-        expect(await p).toEqual({ kind: 'timeout' });
-        expect(long.headCalls).toBe(0);
+        expect(await p).toEqual({ kind: 'local_finish', response: 'empty', reason: 'timeout' });
+        expect(JSON.parse(long.body!).data).toEqual([]);
+        expect(long.headCalls).toBe(1);
         expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it.each([undefined, '', '😀', '\ud800', '"\\\né', '大'.repeat(300)])(
+        'writes empty with the exact UTF-8 budget and echo %s',
+        async (echo) => {
+            const body = JSON.stringify({
+                status: 'ok',
+                retcode: 0,
+                data: [],
+                message: '',
+                ...(echo === undefined ? {} : { echo }),
+            });
+            const bytes = Buffer.byteLength(body, 'utf8');
+            const q = new EventPollBuffer(config);
+            const commit = vi.fn((token: object) => q.commit(token));
+            const release = vi.fn((token: object) => q.release(token));
+            const reserve = vi.fn((options: PollOptions) => q.reserve(options));
+            const t = setup({ queue: queueWrapper(q, { reserve, commit, release }) });
+            expect(
+                await t.coordinator
+                    .create({ ...t.request, echo, limit: 0, maxOutputBytes: bytes }, t.sink)
+                    .run(),
+            ).toEqual({ kind: 'local_finish', response: 'empty', reason: 'empty' });
+            expect(t.sink.body).toBe(body);
+            expect(reserve).toHaveBeenCalledTimes(1);
+            expect(commit).not.toHaveBeenCalled();
+            expect(release).not.toHaveBeenCalled();
+            const shortSink = new FakeSink();
+            expect(
+                await t.coordinator
+                    .create({ ...t.request, echo, maxOutputBytes: bytes - 1 }, shortSink)
+                    .run(),
+            ).toEqual({ kind: 'fatal_budget' });
+            expect(reserve).toHaveBeenCalledTimes(1);
+            expect(shortSink.headCalls).toBe(0);
+            expect(q.stats()).toMatchObject({ count: 0, reserved: 0, waiters: 0 });
+        },
+    );
+
+    it('does not reserve or write for an invalid echo', async () => {
+        const q = new EventPollBuffer(config);
+        const reserve = vi.fn((options: PollOptions) => q.reserve(options));
+        const t = setup({ queue: queueWrapper(q, { reserve }) });
+        const invalid = { ...t.request, echo: 42 } as unknown as PollRequest;
+        expect(await t.coordinator.create(invalid, t.sink).run()).toEqual({
+            kind: 'invalid_input',
+        });
+        expect(reserve).not.toHaveBeenCalled();
+        expect(t.sink.headCalls).toBe(0);
+    });
+
+    it('allows a waiting poll to time out while another reservation holds the queue', async () => {
+        vi.useFakeTimers();
+        const q = new EventPollBuffer(config);
+        q.enqueue(event(1));
+        const held = await q.reserve();
+
+        if (held.status !== 'reserved') {
+            throw new Error('expected reserved');
+        }
+
+        const commit = vi.fn((token: object) => q.commit(token));
+        const release = vi.fn((token: object) => q.release(token));
+        const t = setup({ queue: queueWrapper(q, { commit, release }) });
+        const short = new FakeSink();
+        expect(await t.coordinator.create(t.request, short).run()).toEqual({ kind: 'contended' });
+        expect(short.headCalls).toBe(0);
+        const waiting = t.coordinator.create({ ...t.request, timeoutMs: 20 }, t.sink).run();
+        await vi.advanceTimersByTimeAsync(20);
+        expect(await waiting).toEqual({
+            kind: 'local_finish',
+            response: 'empty',
+            reason: 'timeout',
+        });
+        expect(JSON.parse(t.sink.body!).data).toEqual([]);
+        expect(q.stats()).toMatchObject({ count: 1, reserved: 1, waiters: 0 });
+        expect(commit).not.toHaveBeenCalled();
+        expect(release).not.toHaveBeenCalled();
+        expect(q.release(held.token)).toBe(true);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it.each(['abort', 'close', 'epoch', 'deadline'] as const)(
+        'suppresses the first empty write when %s happens after timeout selection',
+        async (mode) => {
+            vi.useFakeTimers();
+            let clock = 0;
+            let valid = true;
+            const q = new EventPollBuffer(config);
+            let deliver: (() => void) | undefined;
+
+            const reserve: PollQueue['reserve'] = async (options) => {
+                const result = await q.reserve(options);
+                await new Promise<void>((resolve) => {
+                    deliver = resolve;
+                });
+                return result;
+            };
+
+            const commit = vi.fn((token: object) => q.commit(token));
+            const release = vi.fn((token: object) => q.release(token));
+            const t = setup({
+                queue: queueWrapper(q, { reserve, commit, release }),
+                now: () => clock,
+                valid: () => valid,
+            });
+            const abort = new AbortController();
+            const tx = t.coordinator.create(
+                {
+                    ...t.request,
+                    timeoutMs: 20,
+                    responseDeadline: 100,
+                    externalAbortSignal: abort.signal,
+                },
+                t.sink,
+            );
+            const pending = tx.run();
+            await vi.advanceTimersByTimeAsync(20);
+            expect(deliver).toBeDefined();
+
+            if (mode === 'abort') {
+                abort.abort();
+            }
+
+            if (mode === 'close') {
+                tx.close();
+            }
+
+            if (mode === 'epoch') {
+                valid = false;
+            }
+
+            if (mode === 'deadline') {
+                clock = 100;
+            }
+
+            deliver!();
+            expect(await pending).toEqual({
+                kind:
+                    mode === 'abort'
+                        ? 'aborted'
+                        : mode === 'epoch'
+                          ? 'epoch_invalid'
+                          : mode === 'close'
+                            ? 'closed'
+                            : 'deadline',
+            });
+            expect(t.sink.headCalls).toBe(0);
+            expect(commit).not.toHaveBeenCalled();
+            expect(release).not.toHaveBeenCalled();
+            expect(q.stats()).toMatchObject({ count: 0, reserved: 0, waiters: 0 });
+            expect(getEventListeners(abort.signal, 'abort')).toHaveLength(0);
+            expect(vi.getTimerCount()).toBe(0);
+        },
+    );
+
+    it('cancels a positive wait when the response deadline precedes the poll timeout', async () => {
+        vi.useFakeTimers();
+        const t = setup();
+        const pending = t.coordinator
+            .create(
+                { ...t.request, timeoutMs: 200, responseDeadline: performance.now() + 50 },
+                t.sink,
+            )
+            .run();
+        await vi.advanceTimersByTimeAsync(50);
+        expect(await pending).toEqual({ kind: 'deadline' });
+        expect(t.sink.headCalls).toBe(0);
+        expect(t.q.stats().waiters).toBe(0);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it.each(['head-throw', 'head-close', 'end-throw', 'end-close', 'finish-then-throw'] as const)(
+        'keeps empty-write outcome unknown after %s',
+        async (mode) => {
+            const q = new EventPollBuffer(config);
+            const commit = vi.fn((token: object) => q.commit(token));
+            const release = vi.fn((token: object) => q.release(token));
+            const t = setup({ queue: queueWrapper(q, { commit, release }) });
+
+            if (mode === 'head-throw') {
+                t.sink.headAction = () => {
+                    throw new Error('private');
+                };
+            }
+
+            if (mode === 'head-close') {
+                t.sink.headAction = () => t.sink.shutdown();
+            }
+
+            if (mode === 'end-throw') {
+                t.sink.endAction = () => {
+                    throw new Error('private');
+                };
+            }
+
+            if (mode === 'end-close') {
+                t.sink.endAction = () => t.sink.shutdown();
+            }
+
+            if (mode === 'finish-then-throw') {
+                t.sink.endAction = () => {
+                    t.sink.emit('finish');
+                    throw new Error('private');
+                };
+            }
+
+            expect(await t.coordinator.create(t.request, t.sink).run()).toEqual({
+                kind: 'unknown',
+                committed: false,
+            });
+            expect(commit).not.toHaveBeenCalled();
+            expect(release).not.toHaveBeenCalled();
+            expect(q.stats()).toMatchObject({ count: 0, reserved: 0, waiters: 0 });
+        },
+    );
+
+    it('holds empty-write lifecycle until finish or deadline', async () => {
+        vi.useFakeTimers();
+        const t = setup();
+        t.sink.autoFinish = false;
+        const external = new AbortController();
+        const pending = t.coordinator
+            .create({ ...t.request, externalAbortSignal: external.signal }, t.sink)
+            .run();
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(t.sink.endCalls).toBe(1);
+        expect(getEventListeners(external.signal, 'abort')).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(500);
+        expect(await pending).toEqual({ kind: 'unknown', committed: false });
+        expect(getEventListeners(external.signal, 'abort')).toHaveLength(0);
+        expect(t.sink.listenerCount('error')).toBe(0);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('honors limit zero by selecting all events that fit rather than inventing empty', async () => {
+        const t = setup();
+        t.q.enqueue(event(1));
+        t.q.enqueue(event(2));
+        expect(await t.coordinator.create({ ...t.request, limit: 0 }, t.sink).run()).toEqual({
+            kind: 'local_finish',
+            response: 'events',
+        });
+        expect(JSON.parse(t.sink.body!).data).toEqual([event(1), event(2)]);
+        expect(t.q.stats()).toMatchObject({ count: 0, reserved: 0 });
+    });
+
+    it('resolves an in-progress empty write as unknown when the owner closes', async () => {
+        vi.useFakeTimers();
+        const t = setup();
+        t.sink.autoFinish = false;
+        const pending = t.coordinator.create(t.request, t.sink).run();
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(t.sink.endCalls).toBe(1);
+        t.coordinator.close();
+        expect(await pending).toEqual({ kind: 'unknown', committed: false });
+        expect(t.q.stats()).toMatchObject({ count: 0, waiters: 0, reserved: 0 });
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it.each(['epoch', 'deadline'] as const)(
+        'reports unknown when empty end changes %s before finish',
+        async (mode) => {
+            let clock = 0;
+            let valid = true;
+            const t = setup({ now: () => clock, valid: () => valid });
+            t.sink.autoFinish = false;
+
+            t.sink.endAction = () => {
+                if (mode === 'epoch') {
+                    valid = false;
+                }
+
+                if (mode === 'deadline') {
+                    clock = 100;
+                }
+
+                t.sink.open = false;
+                t.sink.emit('finish');
+            };
+
+            expect(
+                await t.coordinator.create({ ...t.request, responseDeadline: 100 }, t.sink).run(),
+            ).toEqual({ kind: 'unknown', committed: false });
+            expect(t.q.stats()).toMatchObject({ count: 0, reserved: 0 });
+        },
+    );
+
+    it('retains the empty reason when cleanup is uncertain', async () => {
+        const t = setup();
+        const realOff = t.sink.off.bind(t.sink);
+        vi.spyOn(t.sink, 'off').mockImplementation((name, listener) => {
+            if (name === 'close') {
+                throw new Error('private');
+            }
+
+            return realOff(name, listener);
+        });
+        expect(await t.coordinator.create(t.request, t.sink).run()).toEqual({
+            kind: 'cleanup_uncertain',
+            committed: false,
+            outcome: { kind: 'local_finish', response: 'empty', reason: 'empty' },
+        });
+    });
+
+    it('accepts local empty finish when the sink becomes non-writable at finish', async () => {
+        const t = setup();
+        t.sink.autoFinish = false;
+
+        t.sink.endAction = () => {
+            t.sink.open = false;
+            t.sink.emit('finish');
+        };
+
+        expect(await t.coordinator.create(t.request, t.sink).run()).toEqual({
+            kind: 'local_finish',
+            response: 'empty',
+            reason: 'empty',
+        });
     });
 
     it('preserves blocked head and reports busy without confusing either for empty', async () => {
