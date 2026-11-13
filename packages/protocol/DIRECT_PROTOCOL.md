@@ -213,8 +213,12 @@ from that pointer. At least 16 readable bytes are therefore a precondition of
 that path. The observed call sequence does not establish a local length check;
 an earlier call and other invariants were not ruled out. The `0x016e` value
 contains a copied global string whose first initialization is empty; subsequent
-writes and the value at send time are not established by that initializer.
-A separate getter produces `Linux` for a field in the third node, not for the
+writes and the value at send time are not established by that initializer. One
+bounded static path copies an input object's string at `J+0x60` through
+`owner+0x170` into that global string. Identifying that as the eventual node
+value requires the copy to happen first, all calls to return normally, and no
+intervening or aliased writes; `J`'s business identity remains unknown. A
+separate getter produces `Linux` for a field in the third node, not for the
 `0x016e` string. These observations do not identify the sender instance or
 prove that this branch executes. The key's business identity, actual input
 bytes, the two session-owned node types and complete transformation remain
