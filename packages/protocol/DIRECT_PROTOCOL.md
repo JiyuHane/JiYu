@@ -8,7 +8,10 @@ calculate QQ signatures, persist an online ticket lifecycle, or connect to the
 OneBot runtime. The experimental attempt owner temporarily holds synthetic or
 caller-validated login material in memory. Tests use
 offline vectors and loopback peers. A successful unit test is not evidence of
-QQ login or delivery.
+QQ login or delivery. The separate Android AArch64 `libfekit.so` sample and
+its bounded signing-related investigation are documented in
+[QQ_SIGNATURE_RESEARCH.md](./QQ_SIGNATURE_RESEARCH.md); that sample is not the
+Linux `wrapper.node` identified below.
 
 Evidence in this document is separated into **target-static** (bytes and
 instructions from the specified QQ build), **reference-static** (source from a
