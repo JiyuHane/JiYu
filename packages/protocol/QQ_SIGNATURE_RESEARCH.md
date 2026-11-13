@@ -95,6 +95,19 @@ saved slots unaffected by aliasing or concurrent writes. The later load from
 neither equality nor inequality with `P` or its fields. No static source bytes
 were interpreted, and the function's purpose and actual execution remain unknown.
 
+In a further conditional window, `0x2b7604` loads `Q` from `[x23]` into
+`x19`, replacing an earlier 32-bit state value. `Q` equals the pointer used at
+`0x2b75ec` only if that slot has not changed in between. After a separate pointer
+`S` is loaded from `[sp+0x128]`, the code reads `[S]` before checking `Q` for
+null. With `Q` non-null and `[S]` null, an observed path writes `Q` to `[S]`.
+With a non-null head and a finite traversal ending at node `T`, another path
+performs two separate stores: `[T]=Q` and `[Q+8]=T`. During traversal, `[x23]`
+is overwritten by the current node, so it cannot be assumed to retain `Q`.
+This linked-structure interpretation assumes valid pointers, normal returns,
+AAPCS64 preservation and no harmful aliasing or concurrent mutation; cyclic
+links may prevent termination. The purpose, entry reachability and relation to
+signing or AES remain unknown.
+
 Separately, `0x2fe5b4–0x2fe5d0` forms the string address for
 `com/tencent/mobileqq/qsec/qseccodec/SecCipher$SecInfo` in `x0` and calls
 `0x33ec58`; its result is stored at `[sp+0x338]`. The helper passes the same
