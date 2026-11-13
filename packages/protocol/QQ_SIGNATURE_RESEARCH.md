@@ -58,6 +58,19 @@ ownership of any freed pointer. The `0x20` and `0x38` fields have different
 offsets and their meaning is unknown. The complete function boundary, input's
 origin, structure's purpose, execution and any connection to signing remain
 unknown. No static source bytes were interpreted as keys.
+
+Another bounded block at `0x2b7298` clears a 129-byte buffer at `x21`, calls
+`__system_property_get` with that buffer, and stores the 32-bit return at
+`[x23]`. Under the observed state transitions, a positive return selects a
+path to `malloc(0x40)` at `0x2b7448`; a non-positive return selects a path
+that saves a length of one, copies that many bytes from a static address into
+the buffer, re-reads the saved length to append a zero byte, then reaches the
+same allocation call. This conditional reconstruction assumes preserved state
+and saved slots, valid non-overlapping buffers and normally returning callees;
+it does not establish that either branch executes or that the buffer contents
+are used for signing. The property name and static source byte were not
+interpreted.
+
 Separately, `0x2fe5b4–0x2fe5d0` forms the string address for
 `com/tencent/mobileqq/qsec/qseccodec/SecCipher$SecInfo` in `x0` and calls
 `0x33ec58`; its result is stored at `[sp+0x338]`. The helper passes the same
