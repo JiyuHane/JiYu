@@ -480,11 +480,21 @@ unproved.
 
 On another bounded path, `0x34f7a74` calls `0x8d34270` with a stack buffer and
 capacity `0x200`. Its return is tested only for zero; a nonzero return is
-sign-extended and passed with the buffer to `0x8b46000`. An inspected error
-path in `0x8d34270` returns `-1`, which that test does not exclude; this static
-observation does not establish that the error path reaches the call at runtime
-or predict its consequences. `0x8b46000` produces 16 bytes using an update and
-finalization path. Independent bounded inspection found its initial state,
+sign-extended and passed with the buffer to `0x8b46000`. On an inspected error
+path, if the call to `0x8d35840` returns normally, `0x8d34270` returns `-1`,
+which that test does not exclude; this static observation does not establish
+that the error path reaches the call at runtime
+or predict its consequences. Separately, the inspected candidate method-table
+initializer assigns `0x8d78860`, `0x8d90350`, and `0x8d70d20` to slots
+`+0x38`, `+0x18`, and `+0x80` respectively. Whether the `0x2c7` path actually
+selects and retains that table is unproved. The first
+contains scalar-bit selection and point-like operations; the second has a
+first-output path compatible with coordinate conversion; and the third performs
+an unresolved intermediate conversion followed by a group-width byte export.
+Its scalar path reverses bytes, while other inspected paths use SIMD blocks.
+These observations do not prove the dynamic table selection, the intermediate
+algebra, or that the exported value is a shared X coordinate.
+`0x8b46000` produces 16 bytes using an update and finalization path. Independent bounded inspection found its initial state,
 64 compression constants and 64 rotation counts match public MD5 values, with
 MD5-like padding and 64-byte block processing. It is therefore a strong MD5
 candidate, not a fully verified byte-equivalent implementation: message-word
@@ -602,6 +612,24 @@ remain to be recovered and independently verified.
   bodies. This is stricter than separately bounded fields and is not a target
   limit. The transform does not authenticate, establish the lookup decision,
   prove native decompression behavior or verify QQ interoperability.
+- `src/direct/selector1-local-qqtea-residual-capacity-candidate.ts` exposes an
+  explicit, standalone two-key **local QQ-TEA candidate**, not a target-native
+  decoder or an authenticated response. It snapshots the primary key and
+  ciphertext; only an explicit local framing failure permits it to inspect and
+  snapshot a secondary key. A local early framing failure retains the original
+  ciphertext length as the second attempt's capacity; a local later trailer
+  failure uses the first attempt's computed plaintext length. Empty successful
+  plaintext, insufficient second-attempt capacity and ordinary candidate
+  validation failures terminate without another retry. Unexpected runtime
+  exceptions are not interpreted as framing failures. These stage labels and
+  capacities are local model choices; byte equivalence with the native routine
+  has not been established. The secondary input must stay isolated until its
+  deferred snapshot. The per-input 16 MiB limit is not a peak-memory or time
+  bound, and synchronous decryption can allocate per block. The caller must
+  independently verify the original frame and must not expose failure details,
+  timing or key selection to a peer; padding is not authentication. Cleanup is
+  best effort. This helper is not wired into the raw transaction or the live
+  Bridge, and does not establish QQ interoperability.
 - `src/direct/target-response-candidate.ts` composes the basic prefix, a single
   explicit-key decryption candidate and that bounded transform. The caller must
   independently verify and isolate the same frame bytes supplied to it; this

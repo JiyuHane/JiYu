@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import { isProxy } from 'node:util/types';
 
 const BLOCK_SIZE = 8;
 const KEY_SIZE = 16;
@@ -60,7 +61,7 @@ function keyWords(key: Uint8Array): number[] {
     return [view.getUint32(0), view.getUint32(4), view.getUint32(8), view.getUint32(12)];
 }
 
-function teaBlock(block: Uint8Array, key: number[], decrypt: boolean): Uint8Array {
+function teaBlock(block: Uint8Array, key: number[], decrypt: boolean, wipe = false): Uint8Array {
     const view = new DataView(block.buffer, block.byteOffset, BLOCK_SIZE);
     let left = view.getUint32(0);
     let right = view.getUint32(4);
@@ -83,10 +84,19 @@ function teaBlock(block: Uint8Array, key: number[], decrypt: boolean): Uint8Arra
     }
 
     const result = new Uint8Array(BLOCK_SIZE);
-    const output = new DataView(result.buffer);
-    output.setUint32(0, left);
-    output.setUint32(4, right);
-    return result;
+
+    try {
+        const output = new DataView(result.buffer);
+        output.setUint32(0, left);
+        output.setUint32(4, right);
+        return result;
+    } catch (error) {
+        if (wipe) {
+            clearLocal(result);
+        }
+
+        throw error;
+    }
 }
 
 /** Encrypt bytes using a fresh secure random prefix by default.
@@ -138,6 +148,76 @@ export function qqTeaEncrypt(
     return result;
 }
 
+function clearLocal(bytes: Uint8Array | undefined): void {
+    if (bytes) {
+        try {
+            typedArrayFill.call(bytes, 0);
+        } catch {
+            // Best effort, independently of other owned allocations.
+        }
+    }
+}
+
+// The legacy path deliberately keeps its historical property access and allocation
+// behavior. Only the new local-candidate path requests temporary-buffer cleanup.
+function decryptPadded(ciphertext: Uint8Array, words: number[], wipe: boolean): Uint8Array {
+    const padded = new Uint8Array(ciphertext.length);
+    let initialCipher: Uint8Array | undefined;
+    let previousCipher: Uint8Array | undefined;
+    let previousMixed: Uint8Array | undefined;
+    let completed = false;
+
+    try {
+        initialCipher = new Uint8Array(BLOCK_SIZE);
+        previousCipher = initialCipher;
+        previousMixed = new Uint8Array(BLOCK_SIZE);
+
+        for (let offset = 0; offset < ciphertext.length; offset += BLOCK_SIZE) {
+            const block = ciphertext.subarray(offset, offset + BLOCK_SIZE);
+            const encrypted = new Uint8Array(BLOCK_SIZE);
+            let mixed: Uint8Array | undefined;
+
+            try {
+                for (let i = 0; i < BLOCK_SIZE; i++) {
+                    encrypted[i] = block[i] ^ previousMixed[i];
+                }
+
+                mixed = teaBlock(encrypted, words, true, wipe);
+
+                for (let i = 0; i < BLOCK_SIZE; i++) {
+                    padded[offset + i] = mixed[i] ^ previousCipher[i];
+                }
+
+                previousCipher = block;
+
+                if (wipe) {
+                    clearLocal(previousMixed);
+                }
+
+                previousMixed = mixed;
+                mixed = undefined;
+            } finally {
+                if (wipe) {
+                    clearLocal(encrypted);
+                    clearLocal(mixed);
+                }
+            }
+        }
+
+        completed = true;
+        return padded;
+    } finally {
+        if (wipe) {
+            clearLocal(initialCipher);
+            clearLocal(previousMixed);
+
+            if (!completed) {
+                clearLocal(padded);
+            }
+        }
+    }
+}
+
 /** Decrypt one complete QQ-TEA ciphertext, rejecting malformed framing. */
 export function qqTeaDecrypt(ciphertext: Uint8Array, key: Uint8Array): Uint8Array {
     const words = keyWords(key);
@@ -146,28 +226,7 @@ export function qqTeaDecrypt(ciphertext: Uint8Array, key: Uint8Array): Uint8Arra
         throw new Error('invalid QQ-TEA ciphertext');
     }
 
-    const padded = new Uint8Array(ciphertext.length);
-    let previousCipher: Uint8Array = new Uint8Array(BLOCK_SIZE);
-    let previousMixed: Uint8Array = new Uint8Array(BLOCK_SIZE);
-
-    for (let offset = 0; offset < ciphertext.length; offset += BLOCK_SIZE) {
-        const block = ciphertext.subarray(offset, offset + BLOCK_SIZE);
-        const encrypted = new Uint8Array(BLOCK_SIZE);
-
-        for (let i = 0; i < BLOCK_SIZE; i++) {
-            encrypted[i] = block[i] ^ previousMixed[i];
-        }
-
-        const mixed = teaBlock(encrypted, words, true);
-
-        for (let i = 0; i < BLOCK_SIZE; i++) {
-            padded[offset + i] = mixed[i] ^ previousCipher[i];
-        }
-
-        previousCipher = block;
-        previousMixed = mixed;
-    }
-
+    const padded = decryptPadded(ciphertext, words, false);
     const start = (padded[0] & 7) + 3;
     const end = padded.length - 7;
 
@@ -182,4 +241,252 @@ export function qqTeaDecrypt(ciphertext: Uint8Array, key: Uint8Array): Uint8Arra
     }
 
     return padded.slice(start, end);
+}
+
+/** @internal Local framing observations, not native equivalence or authentication. */
+type LocalQqTeaResidualResult =
+    | { kind: 'success'; data: Uint8Array }
+    | { kind: 'framing-invalid'; stage: 'early' | 'late'; nextCapacity: number }
+    | { kind: 'capacity-exceeded' };
+
+/** @internal Inputs must already be private snapshots; unexpected exceptions propagate. */
+function qqTeaDecryptLocalResidual(
+    ciphertext: Uint8Array,
+    key: Uint8Array,
+    capacity: number,
+): LocalQqTeaResidualResult {
+    const words = keyWords(key);
+    let padded: Uint8Array | undefined;
+
+    try {
+        if (ciphertext.length < 16 || ciphertext.length % BLOCK_SIZE !== 0) {
+            throw new Error('invalid QQ-TEA ciphertext');
+        }
+
+        padded = decryptPadded(ciphertext, words, true);
+        const start = (padded[0] & 7) + 3;
+        const end = padded.length - 7;
+
+        if (start > end) {
+            return { kind: 'framing-invalid', stage: 'early', nextCapacity: ciphertext.length };
+        }
+
+        const size = end - start;
+
+        if (size > capacity) {
+            return { kind: 'capacity-exceeded' };
+        }
+
+        let invalidTrailer = 0;
+
+        for (let i = end; i < padded.length; i++) {
+            invalidTrailer |= padded[i];
+        }
+
+        if (invalidTrailer !== 0) {
+            return { kind: 'framing-invalid', stage: 'late', nextCapacity: size };
+        }
+
+        return { kind: 'success', data: padded.slice(start, end) };
+    } finally {
+        clearLocal(padded);
+
+        try {
+            words.fill(0);
+        } catch {
+            // Number values and engine copies cannot be reliably erased.
+        }
+    }
+}
+
+/** Local per-input limit; this is not a peak-memory limit or a target rule. */
+export const MAX_SELECTOR1_LOCAL_CANDIDATE_BYTES = 16 * 1024 * 1024;
+
+export interface Selector1LocalQqTeaResidualCapacityOptions {
+    primaryKey: Uint8Array;
+    ciphertext: Uint8Array;
+    /** Read only after a primary framing failure. Keep it stable until then. */
+    secondaryKey?: Uint8Array;
+}
+
+export type Selector1LocalQqTeaResidualCapacityResult = {
+    kind: 'plaintext-candidate';
+    data: Uint8Array;
+};
+
+function candidateFailure(): never {
+    throw new Error('selector 1 local candidate decoding failed');
+}
+
+const Bytes = Uint8Array;
+const typed = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const tag = Object.getOwnPropertyDescriptor(typed, Symbol.toStringTag)!.get!;
+const buffer = Object.getOwnPropertyDescriptor(typed, 'buffer')!.get!;
+const length = Object.getOwnPropertyDescriptor(typed, 'byteLength')!.get!;
+const offset = Object.getOwnPropertyDescriptor(typed, 'byteOffset')!.get!;
+const candidateArrayBufferLength = Object.getOwnPropertyDescriptor(
+    ArrayBuffer.prototype,
+    'byteLength',
+)!.get!;
+const values = Uint8Array.prototype.values;
+const set = Uint8Array.prototype.set;
+const fill = Uint8Array.prototype.fill;
+
+function clear(bytes: Uint8Array | undefined): void {
+    if (bytes) {
+        try {
+            fill.call(bytes, 0);
+        } catch {
+            // Every owned allocation receives an independent best-effort attempt.
+        }
+    }
+}
+
+function dataProperty(object: object, name: string, optional = false): unknown {
+    const descriptor = Object.getOwnPropertyDescriptor(object, name);
+
+    if (!descriptor && optional) {
+        return undefined;
+    }
+
+    if (!descriptor || !Object.hasOwn(descriptor, 'value')) {
+        return candidateFailure();
+    }
+
+    return descriptor.value;
+}
+
+function snapshot(value: unknown, minimum: number, maximum: number): Uint8Array {
+    if (isProxy(value) || !ArrayBuffer.isView(value) || tag.call(value) !== 'Uint8Array') {
+        return candidateFailure();
+    }
+
+    let next: object | null = value;
+
+    for (let depth = 0; next !== null; depth++) {
+        if (depth >= 256 || isProxy(next)) {
+            return candidateFailure();
+        }
+
+        next = Object.getPrototypeOf(next) as object | null;
+    }
+
+    const backing = buffer.call(value) as ArrayBuffer;
+
+    try {
+        candidateArrayBufferLength.call(backing);
+        values.call(value);
+    } catch (error) {
+        if (error instanceof TypeError) {
+            return candidateFailure();
+        }
+
+        throw error;
+    }
+
+    const size = length.call(value) as number;
+    const start = offset.call(value) as number;
+
+    if (size < minimum || size > maximum) {
+        return candidateFailure();
+    }
+
+    const result = new Bytes(size);
+
+    try {
+        set.call(result, new Bytes(backing, start, size));
+        return result;
+    } catch (error) {
+        clear(result);
+        throw error;
+    }
+}
+
+/**
+ * Explicit local selector-1 two-key experiment, not target equivalence or peer
+ * authentication. Only a local QQ-TEA framing failure permits a second attempt.
+ * Verify the original frame independently before use. Do not expose any failure,
+ * timing or key-selection observation to a peer or log; this is not constant-time.
+ * No network, downstream parsing, key discovery or automatic integration occurs.
+ * Each synchronous attempt is O(ciphertext length), with per-block allocations;
+ * the input cap is not a peak-memory or deadline guarantee. Callers must bound
+ * their trusted inputs and execution time. Secondary input is read lazily and
+ * must stay isolated and stable until read.
+ * Caller inputs and successful output stay owned by the caller. Cleanup is best
+ * effort and cannot erase JavaScript number values, GC copies or native copies.
+ */
+export function decodeSelector1LocalQqTeaResidualCapacityCandidate(
+    options: Selector1LocalQqTeaResidualCapacityOptions,
+): Selector1LocalQqTeaResidualCapacityResult {
+    let primaryKey: Uint8Array | undefined;
+    let secondaryKey: Uint8Array | undefined;
+    let ciphertext: Uint8Array | undefined;
+    let plaintext: Uint8Array | undefined;
+
+    try {
+        if (typeof options !== 'object' || options === null || isProxy(options)) {
+            return candidateFailure();
+        }
+
+        primaryKey = snapshot(dataProperty(options, 'primaryKey'), 16, 16);
+        ciphertext = snapshot(
+            dataProperty(options, 'ciphertext'),
+            16,
+            MAX_SELECTOR1_LOCAL_CANDIDATE_BYTES,
+        );
+
+        if (ciphertext.length % 8 !== 0) {
+            return candidateFailure();
+        }
+
+        const first = qqTeaDecryptLocalResidual(ciphertext, primaryKey, ciphertext.length);
+
+        if (first.kind === 'success') {
+            plaintext = first.data;
+
+            if (plaintext.length === 0) {
+                return candidateFailure();
+            }
+
+            const result = plaintext;
+            plaintext = undefined;
+            return { kind: 'plaintext-candidate', data: result };
+        }
+
+        if (first.kind !== 'framing-invalid') {
+            return candidateFailure();
+        }
+
+        const secondary = dataProperty(options, 'secondaryKey', true);
+
+        if (secondary === undefined) {
+            return candidateFailure();
+        }
+
+        secondaryKey = snapshot(secondary, 16, 16);
+        const second = qqTeaDecryptLocalResidual(ciphertext, secondaryKey, first.nextCapacity);
+
+        if (second.kind === 'framing-invalid') {
+            return candidateFailure();
+        }
+
+        if (second.kind === 'capacity-exceeded') {
+            return candidateFailure();
+        }
+
+        plaintext = second.data;
+
+        if (plaintext.length === 0) {
+            return candidateFailure();
+        }
+
+        const result = plaintext;
+        plaintext = undefined;
+        return { kind: 'plaintext-candidate', data: result };
+    } finally {
+        clear(plaintext);
+        clear(secondaryKey);
+        clear(ciphertext);
+        clear(primaryKey);
+    }
 }

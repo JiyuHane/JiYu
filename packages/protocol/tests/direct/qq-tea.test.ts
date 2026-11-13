@@ -91,6 +91,34 @@ describe('QQ-TEA', () => {
         }
     });
 
+    it('preserves legacy key-first error identity, framing error and empty output', () => {
+        const invalidKey = new Uint8Array(15);
+        const invalidCipher = new Uint8Array(1);
+        let error: unknown;
+
+        try {
+            qqTeaDecrypt(invalidCipher, invalidKey);
+        } catch (caught) {
+            error = caught;
+        }
+
+        expect(error).toBeInstanceOf(RangeError);
+        expect((error as Error).name).toBe('RangeError');
+        expect((error as Error).message).toBe('QQ-TEA key must be exactly 16 bytes');
+
+        try {
+            qqTeaDecrypt(invalidCipher, key);
+        } catch (caught) {
+            error = caught;
+        }
+
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).constructor).toBe(Error);
+        expect((error as Error).message).toBe('invalid QQ-TEA ciphertext');
+        const cipher = qqTeaEncrypt(new Uint8Array(), key, fixtureRandom);
+        expect(qqTeaDecrypt(cipher, key)).toEqual(new Uint8Array());
+    });
+
     it('rejects a short or long random source result', () => {
         expect(() => qqTeaEncrypt(new Uint8Array(), key, (n) => new Uint8Array(n - 1))).toThrow(
             /random/,
