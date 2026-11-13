@@ -277,6 +277,22 @@ allocation or construction. It does not directly write `[aligned+0x28]`, though
 aliasing with the local slots is not excluded. The input values' validity,
 actual object lifetime, and any previous initialization remain unknown.
 
+A separate, independently decoded branch of `0x663bf10` calls `0x35a6d20`
+twice and denotes the returned values here as `D` and `N`. When `N` is nonzero,
+it stores function addresses `0x663bf10` and `0x663c050` into two words of an
+entry-supplied container `C`, then calls `0x663c4d0` with `rdi=N`, `rsi=D`.
+Assuming the preceding calls return normally, preserve the required System V
+callee-saved registers, and relevant memory accesses complete, the called routine
+first copies or clears other fields;
+at `0x663c509–0x663c515` it reads `[D+0x28]`, writes zero to that address,
+and writes the read value to `[N+0x28]`. Earlier writes in the same routine or
+the caller may alias those addresses, so this describes ordered operations rather
+than an unconditional final source or destination state. A later indirect call
+may also change state. The evidence does not establish that this function-pointer
+container is invoked, that `N` is the `A` independently computed by
+`0x663c050`, or that the transferred value is a protocol body. The `N=0` branch
+chooses other function addresses and is not covered by this nonzero-branch claim.
+
 Returning to the separately inspected `0x6663d13` path, a conditional branch
 also passes its `T` to classifier `0x6667140`, and another call copies it into
 request `+0x28`. The source object was returned by a prior virtual
