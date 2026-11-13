@@ -30,8 +30,11 @@ The first compatibility subset uses OneBot v11 actions and events. It supports
 selected lifecycle callbacks and a limited account-scoped `actions.call`
 bridge, static JSON configuration schema, explicit configuration hooks, and a
 partial data-only `NapCatConfig` builder. The builder supports `text`, `number`,
-`boolean`, `select`, `multiSelect`, and `combine`; its `html` and `plainText`
-methods explicitly report unsupported. Reactive flags are metadata only. It
+`boolean`, `select`, `multiSelect`, `html`, `plainText`, and `combine`. The
+display methods return untrusted strings as data, not rendered or executed HTML;
+their empty labels cause rejection by the current configuration editor. Their
+UUID-derived keys are an independent strategy, not a claim about the upstream
+random algorithm or collision guarantees. Reactive flags are metadata only. It
 does not recreate the NapCat internal `core`, `oneBot`, `router`, complete
 plugin manager, dynamic configuration controllers or cross-plugin exports.
 Plugins that require those interfaces may fail explicitly.

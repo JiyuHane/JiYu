@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { JsonObject, JsonValue } from '../types';
 
 /** Independently implemented data-only subset of the public NapCat plugin API.
@@ -49,8 +50,8 @@ export interface PluginConfigBuilder {
         description?: string,
         reactive?: boolean,
     ): PluginConfigItem;
-    html(content: string): never;
-    plainText(content: string): never;
+    html(content: string): PluginConfigItem;
+    plainText(content: string): PluginConfigItem;
     combine(...items: PluginConfigItem[]): PluginConfigItem[];
 }
 
@@ -254,6 +255,15 @@ export function createConfigBuilder(deps: BuilderDependencies): PluginConfigBuil
         return freeze(copy);
     }
 
+    function displayItem(kind: 'html' | 'text', content: string): PluginConfigItem {
+        if (typeof content !== 'string' || content.length > MAX_STRING) {
+            return invalid();
+        }
+
+        const key = `_${kind}_${randomUUID().replaceAll('-', '')}`;
+        return item(kind, key, '', content, undefined, undefined);
+    }
+
     const builder: PluginConfigBuilder = {
         text: (key, label, value, description, reactive) =>
             item('string', key, label, value, description, reactive),
@@ -265,8 +275,8 @@ export function createConfigBuilder(deps: BuilderDependencies): PluginConfigBuil
             item('select', key, label, value, description, reactive, options),
         multiSelect: (key, label, options, value, description, reactive) =>
             item('multi-select', key, label, value, description, reactive, options),
-        html: () => deps.unsupported('NapCatConfig.html'),
-        plainText: () => deps.unsupported('NapCatConfig.plainText'),
+        html: (content) => displayItem('html', content),
+        plainText: (content) => displayItem('text', content),
         combine: (...items) => {
             if (items.length > MAX_ITEMS) {
                 invalid();

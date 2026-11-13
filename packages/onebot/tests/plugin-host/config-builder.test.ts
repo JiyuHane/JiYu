@@ -228,18 +228,57 @@ describe('independent plugin config builder', () => {
         await host.shutdown();
     });
 
-    it('keeps a display-dependent init failure explicit and sanitized', async () => {
+    it('returns display items as inert frozen data in two account fixtures', async () => {
         const { root, plugin } = await fixture(`
-            export function plugin_init(c) { c.NapCatConfig.html('<b>NOT_EXECUTED</b>'); }
+            export let plugin_config_schema;
+            export function plugin_init(c) {
+                const html = c.NapCatConfig.html('<img src=x onerror=alert(1)>');
+                const text = c.NapCatConfig.plainText('plain <b>text</b>');
+                const next = c.NapCatConfig.html('');
+                plugin_config_schema = c.NapCatConfig.combine(html, text, next);
+                globalThis.__jiyuBuilderProbe.push({ html, text, next, schema: plugin_config_schema });
+            }
         `);
-        const host = makeHost(root, '123');
-        const error = await host.enable('demo', plugin).catch((reason) => reason);
-        expect(error).toMatchObject({ code: 'ENABLE_FAILED' });
-        expect(String(error)).not.toContain('NOT_EXECUTED');
-        await host.shutdown();
+        const probe: Array<{ html: any; text: any; next: any; schema: any[] }> = [];
+        (globalThis as Record<string, unknown>).__jiyuBuilderProbe = probe;
+        const first = makeHost(root, '123');
+        const second = makeHost(root, '456');
+        await Promise.all([first.enable('demo', plugin), second.enable('demo', plugin)]);
+        expect(probe).toHaveLength(2);
+
+        for (const item of probe) {
+            expect(item.html).toMatchObject({
+                type: 'html',
+                label: '',
+                default: '<img src=x onerror=alert(1)>',
+            });
+            expect(item.text).toMatchObject({
+                type: 'text',
+                label: '',
+                default: 'plain <b>text</b>',
+            });
+            expect(item.next).toMatchObject({ type: 'html', label: '', default: '' });
+            expect(item.html.key).toMatch(/^_html_[0-9a-f]{32}$/);
+            expect(item.text.key).toMatch(/^_text_[0-9a-f]{32}$/);
+            expect(item.next.key).toMatch(/^_html_[0-9a-f]{32}$/);
+            expect(item.html.key).not.toBe(item.next.key);
+            expect(Object.isFrozen(item.html)).toBe(true);
+            expect(Object.isFrozen(item.schema)).toBe(true);
+        }
+
+        const schemas = await Promise.all([
+            first.getConfigSchema('demo'),
+            second.getConfigSchema('demo'),
+        ]);
+
+        for (const result of schemas) {
+            expect(probe.map((item) => item.schema)).toContainEqual(result.fields);
+        }
+
+        await Promise.all([first.shutdown(), second.shutdown()]);
     });
 
-    it('reports display methods as unsupported while preserving old mutable schemas', async () => {
+    it('validates display input while preserving old mutable schemas', async () => {
         const { root, plugin } = await fixture(`
             export const plugin_config_schema = [{ key: 'legacy', label: 'Legacy', type: 'string', default: 'before' }];
             export function plugin_init(c) { globalThis.__jiyuBuilderProbe = { builder: c.NapCatConfig, schema: plugin_config_schema }; }
@@ -248,18 +287,45 @@ describe('independent plugin config builder', () => {
         await host.enable('demo', plugin);
         const probe = (globalThis as Record<string, any>).__jiyuBuilderProbe;
 
+        let trapped = 0;
+        const hostile = new Proxy(
+            {},
+            {
+                get() {
+                    trapped++;
+                    throw Error('PRIVATE');
+                },
+            },
+        );
+
         for (const feature of ['html', 'plainText']) {
-            try {
-                probe.builder[feature]('<b>not rendered</b>');
-                throw Error('missing expected error');
-            } catch (error) {
-                expect(error).toMatchObject({
-                    name: 'UnsupportedPluginFeatureError',
-                    message: `Unsupported plugin feature: NapCatConfig.${feature}`,
-                    stack: `UnsupportedPluginFeatureError: Unsupported plugin feature: NapCatConfig.${feature}`,
-                });
+            const item = probe.builder[feature]('a'.repeat(16384));
+            expect(item.default).toBe('a'.repeat(16384));
+            expect(probe.builder[feature]('\0'.repeat(10000)).default).toBe('\0'.repeat(10000));
+
+            for (const value of [
+                undefined,
+                null,
+                false,
+                0,
+                hostile,
+                'x'.repeat(16385),
+                '\0'.repeat(11000),
+            ]) {
+                try {
+                    probe.builder[feature](value);
+                    throw Error('missing expected error');
+                } catch (error) {
+                    expect(error).toMatchObject({
+                        code: 'CONFIG_INVALID',
+                        stack: 'PluginHostError: Plugin host: CONFIG_INVALID',
+                    });
+                    expect(String(error)).not.toContain('PRIVATE');
+                }
             }
         }
+
+        expect(trapped).toBe(0);
 
         expect(Object.isFrozen(probe.schema)).toBe(false);
         probe.schema[0].default = 'after';
