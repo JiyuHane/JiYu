@@ -418,6 +418,26 @@ function snapshot(value: unknown, minimum: number, maximum: number): Uint8Array 
 export function decodeSelector1LocalQqTeaResidualCapacityCandidate(
     options: Selector1LocalQqTeaResidualCapacityOptions,
 ): Selector1LocalQqTeaResidualCapacityResult {
+    return decodeSelector1LocalResidual(options, { kind: 'property' });
+}
+
+/** The key record remains caller-owned and its secondary key is read only if needed. */
+export function decodeSelector1LocalQqTeaResidualCapacityCandidateWithKeys(
+    ciphertext: Uint8Array,
+    keys: Selector1LocalQqTeaResidualCapacityKeys,
+): Selector1LocalQqTeaResidualCapacityResult {
+    return decodeSelector1LocalResidual(keys, { kind: 'argument', value: ciphertext });
+}
+
+export type Selector1LocalQqTeaResidualCapacityKeys = Pick<
+    Selector1LocalQqTeaResidualCapacityOptions,
+    'primaryKey' | 'secondaryKey'
+>;
+
+function decodeSelector1LocalResidual(
+    options: Selector1LocalQqTeaResidualCapacityKeys,
+    source: { kind: 'property' } | { kind: 'argument'; value: Uint8Array },
+): Selector1LocalQqTeaResidualCapacityResult {
     let primaryKey: Uint8Array | undefined;
     let secondaryKey: Uint8Array | undefined;
     let ciphertext: Uint8Array | undefined;
@@ -430,7 +450,7 @@ export function decodeSelector1LocalQqTeaResidualCapacityCandidate(
 
         primaryKey = snapshot(dataProperty(options, 'primaryKey'), 16, 16);
         ciphertext = snapshot(
-            dataProperty(options, 'ciphertext'),
+            source.kind === 'property' ? dataProperty(options, 'ciphertext') : source.value,
             16,
             MAX_SELECTOR1_LOCAL_CANDIDATE_BYTES,
         );

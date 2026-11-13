@@ -1,6 +1,10 @@
 import { isProxy } from 'node:util/types';
 import { transformTargetResponse } from './target-response-transform';
 import { decodeTargetServiceDecryptCandidate } from './target-service-decrypt-candidate';
+import {
+    decodeSelector1LocalQqTeaResidualCapacityCandidateWithKeys,
+    type Selector1LocalQqTeaResidualCapacityKeys,
+} from './selector1-local-qqtea-residual-capacity-candidate';
 import { decodeTargetServiceResponseBasic } from './target-service-response-basic';
 import { selectTargetResponseBusinessSkip } from './target-sso12-lookup';
 import { decodeTargetSso12NumericReserveCandidate } from './target-sso12-numeric-reserve';
@@ -100,6 +104,104 @@ type Candidate = {
     nextOffset: number;
     compression: 'none' | 'node-zlib-strict';
 };
+
+/**
+ * Explicit local selector-1 composition. The caller independently verifies and
+ * isolates this same frame, and keeps keys stable until each deferred snapshot.
+ * It does not authenticate, prove target-native equivalence or run in constant time.
+ * Never expose failures, key selection or timing to a peer. The per-view cap is
+ * neither a peak-memory nor a deadline bound; two synchronous decryptions may run.
+ * Returned bytes are caller-owned; temporary cleanup is independently best effort.
+ */
+export function composeTargetResponseCandidateWithSelector1LocalResidual(
+    frame: Uint8Array,
+    skip: 0 | 4,
+    compression: 'reject' | 'node-zlib-strict',
+    maxOutputBytes: number,
+    keys: Selector1LocalQqTeaResidualCapacityKeys,
+): Candidate {
+    let snapshot: Uint8Array | undefined;
+    let basic: ReturnType<typeof decodeTargetServiceResponseBasic> | undefined;
+    let candidate: Uint8Array | undefined;
+    let transformed: ReturnType<typeof transformTargetResponse> | undefined;
+    let trailing: Uint8Array | undefined;
+    let success = false;
+
+    try {
+        if (
+            (skip !== 0 && skip !== 4) ||
+            (compression !== 'reject' && compression !== 'node-zlib-strict') ||
+            typeof maxOutputBytes !== 'number' ||
+            !Number.isSafeInteger(maxOutputBytes) ||
+            maxOutputBytes < 0 ||
+            maxOutputBytes > MAX_TARGET_RESPONSE_CANDIDATE_BYTES
+        ) {
+            throw new TypeError('invalid options');
+        }
+
+        const input = inspectBytes(frame);
+
+        if (input.length > MAX_TARGET_RESPONSE_CANDIDATE_BYTES) {
+            throw new RangeError('frame limit');
+        }
+
+        snapshot = new Uint8Array(input.length);
+        copyBytes.call(snapshot, new Uint8Array(input.buffer, input.offset, input.length));
+        basic = decodeTargetServiceResponseBasic(snapshot);
+
+        if (basic.selector !== 1 || basic.nextOffset >= input.length) {
+            throw new TypeError('invalid selector or remainder');
+        }
+
+        const remainder = new Uint8Array(
+            snapshot.buffer,
+            basic.nextOffset,
+            input.length - basic.nextOffset,
+        );
+        candidate = decodeSelector1LocalQqTeaResidualCapacityCandidateWithKeys(
+            remainder,
+            keys,
+        ).data;
+        transformed = transformTargetResponse(candidate, skip, compression, maxOutputBytes);
+        trailing = new Uint8Array(candidate.length - transformed.nextOffset);
+        copyBytes.call(
+            trailing,
+            new Uint8Array(
+                candidate.buffer,
+                candidate.byteOffset + transformed.nextOffset,
+                trailing.length,
+            ),
+        );
+        const result: Candidate = {
+            kind: 'unverified-response-candidate',
+            basic,
+            head: transformed.head,
+            body: transformed.body,
+            trailing,
+            businessOffset: transformed.businessOffset,
+            nextOffset: transformed.nextOffset,
+            compression: transformed.compression,
+        };
+        success = true;
+        return result;
+    } catch {
+        throw new Error('target response candidate decoding failed');
+    } finally {
+        clear(snapshot);
+        clear(candidate);
+
+        if (!success) {
+            clear(basic?.opaque);
+            clear(transformed?.head.field1);
+            clear(transformed?.head.field2);
+            clear(transformed?.head.field3);
+            clear(transformed?.head.reserve);
+            clear(transformed?.head.tail);
+            clear(transformed?.body);
+            clear(trailing);
+        }
+    }
+}
 
 type CandidateWithFinal = Candidate & { finalWord: number; finalWordRead: boolean };
 export type CandidateWithLookup = Candidate & {

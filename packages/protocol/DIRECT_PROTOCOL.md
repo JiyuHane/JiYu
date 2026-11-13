@@ -478,6 +478,27 @@ active methods, cofactor, peer point, key derivation or login reachability. The
 proof of the mathematical group. Function identities and input provenance remain
 unproved.
 
+On the inspected `0x34f7740` path, the entry `rsi` addresses a short-or-long
+string-like object; its bytes and length are passed to `0x8bc0600`. For valid
+ASCII hexadecimal digits, independently checked table entries and instructions
+show pairs of characters combined into one byte, with output length
+`floor(input length / 2)`; a final unpaired character is not processed. Invalid
+character behavior and the input's origin or business meaning were not
+established. The converted bytes are then passed to `0x8d76300` with a freshly
+created point-like object and group reference. On its separately inspected
+`0x04` prefix branch, `0x8d76150` derives a width `w` from the group and requires
+length `1 + 2*w`, before passing each `w`-byte component to the current group
+method at `+0x88` and then to `0x8d6cea0`. Other prefix paths and dynamic method
+identity remain unknown. On the statically inspected success path, `0x8d6cea0`
+copies the two converted components to a temporary object; afterward,
+`0x8d76300` copies those two fields into the new wrapper at `+8` and `+0x50`,
+and copies group `+0x140` to wrapper `+0x98`. This description assumes calls
+return normally and relevant aliases do not change the copied values. The
+setter's conditional arithmetic and comparison support an elliptic-curve-
+equation check if the candidate field operations and group coefficients have
+their inferred meanings. They do not establish the third field's value, complete
+point representation, actual peer identity or runtime reachability.
+
 On another bounded path, `0x34f7a74` calls `0x8d34270` with a stack buffer and
 capacity `0x200`. Its return is tested only for zero; a nonzero return is
 sign-extended and passed with the buffer to `0x8b46000`. On an inspected error
@@ -506,13 +527,21 @@ The inspected helper structure suggests exponentiation and modular arithmetic,
 but their complete mathematical equivalence and the point-field roles remain
 unproved. These observations do not prove dynamic table selection, the
 intermediate algebra, or that the exported value is a shared X coordinate.
-`0x8b46000` produces 16 bytes using an update and finalization path. Independent bounded inspection found its initial state,
-64 compression constants and 64 rotation counts match public MD5 values, with
-MD5-like padding and 64-byte block processing. It is therefore a strong MD5
-candidate, not a fully verified byte-equivalent implementation: message-word
-indices and complete state flow were not exhaustively checked. The input to this
-candidate is not established as an ECDH shared X coordinate, and its key or
-peer-point provenance remains unknown. The disassembler automatically displayed an
+`0x8b46000` produces 16 bytes using an update and finalization path. One bounded
+static symbolic inspection compared all 64 compression steps with
+[RFC 1321](https://www.rfc-editor.org/rfc/rfc1321): message-word indices,
+Boolean expressions, constants, rotations, state flow, and final feed-forward
+matched. A separate inspection independently checked the 64 rotations, found
+corresponding constants in their rotation-delimited instruction windows, and
+checked eight round-boundary steps, initialization, block handling, padding,
+length encoding, and little-endian output; it did not independently trace the
+other 56 steps' Boolean and message-word data flow. Under valid-memory,
+normal-return and non-destructive-alias assumptions, these observations
+support MD5 on the inspected well-formed path; they are not a formal proof or an
+observation of
+runtime execution. The input to this candidate is not established as an ECDH
+shared X coordinate, and its key or peer-point provenance remains unknown.
+The disassembler automatically displayed an
 annotation that may contain a hardcoded public-key string; its value was not
 retained in this record.
 The fixed public reference's server point and verification key were not found as
@@ -642,6 +671,16 @@ remain to be recovered and independently verified.
   timing or key selection to a peer; padding is not authentication. Cleanup is
   best effort. This helper is not wired into the raw transaction or the live
   Bridge, and does not establish QQ interoperability.
+- `composeTargetResponseCandidateWithSelector1LocalResidual` explicitly
+  combines a private basic-frame snapshot, the standalone local two-key model
+  and a single strict response transform. It accepts only selector 1, reads the
+  secondary key only after a local framing failure, and does not retry because
+  head, business framing or decompression failed. The caller must independently
+  verify and isolate the exact supplied frame and keep keys stable until their
+  respective snapshots. Returned values are unverified candidates; this path is
+  neither a native-equivalence claim nor part of raw transport or live login.
+  The per-view bounds do not bound aggregate memory, synchronous CPU time, or
+  retained copies, and errors or timing must not be exposed to a peer.
 - `src/direct/target-response-candidate.ts` composes the basic prefix, a single
   explicit-key decryption candidate and that bounded transform. The caller must
   independently verify and isolate the same frame bytes supplied to it; this
@@ -779,6 +818,16 @@ remain to be recovered and independently verified.
 - `src/direct/service-stream.ts` incrementally separates inclusive-length service
   frames from arbitrary byte chunks, rejects oversized/truncated frames and
   retains at most one incomplete frame. It does not open a TCP connection.
+- `src/direct/target-wt-hex-point-candidate.ts` decodes a deliberately strict
+  subset of the target's observed hexadecimal input path. The caller supplies a
+  coordinate width from 1 to 256 bytes; the helper requires exactly `2*(1+2*w)`
+  ASCII hexadecimal characters and an uncompressed `0x04` prefix. It rejects odd
+  input even though the inspected native converter ignores an unpaired final
+  character, and it rejects invalid hex without claiming to reproduce the
+  native invalid-character behavior. The returned point bytes are a caller-owned
+  format candidate, not evidence of curve membership, group selection, peer
+  identity, authentication or target interoperability. No curve or peer key is
+  selected automatically; the width and size limits are local policies.
 - `src/direct/wt-tlv.ts` encodes and decodes counted WT TLV records with bounded
   lengths and preserves repeated tags. `src/direct/wt-ecdh.ts` implements the
   reference secp192k1 shared-X and TEA-key derivation; the peer key must be
