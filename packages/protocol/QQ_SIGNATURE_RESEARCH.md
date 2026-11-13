@@ -47,8 +47,17 @@ the first allocation. The null second-allocation branch stores zero instead.
 This local reconstruction assumes the indicated state transitions, stable
 saved slots and registers, valid NUL-terminated input, non-overflowing length,
 valid non-aliasing memory, and normally returning AAPCS64-conforming callees.
-The complete function boundary, input's origin, structure's purpose, execution
-and any connection to signing remain unknown.
+A later conditional window reads the object again and, if non-null, checks a
+separate pointer field at offset `0x38`. A non-null old pointer is passed to
+`free`; subsequent blocks allocate four bytes and, when allocation succeeds,
+copy four bytes from a static address before writing a re-read pointer to that
+field. The failure branch writes zero. The old field is not immediately cleared
+after `free`; successful writeback and preserved slots are separate assumptions.
+The same memory and calling-convention conditions apply, together with valid
+ownership of any freed pointer. The `0x20` and `0x38` fields have different
+offsets and their meaning is unknown. The complete function boundary, input's
+origin, structure's purpose, execution and any connection to signing remain
+unknown. No static source bytes were interpreted as keys.
 Separately, `0x2fe5b4–0x2fe5d0` forms the string address for
 `com/tencent/mobileqq/qsec/qseccodec/SecCipher$SecInfo` in `x0` and calls
 `0x33ec58`; its result is stored at `[sp+0x338]`. The helper passes the same
