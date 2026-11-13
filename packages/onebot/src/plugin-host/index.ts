@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { types } from 'node:util';
 import type { ApiResponse, JsonObject, JsonValue } from '../types';
+import { createConfigBuilder, type PluginConfigBuilder } from './config-builder';
 
 /** Independently implemented subset of the NapCat plugin interface.
  * Reference: https://doc.napneko.icu/develop/plugin and /develop/plugin/api/type
@@ -58,7 +59,7 @@ export interface PluginContext {
     readonly core: never;
     readonly oneBot: never;
     readonly router: never;
-    readonly NapCatConfig: never;
+    readonly NapCatConfig: PluginConfigBuilder;
     getPluginExports(id: string): never;
 }
 
@@ -306,6 +307,18 @@ function copyJson(
 
     return { value: visit(input, 0), bytes };
 }
+
+const napcatConfig = createConfigBuilder({
+    copySchema: (input) => copyJson(input, SCHEMA_LIMIT, 16).value,
+    invalid: () => {
+        throw configError('CONFIG_INVALID');
+    },
+    unsupported: (feature) => {
+        const error = new UnsupportedPluginFeatureError(feature);
+        error.stack = `${error.name}: ${error.message}`;
+        throw error;
+    },
+});
 
 function copyConfig(input: unknown): { value: JsonObject; bytes: number } {
     const copy = copyJson(input, CONFIG_LIMIT, 32);
@@ -781,9 +794,7 @@ export class PluginHost {
                     get router(): never {
                         return unsupported('router');
                     },
-                    get NapCatConfig(): never {
-                        return unsupported('NapCatConfig');
-                    },
+                    NapCatConfig: napcatConfig,
                     getPluginExports: () => unsupported('getPluginExports'),
                 });
                 Object.assign(slot, { context });

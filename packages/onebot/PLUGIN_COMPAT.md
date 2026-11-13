@@ -28,18 +28,24 @@ provider.
 
 The first compatibility subset uses OneBot v11 actions and events. It supports
 selected lifecycle callbacks and a limited account-scoped `actions.call`
-bridge, static JSON configuration schema, and explicit configuration hooks; it
-does not recreate the NapCat internal `core`, `oneBot`, `router`,
-`NapCatConfig`, complete plugin manager, dynamic configuration controllers or
-cross-plugin exports. Plugins that require those interfaces may fail explicitly.
+bridge, static JSON configuration schema, explicit configuration hooks, and a
+partial data-only `NapCatConfig` builder. The builder supports `text`, `number`,
+`boolean`, `select`, `multiSelect`, and `combine`; its `html` and `plainText`
+methods explicitly report unsupported. Reactive flags are metadata only. It
+does not recreate the NapCat internal `core`, `oneBot`, `router`, complete
+plugin manager, dynamic configuration controllers or cross-plugin exports.
+Plugins that require those interfaces may fail explicitly.
 A plugin that appears in the index is not necessarily usable in Jiyu. The supported
 hooks, entry-point rules, action behavior and queue limits are described in the
 [host implementation notes](./src/plugin-host/README.md).
 
 The current plugin host executes explicitly selected ESM code in the Jiyu Node
 process. It is not a process, filesystem, network or permission sandbox. Code
-can access the full process and other accounts. Node may retain imported module
-and dependency state across activations. Stopping event delivery and running
+can access the full process, its network permissions and other accounts, and
+can block the host. Schema and configuration limits bound accepted JSON copies,
+not already-constructed input objects, transient `Reflect.ownKeys` enumeration,
+CPU use or RSS. They do not provide process or resource isolation. Node may
+retain imported module and dependency state across activations. Stopping event delivery and running
 `plugin_cleanup` does not prove plugin-created timers, workers, subprocesses or
 other detached work have stopped, and must not be treated as permission to
 overwrite a live plugin's files.
@@ -67,9 +73,12 @@ than treated as a successful preview. Files can change after preview; enabling
 continues to perform its own checks.
 
 The configuration panel calls static schema and optional get/set hooks only
-on explicit user actions. Its editor supports a narrow subset of fields and
-requires the returned object to match that schema; unsupported schemas are not
-silently rewritten. A successful set means the plugin's hook returned, not
+on explicit user actions. Its editor accepts at most 64 fields, only `key`,
+`label`, `type`, `default`, and `description` properties, nonempty safe keys
+and nonempty labels, and the `string`, `text`, `number`, and `boolean` types with
+additional value checks. Even a builder-produced scalar may be rejected. The
+returned object must match the schema; unsupported schemas are not silently
+rewritten. A successful set means the plugin's hook returned, not
 that data was durably stored. There is no host-managed configuration-file
 fallback, version check, merge guarantee, dynamic controller or HTML editor.
 Hooks run with the same process privileges as the plugin, and a request failure
