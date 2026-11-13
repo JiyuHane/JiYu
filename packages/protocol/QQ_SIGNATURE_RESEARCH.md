@@ -83,6 +83,18 @@ valid non-aliasing storage, a terminated buffer, a representable length and
 normally returning calls. It establishes neither runtime reachability nor the
 structure's purpose or any relationship to signing or AES.
 
+Under the inspected dispatch-state and AAPCS64 preservation conditions, the
+`0x2b75ec` write is followed by the `0x2b7604` branch. For non-null `P`, that
+branch saves the address `P+0x38`, conditionally frees its old pointer, allocates
+four bytes, conditionally copies from a static address, then writes the re-read
+allocation pointer or zero through the re-read saved address. The old field is
+not cleared immediately after `free`. This interpretation additionally assumes
+valid ownership, valid non-overlapping memory, normally returning calls and
+saved slots unaffected by aliasing or concurrent writes. The later load from
+`[sp+0x128]` has a different source expression; the inspected window establishes
+neither equality nor inequality with `P` or its fields. No static source bytes
+were interpreted, and the function's purpose and actual execution remain unknown.
+
 Separately, `0x2fe5b4–0x2fe5d0` forms the string address for
 `com/tencent/mobileqq/qsec/qseccodec/SecCipher$SecInfo` in `x0` and calls
 `0x33ec58`; its result is stored at `[sp+0x338]`. The helper passes the same
