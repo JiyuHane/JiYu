@@ -2,6 +2,40 @@ import { WebSocketServer, type WebSocket } from '@snowluma/websocket';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo, Socket } from 'node:net';
 import type { Duplex } from 'node:stream';
+import { isPromise, isProxy } from 'node:util/types';
+import { NodePollResponseSink } from './poll-response-sink';
+import type { PollOutcome, PollSink } from '../v12-runtime/poll-transaction';
+
+/** Trusted internal host seam. The host owns shared preflight, ordering readiness,
+ * transaction cleanup and tracking the original work through its actual settlement.
+ * All writes must precede promise settlement; a previously registered callback
+ * can run before the transport observes settlement. Custom thenables are unsupported.
+ * Tampered Promise constructors/species and unrelated same-process writers are outside
+ * this contract; a host returning a thenable must observe its own rejection. */
+export interface V12HttpPollCapability {
+    run(
+        input: unknown,
+        context: {
+            sink: PollSink;
+            signal: AbortSignal;
+            responseDeadline: number;
+            maxOutputBytes: number;
+        },
+    ): V12HttpPollResult | Promise<V12HttpPollResult>;
+}
+
+export type V12HttpPollResult =
+    | { kind: 'unavailable' }
+    | {
+          kind: 'preflight';
+          error:
+              | 'invalid_request'
+              | 'unknown_self'
+              | 'invalid_params'
+              | 'unsupported_field'
+              | 'unsupported_parameter';
+      }
+    | { kind: 'outcome'; outcome: PollOutcome };
 
 /** A transport instance belongs to exactly one account. The injected dispatcher
  * must enforce that binding, including an explicitly supplied `self`. */
@@ -17,6 +51,8 @@ export interface V12TransportOptions {
     port: number;
     accessToken?: string;
     handle: (request: unknown) => V12Response | Promise<V12Response>;
+    /** Internal HTTP-only capability; absent means the legacy action path. */
+    httpPoll?: V12HttpPollCapability;
     getConnectEvent: () => unknown;
     subscribe: (listener: (event: unknown) => void) => () => void;
     /** Called on asynchronous listener failure with a sanitized diagnostic. */
@@ -182,6 +218,9 @@ export class V12Transport {
     private readonly clientDisposers = new Map<WebSocket, () => void>();
     private readonly responses = new Set<ServerResponse>();
     private active = 0;
+    private pollActive = 0;
+    private pollUnknown = 0;
+    private readonly pollAborters = new Map<ServerResponse, () => void>();
     private quiesced = false;
     private readonly maxBody: number;
     private readonly maxOutput: number;
@@ -336,6 +375,7 @@ export class V12Transport {
 
         this.responses.add(res);
         let settled = false;
+        let requestAborted = false;
         let size = 0;
         const chunks: Buffer[] = [];
         const timer = setTimeout(() => finish(failed(10001, 'request timeout')), this.timeout);
@@ -359,13 +399,23 @@ export class V12Transport {
         res.once('finish', cleanup);
         res.once('close', () => {
             settled = true;
+            this.pollAborters.get(res)?.();
             cleanup();
         });
         req.on('error', () => {
             settled = true;
+            this.pollAborters.get(res)?.();
             cleanup();
             res.destroy();
         });
+
+        if (this.options.httpPoll) {
+            req.on('aborted', () => {
+                requestAborted = true;
+                this.pollAborters.get(res)?.();
+            });
+        }
+
         req.on('data', (chunk: Buffer) => {
             if (settled) {
                 return;
@@ -399,6 +449,19 @@ export class V12Transport {
             }
 
             clearTimeout(timer);
+            const capability = this.options.httpPoll;
+
+            if (
+                capability &&
+                input !== null &&
+                typeof input === 'object' &&
+                !Array.isArray(input) &&
+                (input as Record<string, unknown>).action === 'get_latest_events'
+            ) {
+                this.dispatchHttpPoll(input, res, capability, () => settled || requestAborted);
+                return;
+            }
+
             void this.dispatch(input)
                 .then(finish)
                 .catch(() => {
@@ -578,6 +641,566 @@ export class V12Transport {
         }
     }
 
+    /** Poll failures have their own reentrancy-aware writer; ordinary json remains unchanged. */
+    private writePollFailure(
+        res: ServerResponse,
+        response: V12Response,
+        canWrite: (afterHead: boolean) => boolean,
+        markHead: () => void,
+        stop: () => void,
+        countUnknown: () => void,
+    ): void {
+        try {
+            if (!canWrite(false)) {
+                stop();
+                return;
+            }
+
+            const text = encodeResponse(response, this.maxOutput, response.echo);
+
+            if (text === null || !canWrite(false)) {
+                stop();
+                return;
+            }
+
+            markHead();
+            res.writeHead(200, {
+                'content-type': 'application/json; charset=utf-8',
+                connection: 'close',
+            });
+
+            if (!canWrite(true)) {
+                countUnknown();
+                stop();
+                return;
+            }
+
+            res.end(text);
+
+            if (res.destroyed && !res.writableFinished) {
+                countUnknown();
+            }
+        } catch {
+            countUnknown();
+            stop();
+        }
+    }
+
+    /** The pre-admission busy/shape paths also need independent response ownership. */
+    private rejectHttpPoll(
+        res: ServerResponse,
+        response: V12Response,
+        unavailable: () => boolean,
+    ): void {
+        const controller = new AbortController();
+        const deadline = performance.now() + Math.min(this.timeout, 15_000);
+        let stopped = false;
+        let headAttempted = false;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let reported = false;
+        let unknownCounted = false;
+
+        const countUnknown = (): void => {
+            if (!unknownCounted) {
+                unknownCounted = true;
+                this.pollUnknown = Math.min(Number.MAX_SAFE_INTEGER, this.pollUnknown + 1);
+            }
+        };
+
+        const stop = (): void => {
+            if (stopped) {
+                return;
+            }
+
+            stopped = true;
+
+            if (timer !== undefined) {
+                clearTimeout(timer);
+            }
+
+            controller.abort();
+            res.destroy();
+        };
+
+        const cleanup = (): void => {
+            if (timer !== undefined) {
+                clearTimeout(timer);
+            }
+
+            if (this.pollAborters.get(res) === stop) {
+                this.pollAborters.delete(res);
+            }
+        };
+
+        const onError = (): void => {
+            countUnknown();
+            stop();
+
+            if (!reported) {
+                reported = true;
+
+                try {
+                    const result: unknown = this.options.onError?.(
+                        new Error('poll response error'),
+                    );
+                    void Promise.resolve(result).catch(() => undefined);
+                } catch {
+                    /* reporting is best effort */
+                }
+            }
+        };
+
+        this.pollAborters.set(res, stop);
+
+        try {
+            res.on('error', onError);
+            res.once('finish', cleanup);
+            res.once('close', cleanup);
+
+            if (stopped || res.destroyed || res.writableFinished || res.finished) {
+                cleanup();
+                return;
+            }
+
+            timer = setTimeout(stop, Math.min(this.timeout, 15_000));
+            timer.unref();
+            const canWrite = (afterHead: boolean): boolean =>
+                !stopped &&
+                !controller.signal.aborted &&
+                !this.quiesced &&
+                !unavailable() &&
+                performance.now() < deadline &&
+                !res.destroyed &&
+                !res.writableEnded &&
+                !res.writableFinished &&
+                !res.finished &&
+                res.headersSent === afterHead &&
+                headAttempted === afterHead &&
+                !stopped &&
+                !controller.signal.aborted &&
+                !this.quiesced &&
+                !unavailable() &&
+                performance.now() < deadline;
+            this.writePollFailure(
+                res,
+                response,
+                canWrite,
+                () => {
+                    headAttempted = true;
+                },
+                stop,
+                countUnknown,
+            );
+        } catch {
+            countUnknown();
+            stop();
+        }
+    }
+
+    /** The capability must perform shared preflight and explicitly gate ordering readiness.
+     * Its promise represents the original tracked work, including transaction cleanup. */
+    private dispatchHttpPoll(
+        input: unknown,
+        res: ServerResponse,
+        capability: V12HttpPollCapability,
+        unavailable: () => boolean,
+    ): void {
+        const echo = requestEcho(input);
+
+        if (!validRequest(input)) {
+            this.rejectHttpPoll(res, failed(10001, 'invalid request', echo), unavailable);
+            return;
+        }
+
+        if (this.active >= this.maxConcurrent) {
+            this.rejectHttpPoll(res, failed(20002, 'transport busy', echo), unavailable);
+            return;
+        }
+
+        if (this.pollActive >= Math.min(8, this.maxConcurrent - 1)) {
+            this.rejectHttpPoll(res, failed(20002, 'transport busy', echo), unavailable);
+            return;
+        }
+
+        if (unavailable() || this.quiesced || res.destroyed || res.writableEnded) {
+            res.destroy();
+            return;
+        }
+
+        this.active++;
+        this.pollActive++;
+        const controller = new AbortController();
+        const deadline = performance.now() + Math.min(this.timeout, 15_000);
+        let stopped = false;
+        let writeAttempted = false;
+        let writeSealed = false;
+        let finishSeen = false;
+        let responseTerminal = false;
+        let taskDone = false;
+        let sink: NodePollResponseSink | undefined;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let reported = false;
+        let unknownCounted = false;
+
+        const countUnknown = (): void => {
+            if (!unknownCounted) {
+                unknownCounted = true;
+                this.pollUnknown = Math.min(Number.MAX_SAFE_INTEGER, this.pollUnknown + 1);
+            }
+        };
+
+        const stop = (): void => {
+            if (stopped) {
+                return;
+            }
+
+            stopped = true;
+
+            if (timer !== undefined) {
+                clearTimeout(timer);
+            }
+
+            controller.abort();
+            res.destroy();
+        };
+
+        // Keep this independent listener attached for the response's entire lifetime,
+        // including constructor/dispose failure and late error events after close.
+        const onHostError = (): void => {
+            countUnknown();
+            stop();
+
+            if (!reported) {
+                reported = true;
+
+                try {
+                    const reportedResult: unknown = this.options.onError?.(
+                        new Error('poll response error'),
+                    );
+                    void Promise.resolve(reportedResult).catch(() => undefined);
+                } catch {
+                    /* reporting is best effort */
+                }
+            }
+        };
+
+        const cleanupIfDone = (): void => {
+            if (taskDone && responseTerminal) {
+                if (timer !== undefined) {
+                    clearTimeout(timer);
+                }
+
+                if (this.pollAborters.get(res) === stop) {
+                    this.pollAborters.delete(res);
+                }
+            }
+        };
+
+        this.pollAborters.set(res, stop);
+
+        try {
+            res.on('error', onHostError);
+            res.once('finish', () => {
+                finishSeen = true;
+                responseTerminal = true;
+                cleanupIfDone();
+            });
+            res.once('close', () => {
+                responseTerminal = true;
+                cleanupIfDone();
+            });
+
+            if (res.destroyed || res.writableFinished || res.finished) {
+                responseTerminal = true;
+            }
+        } catch {
+            stop();
+        }
+
+        if (!stopped) {
+            timer = setTimeout(stop, Math.min(this.timeout, 15_000));
+            timer.unref();
+        }
+
+        const sendFailure = (response: V12Response): void => {
+            const canWrite = (afterHead: boolean): boolean =>
+                !stopped &&
+                !controller.signal.aborted &&
+                !this.quiesced &&
+                !unavailable() &&
+                performance.now() < deadline &&
+                !res.destroyed &&
+                !res.writableEnded &&
+                !res.writableFinished &&
+                !res.finished &&
+                res.headersSent === afterHead &&
+                writeAttempted === afterHead &&
+                !stopped &&
+                !controller.signal.aborted &&
+                !this.quiesced &&
+                !unavailable() &&
+                performance.now() < deadline;
+            this.writePollFailure(
+                res,
+                response,
+                canWrite,
+                () => {
+                    writeAttempted = true;
+                },
+                stop,
+                countUnknown,
+            );
+        };
+
+        // Preserve the original action microtask boundary and observe this exact task
+        // until it settles even if the timer or a response event stops the transaction.
+        const task = Promise.resolve().then(() => {
+            if (stopped || unavailable() || this.quiesced || performance.now() >= deadline) {
+                stop();
+                return null;
+            }
+
+            sink = new NodePollResponseSink(res, () => undefined);
+            const owned = sink;
+            const guarded: PollSink = {
+                isOpen: () =>
+                    !writeSealed &&
+                    !stopped &&
+                    performance.now() < deadline &&
+                    owned.isOpen() &&
+                    !writeSealed &&
+                    !stopped &&
+                    performance.now() < deadline,
+                on: (event, listener) => owned.on(event, listener),
+                off: (event, listener) => owned.off(event, listener),
+                writeHead: () => {
+                    if (writeSealed) {
+                        throw new Error('poll response unavailable');
+                    }
+
+                    if (stopped || performance.now() >= deadline) {
+                        stop();
+                        throw new Error('poll response unavailable');
+                    }
+
+                    writeAttempted = true;
+                    owned.writeHead();
+                },
+                end: (body) => {
+                    if (writeSealed) {
+                        throw new Error('poll response unavailable');
+                    }
+
+                    if (stopped || performance.now() >= deadline) {
+                        stop();
+                        throw new Error('poll response unavailable');
+                    }
+
+                    owned.end(body);
+                },
+            };
+
+            if (stopped || unavailable() || this.quiesced || performance.now() >= deadline) {
+                stop();
+                return null;
+            }
+
+            const result = capability.run(input, {
+                sink: guarded,
+                signal: controller.signal,
+                responseDeadline: deadline,
+                maxOutputBytes: this.maxOutput,
+            });
+
+            if (!isPromise(result)) {
+                writeSealed = true;
+
+                if (
+                    result === null ||
+                    typeof result !== 'object' ||
+                    isProxy(result) ||
+                    (Object.getPrototypeOf(result) !== Object.prototype &&
+                        Object.getPrototypeOf(result) !== null) ||
+                    Object.getOwnPropertyDescriptor(result, 'then') !== undefined
+                ) {
+                    throw new Error('poll capability result invalid');
+                }
+
+                const kind = Object.getOwnPropertyDescriptor(result, 'kind');
+
+                if (
+                    !kind ||
+                    !('value' in kind) ||
+                    !['unavailable', 'preflight', 'outcome'].includes(kind.value)
+                ) {
+                    throw new Error('poll capability result invalid');
+                }
+
+                return result;
+            }
+
+            return result.then(
+                (value) => {
+                    writeSealed = true;
+                    return value;
+                },
+                (error: unknown) => {
+                    writeSealed = true;
+                    throw error;
+                },
+            );
+        });
+        void task
+            .then(
+                (result) => {
+                    writeSealed = true;
+
+                    try {
+                        if (
+                            result?.kind === 'outcome' &&
+                            [
+                                'cleanup_uncertain',
+                                'release_unknown',
+                                'commit_unknown',
+                                'committed_unsent',
+                                'unknown',
+                            ].includes(result.outcome.kind)
+                        ) {
+                            countUnknown();
+                        }
+
+                        if (stopped && writeAttempted) {
+                            countUnknown();
+                        }
+
+                        if (sink) {
+                            sink.dispose();
+                        }
+
+                        if (
+                            stopped ||
+                            unavailable() ||
+                            this.quiesced ||
+                            performance.now() >= deadline
+                        ) {
+                            stop();
+                            return;
+                        }
+
+                        if (result?.kind === 'outcome' && result.outcome.kind === 'local_finish') {
+                            if (!writeAttempted || !finishSeen) {
+                                countUnknown();
+                                stop();
+                            }
+
+                            return;
+                        }
+
+                        // A header attempt may have partially published even if it threw.
+                        if (
+                            writeAttempted ||
+                            res.headersSent ||
+                            res.destroyed ||
+                            res.writableEnded
+                        ) {
+                            countUnknown();
+                            stop();
+                            return;
+                        }
+
+                        if (result?.kind === 'unavailable') {
+                            sendFailure(failed(20002, 'poll unavailable', echo));
+                            return;
+                        }
+
+                        if (result?.kind === 'preflight') {
+                            const failures = {
+                                invalid_request: [10001, 'invalid action request'],
+                                unknown_self: [10102, 'unknown self'],
+                                invalid_params: [10003, 'invalid poll parameters'],
+                                unsupported_field: [10004, 'unsupported request field'],
+                                unsupported_parameter: [10004, 'unsupported parameter'],
+                            } as const;
+                            const failure = Object.hasOwn(failures, result.error)
+                                ? failures[result.error]
+                                : undefined;
+
+                            if (failure) {
+                                sendFailure(failed(failure[0], failure[1], echo));
+                            } else {
+                                stop();
+                            }
+
+                            return;
+                        }
+
+                        if (result?.kind === 'outcome') {
+                            const kind = result.outcome.kind;
+
+                            if (kind === 'invalid_input' || kind === 'invalid') {
+                                sendFailure(failed(10003, 'invalid poll parameters', echo));
+                                return;
+                            }
+
+                            if (
+                                kind === 'busy' ||
+                                kind === 'contended' ||
+                                kind === 'blocked' ||
+                                kind === 'epoch_invalid' ||
+                                kind === 'commit_rejected'
+                            ) {
+                                sendFailure(failed(20002, 'poll unavailable', echo));
+                                return;
+                            }
+                        }
+
+                        if (
+                            result?.kind !== 'outcome' ||
+                            !['aborted', 'cancelled', 'closed', 'deadline'].includes(
+                                result.outcome.kind,
+                            )
+                        ) {
+                            countUnknown();
+                        }
+
+                        stop();
+                    } catch {
+                        countUnknown();
+                        stop();
+                    } finally {
+                        taskDone = true;
+                        cleanupIfDone();
+                        this.active--;
+                        this.pollActive--;
+                    }
+                },
+                () => {
+                    writeSealed = true;
+
+                    try {
+                        countUnknown();
+
+                        try {
+                            sink?.dispose();
+                        } catch {
+                            /* stop below; the host error listener remains installed */
+                        }
+
+                        stop();
+                    } finally {
+                        taskDone = true;
+                        cleanupIfDone();
+                        this.active--;
+                        this.pollActive--;
+                    }
+                },
+            )
+            .catch(() => {
+                // Observe failures from the completion observer itself.
+                stop();
+            });
+    }
+
     private async dispatch(input: unknown): Promise<V12Response> {
         const echo = requestEcho(input);
 
@@ -662,6 +1285,10 @@ export class V12Transport {
     /** Stop admission synchronously, including while open() is binding. */
     quiesce(): void {
         this.quiesced = true;
+
+        for (const stop of this.pollAborters.values()) {
+            stop();
+        }
 
         for (const res of this.responses) {
             res.destroy();
