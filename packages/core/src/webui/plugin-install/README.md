@@ -107,6 +107,31 @@ The handler has no built-in Worker factory, package extraction or production
 entry and uses no plugin code. Its buffer capability behavior is tested on Node
 24.22.1; Node 26 and future runtime behavior remain unverified.
 
+The same module also defines a separate one-shot manifest protocol. Its request
+uses `{ kind: 'zip-manifest', version: 2, bytes: ArrayBuffer }`; its successful
+or failed response uses a distinct `zip-manifest-result` envelope with version 2
+and the archive snapshot's SHA-256. The fixed-key validator compares that digest
+with a caller-supplied expected digest, validates the allowed result and creates
+frozen copies. Version 1 does not accept version 2 envelopes, including failures
+whose underlying ZIP error codes overlap. A reported digest ties the reported
+identifier to the expected value; it does not establish a trustworthy Worker,
+classification, source, license or compatibility. The failure envelope also contains the archive fingerprint; keep
+it within the trusted channel rather than treating it as public diagnostic data.
+ZIP request bytes themselves can include plaintext manifest content. Result
+validation occurs after structured
+cloning and does not impose a bound on a malicious sender's pre-validation
+allocation.
+
+This manifest handler and validator are protocol prototypes, not a parent Worker
+controller. Validation does not observe a Worker exit, detect a later duplicate
+message, or establish successful cleanup. No production Worker entry or factory
+is provided; the version 1 controller is not a version 2 controller. The
+synchronous port wrapper must be trusted and exclusive, and Worker-side send or
+close errors must escape the Worker entry. Independent wrappers of the same
+endpoint, other copies of input bytes and runtime-managed memory remain outside
+the handler's proof. Tests use synthetic archives and synthetic Worker entries;
+they do not run or install plugins.
+
 The existing Core entry is not a preflight Worker bootstrap: its static application
 imports are evaluated before the entry-point branch, and Worker data not recognized
 as the existing migration task can enter the application or supervisor path.

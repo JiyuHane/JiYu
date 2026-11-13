@@ -1,5 +1,7 @@
+import { createHash } from 'node:crypto';
 import { types } from 'node:util';
-import { preflightZip } from './zip-preflight.ts';
+import { isMarkedAsUntransferable } from 'node:worker_threads';
+import { inspectZipManifest, preflightZip, type ZipManifestResult } from './zip-preflight.ts';
 
 const MAX_ARCHIVE = 32 * 1024 * 1024;
 const usedPorts = new WeakSet<object>();
@@ -50,6 +52,25 @@ export function createPreflightWorkerData(input: unknown): PreflightWorkerData {
     }
 }
 
+export interface ManifestWorkerData {
+    readonly kind: 'zip-manifest';
+    readonly version: 2;
+    readonly bytes: ArrayBuffer;
+}
+
+/** Copy a view without transferring its original backing buffer. */
+export function createManifestWorkerData(input: unknown): ManifestWorkerData {
+    const { bytes } = createPreflightWorkerData(input);
+    return { kind: 'zip-manifest', version: 2, bytes };
+}
+
+export interface ManifestWorkerResult {
+    readonly kind: 'zip-manifest-result';
+    readonly version: 2;
+    readonly sha256: string;
+    readonly result: ZipManifestResult;
+}
+
 export interface PreflightWorkerPort {
     postMessage(message: unknown): void;
     close(): void;
@@ -90,7 +111,7 @@ function dataObject(value: unknown, keys: readonly string[]): Record<string, unk
     return result;
 }
 
-function requestBuffer(value: unknown): unknown {
+function requestBuffer(value: unknown, expectedKind: string, expectedVersion: number): unknown {
     if (typeof value !== 'object' || value === null || types.isProxy(value)) {
         return undefined;
     }
@@ -112,16 +133,140 @@ function requestBuffer(value: unknown): unknown {
     if (
         !kind ||
         !('value' in kind) ||
-        kind.value !== 'zip-preflight' ||
+        kind.value !== expectedKind ||
         !version ||
         !('value' in version) ||
-        version.value !== 1
+        version.value !== expectedVersion
     ) {
         return undefined;
     }
 
     const bytes = Object.getOwnPropertyDescriptor(value, 'bytes');
     return bytes && 'value' in bytes ? bytes.value : undefined;
+}
+
+const manifestErrors: readonly string[] = [
+    'malformed',
+    'unsupported',
+    'unsafe_path',
+    'collision',
+    'integrity',
+    'limit',
+    'invalid_input',
+    'internal',
+    'manifest_missing',
+    'manifest_too_large',
+    'manifest_invalid',
+    'manifest_internal',
+];
+const mainTypes: readonly string[] = ['absent', 'empty', 'string', 'non_string'];
+const moduleTypes: readonly string[] = [
+    'absent',
+    'module',
+    'commonjs',
+    'other_string',
+    'non_string',
+];
+
+/**
+ * Validate a candidate only; this does not observe Worker exit or cleanup and
+ * the matching hash cannot prove a Worker was honest. No input object is retained.
+ */
+export function readManifestWorkerResult(
+    message: unknown,
+    expectedSha256: unknown,
+): ManifestWorkerResult | null {
+    try {
+        if (typeof expectedSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(expectedSha256)) {
+            return null;
+        }
+
+        const envelope = dataObject(message, ['kind', 'version', 'sha256', 'result']);
+
+        if (
+            !envelope ||
+            envelope.kind !== 'zip-manifest-result' ||
+            envelope.version !== 2 ||
+            envelope.sha256 !== expectedSha256
+        ) {
+            return null;
+        }
+
+        const raw = envelope.result;
+
+        if (typeof raw !== 'object' || raw === null || types.isProxy(raw)) {
+            return null;
+        }
+
+        const ok = Object.getOwnPropertyDescriptor(raw, 'ok');
+
+        if (!ok || !('value' in ok)) {
+            return null;
+        }
+
+        let result: ZipManifestResult;
+
+        if (ok.value === false) {
+            const failure = dataObject(raw, ['ok', 'code']);
+
+            if (
+                !failure ||
+                typeof failure.code !== 'string' ||
+                !manifestErrors.includes(failure.code)
+            ) {
+                return null;
+            }
+
+            result = Object.freeze({
+                ok: false,
+                code: failure.code as Extract<ZipManifestResult, { ok: false }>['code'],
+            });
+        } else if (ok.value === true) {
+            const success = dataObject(raw, ['ok', 'sha256', 'manifest']);
+
+            if (!success || success.sha256 !== expectedSha256) {
+                return null;
+            }
+
+            const manifest = dataObject(success.manifest, ['main', 'type']);
+
+            if (
+                !manifest ||
+                typeof manifest.main !== 'string' ||
+                !mainTypes.includes(manifest.main) ||
+                typeof manifest.type !== 'string' ||
+                !moduleTypes.includes(manifest.type)
+            ) {
+                return null;
+            }
+
+            result = Object.freeze({
+                ok: true,
+                sha256: expectedSha256,
+                manifest: Object.freeze({
+                    main: manifest.main as Extract<
+                        ZipManifestResult,
+                        { ok: true }
+                    >['manifest']['main'],
+                    type: manifest.type as Extract<
+                        ZipManifestResult,
+                        { ok: true }
+                    >['manifest']['type'],
+                }),
+            });
+        } else {
+            return null;
+        }
+
+        return Object.freeze({
+            kind: 'zip-manifest-result',
+            version: 2,
+            sha256: expectedSha256,
+            result,
+        });
+    } catch {
+        return null;
+    }
 }
 
 /**
@@ -140,6 +285,36 @@ function requestBuffer(value: unknown): unknown {
  */
 export function createPreflightWorkerHandler(
     port: unknown,
+): (data: unknown) => PreflightHandlerStatus {
+    return createWorkerHandler(port, 'zip-preflight', 1, (owned) => ({
+        kind: 'result',
+        result: preflightZip(new Uint8Array(owned)),
+    }));
+}
+
+/**
+ * Manifest candidate only: no parent lifecycle controller, default factory or
+ * production entry exists. The supplied synchronous adapter is trusted.
+ */
+export function createManifestWorkerHandler(
+    port: unknown,
+): (data: unknown) => PreflightHandlerStatus {
+    return createWorkerHandler(port, 'zip-manifest', 2, (owned) => {
+        const bytes = new Uint8Array(owned);
+        const sha256 = createHash('sha256').update(bytes).digest('hex');
+        const result = inspectZipManifest(bytes);
+        return readManifestWorkerResult(
+            { kind: 'zip-manifest-result', version: 2, sha256, result },
+            sha256,
+        );
+    });
+}
+
+function createWorkerHandler(
+    port: unknown,
+    kind: string,
+    version: number,
+    inspect: (owned: ArrayBuffer) => unknown,
 ): (data: unknown) => PreflightHandlerStatus {
     let handled = false;
 
@@ -174,7 +349,7 @@ export function createPreflightWorkerHandler(
         let sendFailed = false;
 
         try {
-            const buffer: unknown = requestBuffer(data);
+            const buffer: unknown = requestBuffer(data, kind, version);
 
             if (
                 !types.isProxy(buffer) &&
@@ -183,6 +358,9 @@ export function createPreflightWorkerHandler(
                 Reflect.ownKeys(buffer).length === 0 &&
                 getResizable !== undefined &&
                 typeof transfer === 'function' &&
+                (kind !== 'zip-manifest' ||
+                    (typeof isMarkedAsUntransferable === 'function' &&
+                        !isMarkedAsUntransferable(buffer))) &&
                 getResizable.call(buffer) === false &&
                 getArrayBufferLength.call(buffer) <= MAX_ARCHIVE
             ) {
@@ -190,11 +368,14 @@ export function createPreflightWorkerHandler(
                 // explicitly untransferable buffers, and establishes this turn's
                 // exclusive ownership without executing any input properties.
                 const owned = transfer.call(buffer as ArrayBuffer);
-                const result = preflightZip(new Uint8Array(owned));
-                sendFailed = true;
-                Reflect.apply(adapter.postMessage, undefined, [{ kind: 'result', result }]);
-                sendFailed = false;
-                status = 'sent';
+                const message = inspect(owned);
+
+                if (message !== null) {
+                    sendFailed = true;
+                    Reflect.apply(adapter.postMessage, undefined, [message]);
+                    sendFailed = false;
+                    status = 'sent';
+                }
             }
         } catch {
             // A preflight exception or invalid/detached buffer is not exposed.
