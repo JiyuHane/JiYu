@@ -71,6 +71,18 @@ it does not establish that either branch executes or that the buffer contents
 are used for signing. The property name and static source byte were not
 interpreted.
 
+In a conditionally connected continuation after that allocation, a non-null
+64-byte allocation is zeroed by two paired vector stores. The allocation pointer
+is written to `[x23]`, overwriting the saved property return. On the non-null
+path a 32-bit value of four is stored at offset `0x18`, and `strlen(x21)+1`
+bytes are allocated for a copy of the same buffer. A later conditional block
+copies those bytes and stores the re-read allocation pointer at offset `0x20`;
+if that allocation is null, zero is stored instead. This linkage depends on the
+indicated state constants, AAPCS64 register preservation, unchanged saved slots,
+valid non-aliasing storage, a terminated buffer, a representable length and
+normally returning calls. It establishes neither runtime reachability nor the
+structure's purpose or any relationship to signing or AES.
+
 Separately, `0x2fe5b4–0x2fe5d0` forms the string address for
 `com/tencent/mobileqq/qsec/qseccodec/SecCipher$SecInfo` in `x0` and calls
 `0x33ec58`; its result is stored at `[sp+0x338]`. The helper passes the same
