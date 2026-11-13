@@ -44,8 +44,12 @@ Four 256-byte windows in `.rodata` were independently compared, byte for byte,
 with an AES S-box generated using GF(2^8) reduction polynomial `0x11b` and its
 inverse: forward tables at `0x908d5b`, `0x90bf88`, `0x911eff`, and an inverse
 table at `0x912094`. The observed bytes match the respective standard tables.
-This establishes the presence of matching constants in this exact artifact,
-not that they are used, what AES mode or keys would apply, or that they are on
+Separate bounded AArch64 instruction windows also construct these table
+addresses and use byte-indexed loads. For example, `0x844c48–0x844c60`
+constructs `0x911eff`, loads an index byte, reads the forward table and writes
+the result back; `0x860268–0x860274` constructs `0x912094` and reads the
+inverse table by index. These are static instructions, not observed execution.
+They do not establish a complete AES operation, mode, keys, or a connection to
 a signing path. These are file-backed static virtual addresses, not live process
 addresses. No keys were extracted or recorded.
 
