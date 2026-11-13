@@ -261,6 +261,22 @@ to either `0x663c090` or `0x663c7d0`; it does not cover other relocation types,
 tables or indirect references. Other branches, object construction and the body
 producer remain unresolved.
 
+One independently decoded caller at `0x663c050` stores its entry `rdi` and
+`rsi` as local values `p0` and `n0`, passes their slot addresses to
+`0x35a6d20` in `rdx` and `rcx`, and supplies `0x10` in `edi` and `0x90` in
+`esi`. If that helper returns normally, the caller immediately passes its
+`rax` to `0x663c090` at `0x663c07a`, without a null check. For these arguments,
+the helper's decoded instructions first reject unsigned `n0 < 0x90`; otherwise
+they compute `aligned=(p0+15)&~15` and `delta=aligned-p0` with 64-bit modular
+arithmetic, rejecting unsigned `delta > n0-0x90`. On the remaining branch they
+write `aligned` to the `p0` slot, write `n0-delta` to the `n0` slot, and return
+`aligned`. The two rejecting branches return zero without writing either slot;
+a computed `aligned` value of zero is also possible and does not alone identify
+the branch. This is alignment and available-space arithmetic, not evidence of
+allocation or construction. It does not directly write `[aligned+0x28]`, though
+aliasing with the local slots is not excluded. The input values' validity,
+actual object lifetime, and any previous initialization remain unknown.
+
 Returning to the separately inspected `0x6663d13` path, a conditional branch
 also passes its `T` to classifier `0x6667140`, and another call copies it into
 request `+0x28`. The source object was returned by a prior virtual
