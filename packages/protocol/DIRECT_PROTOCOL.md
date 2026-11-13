@@ -499,6 +499,21 @@ equation check if the candidate field operations and group coefficients have
 their inferred meanings. They do not establish the third field's value, complete
 point representation, actual peer identity or runtime reachability.
 
+Two bounded static entry paths supply that string-like input. When the selector
+is `1`, `0x34f75e0` constructs a temporary string-like object from embedded
+image data and calls `0x34f7740`; the data itself was not recorded here. A
+separate selector-`1` branch at `0x34f8490` forwards its `rcx` as `rsi` through
+a tail jump. One observed caller, `0x34f8af0`, first reads a caller-supplied
+pointer slot, writes zero to the slot and stores the read value at object
+`+0x48`; on a nonnull path it passes the current stored pointer plus eight to
+`0x34f8490`. The corresponding null-pointer path can select the embedded-data
+constructor; a false result on the nonnull path instead reaches a separate
+fallback. These are conditional instruction-level paths, not a complete caller
+inventory: intervening calls, aliases, allocation failures and dynamic
+state can affect the values. The transferred pointer's construction, the
+embedded string's semantics, peer identity and runtime reachability remain
+unknown.
+
 On another bounded path, `0x34f7a74` calls `0x8d34270` with a stack buffer and
 capacity `0x200`. Its return is tested only for zero; a nonzero return is
 sign-extended and passed with the buffer to `0x8b46000`. On an inspected error
