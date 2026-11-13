@@ -233,6 +233,34 @@ passing that return in a local slot. Within the scanned virtual-address interval
 `0x665ca70`; this does not exclude indirect calls, callers outside the interval,
 or other modules. The construction and contents of `T2` remain unknown.
 
+An independently decoded wrapper beginning at `0x6639cd0` directly calls
+`0x665ca70` at `0x6639d55`. Under the same normal-return and System V ABI
+assumptions, it reads the current contents `T0` of the slot addressed by its
+entry `rdx` at `0x6639cfb`, clears that source slot, and stores `T0` in a local
+slot. An earlier direct call precedes that read, and an indirect call at
+`0x6639d26` precedes passing the local slot's address in `rdx` to `0x665ca70`.
+Those calls or aliases may modify relevant memory; the evidence does not prove
+that `T0` equals `T2` at the callee's later read, or identify how either value
+was constructed. A single bounded pass also decoded a similar transfer from a
+slot addressed by entry `rcx` in a separate wrapper at `0x6639e10`, calling
+`0x665d160` at `0x6639eae`; that second wrapper has not been independently
+checked.
+
+On one independently decoded branch of the `0x663c090` entry, after preceding
+calls return and a helper result is zero, `0x663c1ff` reads a slot at `A+0x28`
+where `A` is the entry `rdi`. The path clears that source slot and stores the
+read value in a local slot; after an indirect callback at `0x663c232`, it passes
+the local slot's address in `rdx` to `0x6639cd0` at `0x663c270`. Normal-return
+and System V callee-saved register assumptions apply. In particular, the
+receiver passed to this call is a register value loaded from `[A]` earlier, not
+a fresh read of `[A]` at the call. Intervening calls or aliases may modify the
+source slot, local slot, or receiver's fields; the value read from `A+0x28` is
+not established as `T0` or `T2` at their later reads. A bounded examination of
+the 357,420 entries in the ELF dynamic RELA table found no type-8 addend equal
+to either `0x663c090` or `0x663c7d0`; it does not cover other relocation types,
+tables or indirect references. Other branches, object construction and the body
+producer remain unresolved.
+
 Returning to the separately inspected `0x6663d13` path, a conditional branch
 also passes its `T` to classifier `0x6667140`, and another call copies it into
 request `+0x28`. The source object was returned by a prior virtual
