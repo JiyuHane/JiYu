@@ -1234,8 +1234,19 @@ remain to be recovered and independently verified.
   closed when a required signature is missing; it neither implements the
   signing algorithm nor determines the target build's signed-command policy.
   The external signer receives the full service command, account, unsigned
-  32-bit sequence pattern, and a copy of the exact SSO body. Adapters targeting
-  a signed-int32 API must preserve the sequence's bit pattern.
+  32-bit sequence pattern, and a copy of the SSO body captured before the trace
+  and classification callbacks. Existing direct callers pass separate frame and
+  signer-input buffers; a wrapper may still change inputs before builder entry.
+  The same bounded copy, up to 16 MiB, is made for unsigned requests. Inputs
+  must remain stable until read and copied; accessors, proxies, caller callbacks
+  and their exceptions are not isolated. Concurrent changes to shared memory do
+  not have an atomic-snapshot guarantee. Cross-realm byte views are rejected by
+  the existing `instanceof` check; ordinary Buffers and same-realm Uint8Array
+  subclasses remain accepted, but customized subclass iterators are not used.
+  Signature fields are read once and independently copied using their actual
+  typed-array lengths; a nonempty sign and the per-field limit are enforced on
+  those copies. This does not establish the authenticity of a returned signature.
+  Adapters targeting a signed-int32 API must preserve the sequence's bit pattern.
 - `src/direct/lagrange-v2-milky-signer.ts` independently adapts that callback to
   the V2 Milky external signing-service contract using a caller-injected
   asynchronous transport, not an offline signing algorithm. Its JSON data contract

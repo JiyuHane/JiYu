@@ -7,6 +7,10 @@ import { protobuf_encode } from '@snowluma/proton';
 // https://github.com/LagrangeDev/Lagrange.Core/blob/fe789c4a23796fbc82fa09e70a9c44c8a5cf2948/Lagrange.Core/Internal/Packets/Struct/SsoPacker.cs
 const MAX_METADATA_FIELD_BYTES = 64 * 1024;
 const MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024;
+const typedArrayByteLength = Object.getOwnPropertyDescriptor(
+    Object.getPrototypeOf(Uint8Array.prototype),
+    'byteLength',
+)!.get!;
 
 export interface SsoSigningRequest {
     uin: string;
@@ -59,18 +63,24 @@ function validateUint32(value: unknown, name: string): void {
     }
 }
 
-function validateSignatureField(
-    value: unknown,
-    name: string,
-    nonempty: boolean,
-): asserts value is Uint8Array {
-    if (
-        !(value instanceof Uint8Array) ||
-        (nonempty && value.length === 0) ||
-        value.length > MAX_METADATA_FIELD_BYTES
-    ) {
+function snapshotSignatureField(value: unknown, name: string, nonempty: boolean): Uint8Array {
+    if (!(value instanceof Uint8Array)) {
         throw new TypeError(`invalid signature ${name}`);
     }
+
+    const length = typedArrayByteLength.call(value);
+
+    if ((nonempty && length === 0) || length > MAX_METADATA_FIELD_BYTES) {
+        throw new TypeError(`invalid signature ${name}`);
+    }
+
+    const snapshot = new Uint8Array(value);
+
+    if ((nonempty && snapshot.byteLength === 0) || snapshot.byteLength > MAX_METADATA_FIELD_BYTES) {
+        throw new TypeError(`invalid signature ${name}`);
+    }
+
+    return snapshot;
 }
 
 function makeTraceParent(): string {
@@ -113,24 +123,35 @@ export function createSsoReserveBuilder(
             throw new Error('SSO reserve account mismatch');
         }
 
-        validateString(request.command, 'command', false);
+        const command = request.command;
+        validateString(command, 'command', false);
 
-        if (request.sequence === undefined) {
+        const sequence = request.sequence;
+
+        if (sequence === undefined) {
             throw new RangeError('invalid sequence');
         }
 
-        validateUint32(request.sequence, 'sequence');
+        validateUint32(sequence, 'sequence');
+        const inputBody = request.body;
 
         if (
-            !(request.body instanceof Uint8Array) ||
-            request.body.byteLength > MAX_REQUEST_BODY_BYTES
+            !(inputBody instanceof Uint8Array) ||
+            typedArrayByteLength.call(inputBody) > MAX_REQUEST_BODY_BYTES
         ) {
+            throw new TypeError('invalid SSO request body');
+        }
+
+        // Snapshot before invoking caller callbacks, including for unsigned requests.
+        const body = new Uint8Array(inputBody);
+
+        if (body.byteLength > MAX_REQUEST_BODY_BYTES) {
             throw new TypeError('invalid SSO request body');
         }
 
         const traceParent = createTraceParent();
         validateString(traceParent, 'trace parent', false);
-        const disposition = classifySigning(request.command);
+        const disposition = classifySigning(command);
         let secureInfo: DirectSsoSecureInfo | undefined;
 
         if (disposition === 'sign') {
@@ -140,23 +161,20 @@ export function createSsoReserveBuilder(
 
             const signature = await sign({
                 uin,
-                command: request.command,
-                sequence: request.sequence,
-                body: Uint8Array.from(request.body),
+                command,
+                sequence,
+                body,
             });
 
             if (!signature || typeof signature !== 'object') {
                 throw new TypeError('invalid SSO signature');
             }
 
-            validateSignatureField(signature.sign, 'sign', true);
-            validateSignatureField(signature.token, 'token', false);
-            validateSignatureField(signature.extra, 'extra', false);
-            secureInfo = {
-                sign: Uint8Array.from(signature.sign),
-                token: Uint8Array.from(signature.token),
-                extra: Uint8Array.from(signature.extra),
-            };
+            // Snapshot each field before reading the next caller-controlled property.
+            const signBytes = snapshotSignatureField(signature.sign, 'sign', true);
+            const token = snapshotSignatureField(signature.token, 'token', false);
+            const extra = snapshotSignatureField(signature.extra, 'extra', false);
+            secureInfo = { sign: signBytes, token, extra };
         } else if (disposition !== 'unsigned') {
             throw new Error('invalid signature classification');
         }
