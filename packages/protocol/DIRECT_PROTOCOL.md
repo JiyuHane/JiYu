@@ -1427,6 +1427,25 @@ remain to be recovered and independently verified.
   it does not establish arbitrary late-callback behavior or cancel effects
   performed by the callback itself. Its fabricated peer and verification policy
   do not prove server identity or wire compatibility.
+  The separate `referenceRegisterOnTransport` entry can borrow an existing raw
+  transport without explicitly closing or awaiting it. It locally checks callback
+  order, context, observed transport identity and sequence, verified response
+  bytes, and the returned result token. The confirmed login UIN, which may differ
+  from the transport's local UIN, is used for signing and envelope checks. This
+  is still one registration transaction, not a combined login session: the
+  transport owner must provide exclusivity, sequence allocation, timeout and
+  cancellation enforcement, accurate write status, and quiescence before reuse.
+  A transport may stall indefinitely, close itself on cancellation, misreport its
+  effects or invoke late callbacks; the guard cannot prove actual writes, server
+  identity, signature authenticity or a physical session. Once invoked, transport
+  failures use fixed result codes; locally detected pre-cancellation or expiry have
+  separate codes, while invalid configuration rejects instead of returning a
+  result. A valid failure's write status remains the transport's claim; exceptions,
+  invalid results and guard violations instead report `unknown`. A method getter
+  can run even before options validation, and Promise/thenable assimilation can
+  have effects; both belong to the caller's transport trust boundary.
+  Bounded candidate copies and synchronous validation do not bound total memory,
+  concurrency or timer latency. No retries are performed.
 - `src/direct/sso-register.ts` encodes the reference PC registration and SSO
   heartbeat bodies, and classifies a registration response using its command,
   SSO return code and exact `register success` message. Account and sequence
