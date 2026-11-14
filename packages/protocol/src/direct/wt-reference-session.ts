@@ -1,9 +1,17 @@
 import { addAbortListener } from 'node:events';
 import { isProxy, isPromise, isSharedArrayBuffer, isUint8Array } from 'node:util/types';
-import type { RawSessionLease } from './raw-session-broker';
+import type { RawSessionLease, RawSessionTerminalAuthority } from './raw-session-broker';
+import {
+    cancelReferenceTerminal,
+    createReferenceTerminalPort,
+    hasReferenceTerminal,
+    takeReferenceTerminal,
+    type ReferenceTerminalFence,
+} from './wt-reference-terminal-private';
 import {
     createBorrowedWtReferenceLoginAttempt,
     bindReferenceKeyCapability,
+    bindReferenceTerminalPort,
     type BorrowedWtReferenceLoginAttempt,
     type BorrowedWtReferenceLoginAttemptOptions,
     type WtReferenceLoginResult,
@@ -21,6 +29,7 @@ import { referenceAliveOnTransport, type SsoAliveOutcome } from './sso-reference
 import {
     assertReferenceKeyCapabilityAvailable,
     commitReferenceKey,
+    discardReferenceBusinessFailure,
     reserveReferenceKeyCapability,
     revokeReferenceKey,
     stageReferenceBusinessFailure,
@@ -185,15 +194,19 @@ export function createWtReferenceSessionWithCapability(
     lease: RawSessionLease,
     options: WtReferenceSessionOptions,
     capability: object,
+    terminal?: RawSessionTerminalAuthority,
+    fence?: ReferenceTerminalFence,
 ): WtReferenceSession {
     assertReferenceKeyCapabilityAvailable(capability);
-    return createSession(lease, options, capability);
+    return createSession(lease, options, capability, terminal, fence);
 }
 
 function createSession(
     lease: RawSessionLease,
     options: WtReferenceSessionOptions,
     capability?: object,
+    terminal?: RawSessionTerminalAuthority,
+    fence?: ReferenceTerminalFence,
 ): WtReferenceSession {
     if (!lease || typeof lease !== 'object' || isProxy(lease) || claimed.has(lease)) {
         throw new TypeError('invalid or already claimed lease');
@@ -205,6 +218,8 @@ function createSession(
     let state: WtReferenceSessionState = 'new';
     let busy = false;
     let poisoned = false;
+    let epoch = 0;
+    let terminalPort: object | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let abortListener: ReturnType<typeof addAbortListener> | undefined;
     let retained: Extract<WtReferenceLoginResult, { status: 'tickets' }> | undefined;
@@ -292,6 +307,12 @@ function createSession(
     };
 
     const fail = (): void => {
+        epoch++;
+
+        if (terminalPort) {
+            cancelReferenceTerminal(terminalPort);
+        }
+
         try {
             revoke();
         } finally {
@@ -476,6 +497,25 @@ function createSession(
             bindReferenceKeyCapability(attempt, capability, reservation!);
         }
 
+        if (terminal && capability) {
+            terminalPort = createReferenceTerminalPort(
+                lease,
+                terminal,
+                (operation) => {
+                    try {
+                        active();
+                        return (
+                            busy && state === (operation === 'poll' ? 'qr-ready' : 'login-register')
+                        );
+                    } catch {
+                        return false;
+                    }
+                },
+                fence,
+            );
+            bindReferenceTerminalPort(attempt, terminalPort);
+        }
+
         wipe(unknown21);
         wipe(randomKey);
         wipe(peerPublicKey);
@@ -490,17 +530,92 @@ function createSession(
         void then.call(
             observed,
             () => {
-                if (state !== 'closed') {
+                if (terminalPort && hasReferenceTerminal(terminalPort, attempt)) {
+                    revoke();
+                    wipeAll();
+                } else if (state !== 'closed') {
                     fail();
                 }
             },
             () => {
-                if (state !== 'closed') {
+                if (terminalPort && hasReferenceTerminal(terminalPort, attempt)) {
+                    revoke();
+                    wipeAll();
+                } else if (state !== 'closed') {
                     fail();
                 }
             },
         );
         active();
+
+        const finishBusiness = (
+            operation: 'poll' | 'login-register',
+            result: { status: string },
+        ): void => {
+            const currentAttempt = attempt;
+
+            if (!terminalPort || !currentAttempt || !capability) {
+                throw new Error('missing terminal binding');
+            }
+
+            const receipt = takeReferenceTerminal(terminalPort, currentAttempt, operation, result);
+
+            if (!receipt) {
+                throw new Error('missing terminal receipt');
+            }
+
+            const previousEpoch = epoch;
+            const valid = (
+                expectedEpoch: number,
+                expectedState: WtReferenceSessionState,
+            ): boolean =>
+                epoch === expectedEpoch &&
+                state === expectedState &&
+                (!signal || !aborted.call(signal)) &&
+                performance.now() < deadline &&
+                performance.now() < receipt.attemptDeadline &&
+                performance.now() < receipt.transactionDeadline &&
+                (!signal || !aborted.call(signal)) &&
+                epoch === expectedEpoch &&
+                state === expectedState;
+
+            if (
+                !valid(previousEpoch, operation === 'poll' ? 'qr-ready' : 'login-register') ||
+                !receipt.afterClaim() ||
+                !valid(previousEpoch, operation === 'poll' ? 'qr-ready' : 'login-register')
+            ) {
+                throw new Error('terminal stopped');
+            }
+
+            fail();
+
+            if (
+                !valid(previousEpoch + 1, 'failed') ||
+                !receipt.afterClaim() ||
+                !valid(previousEpoch + 1, 'failed')
+            ) {
+                throw new Error('terminal stopped');
+            }
+
+            const resultDeadline = Math.min(
+                deadline,
+                receipt.attemptDeadline,
+                receipt.transactionDeadline,
+            );
+            stageReferenceBusinessFailure(
+                capability,
+                operation,
+                result.status,
+                result,
+                resultDeadline,
+            );
+
+            if (!valid(previousEpoch + 1, 'failed')) {
+                discardReferenceBusinessFailure(capability, true);
+                throw new Error('terminal stopped');
+            }
+        };
+
         const signer = input.buildRegisterReserved as RegisterOptions['buildReserved'];
         const verifier = input.verifyRegisterRaw as RegisterOptions['verifyRaw'];
         return {
@@ -530,11 +645,15 @@ function createSession(
                     if (result.status === 'confirmed') {
                         state = 'confirmed';
                     } else if (result.status !== 'wait' && result.status !== 'confirm') {
-                        if (capability) {
-                            stageReferenceBusinessFailure(capability, 'poll', result.status);
-                        }
+                        if (terminalPort) {
+                            finishBusiness('poll', result);
+                        } else {
+                            if (capability) {
+                                stageReferenceBusinessFailure(capability, 'poll', result.status);
+                            }
 
-                        fail();
+                            fail();
+                        }
                     }
 
                     return result;
@@ -555,15 +674,20 @@ function createSession(
                     active();
 
                     if (login.status !== 'tickets') {
-                        if (capability) {
-                            stageReferenceBusinessFailure(
-                                capability,
-                                'login-register',
-                                login.status,
-                            );
+                        if (terminalPort) {
+                            finishBusiness('login-register', login);
+                        } else {
+                            if (capability) {
+                                stageReferenceBusinessFailure(
+                                    capability,
+                                    'login-register',
+                                    login.status,
+                                );
+                            }
+
+                            fail();
                         }
 
-                        fail();
                         return login;
                     }
 
@@ -763,6 +887,16 @@ function createSession(
                 }
             },
             close() {
+                epoch++;
+
+                if (terminalPort) {
+                    cancelReferenceTerminal(terminalPort);
+                }
+
+                if (capability) {
+                    discardReferenceBusinessFailure(capability, true);
+                }
+
                 if (state === 'closed') {
                     return;
                 }

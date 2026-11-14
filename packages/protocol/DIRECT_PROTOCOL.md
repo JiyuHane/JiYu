@@ -1502,9 +1502,10 @@ remain to be recovered and independently verified.
   lease before its sampled deadline and cancellation. It does not establish
   cleanup completion, peer identity, response authenticity or the order in which
   the underlying client closed: client closure can precede the broker's
-  asynchronous observation. This authority is not wired into WT business-result
-  handoff yet; its deep-importable interface is not an isolation boundary against
-  other code in the process. Synthetic tests exercise both two registrations and a WT fetch/poll/login followed
+  asynchronous observation. The injected WT multiplex composition uses this
+  authority for terminal poll and non-ticket login handoff; its deep-importable
+  interface is not an isolation boundary against other code in the process.
+  Synthetic tests exercise both two registrations and a WT fetch/poll/login followed
   by registration through one lease and production codecs. The application runtime
   is not yet attached: an owner must keep the lease across login and registration,
   and explicitly poison it if an outer registration guard later rejects a result
@@ -1560,10 +1561,16 @@ remain to be recovered and independently verified.
   is observed via the next synchronous entry check or an asynchronous close
   notification; the latter is not a same-stack revocation fence. Its `whenClosed`
   indicates logical closure, not physical stream teardown or completion of a
-  callback already in progress. The borrowed attempt can poison its lease before
-  the session resumes on a terminal QR poll or a non-ticket login response; those
-  cases can therefore surface as session failures rather than preserving the
-  underlying business status. This inherited ordering remains unresolved.
+  callback already in progress. In this composition, a terminal QR poll or
+  non-ticket login result can be returned with its original status and code or
+  state after the guard commits, an internal authority claims the broker-local
+  terminal, and an exact-result receipt passes the local closure, cancellation and
+  deadline checks. The receipt does not authenticate the peer or prove physical
+  stream ordering. An independently closed stream or failed check remains a
+  session error. The older standalone session without the internal authority can
+  still lose these business details when its borrowed attempt poisons the lease
+  before the session resumes. The exact-result final-delivery deadline fence does
+  not extend to legacy registration, heartbeat or alive outcomes.
 - `src/direct/raw-multiplex-stream.ts` adapts a caller-supplied, already-established
   byte stream to that client without opening or connecting a socket. It requires
   exclusive ownership and uses the shared direct-socket ownership registry for

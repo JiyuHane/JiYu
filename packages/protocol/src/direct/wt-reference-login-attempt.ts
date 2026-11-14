@@ -9,6 +9,13 @@ import {
 } from './sso12-packet-client';
 import type { RawSessionLease } from './raw-session-broker';
 import { guardBorrowedTransport } from './guard-raw-transaction';
+import {
+    bindReferenceTerminalAttempt,
+    cancelReferenceTerminal,
+    claimReferenceTerminal,
+    hasReferenceTerminal,
+    publishReferenceTerminal,
+} from './wt-reference-terminal-private';
 import { decodeServiceResponse, encodeServiceRequest } from './service-frame';
 import { decodeSsoResponse, encodeSso12Request } from './sso';
 import { createWtEcdh } from './wt-ecdh';
@@ -222,6 +229,19 @@ const borrowedPorts = new WeakMap<
     { lease: RawSessionLease; closed: PromiseLike<unknown> }
 >();
 const referenceCapabilities = new WeakMap<object, object>();
+const terminalPorts = new WeakMap<object, object>();
+
+export function bindReferenceTerminalPort(
+    attempt: BorrowedWtReferenceLoginAttempt,
+    port: object,
+): void {
+    if (terminalPorts.has(attempt)) {
+        throw new Error('terminal port already bound');
+    }
+
+    bindReferenceTerminalAttempt(port, attempt);
+    terminalPorts.set(attempt, port);
+}
 
 /** Internal composition hook; does not expose ticket bytes. */
 export function bindReferenceKeyCapability(
@@ -273,6 +293,7 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
     private qrSig?: Uint8Array;
     private held?: Held;
     private borrowedPoisoned = false;
+    private transactionDeadline = Infinity;
 
     constructor(options: WtReferenceLoginAttemptOptions);
     constructor(
@@ -448,6 +469,12 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
         }
 
         const stopped = (): void => {
+            const port = terminalPorts.get(this);
+
+            if (port && hasReferenceTerminal(port, this)) {
+                return;
+            }
+
             if (this.state !== 'tickets' && this.state !== 'closed') {
                 this.fail();
             }
@@ -540,11 +567,18 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
                 return { status: 'confirmed' };
             }
 
+            const output = { status: value.status, code: value.code };
+
             if (value.status !== 'wait' && value.status !== 'confirm') {
-                this.fail();
+                if (terminalPorts.has(this)) {
+                    Object.freeze(output);
+                    this.finishTerminal('poll', output);
+                } else {
+                    this.fail();
+                }
             }
 
-            return { status: value.status, code: value.code };
+            return output;
         } catch {
             this.fail();
             throw new Error('attempt poll failed');
@@ -610,6 +644,14 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
                 }
 
                 this.active();
+
+                if (value.result.status !== 'tickets' && terminalPorts.has(this)) {
+                    const output = Object.freeze(value.result);
+                    this.finishTerminal('login-register', output);
+                    value = undefined;
+                    return output;
+                }
+
                 this.state = value.result.status === 'tickets' ? 'tickets' : 'failed';
 
                 if (this.state === 'failed') {
@@ -643,6 +685,12 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
     }
 
     close(): void {
+        const port = terminalPorts.get(this);
+
+        if (port) {
+            cancelReferenceTerminal(port);
+        }
+
         const wasBusy = this.busy;
 
         try {
@@ -661,6 +709,55 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
             }
         }
     }
+    private finishTerminal(operation: 'poll' | 'login-register', result: object): void {
+        const port = terminalPorts.get(this);
+
+        if (!port) {
+            throw new Error('terminal port missing');
+        }
+
+        const live = (): boolean =>
+            this.state !== 'closed' &&
+            this.state !== 'failed' &&
+            !this.controller.signal.aborted &&
+            (!this.signal || !signalAborted.call(this.signal)) &&
+            performance.now() < this.deadline &&
+            performance.now() < this.transactionDeadline &&
+            this.getState() !== 'closed' &&
+            this.getState() !== 'failed' &&
+            !this.controller.signal.aborted &&
+            (!this.signal || !signalAborted.call(this.signal));
+
+        if (
+            !claimReferenceTerminal(
+                port,
+                this,
+                operation,
+                result,
+                this.deadline,
+                this.transactionDeadline,
+                live,
+            )
+        ) {
+            throw new Error('terminal claim failed');
+        }
+
+        this.state = 'failed';
+        this.revokeReferenceCapability();
+        this.clean();
+        const afterClean = (): boolean =>
+            this.state === 'failed' &&
+            (!this.signal || !signalAborted.call(this.signal)) &&
+            performance.now() < this.deadline &&
+            performance.now() < this.transactionDeadline &&
+            this.state === 'failed' &&
+            (!this.signal || !signalAborted.call(this.signal));
+
+        if (!publishReferenceTerminal(port, this, operation, result, afterClean)) {
+            throw new Error('terminal publication failed');
+        }
+    }
+
     private enter(expected: State): void {
         if (this.busy) {
             // A borrowed success is not committed until cleanup and its reentry check finish.
@@ -793,6 +890,12 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
         }
     }
     private fail(): void {
+        const port = terminalPorts.get(this);
+
+        if (port) {
+            cancelReferenceTerminal(port);
+        }
+
         try {
             this.revokeReferenceCapability();
         } finally {
@@ -1248,6 +1351,7 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
         let result;
 
         try {
+            this.transactionDeadline = performance.now() + this.timeout;
             result = this.borrowed
                 ? await guardBorrowedTransport<Context, ExchangeResult>(this.transport, {
                       disposeContext: (value) => {

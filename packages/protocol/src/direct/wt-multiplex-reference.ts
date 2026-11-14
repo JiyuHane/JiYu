@@ -1,11 +1,12 @@
 import { addAbortListener } from 'node:events';
+import { isProxy } from 'node:util/types';
 import type { RawMultiplexPushRoute } from './raw-multiplex-client';
 import {
     createRawMultiplexStream,
     type RawMultiplexByteStream,
     type RawMultiplexStreamClient,
 } from './raw-multiplex-stream';
-import { createRawSessionBroker, type RawSessionLease } from './raw-session-broker';
+import { createRawSessionBrokerInternal, type RawSessionLease } from './raw-session-broker';
 import { SSO_HEARTBEAT_COMMAND, SSO_INFO_SYNC_COMMAND } from './sso-register';
 import { SSO_REFERENCE_ALIVE_COMMAND } from './sso-reference-alive-flow';
 import {
@@ -21,8 +22,9 @@ import {
     referenceExpectedUin,
     referenceKeyState,
     revokeReferenceKey,
+    takeReferenceExactBusinessFailure,
 } from './wt-reference-session-private';
-import type { Sso12CloseReason } from './sso12-packet-client';
+import type { Sso12CloseReason, Sso12RawClient } from './sso12-packet-client';
 
 const PUSH_COMMAND = 'trpc.msg.olpush.OlPushService.MsgPush';
 const MAX_TIMER = 0x7fffffff;
@@ -162,6 +164,20 @@ export function createWtMultiplexReference(
     let externallyStopped = false;
     let registered = false;
     let generation = 0;
+    let externalEpoch = 0;
+    let runId: object | undefined;
+    let claim:
+        | {
+              run: object;
+              operation: Operation;
+              generation: number;
+              externalEpoch: number;
+              preclosed?: boolean;
+              selfRevoked: boolean;
+              accepted: boolean;
+              invalid: boolean;
+          }
+        | undefined;
     let delivering = false;
     let inCallback = false;
     let queuedBytes = 0;
@@ -176,6 +192,17 @@ export function createWtMultiplexReference(
             if (value) {
                 nativeFill.call(value, 0);
             }
+        } catch {
+            /* best effort */
+        }
+    };
+
+    const disposeAbortListener = (): void => {
+        const listener = abortListener;
+        abortListener = undefined;
+
+        try {
+            listener?.[Symbol.dispose]();
         } catch {
             /* best effort */
         }
@@ -206,17 +233,33 @@ export function createWtMultiplexReference(
 
         queuedBytes = 0;
 
-        try {
-            abortListener?.[Symbol.dispose]();
-        } catch {
-            /* best effort */
+        // Keep observing an external abort until an in-flight result has been fenced.
+        if (!busy) {
+            disposeAbortListener();
         }
-
-        abortListener = undefined;
     };
 
-    const closeAll = (): void => {
+    const closeAll = (propagated = false): void => {
+        const candidate =
+            propagated && claim?.accepted === true && claim.preclosed === false && !claim.invalid;
+
+        if (claim) {
+            if (candidate) {
+                if (!stopped && generation === claim.generation) {
+                    claim.selfRevoked = true;
+                }
+            } else {
+                claim.invalid = true;
+            }
+        }
+
         revoke();
+
+        if (candidate) {
+            // A candidate still requires the owner's exact, single-use receipt. Defer
+            // owner.close() until the in-flight result has settled and been checked.
+            return;
+        }
 
         try {
             owner?.close();
@@ -238,6 +281,7 @@ export function createWtMultiplexReference(
     };
 
     const stopExternally = (): void => {
+        externalEpoch++;
         externallyStopped = true;
         closeAll();
     };
@@ -247,17 +291,17 @@ export function createWtMultiplexReference(
             return false;
         }
 
-        if (
-            performance.now() >= leaseDeadline ||
-            mux?.closed ||
-            referenceKeyState(token) === 'revoked' ||
-            signal?.aborted
-        ) {
+        if (performance.now() >= leaseDeadline || signal?.aborted) {
             closeAll();
             return false;
         }
 
-        return true;
+        if (mux?.closed || referenceKeyState(token) === 'revoked') {
+            closeAll(true);
+            return false;
+        }
+
+        return !stopped && expected === generation && !externallyStopped;
     };
 
     const makeExpected = (
@@ -511,10 +555,98 @@ export function createWtMultiplexReference(
             },
         });
         const streamClient = mux;
-        const broker = createRawSessionBroker(streamClient, {
+        // The broker retains this exact adapter; the stream client still owns its
+        // original stream and its whenClosed promise keeps its original identity.
+        const adapter: Sso12RawClient = {
+            whenClosed: streamClient.whenClosed,
+            transactRaw: (input) => streamClient.transactRaw(input),
+            close() {
+                if (claim) {
+                    if (claim.preclosed !== undefined) {
+                        claim.invalid = true;
+                    } else {
+                        claim.preclosed = streamClient.closed;
+                    }
+                }
+
+                streamClient.close();
+            },
+        };
+        const { broker, terminal } = createRawSessionBrokerInternal(adapter, {
             trustedSuccessQuiescence: true,
             isUsable: () => live() && !streamClient.closed,
         });
+        const fence = {
+            beforeClaim(): boolean {
+                if (
+                    !runId ||
+                    !operation ||
+                    claim ||
+                    stopped ||
+                    externallyStopped ||
+                    streamClient.closed ||
+                    referenceKeyState(token) === 'revoked'
+                ) {
+                    return false;
+                }
+
+                const current = {
+                    run: runId,
+                    operation,
+                    generation,
+                    externalEpoch,
+                    selfRevoked: false,
+                    accepted: false,
+                    invalid: false,
+                };
+                claim = current;
+                const valid =
+                    performance.now() < leaseDeadline &&
+                    !signal?.aborted &&
+                    claim === current &&
+                    runId === current.run &&
+                    operation === current.operation &&
+                    generation === current.generation &&
+                    externalEpoch === current.externalEpoch &&
+                    !stopped &&
+                    !externallyStopped &&
+                    !streamClient.closed &&
+                    referenceKeyState(token) !== 'revoked';
+
+                if (!valid) {
+                    current.invalid = true;
+                }
+
+                return valid;
+            },
+            afterClaim(): boolean {
+                const current = claim;
+
+                if (!current) {
+                    return false;
+                }
+
+                const valid =
+                    performance.now() < leaseDeadline &&
+                    !signal?.aborted &&
+                    claim === current &&
+                    runId === current.run &&
+                    operation === current.operation &&
+                    externalEpoch === current.externalEpoch &&
+                    !externallyStopped &&
+                    !current.invalid &&
+                    current.preclosed === false &&
+                    (stopped
+                        ? current.accepted &&
+                          current.selfRevoked &&
+                          generation === current.generation + 1
+                        : generation === current.generation) &&
+                    streamClient.closed;
+                current.accepted = valid;
+                current.invalid ||= !valid;
+                return valid;
+            },
+        };
         lease = broker.acquire({
             deadline: leaseDeadline,
             signal,
@@ -548,6 +680,8 @@ export function createWtMultiplexReference(
                 },
             },
             token,
+            terminal,
+            fence,
         );
 
         if (signal) {
@@ -558,8 +692,14 @@ export function createWtMultiplexReference(
             }
         }
 
-        void streamClient.whenClosed.then(closeAll, closeAll);
-        void lease.whenClosed.then(closeAll, closeAll);
+        void streamClient.whenClosed.then(
+            () => closeAll(true),
+            () => closeAll(),
+        );
+        void lease.whenClosed.then(
+            () => closeAll(true),
+            () => closeAll(),
+        );
 
         if (!live()) {
             throw new Error('session stopped');
@@ -573,10 +713,21 @@ export function createWtMultiplexReference(
             busy = true;
             operation = next;
             const current = generation;
+            const currentRun = {};
+            let pendingExactDelivery: { deadline: number; externalEpoch: number } | undefined;
+            runId = currentRun;
 
             try {
                 const result = await action();
-                const status = (result as { status?: unknown }).status;
+
+                // Owner results are ordinary records; do not run an accessor while
+                // deciding whether a terminal receipt matches this exact value.
+                if (!result || typeof result !== 'object' || isProxy(result)) {
+                    throw new Error('invalid session result');
+                }
+
+                const descriptor = Object.getOwnPropertyDescriptor(result, 'status');
+                const status = descriptor && 'value' in descriptor ? descriptor.value : undefined;
                 const businessFailure =
                     (next === 'poll' &&
                         (status === 'expired' ||
@@ -594,6 +745,102 @@ export function createWtMultiplexReference(
                     ((next === 'heartbeat' || next === 'alive') && status === 'sso-error');
 
                 if (businessFailure && typeof status === 'string') {
+                    const exactReceipt =
+                        next === 'poll' ||
+                        (next === 'login-register' &&
+                            (status === 'verification-required' ||
+                                status === 'nonzero' ||
+                                status === 'incomplete' ||
+                                status === 'error'));
+
+                    if (exactReceipt && (next === 'poll' || next === 'login-register')) {
+                        const candidate = claim;
+
+                        const candidateValid = (deadline: number): boolean => {
+                            if (
+                                !candidate ||
+                                claim !== candidate ||
+                                candidate.invalid ||
+                                !candidate.accepted ||
+                                candidate.preclosed !== false ||
+                                candidate.run !== currentRun ||
+                                candidate.operation !== next ||
+                                candidate.generation !== current ||
+                                candidate.externalEpoch !== externalEpoch ||
+                                runId !== currentRun ||
+                                operation !== next ||
+                                externallyStopped ||
+                                (stopped
+                                    ? !candidate.selfRevoked || generation !== current + 1
+                                    : generation !== current)
+                            ) {
+                                return false;
+                            }
+
+                            const now = performance.now();
+
+                            if (now >= leaseDeadline || now >= deadline || signal?.aborted) {
+                                return false;
+                            }
+
+                            return (
+                                claim === candidate &&
+                                !candidate.invalid &&
+                                externalEpoch === candidate.externalEpoch &&
+                                runId === currentRun &&
+                                operation === next &&
+                                !externallyStopped &&
+                                (stopped
+                                    ? candidate.selfRevoked && generation === current + 1
+                                    : generation === current)
+                            );
+                        };
+
+                        if (!candidateValid(leaseDeadline)) {
+                            throw new Error('session stopped');
+                        }
+
+                        // The take burns its exact receipt even on a mismatch.
+                        const receipt = takeReferenceExactBusinessFailure(
+                            token,
+                            next,
+                            status,
+                            result,
+                        );
+
+                        if (
+                            !receipt ||
+                            typeof receipt.deadline !== 'number' ||
+                            !Number.isFinite(receipt.deadline) ||
+                            !candidateValid(receipt.deadline)
+                        ) {
+                            throw new Error('session stopped');
+                        }
+
+                        // Completing cleanup can itself reenter public close/abort.
+                        // The receipt is already consumed; never retry it.
+                        closeAll();
+                        const now = performance.now();
+
+                        if (
+                            now >= leaseDeadline ||
+                            now >= receipt.deadline ||
+                            signal?.aborted ||
+                            externallyStopped ||
+                            externalEpoch !== candidate!.externalEpoch ||
+                            runId !== currentRun ||
+                            operation !== next
+                        ) {
+                            throw new Error('session stopped');
+                        }
+
+                        pendingExactDelivery = {
+                            deadline: receipt.deadline,
+                            externalEpoch: candidate!.externalEpoch,
+                        };
+                        return result;
+                    }
+
                     if (
                         externallyStopped ||
                         signal?.aborted ||
@@ -618,7 +865,24 @@ export function createWtMultiplexReference(
                         throw new Error('session stopped');
                     }
 
+                    const stopEpoch = externalEpoch;
                     closeAll();
+
+                    // The clock and cleanup can synchronously reenter close or abort.
+                    // Timers and disposal of the listener in finally are not hard-real-time
+                    // fences against modified intrinsics or arbitrary same-process effects.
+                    if (
+                        externallyStopped ||
+                        externalEpoch !== stopEpoch ||
+                        signal?.aborted ||
+                        performance.now() >= leaseDeadline ||
+                        signal?.aborted ||
+                        externallyStopped ||
+                        externalEpoch !== stopEpoch
+                    ) {
+                        throw new Error('session stopped');
+                    }
+
                     return result;
                 }
 
@@ -627,8 +891,6 @@ export function createWtMultiplexReference(
                 }
 
                 if (next === 'login-register') {
-                    const status = (result as { status?: unknown }).status;
-
                     if (status === 'success') {
                         if (referenceKeyState(token) !== 'active') {
                             throw new Error('key not committed');
@@ -651,10 +913,45 @@ export function createWtMultiplexReference(
             } finally {
                 expected = undefined;
                 operation = undefined;
+                runId = undefined;
+                claim = undefined;
                 busy = false;
+
+                if (stopped) {
+                    disposeAbortListener();
+                }
 
                 if (registered && live(current)) {
                     drain();
+                }
+
+                // Only a pending WT failure may reach this fence. It runs after
+                // listener disposal, which can synchronously reenter cancellation.
+                // Existing thrown errors and other result paths are unchanged.
+                if (pendingExactDelivery) {
+                    const pending = pendingExactDelivery;
+
+                    if (
+                        externallyStopped ||
+                        externalEpoch !== pending.externalEpoch ||
+                        signal?.aborted
+                    ) {
+                        // eslint-disable-next-line no-unsafe-finally -- Reject pending WT delivery after cancellation during cleanup.
+                        throw new Error('session stopped');
+                    }
+
+                    const finalNow = performance.now();
+
+                    if (
+                        finalNow >= leaseDeadline ||
+                        finalNow >= pending.deadline ||
+                        signal?.aborted ||
+                        externallyStopped ||
+                        externalEpoch !== pending.externalEpoch
+                    ) {
+                        // eslint-disable-next-line no-unsafe-finally -- Reject an expired pending WT terminal delivery.
+                        throw new Error('session stopped');
+                    }
                 }
             }
         };

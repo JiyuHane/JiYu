@@ -11,7 +11,12 @@ type Slot = {
     reservation?: object;
     businessOwner?: object;
     businessFinalized?: boolean;
-    businessFailure?: { operation: BusinessOperation; status: string };
+    businessFailure?: {
+        operation: BusinessOperation;
+        status: string;
+        exactResult?: object;
+        deadline?: number;
+    };
     transportUin?: string;
     confirmedUin?: string;
     sequence?: number;
@@ -74,6 +79,8 @@ export function stageReferenceBusinessFailure(
     token: object,
     operation: BusinessOperation,
     status: string,
+    exactResult?: object,
+    deadline?: number,
 ): void {
     const value = slot(token);
     const allowed =
@@ -90,12 +97,27 @@ export function stageReferenceBusinessFailure(
             ].includes(status)) ||
         ((operation === 'heartbeat' || operation === 'alive') && status === 'sso-error');
 
-    if (!value.businessOwner || value.businessFinalized || !allowed) {
+    if (
+        !value.businessOwner ||
+        value.businessFinalized ||
+        !allowed ||
+        (exactResult !== undefined &&
+            (typeof deadline !== 'number' || !Number.isFinite(deadline))) ||
+        (exactResult === undefined && deadline !== undefined)
+    ) {
         throw new Error('invalid reference business failure');
     }
 
     value.businessFinalized = true;
-    value.businessFailure = { operation, status };
+    value.businessFailure = { operation, status, exactResult, deadline };
+}
+
+export function discardReferenceBusinessFailure(token: object, exactOnly = false): void {
+    const value = slot(token);
+
+    if (!exactOnly || value.businessFailure?.exactResult !== undefined) {
+        value.businessFailure = undefined;
+    }
 }
 
 /** Consume the tombstone once, including on a mismatched query. */
@@ -103,11 +125,43 @@ export function consumeReferenceBusinessFailure(
     token: object,
     operation: BusinessOperation,
     status: string,
+    exactResult?: object,
 ): boolean {
     const value = slot(token);
     const failure = value.businessFailure;
     value.businessFailure = undefined;
-    return failure?.operation === operation && failure.status === status;
+    return (
+        failure?.operation === operation &&
+        failure.status === status &&
+        failure.exactResult === undefined &&
+        exactResult === undefined
+    );
+}
+
+/** Burn first; only exact committed WT results carry an absolute monotonic deadline. */
+export function takeReferenceExactBusinessFailure(
+    token: object,
+    operation: BusinessOperation,
+    status: string,
+    exactResult: object,
+): { deadline: number } | undefined {
+    const value = slot(token);
+    const failure = value.businessFailure;
+    value.businessFailure = undefined;
+
+    if (
+        !failure ||
+        failure.operation !== operation ||
+        failure.status !== status ||
+        failure.exactResult !== exactResult ||
+        typeof failure.deadline !== 'number' ||
+        !Number.isFinite(failure.deadline) ||
+        performance.now() >= failure.deadline
+    ) {
+        return undefined;
+    }
+
+    return { deadline: failure.deadline };
 }
 
 export function stageReferenceConfirmed(

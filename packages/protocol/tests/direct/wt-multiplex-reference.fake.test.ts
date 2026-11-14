@@ -1097,7 +1097,8 @@ describe('WT multiplex reference with a synthetic EventEmitter peer', () => {
                 ),
                 'terminal poll',
             );
-            expect(actual).toEqual(baseline);
+            expect(baseline).toEqual({ kind: 'error' });
+            expect(actual).toEqual({ kind: 'result', value: { status, code } });
             expect(f.getVerifyPushCalls()).toBe(0);
             expect(f.observed).toEqual([]);
         } finally {
@@ -1118,7 +1119,11 @@ describe('WT multiplex reference with a synthetic EventEmitter peer', () => {
                 ),
                 'login business error',
             );
-            expect(actual).toEqual(baseline);
+            expect(baseline).toEqual({ kind: 'error' });
+            expect(actual).toEqual({
+                kind: 'result',
+                value: { status: 'error', state: 1, code: 42 },
+            });
             expect(f.requests).toHaveLength(3);
             expect(f.getVerifyPushCalls()).toBe(0);
             expect(f.observed).toEqual([]);
