@@ -888,6 +888,63 @@ describe('community plugin index', () => {
         expect(parseConfigNumber(' 1.5 ')).toBe(1.5);
         expect(() => configDraftToValue([], {})).toThrow();
     });
+    it('accepts only explicit false reactive metadata on scalar fields', () => {
+        const fields = parseConfigFields([
+            { key: 's', label: 'String', type: 'string', default: '', reactive: false },
+            { key: 't', label: 'Text', type: 'text', reactive: false },
+            { key: 'n', label: 'Number', type: 'number', default: 0, reactive: false },
+            { key: 'b', label: 'Boolean', type: 'boolean', default: false, reactive: false },
+            { key: 'legacy', label: 'Legacy', type: 'boolean' },
+        ]);
+        expect(fields[0]).toMatchObject({ reactive: false });
+        expect(
+            parseConfigValue(fields, { s: '', t: 'value', n: 0, b: false, legacy: true }),
+        ).toEqual({
+            s: '',
+            t: 'value',
+            n: 0,
+            b: false,
+            legacy: true,
+        });
+        expect(
+            configDraftToValue(fields, { s: '', t: 'value', n: '0', b: false, legacy: true }),
+        ).toEqual({
+            s: '',
+            t: 'value',
+            n: 0,
+            b: false,
+            legacy: true,
+        });
+
+        for (const reactive of [true, undefined, null, 0, 'false', {}, []]) {
+            expect(() =>
+                parseConfigFields([{ key: 'x', label: 'X', type: 'string', reactive }]),
+            ).toThrow();
+        }
+
+        const getter = vi.fn(() => false);
+        const accessor = Object.defineProperty(
+            { key: 'x', label: 'X', type: 'string' },
+            'reactive',
+            {
+                enumerable: true,
+                get: getter,
+            },
+        );
+        expect(() => parseConfigFields([accessor])).toThrow();
+        expect(getter).not.toHaveBeenCalled();
+        expect(() =>
+            parseConfigFields([
+                { key: 'x', label: 'X', type: 'string', reactive: false, hidden: false },
+            ]),
+        ).toThrow();
+        expect(() =>
+            parseConfigFields([
+                { key: 'x', label: 'X', type: 'string', reactive: false },
+                { key: 'x', label: 'X', type: 'boolean' },
+            ]),
+        ).toThrow();
+    });
     it('rejects numeric precision loss, negative zero and nonzero underflow before posting', () => {
         const fields = parseConfigFields([{ key: 'n', label: '数字', type: 'number' }]);
         const send = vi.fn();

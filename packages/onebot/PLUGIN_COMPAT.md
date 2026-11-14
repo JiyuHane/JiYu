@@ -77,9 +77,10 @@ continues to perform its own checks.
 
 The configuration panel calls static schema and optional get/set hooks only
 on explicit user actions. Its editor accepts at most 64 fields, only `key`,
-`label`, `type`, `default`, and `description` properties, nonempty safe keys
-and nonempty labels, and the `string`, `text`, `number`, and `boolean` types with
-additional value checks. Even a builder-produced scalar may be rejected. For a
+`label`, `type`, `default`, `description`, and an optional `reactive: false`
+property, nonempty safe keys and nonempty labels, and the `string`, `text`,
+`number`, and `boolean` types with additional value checks. Other `reactive`
+values remain unsupported; this does not enable dynamic controllers. Even a builder-produced scalar may be rejected. For a
 `plainText` item made by the current slot's own builder, a versioned sidecar
 can identify that item in the captured static schema. The editor displays its
 text only as a read-only snapshot and does not call the configuration getter or

@@ -213,6 +213,7 @@ export interface PluginConfigField {
     type: 'string' | 'text' | 'number' | 'boolean';
     description?: string;
     default?: PluginConfigScalar;
+    reactive?: false;
 }
 export interface PluginDisplaySidecar {
     version: 1;
