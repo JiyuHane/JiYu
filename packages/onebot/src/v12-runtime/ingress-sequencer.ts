@@ -1,6 +1,7 @@
 import { isPromise, isProxy } from 'node:util/types';
 
-/** Internal, standalone ordering primitive. It is not connected to HTTP or the pipeline.
+/** Internal ordering primitive. An explicitly prepared fixture path can connect it
+ * to pipeline admission and an injected HTTP capability; production does not enable it.
  * The host owns source/epoch verification and must install it before declaring ready.
  * Ordering means admission order, not QQ occurrence time or OneBot event.time.
  * Encoded byte budgets do not bound RSS, allocation during ownKeys, or CPU time.

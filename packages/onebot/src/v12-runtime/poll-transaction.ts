@@ -1,7 +1,8 @@
 import { addAbortListener } from 'node:events';
 import type { PollOptions, PollResult } from './event-poll-buffer';
 
-/** Offline seam only: not connected to a runtime, HTTP transport or public export.
+/** Internal transaction seam: an explicitly activated runtime owner and an injected
+ * HTTP capability can use it, but the production runtime does not wire them together.
  * The trusted host owns one coordinator per account and binding epoch, validates
  * event origin, creates the buffer and supplies its exact maxQueueBytes. Neither
  * request input nor an arbitrary same-process object is an authority for these.
@@ -12,8 +13,9 @@ import type { PollOptions, PollResult } from './event-poll-buffer';
  * The host bounds concurrency (including unfinished writes), relative deadlines,
  * parsed request/echo and output sizes. Deadlines and now() use the same monotonic
  * millisecond clock; timers are not real-time guarantees and byte caps do not bound RSS.
- * The injected sink is an in-memory fake, not a socket. isOpen covers every unusable
- * writing state. The host owns error handling before and after this transaction and
+ * The sink is injected: fixtures use in-memory fakes, while the optional transport
+ * seam can supply a response sink. isOpen covers every unusable writing state. The
+ * host owns error handling before and after this transaction and
  * for late sink errors. Local finish is not evidence of remote receipt. Real transport
  * needs its own authentication, source provenance, admission and effect accounting.
  * Legacy mode writes [] for empty or timeout; ordered mode instead returns an
