@@ -23,6 +23,115 @@ const aborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted'
 const nativeThen = Promise.prototype.then;
 const maxTimer = 0x7fffffff;
 
+declare const terminalProofBrand: unique symbol;
+/** Opaque evidence of a locally claimed first terminal transition, not peer authentication. */
+export interface RawSessionTerminalProof {
+    readonly [terminalProofBrand]: never;
+}
+
+interface TerminalContext {
+    readonly owner: object;
+    readonly generation: object;
+    readonly nonce: object;
+    readonly deadline: number;
+    readonly signal: AbortSignal | undefined;
+    terminal: 'released' | 'poisoned' | undefined;
+    ownedProof: RawSessionTerminalProof | undefined;
+    claim(): RawSessionTerminalProof | undefined;
+}
+
+interface TerminalProofContext {
+    readonly lease: object;
+    readonly owner: object;
+    readonly generation: object;
+    readonly nonce: object;
+    consumed: boolean;
+}
+
+const terminalContexts = new WeakMap<object, TerminalContext>();
+const terminalProofs = new WeakMap<object, TerminalProofContext>();
+
+/**
+ * This authority is a local coordination capability, not a same-process security
+ * boundary. A proof records the first local transition, not cleanup or peer identity.
+ */
+export interface RawSessionTerminalAuthority {
+    poison(lease: unknown): RawSessionTerminalProof | undefined;
+    consume(lease: unknown, proof: unknown): boolean;
+}
+
+function objectKey(value: unknown): value is object {
+    return (typeof value === 'object' && value !== null) || typeof value === 'function';
+}
+
+function createTerminalAuthority(owner: object): RawSessionTerminalAuthority {
+    return {
+        poison(lease) {
+            if (!objectKey(lease)) {
+                return undefined;
+            }
+
+            const context = terminalContexts.get(lease);
+
+            if (!context || context.owner !== owner) {
+                return undefined;
+            }
+
+            return context.claim();
+        },
+        consume(lease, proof) {
+            if (!objectKey(proof)) {
+                return false;
+            }
+
+            const evidence = terminalProofs.get(proof);
+
+            if (!evidence || evidence.consumed) {
+                return false;
+            }
+
+            // Burn before any further validation, including reentrant clock access.
+            evidence.consumed = true;
+
+            if (!objectKey(lease) || evidence.owner !== owner || evidence.lease !== lease) {
+                return false;
+            }
+
+            const context = terminalContexts.get(lease);
+
+            if (
+                !context ||
+                context.owner !== owner ||
+                context.generation !== evidence.generation ||
+                context.nonce !== evidence.nonce ||
+                context.terminal !== 'poisoned' ||
+                context.ownedProof !== proof
+            ) {
+                return false;
+            }
+
+            try {
+                if (
+                    performance.now() >= context.deadline ||
+                    (context.signal !== undefined && signalState(context.signal))
+                ) {
+                    return false;
+                }
+            } catch {
+                return false;
+            }
+
+            return (
+                context.owner === owner &&
+                context.generation === evidence.generation &&
+                context.nonce === evidence.nonce &&
+                context.terminal === 'poisoned' &&
+                context.ownedProof === proof
+            );
+        },
+    };
+}
+
 /** Attach to genuine promises without consulting a potentially overridden own `then`.
  * The returned native child remains fulfilled because both callbacks return undefined.
  * Promise species/constructor machinery still executes; arbitrary modified species,
@@ -105,6 +214,24 @@ export function createRawSessionBroker(
     client: Sso12RawClient,
     config: { trustedSuccessQuiescence: true; isUsable: () => boolean },
 ): RawSessionBroker {
+    return createBroker(client, config, {});
+}
+
+/** Internal coordination API; deep imports do not isolate same-process callers. */
+export function createRawSessionBrokerInternal(
+    client: Sso12RawClient,
+    config: { trustedSuccessQuiescence: true; isUsable: () => boolean },
+): { broker: RawSessionBroker; terminal: RawSessionTerminalAuthority } {
+    const owner = {};
+    const broker = createBroker(client, config, owner);
+    return { broker, terminal: createTerminalAuthority(owner) };
+}
+
+function createBroker(
+    client: Sso12RawClient,
+    config: { trustedSuccessQuiescence: true; isUsable: () => boolean },
+    owner: object,
+): RawSessionBroker {
     const cfg = record(config, ['trustedSuccessQuiescence', 'isUsable']);
 
     if (
@@ -150,13 +277,20 @@ export function createRawSessionBroker(
                 resolveClosed = resolve;
             });
             const controller = new AbortController();
+            let terminalContext!: TerminalContext;
 
-            const finish = (reason: 'released' | 'poisoned'): void => {
+            const finish = (
+                reason: 'released' | 'poisoned',
+                ownedProof?: RawSessionTerminalProof,
+            ): void => {
                 if (terminal) {
                     return;
                 }
 
+                // No external code runs between the terminal and provenance writes.
                 terminal = reason;
+                terminalContext.terminal = reason;
+                terminalContext.ownedProof = ownedProof;
 
                 if (timer !== undefined) {
                     clearTimeout(timer);
@@ -520,6 +654,52 @@ export function createRawSessionBroker(
                     }
                 },
             };
+
+            terminalContext = {
+                owner,
+                generation: {},
+                nonce: {},
+                deadline,
+                signal,
+                terminal: undefined,
+                ownedProof: undefined,
+                claim() {
+                    if (terminal || terminalContexts.get(lease) !== terminalContext) {
+                        return undefined;
+                    }
+
+                    try {
+                        if (sessionExpired()) {
+                            return undefined;
+                        }
+                    } catch {
+                        return undefined;
+                    }
+
+                    // Clock/signal inspection may reenter: validate again before claim.
+                    if (terminal || terminalContexts.get(lease) !== terminalContext) {
+                        return undefined;
+                    }
+
+                    const proof = {} as RawSessionTerminalProof;
+                    terminalProofs.set(proof, {
+                        lease,
+                        owner,
+                        generation: terminalContext.generation,
+                        nonce: terminalContext.nonce,
+                        consumed: false,
+                    });
+
+                    try {
+                        finish('poisoned', proof);
+                    } catch {
+                        // The claim proves only the transition, never completed cleanup.
+                    }
+
+                    return terminalContext.ownedProof === proof ? proof : undefined;
+                },
+            };
+            terminalContexts.set(lease, terminalContext);
 
             try {
                 if (signal) {

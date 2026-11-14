@@ -1497,7 +1497,14 @@ remain to be recovered and independently verified.
   ordering or prove writes. It accepts same-realm standard AbortSignals whose
   prototype and listener methods remain unchanged while in use. Timers are not
   hard realtime and callback-owned late allocations require producer cleanup.
-  Synthetic tests exercise both two registrations and a WT fetch/poll/login followed
+  The separate internal broker factory can issue a single-use proof that its own
+  authority claimed the first local broker terminal transition for a particular
+  lease before its sampled deadline and cancellation. It does not establish
+  cleanup completion, peer identity, response authenticity or the order in which
+  the underlying client closed: client closure can precede the broker's
+  asynchronous observation. This authority is not wired into WT business-result
+  handoff yet; its deep-importable interface is not an isolation boundary against
+  other code in the process. Synthetic tests exercise both two registrations and a WT fetch/poll/login followed
   by registration through one lease and production codecs. The application runtime
   is not yet attached: an owner must keep the lease across login and registration,
   and explicitly poison it if an outer registration guard later rejects a result
@@ -1539,9 +1546,11 @@ remain to be recovered and independently verified.
   That limit is checked after SSO parsing and decompression, whose separate
   16 MiB output cap is not a limit on total process memory. Callback copies are
   wiped best-effort after settlement or termination; an independently closing
-  transport may be observed in a subsequent microtask. Parser-internal or
-  engine-held temporary copies and copies retained by callers are not guaranteed
-  to be erased. The API does not expose the D2 key for caller-side decoding. The
+  transport may be observed in a subsequent microtask. The SSO parser also wipes
+  its reachable temporary field copies on success or failure while preserving
+  caller-owned input and successfully returned fields. Copies internal to zlib or
+  the JavaScript engine and copies retained by callers are not guaranteed to be
+  erased. The API does not expose the D2 key for caller-side decoding. The
   deep-importable capability helpers are an internal ownership convention, not isolation from
   other code in the same process. The legacy borrowed attempt API still returns
   tickets. The classifier and caller-provided verification are local policies;
