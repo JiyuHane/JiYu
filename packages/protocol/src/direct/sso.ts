@@ -8,6 +8,25 @@ import { inflateSync } from 'node:zlib';
 const MAX_SSO_BYTES = 16 * 1024 * 1024;
 const FIXED_12 = Uint8Array.of(2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 const utf8 = new TextDecoder('utf-8', { fatal: true });
+const fillBytes = Uint8Array.prototype.fill;
+
+function wipe(bytes: Uint8Array | undefined): void {
+    try {
+        if (bytes !== undefined) {
+            fillBytes.call(bytes, 0);
+        }
+    } catch {
+        // Best effort: preserve the parse result or original error and continue cleanup.
+    }
+}
+
+function decodeText(bytes: Uint8Array): string {
+    try {
+        return utf8.decode(bytes);
+    } finally {
+        wipe(bytes);
+    }
+}
 
 export interface Sso12Request {
     sequence: number;
@@ -165,30 +184,72 @@ export function decodeSsoResponse(bytes: Uint8Array): SsoResponse {
     }
 
     const outer = new Reader(bytes);
-    const header = new Reader(outer.readField());
-    const encodedBody = outer.readField();
+    let headerBytes: Uint8Array | undefined;
+    let encodedBody: Uint8Array | undefined;
+    let trailing: Uint8Array | undefined;
+    let cookie: Uint8Array | undefined;
+    let reserved: Uint8Array | undefined;
+    let headerExtension: Uint8Array | undefined;
+    let body: Uint8Array | undefined;
+    let transferred = false;
 
-    if (outer.rest().length !== 0) {
-        throw new Error('unexpected trailing SSO data');
+    try {
+        headerBytes = outer.readField();
+        const header = new Reader(headerBytes);
+        encodedBody = outer.readField();
+        trailing = outer.rest();
+
+        if (trailing.length !== 0) {
+            throw new Error('unexpected trailing SSO data');
+        }
+
+        const sequence = header.readInt32();
+        const retCode = header.readInt32();
+        const extra = decodeText(header.readField());
+        const command = decodeText(header.readField());
+        cookie = header.readField();
+        const dataFlag = header.readInt32();
+        reserved = header.readField();
+        headerExtension = header.rest();
+
+        if (dataFlag === 0 || dataFlag === 4) {
+            body = encodedBody;
+        } else if (dataFlag === 1) {
+            body = inflateSync(encodedBody, { maxOutputLength: MAX_SSO_BYTES });
+        } else {
+            throw new Error(`unsupported SSO data flag: ${dataFlag}`);
+        }
+
+        const result = {
+            sequence,
+            retCode,
+            extra,
+            command,
+            cookie,
+            dataFlag,
+            reserved,
+            body,
+            headerExtension,
+        };
+        transferred = true;
+        return result;
+    } finally {
+        // The input is borrowed; only independently allocated copies are wiped here.
+        wipe(headerBytes);
+        wipe(trailing);
+
+        if (!transferred || encodedBody !== body) {
+            wipe(encodedBody);
+        }
+
+        if (!transferred) {
+            wipe(cookie);
+            wipe(reserved);
+            wipe(headerExtension);
+
+            if (body !== encodedBody) {
+                wipe(body);
+            }
+        }
     }
-
-    const sequence = header.readInt32();
-    const retCode = header.readInt32();
-    const extra = utf8.decode(header.readField());
-    const command = utf8.decode(header.readField());
-    const cookie = header.readField();
-    const dataFlag = header.readInt32();
-    const reserved = header.readField();
-    const headerExtension = header.rest();
-    let body: Uint8Array;
-
-    if (dataFlag === 0 || dataFlag === 4) {
-        body = encodedBody;
-    } else if (dataFlag === 1) {
-        body = inflateSync(encodedBody, { maxOutputLength: MAX_SSO_BYTES });
-    } else {
-        throw new Error(`unsupported SSO data flag: ${dataFlag}`);
-    }
-
-    return { sequence, retCode, extra, command, cookie, dataFlag, reserved, body, headerExtension };
 }
