@@ -3,6 +3,7 @@ import { isProxy, isPromise, isSharedArrayBuffer, isUint8Array } from 'node:util
 import type { RawSessionLease } from './raw-session-broker';
 import {
     createBorrowedWtReferenceLoginAttempt,
+    bindReferenceKeyCapability,
     type BorrowedWtReferenceLoginAttempt,
     type BorrowedWtReferenceLoginAttemptOptions,
     type WtReferenceLoginResult,
@@ -17,6 +18,13 @@ import {
     type SsoHeartbeatOutcome,
 } from './sso-reference-heartbeat-flow';
 import { referenceAliveOnTransport, type SsoAliveOutcome } from './sso-reference-alive-flow';
+import {
+    assertReferenceKeyCapabilityAvailable,
+    commitReferenceKey,
+    reserveReferenceKeyCapability,
+    revokeReferenceKey,
+    stageReferenceBusinessFailure,
+} from './wt-reference-session-private';
 
 type AttemptOptions = BorrowedWtReferenceLoginAttemptOptions;
 type RegisterOptions = SsoReferenceRegisterBorrowedOptions;
@@ -169,10 +177,29 @@ export function createWtReferenceSession(
     lease: RawSessionLease,
     options: WtReferenceSessionOptions,
 ): WtReferenceSession {
+    return createSession(lease, options);
+}
+
+/** Internal factory for a composite owner; capability is never returned by this session. */
+export function createWtReferenceSessionWithCapability(
+    lease: RawSessionLease,
+    options: WtReferenceSessionOptions,
+    capability: object,
+): WtReferenceSession {
+    assertReferenceKeyCapabilityAvailable(capability);
+    return createSession(lease, options, capability);
+}
+
+function createSession(
+    lease: RawSessionLease,
+    options: WtReferenceSessionOptions,
+    capability?: object,
+): WtReferenceSession {
     if (!lease || typeof lease !== 'object' || isProxy(lease) || claimed.has(lease)) {
         throw new TypeError('invalid or already claimed lease');
     }
 
+    const reservation = capability ? reserveReferenceKeyCapability(capability) : undefined;
     claimed.add(lease);
     let attempt: BorrowedWtReferenceLoginAttempt | undefined;
     let state: WtReferenceSessionState = 'new';
@@ -216,44 +243,68 @@ export function createWtReferenceSession(
             timer = undefined;
         }
 
-        stoppedAttempt?.close();
-        controller.abort();
+        try {
+            stoppedAttempt?.close();
+        } finally {
+            controller.abort();
+        }
+    };
+
+    const revoke = (): void => {
+        if (capability) {
+            revokeReferenceKey(capability);
+        }
     };
 
     const cleanup = (): void => {
-        sessionController.abort();
-
-        if (abortListener) {
+        try {
+            revoke();
+        } finally {
             try {
-                abortListener[Symbol.dispose]();
-            } catch {
-                /* best effort */
+                sessionController.abort();
+            } finally {
+                if (abortListener) {
+                    try {
+                        abortListener[Symbol.dispose]();
+                    } catch {
+                        /* best effort */
+                    }
+
+                    abortListener = undefined;
+                }
+
+                try {
+                    stopAttempt();
+                } finally {
+                    if (retained) {
+                        wipe(retained.tickets.d2);
+                        wipe(retained.tickets.d2Key);
+                        wipe(retained.tickets.a1);
+                        wipe(retained.tickets.a2);
+                        delete retained.uidProjection;
+                        retained = undefined;
+                    }
+
+                    wipeAll();
+                }
             }
-
-            abortListener = undefined;
         }
-
-        stopAttempt();
-
-        if (retained) {
-            wipe(retained.tickets.d2);
-            wipe(retained.tickets.d2Key);
-            wipe(retained.tickets.a1);
-            wipe(retained.tickets.a2);
-            delete retained.uidProjection;
-            retained = undefined;
-        }
-
-        wipeAll();
     };
 
     const fail = (): void => {
-        if (state !== 'closed') {
-            state = 'failed';
-        }
+        try {
+            revoke();
+        } finally {
+            if (state !== 'closed') {
+                state = 'failed';
+            }
 
-        poison();
-        cleanup();
+            try {
+                poison();
+            } finally {
+                cleanup();
+            }
+        }
     };
 
     try {
@@ -420,6 +471,11 @@ export function createWtReferenceSession(
             verifyContext: input.verifyContext as AttemptOptions['verifyContext'],
             sliceBusiness: input.sliceBusiness as AttemptOptions['sliceBusiness'],
         });
+
+        if (capability) {
+            bindReferenceKeyCapability(attempt, capability, reservation!);
+        }
+
         wipe(unknown21);
         wipe(randomKey);
         wipe(peerPublicKey);
@@ -474,6 +530,10 @@ export function createWtReferenceSession(
                     if (result.status === 'confirmed') {
                         state = 'confirmed';
                     } else if (result.status !== 'wait' && result.status !== 'confirm') {
+                        if (capability) {
+                            stageReferenceBusinessFailure(capability, 'poll', result.status);
+                        }
+
                         fail();
                     }
 
@@ -495,6 +555,14 @@ export function createWtReferenceSession(
                     active();
 
                     if (login.status !== 'tickets') {
+                        if (capability) {
+                            stageReferenceBusinessFailure(
+                                capability,
+                                'login-register',
+                                login.status,
+                            );
+                        }
+
                         fail();
                         return login;
                     }
@@ -523,6 +591,14 @@ export function createWtReferenceSession(
                     }
 
                     if (result.value !== 'success') {
+                        if (capability) {
+                            stageReferenceBusinessFailure(
+                                capability,
+                                'login-register',
+                                result.value,
+                            );
+                        }
+
                         fail();
                         return { status: result.value };
                     }
@@ -537,6 +613,10 @@ export function createWtReferenceSession(
                         performance.now() >= deadline
                     ) {
                         throw new Error('session stopped');
+                    }
+
+                    if (capability) {
+                        commitReferenceKey(capability);
                     }
 
                     return { status: 'success' };
@@ -594,6 +674,14 @@ export function createWtReferenceSession(
                     }
 
                     if (result.value.status === 'sso-error') {
+                        if (capability) {
+                            stageReferenceBusinessFailure(
+                                capability,
+                                'heartbeat',
+                                result.value.status,
+                            );
+                        }
+
                         fail();
                         return result.value;
                     }
@@ -654,6 +742,10 @@ export function createWtReferenceSession(
                     }
 
                     if (result.value.status === 'sso-error') {
+                        if (capability) {
+                            stageReferenceBusinessFailure(capability, 'alive', result.value.status);
+                        }
+
                         fail();
                         return result.value;
                     }
@@ -675,12 +767,21 @@ export function createWtReferenceSession(
                     return;
                 }
 
-                if (busy || (state !== 'new' && state !== 'success')) {
-                    poison();
-                }
+                const mustPoison = busy || (state !== 'new' && state !== 'success');
 
-                state = 'closed';
-                cleanup();
+                try {
+                    revoke();
+                } finally {
+                    state = 'closed';
+
+                    try {
+                        if (mustPoison) {
+                            poison();
+                        }
+                    } finally {
+                        cleanup();
+                    }
+                }
             },
         };
     } catch {

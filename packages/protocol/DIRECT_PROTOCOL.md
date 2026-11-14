@@ -1523,8 +1523,29 @@ remain to be recovered and independently verified.
   transactions report failure with uncertain write state after a write attempt.
   The configured classification and UIN/sequence comparisons are local policies,
   not peer or message authentication. This client does not open a socket or attach pushes to
-  Bridge or OneBot. A synthetic fixture can give its classifier a test D2 key;
-  the session owner does not yet supply its private post-login key to the classifier.
+  Bridge or OneBot. The older standalone fixture supplies a synthetic D2 key
+  directly to its classifier; it does not establish session key handoff.
+- `src/direct/wt-multiplex-reference.ts` composes an injected stream, broker and
+  WT session with an owner-specific internal classifier. It stages the confirmed
+  UIN and a private copy of the login-derived D2 key during validated response
+  consumption, before the matching barrier releases later frames. Registration
+  must finish successfully before locally classified push frames are released
+  from the bounded FIFO to the caller's verifier and handler. Those callbacks
+  receive temporary copies of the original encrypted frame, not a decoded message;
+  this API does not expose the D2 key for caller-side decoding. The deep-importable
+  capability helpers are an internal ownership convention, not isolation from
+  other code in the same process. The legacy borrowed attempt API still returns
+  tickets. The classifier and caller-provided verification are local policies;
+  QQ-TEA does not authenticate the peer. This composition does not create a
+  connection, implement the signing algorithm, attach events to Bridge or OneBot,
+  or establish real QQ interoperability. A transport that closes independently
+  is observed via the next synchronous entry check or an asynchronous close
+  notification; the latter is not a same-stack revocation fence. Its `whenClosed`
+  indicates logical closure, not physical stream teardown or completion of a
+  callback already in progress. The borrowed attempt can poison its lease before
+  the session resumes on a terminal QR poll or a non-ticket login response; those
+  cases can therefore surface as session failures rather than preserving the
+  underlying business status. This inherited ordering remains unresolved.
 - `src/direct/raw-multiplex-stream.ts` adapts a caller-supplied, already-established
   byte stream to that client without opening or connecting a socket. It requires
   exclusive ownership and uses the shared direct-socket ownership registry for

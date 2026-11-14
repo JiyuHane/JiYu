@@ -23,6 +23,12 @@ import {
 import { encodeWtLoginRequestBody, type WtLoginRequestBody } from './wt-login-request';
 import { decodeWtLoginResponse } from './wt-login-response';
 import { projectWtLoginUid, type WtLoginUidProjection } from './wt-login-keystore';
+import {
+    bindReferenceKeyAttempt,
+    revokeReferenceKey,
+    stageReferenceConfirmed,
+    stageReferenceKey,
+} from './wt-reference-session-private';
 
 type Operation = 'fetch' | 'poll' | 'login';
 type FetchFields = Extract<WtQrFrameOperation, { type: 'fetch' }>['fields'];
@@ -215,6 +221,22 @@ const borrowedPorts = new WeakMap<
     object,
     { lease: RawSessionLease; closed: PromiseLike<unknown> }
 >();
+const referenceCapabilities = new WeakMap<object, object>();
+
+/** Internal composition hook; does not expose ticket bytes. */
+export function bindReferenceKeyCapability(
+    attempt: BorrowedWtReferenceLoginAttempt,
+    capability: object,
+    reservation: object,
+): void {
+    if (referenceCapabilities.has(attempt)) {
+        throw new Error('attempt capability already bound');
+    }
+
+    bindReferenceKeyAttempt(capability, attempt, reservation);
+    referenceCapabilities.set(attempt, capability);
+}
+
 const promiseThen = Promise.prototype.then;
 
 function observeClosure(value: PromiseLike<unknown>): Promise<unknown> {
@@ -622,13 +644,22 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
 
     close(): void {
         const wasBusy = this.busy;
-        this.state = 'closed';
 
-        if (wasBusy) {
-            this.poisonBorrowed();
+        try {
+            if (wasBusy || this.state !== 'tickets') {
+                this.revokeReferenceCapability();
+            }
+        } finally {
+            this.state = 'closed';
+
+            try {
+                if (wasBusy) {
+                    this.poisonBorrowed();
+                }
+            } finally {
+                this.clean();
+            }
         }
-
-        this.clean();
     }
     private enter(expected: State): void {
         if (this.busy) {
@@ -754,11 +785,26 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
             // A foreign lease may throw; the attempt remains terminal.
         }
     }
+    private revokeReferenceCapability(): void {
+        const capability = referenceCapabilities.get(this);
+
+        if (capability) {
+            revokeReferenceKey(capability);
+        }
+    }
     private fail(): void {
-        if (this.state !== 'closed' && this.state !== 'tickets') {
-            this.state = 'failed';
-            this.poisonBorrowed();
-            this.clean();
+        try {
+            this.revokeReferenceCapability();
+        } finally {
+            if (this.state !== 'closed' && this.state !== 'tickets') {
+                this.state = 'failed';
+
+                try {
+                    this.poisonBorrowed();
+                } finally {
+                    this.clean();
+                }
+            }
         }
     }
 
@@ -1075,6 +1121,20 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
                                 }
 
                                 const uin = poll.uin;
+                                const capability = referenceCapabilities.get(this);
+
+                                if (capability) {
+                                    exchangeActive();
+                                    stageReferenceConfirmed(
+                                        capability,
+                                        this,
+                                        identity.uin,
+                                        uin.toString(),
+                                        identity.sequence,
+                                    );
+                                    exchangeActive();
+                                }
+
                                 return stage({
                                     type: 'poll',
                                     status: 'confirmed',
@@ -1092,6 +1152,21 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
                             const login = parsed as ReturnType<typeof decodeWtLoginResponse>;
 
                             if (login.status === 'tickets') {
+                                const capability = referenceCapabilities.get(this);
+
+                                if (capability) {
+                                    exchangeActive();
+                                    stageReferenceKey(
+                                        capability,
+                                        this,
+                                        identity.uin,
+                                        this.held!.decimal,
+                                        identity.sequence,
+                                        login.tickets.d2Key,
+                                    );
+                                    exchangeActive();
+                                }
+
                                 const uidProjection = this.enableUidProjection
                                     ? projectWtLoginUid(login.innerTlvs)
                                     : undefined;
@@ -1126,6 +1201,9 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
                                 type: 'login',
                                 result: { status: login.status, state: login.state },
                             });
+                        } catch (error) {
+                            this.revokeReferenceCapability();
+                            throw error;
                         } finally {
                             if ('outerTlvs' in parsed) {
                                 parsed.outerTlvs.forEach((e) => e.value.fill(0));
@@ -1153,9 +1231,16 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
                     } finally {
                         business.fill(0);
                     }
+                } catch (error) {
+                    this.revokeReferenceCapability();
+                    throw error;
                 } finally {
                     for (const bytes of owned) {
-                        bytes.fill(0);
+                        if (this.borrowed) {
+                            wipeOwned(bytes);
+                        } else {
+                            bytes.fill(0);
+                        }
                     }
                 }
             },
@@ -1169,10 +1254,18 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
                           wipeOwned(value.requestFrame);
                           wipeOwned(value.requestOicq);
                       },
-                      disposeResult: scrubResult,
+                      disposeResult: (value) => {
+                          try {
+                              this.revokeReferenceCapability();
+                          } finally {
+                              scrubResult(value);
+                          }
+                      },
                   })(rawOptions)
                 : await this.transport.transactRaw(rawOptions);
         } catch (error) {
+            this.revokeReferenceCapability();
+
             if (staged) {
                 scrubResult(staged);
             }
@@ -1186,6 +1279,8 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
         }
 
         if (result.kind !== 'response') {
+            this.revokeReferenceCapability();
+
             if (staged) {
                 scrubResult(staged);
             }
