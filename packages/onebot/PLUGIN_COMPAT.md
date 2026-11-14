@@ -79,9 +79,17 @@ The configuration panel calls static schema and optional get/set hooks only
 on explicit user actions. Its editor accepts at most 64 fields, only `key`,
 `label`, `type`, `default`, and `description` properties, nonempty safe keys
 and nonempty labels, and the `string`, `text`, `number`, and `boolean` types with
-additional value checks. Even a builder-produced scalar may be rejected. The
-returned object must match the schema; unsupported schemas are not silently
-rewritten. A successful set means the plugin's hook returned, not
+additional value checks. Even a builder-produced scalar may be rejected. For a
+`plainText` item made by the current slot's own builder, a versioned sidecar
+can identify that item in the captured static schema. The editor displays its
+text only as a read-only snapshot and does not call the configuration getter or
+setter for that view; an unmarked item, unknown version or mismatched snapshot
+remains unsupported. This does not prevent direct `setConfig` API calls, other
+tabs, or plugin-side changes. The sidecar is not authentication or an isolation
+boundary against an untrusted backend or same-process plugin. HTML display is
+still unsupported in the editor. Other fields in such a view are not writable;
+editing them requires a separate server consistency design. The returned object
+must match the schema; unsupported schemas are not silently rewritten. A successful set means the plugin's hook returned, not
 that data was durably stored. There is no host-managed configuration-file
 fallback, version check, merge guarantee, dynamic controller or HTML editor.
 Hooks run with the same process privileges as the plugin, and a request failure

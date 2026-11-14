@@ -214,6 +214,13 @@ export interface PluginConfigField {
     description?: string;
     default?: PluginConfigScalar;
 }
+export interface PluginDisplaySidecar {
+    version: 1;
+    generation: string;
+    source: 'schema' | 'ui';
+    snapshot: unknown[];
+    entries: Array<{ index: number; kind: 'plainText' }>;
+}
 export interface ApiClient {
     plugins: {
         index(refresh?: boolean, signal?: AbortSignal): Promise<CommunityIndexResult>;
@@ -222,7 +229,12 @@ export interface ApiClient {
         configSchema(
             uin: string,
             id: string,
-        ): Promise<{ fields: unknown; source: 'schema' | 'ui' | 'none'; generation: string }>;
+        ): Promise<{
+            fields: unknown;
+            source: 'schema' | 'ui' | 'none';
+            generation: string;
+            displaySidecar?: PluginDisplaySidecar;
+        }>;
         configRead(
             uin: string,
             id: string,

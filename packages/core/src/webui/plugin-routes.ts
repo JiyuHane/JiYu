@@ -724,6 +724,34 @@ export function registerLocalPluginRoutes(
                         return failure('CONFIG_OUTCOME_UNKNOWN', 'unknown', 409);
                     }
 
+                    if (action === 'schema' && 'displaySidecar' in result) {
+                        const sidecar = result.displaySidecar;
+
+                        if (
+                            !sidecar ||
+                            sidecar.version !== 1 ||
+                            sidecar.generation !== generation ||
+                            !('source' in result) ||
+                            sidecar.source !== result.source ||
+                            !('fields' in result) ||
+                            JSON.stringify(sidecar.snapshot) !== JSON.stringify(result.fields)
+                        ) {
+                            return failure('CONFIG_INVALID', 'unknown', 409);
+                        }
+                    }
+
+                    // Generation observers can synchronously replace an account or
+                    // revoke this reservation. Revalidate ownership after them.
+                    if (
+                        manager.getInstance(uin) !== instance ||
+                        pending.cancelled ||
+                        pendingDisables.has(key) ||
+                        pendingConfigs.get(key) !== pending ||
+                        c.req.raw.signal.aborted
+                    ) {
+                        return failure('CONFIG_OUTCOME_UNKNOWN', 'unknown', 409);
+                    }
+
                     return c.json({
                         status: 'ok',
                         ...result,

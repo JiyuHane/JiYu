@@ -30,7 +30,7 @@ import {
 import {
     filterPlugins,
     safePluginHomepage,
-    parseConfigFields,
+    parseConfigView,
     parseConfigValue,
     parseConfigNumber,
 } from '@/lib/plugin-index';
@@ -263,6 +263,134 @@ export function createConfigViewGuard(
         },
         isActive: () => active,
     };
+}
+
+export interface ConfigViewBinding {
+    readonly epoch: number;
+    readonly generation: string;
+}
+
+/** Synchronous invalidation prevents stale confirmation closures from writing. */
+export function createConfigModeGuard() {
+    let epoch = 0;
+    let mode: 'none' | 'editable' | 'display' = 'none';
+    let generation: string | null = null;
+    return {
+        invalidate() {
+            epoch++;
+            mode = 'none';
+            generation = null;
+        },
+        open(next: 'editable' | 'display', nextGeneration: string) {
+            epoch++;
+            mode = next;
+            generation = nextGeneration;
+        },
+        revision(): number {
+            return epoch;
+        },
+        capture(): ConfigViewBinding | null {
+            return mode === 'editable' && generation ? { epoch, generation } : null;
+        },
+        allows(binding: ConfigViewBinding | null): boolean {
+            return (
+                binding !== null &&
+                mode === 'editable' &&
+                binding.epoch === epoch &&
+                binding.generation === generation
+            );
+        },
+    };
+}
+
+export function isEditableConfigBinding(
+    guard: ReturnType<typeof createConfigModeGuard>,
+    binding: ConfigViewBinding | null,
+    generation: string | null,
+): boolean {
+    return guard.allows(binding) && generation === binding?.generation;
+}
+
+export function dispatchEditableConfigConfirmation(
+    guard: ReturnType<typeof createConfigModeGuard>,
+    binding: ConfigViewBinding | null,
+    generation: string | null,
+    run: () => void,
+): boolean {
+    if (!isEditableConfigBinding(guard, binding, generation)) {
+        return false;
+    }
+
+    run();
+    return true;
+}
+
+export interface ConfigConfirmationTicket {
+    readonly operation: ConfigOperation;
+    readonly binding: ConfigViewBinding | null;
+    readonly epoch: number;
+}
+
+/** A confirmation closure retains its own one-shot ticket, never a newer ref value. */
+export function createConfigTicketGuard() {
+    let current: ConfigConfirmationTicket | null = null;
+    let claimed = false;
+    return {
+        issue(
+            operation: ConfigOperation,
+            binding: ConfigViewBinding | null,
+            epoch: number,
+        ): ConfigConfirmationTicket {
+            current = Object.freeze({ operation, binding, epoch });
+            claimed = false;
+            return current;
+        },
+        isCurrent(ticket: ConfigConfirmationTicket | null, operation: ConfigOperation): boolean {
+            return ticket !== null && current === ticket && ticket.operation === operation;
+        },
+        claim(ticket: ConfigConfirmationTicket, operation: ConfigOperation): boolean {
+            if (current !== ticket || ticket.operation !== operation || claimed) {
+                return false;
+            }
+
+            claimed = true;
+            return true;
+        },
+        close(ticket: ConfigConfirmationTicket | null): boolean {
+            if (!ticket || current !== ticket) {
+                return false;
+            }
+
+            current = null;
+            claimed = false;
+            return true;
+        },
+        invalidate() {
+            current = null;
+            claimed = false;
+        },
+    };
+}
+
+export function dispatchConfigTicket(
+    tickets: ReturnType<typeof createConfigTicketGuard>,
+    modeGuard: ReturnType<typeof createConfigModeGuard>,
+    ticket: ConfigConfirmationTicket | null,
+    operation: ConfigOperation,
+    generation: string | null,
+    run: (ticket: ConfigConfirmationTicket) => void,
+): boolean {
+    if (
+        !ticket ||
+        !tickets.isCurrent(ticket, operation) ||
+        ticket.epoch !== modeGuard.revision() ||
+        (operation !== 'schema' && !isEditableConfigBinding(modeGuard, ticket.binding, generation))
+    ) {
+        return false;
+    }
+
+    run(ticket);
+    return true;
 }
 
 function LocalPluginsPanel() {
@@ -916,6 +1044,19 @@ export function configErrorText(caught: unknown): string {
     return code && Object.hasOwn(fixed, code) ? fixed[code] : '配置操作未确认，结果可能未知。';
 }
 
+export function PluginPlainTextView({ texts }: { texts: readonly string[] }) {
+    return (
+        <div className="flex flex-col gap-4">
+            <p className="text-xs text-muted-foreground">本视图只读，配置未读取，也不会保存。</p>
+            {texts.map((text, index) => (
+                <p key={index} className="whitespace-pre-wrap text-sm">
+                    {text}
+                </p>
+            ))}
+        </div>
+    );
+}
+
 function PluginConfigDialog({
     uin,
     id,
@@ -929,6 +1070,9 @@ function PluginConfigDialog({
 }) {
     const api = useApi();
     const [guard] = useState(() => createConfigViewGuard(localOperationTracker, uin));
+    const [modeGuard] = useState(() => createConfigModeGuard());
+    const [tickets] = useState(() => createConfigTicketGuard());
+    const [displayTexts, setDisplayTexts] = useState<string[] | null>(null);
     const [fields, setFields] = useState<PluginConfigField[] | null>(null);
     const [generation, setGeneration] = useState<string | null>(null);
     const [schemaSource, setSchemaSource] = useState<'schema' | 'ui' | 'none' | null>(null);
@@ -936,10 +1080,16 @@ function PluginConfigDialog({
     const [error, setError] = useState('');
     const [notice, setNotice] = useState('');
     const [busy, setBusy] = useState(false);
-    const [confirm, setConfirm] = useState<ConfigOperation | null>(null);
+    const [confirm, setConfirm] = useState<ConfigConfirmationTicket | null>(null);
     useEffect(() => {
         guard.activate();
-        const invalidate = () => guard.close();
+
+        const invalidate = () => {
+            modeGuard.invalidate();
+            tickets.invalidate();
+            guard.close();
+        };
+
         invalidateConfigView = invalidate;
 
         return () => {
@@ -949,15 +1099,52 @@ function PluginConfigDialog({
                 invalidateConfigView = null;
             }
         };
-    }, [guard]);
+    }, [guard, modeGuard, tickets]);
 
     const close = () => {
+        modeGuard.invalidate();
+        tickets.invalidate();
         guard.close();
         onClose();
     };
 
-    const run = async (operation: ConfigOperation) => {
-        if (!guard.isActive() || !canExecute || !guard.begin()) {
+    const resetSchema = () => {
+        modeGuard.invalidate();
+        tickets.invalidate();
+        setGeneration(null);
+        setFields(null);
+        setDraft(null);
+        setDisplayTexts(null);
+        setSchemaSource(null);
+    };
+
+    const run = async (ticket: ConfigConfirmationTicket) => {
+        const { operation, binding } = ticket;
+
+        if (
+            !tickets.isCurrent(ticket, operation) ||
+            ticket.epoch !== modeGuard.revision() ||
+            (operation !== 'schema' && !isEditableConfigBinding(modeGuard, binding, generation))
+        ) {
+            return;
+        }
+
+        if (
+            !guard.isActive() ||
+            !canExecute ||
+            !tickets.claim(ticket, operation) ||
+            !guard.begin()
+        ) {
+            return;
+        }
+
+        // begin() can notify subscribers synchronously: check the exact ticket again.
+        if (
+            !tickets.isCurrent(ticket, operation) ||
+            ticket.epoch !== modeGuard.revision() ||
+            (operation !== 'schema' && !isEditableConfigBinding(modeGuard, binding, generation))
+        ) {
+            guard.finish(false);
             return;
         }
 
@@ -966,9 +1153,9 @@ function PluginConfigDialog({
         setNotice('');
 
         if (operation === 'schema') {
-            setGeneration(null);
-            setFields(null);
-            setDraft(null);
+            tickets.close(ticket);
+            setConfirm((previous) => (previous === ticket ? null : previous));
+            resetSchema();
         }
 
         try {
@@ -988,11 +1175,20 @@ function PluginConfigDialog({
                     setError('插件未声明静态字段，暂不支持编辑。');
                 } else {
                     try {
-                        const parsed = parseConfigFields(result.fields);
-                        setFields(parsed);
+                        const parsed = parseConfigView(result.fields, result.displaySidecar);
 
-                        if (parsed.length === 0) {
-                            setError('插件字段为空，暂不支持编辑。');
+                        if (parsed.readOnly) {
+                            modeGuard.open('display', result.generation);
+                            setFields(null);
+                            setDisplayTexts(parsed.displayTexts);
+                        } else {
+                            setFields(parsed.fields);
+
+                            if (parsed.fields.length === 0) {
+                                setError('插件字段为空，暂不支持编辑。');
+                            } else {
+                                modeGuard.open('editable', result.generation);
+                            }
                         }
                     } catch {
                         setFields(null);
@@ -1004,9 +1200,22 @@ function PluginConfigDialog({
                     throw new ApiError(400, '请重新读取字段', 'CONFIG_GENERATION_REQUIRED');
                 }
 
+                if (
+                    !tickets.isCurrent(ticket, 'read') ||
+                    ticket.epoch !== modeGuard.revision() ||
+                    !isEditableConfigBinding(modeGuard, binding, generation)
+                ) {
+                    guard.finish(false);
+                    return;
+                }
+
                 const result = await api.plugins.configRead(uin, id, generation);
 
                 if (!guard.finish(false)) {
+                    return;
+                }
+
+                if (!modeGuard.allows(binding)) {
                     return;
                 }
 
@@ -1042,6 +1251,15 @@ function PluginConfigDialog({
                     throw new ApiError(400, '请重新读取字段', 'CONFIG_GENERATION_REQUIRED');
                 }
 
+                if (
+                    !tickets.isCurrent(ticket, 'write') ||
+                    ticket.epoch !== modeGuard.revision() ||
+                    !isEditableConfigBinding(modeGuard, binding, generation)
+                ) {
+                    guard.finish(false);
+                    return;
+                }
+
                 await api.plugins.configWrite(uin, id, generation, value);
 
                 if (!guard.finish(false)) {
@@ -1056,6 +1274,9 @@ function PluginConfigDialog({
             }
 
             // Discard stale drafts on any unconfirmed operation, without logging values.
+            modeGuard.invalidate();
+            tickets.invalidate();
+            setDisplayTexts(null);
             setGeneration(null);
             setFields(null);
             setDraft(null);
@@ -1091,7 +1312,9 @@ function PluginConfigDialog({
                         size="sm"
                         variant="outline"
                         disabled={busy || !canExecute}
-                        onClick={() => setConfirm('schema')}
+                        onClick={() => {
+                            setConfirm(tickets.issue('schema', null, modeGuard.revision()));
+                        }}
                     >
                         读取字段描述
                     </Button>
@@ -1099,7 +1322,15 @@ function PluginConfigDialog({
                         size="sm"
                         variant="outline"
                         disabled={busy || !canExecute || !fields?.length}
-                        onClick={() => setConfirm('read')}
+                        onClick={() => {
+                            const binding = modeGuard.capture();
+
+                            if (!isEditableConfigBinding(modeGuard, binding, generation)) {
+                                return;
+                            }
+
+                            setConfirm(tickets.issue('read', binding, modeGuard.revision()));
+                        }}
                     >
                         读取配置
                     </Button>
@@ -1124,7 +1355,8 @@ function PluginConfigDialog({
                         {notice}
                     </p>
                 )}
-                {draft && fields && (
+                {displayTexts !== null && <PluginPlainTextView texts={displayTexts} />}
+                {draft && fields && displayTexts === null && (
                     <div className="flex flex-col gap-4">
                         {fields.map((field) => (
                             <label key={field.key} className="flex flex-col gap-1 text-sm">
@@ -1174,7 +1406,7 @@ function PluginConfigDialog({
                         ))}
                     </div>
                 )}
-                {draft && (
+                {draft && displayTexts === null && (
                     <Button
                         size="sm"
                         disabled={busy || !canExecute}
@@ -1185,7 +1417,13 @@ function PluginConfigDialog({
                                 }
 
                                 configDraftToValue(fields, draft);
-                                setConfirm('write');
+                                const binding = modeGuard.capture();
+
+                                if (!isEditableConfigBinding(modeGuard, binding, generation)) {
+                                    throw new Error();
+                                }
+
+                                setConfirm(tickets.issue('write', binding, modeGuard.revision()));
                             } catch {
                                 setError('请检查配置字段和数字格式。');
                             }
@@ -1197,21 +1435,21 @@ function PluginConfigDialog({
                 <ConfirmDialog
                     open={confirm !== null}
                     onOpenChange={(open) => {
-                        if (!open) {
-                            setConfirm(null);
+                        if (!open && tickets.close(confirm)) {
+                            setConfirm((previous) => (previous === confirm ? null : previous));
                         }
                     }}
                     title={
-                        confirm === 'schema'
+                        confirm?.operation === 'schema'
                             ? '确认读取字段描述'
-                            : confirm === 'read'
+                            : confirm?.operation === 'read'
                               ? '确认读取配置'
                               : '确认提交配置'
                     }
                     description={`账号 ${uin} · 插件 ${id}`}
                     content={
                         <p className="text-sm">
-                            {confirm === 'write'
+                            {confirm?.operation === 'write'
                                 ? '将整体提交当前配置，可能覆盖插件或后台的并发修改；持久化由插件决定。'
                                 : '此操作可能执行插件代码；插件拥有当前进程完整权限。'}{' '}
                             不会自动重试。
@@ -1220,7 +1458,16 @@ function PluginConfigDialog({
                     confirmText="确认执行"
                     onConfirm={() => {
                         if (confirm) {
-                            void run(confirm);
+                            dispatchConfigTicket(
+                                tickets,
+                                modeGuard,
+                                confirm,
+                                confirm.operation,
+                                generation,
+                                (ticket) => {
+                                    void run(ticket);
+                                },
+                            );
                         }
                     }}
                 />

@@ -86,6 +86,14 @@ export interface PluginHostOptions {
     maxPendingConfigBytes?: number;
 }
 
+export interface PluginDisplaySidecar {
+    version: 1;
+    generation: string;
+    source: 'schema' | 'ui';
+    snapshot: JsonValue[];
+    entries: Array<{ index: number; kind: 'plainText' }>;
+}
+
 export interface PluginStatus {
     readonly id: string;
     readonly state: 'initializing' | 'active' | 'stopping' | 'cleanup_failed';
@@ -99,6 +107,7 @@ interface Slot {
     readonly configGeneration: string;
     readonly module: PluginModule;
     readonly context: PluginContext;
+    readonly getDisplayKind: (value: unknown) => 'plainText' | undefined;
     accepting: boolean;
     callable: boolean;
     state: 'active' | 'stopping' | 'cleanup_failed';
@@ -139,6 +148,11 @@ const MANIFEST_LIMIT = 64 * 1024;
 const SCHEMA_LIMIT = 64 * 1024;
 const CONFIG_LIMIT = 256 * 1024;
 const JSON_NODE_LIMIT = 10000;
+// Each top-level input node can contribute at most one bounded sidecar entry.
+// Its index has at most five decimal digits; 64 bytes per entry plus the
+// original schema and 1024 bytes for the fixed envelope bounds serialized JSON.
+const SIDECAR_LIMIT = SCHEMA_LIMIT + JSON_NODE_LIMIT * 64 + 1024;
+const SIDECAR_NODE_LIMIT = JSON_NODE_LIMIT * 4 + 16;
 
 function configError(code: string): PluginHostError {
     const error = new PluginHostError(code);
@@ -174,6 +188,8 @@ function copyJson(
     input: unknown,
     limit: number,
     maxDepth: number,
+    onTopLevelItem?: (original: unknown, copied: JsonValue, index: number) => void,
+    nodeLimit = JSON_NODE_LIMIT,
 ): { value: JsonValue; bytes: number } {
     let bytes = 0;
     let nodes = 0;
@@ -196,7 +212,7 @@ function copyJson(
     };
 
     const visit = (value: unknown, depth: number): JsonValue => {
-        if (++nodes > JSON_NODE_LIMIT || depth > maxDepth || types.isProxy(value)) {
+        if (++nodes > nodeLimit || depth > maxDepth || types.isProxy(value)) {
             throw configError('CONFIG_INVALID');
         }
 
@@ -235,7 +251,7 @@ function copyJson(
         try {
             const keys = Reflect.ownKeys(value);
 
-            if (keys.length > JSON_NODE_LIMIT + (array ? 1 : 0)) {
+            if (keys.length > nodeLimit + (array ? 1 : 0)) {
                 throw configError('CONFIG_INVALID');
             }
 
@@ -265,7 +281,13 @@ function copyJson(
                         add(1);
                     }
 
-                    result.push(visit(descriptor.value, depth + 1));
+                    const copied = visit(descriptor.value, depth + 1);
+
+                    if (depth === 0) {
+                        onTopLevelItem?.(descriptor.value, copied, index);
+                    }
+
+                    result.push(copied);
                 }
 
                 return result;
@@ -308,17 +330,20 @@ function copyJson(
     return { value: visit(input, 0), bytes };
 }
 
-const napcatConfig = createConfigBuilder({
-    copySchema: (input) => copyJson(input, SCHEMA_LIMIT, 16).value,
-    invalid: () => {
-        throw configError('CONFIG_INVALID');
-    },
-    unsupported: (feature) => {
-        const error = new UnsupportedPluginFeatureError(feature);
-        error.stack = `${error.name}: ${error.message}`;
-        throw error;
-    },
-});
+function createSlotConfigBuilder() {
+    return createConfigBuilder({
+        copySchema: (input, onTopLevelItem) =>
+            copyJson(input, SCHEMA_LIMIT, 16, onTopLevelItem).value,
+        invalid: () => {
+            throw configError('CONFIG_INVALID');
+        },
+        unsupported: (feature) => {
+            const error = new UnsupportedPluginFeatureError(feature);
+            error.stack = `${error.name}: ${error.message}`;
+            throw error;
+        },
+    });
+}
 
 function copyConfig(input: unknown): { value: JsonObject; bytes: number } {
     const copy = copyJson(input, CONFIG_LIMIT, 32);
@@ -666,7 +691,9 @@ export class PluginHost {
                 }
 
                 const module = mod as unknown as PluginModule;
+                const configBuilder = createSlotConfigBuilder();
                 slot = {
+                    getDisplayKind: configBuilder.getDisplayKind,
                     configGeneration: randomUUID(),
                     module,
                     context: undefined as unknown as PluginContext,
@@ -794,7 +821,7 @@ export class PluginHost {
                     get router(): never {
                         return unsupported('router');
                     },
-                    NapCatConfig: napcatConfig,
+                    NapCatConfig: configBuilder.builder,
                     getPluginExports: () => unsupported('getPluginExports'),
                 });
                 Object.assign(slot, { context });
@@ -908,31 +935,53 @@ export class PluginHost {
         }
     }
 
-    getConfigSchema(
-        id: string,
-    ): Promise<{ fields: JsonValue[] | null; source: 'schema' | 'ui' | 'none' }> {
+    getConfigSchema(id: string): Promise<{
+        fields: JsonValue[] | null;
+        source: 'schema' | 'ui' | 'none';
+        displaySidecar?: PluginDisplaySidecar;
+    }> {
         return this.admitConfig(id, undefined, false, async (slot) => {
             try {
                 const schema = slot.module.plugin_config_schema;
-                const source =
-                    schema !== undefined
-                        ? 'schema'
-                        : slot.module.plugin_config_ui !== undefined
-                          ? 'ui'
-                          : 'none';
+                const ui = schema === undefined ? slot.module.plugin_config_ui : undefined;
+                const source = schema !== undefined ? 'schema' : ui !== undefined ? 'ui' : 'none';
 
                 if (source === 'none') {
                     return { fields: null, source };
                 }
 
-                const value = source === 'schema' ? schema : slot.module.plugin_config_ui;
+                const value = source === 'schema' ? schema : ui;
 
                 if (types.isProxy(value) || !Array.isArray(value)) {
                     throw configError('CONFIG_INVALID');
                 }
 
-                const copy = copyJson(value, SCHEMA_LIMIT, 16);
-                return { fields: copy.value as JsonValue[], source };
+                const entries: Array<{ index: number; kind: 'plainText' }> = [];
+                const copy = copyJson(value, SCHEMA_LIMIT, 16, (original, _copied, index) => {
+                    if (slot.getDisplayKind(original) === 'plainText') {
+                        entries.push({ index, kind: 'plainText' });
+                    }
+                });
+                const fields = copy.value as JsonValue[];
+
+                if (!entries.length) {
+                    return { fields, source };
+                }
+
+                const displaySidecar = copyJson(
+                    {
+                        version: 1,
+                        generation: slot.configGeneration,
+                        source,
+                        snapshot: fields,
+                        entries,
+                    },
+                    SIDECAR_LIMIT,
+                    20,
+                    undefined,
+                    SIDECAR_NODE_LIMIT,
+                ).value as unknown as PluginDisplaySidecar;
+                return { fields, source, displaySidecar };
             } catch {
                 throw configError('CONFIG_INVALID');
             }

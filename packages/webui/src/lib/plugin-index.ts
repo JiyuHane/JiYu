@@ -7,6 +7,7 @@ import {
     type LocalPluginMutationResult,
     type PluginConfigField,
     type PluginConfigValue,
+    type PluginDisplaySidecar,
 } from '@/lib/api/types';
 
 function invalid(): never {
@@ -258,6 +259,198 @@ function isConfigScalar(type: string, value: unknown): value is string | number 
     return type === 'number' && typeof value === 'number' && isSafeConfigNumber(value);
 }
 
+export interface PluginConfigView {
+    readonly fields: PluginConfigField[];
+    readonly displayTexts: string[];
+    readonly readOnly: boolean;
+}
+
+/** Compare the two decoded JSON snapshots without invoking object accessors. */
+function sameConfigSnapshot(left: unknown, right: unknown): boolean {
+    let visited = 0;
+
+    const same = (a: unknown, b: unknown, depth: number): boolean => {
+        if (++visited > 20000 || depth > 20) {
+            return false;
+        }
+
+        if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') {
+            if (typeof a === 'number' && !Number.isFinite(a)) {
+                return false;
+            }
+
+            return (
+                (a === null || ['string', 'number', 'boolean'].includes(typeof a)) &&
+                Object.is(a, b)
+            );
+        }
+
+        if (Array.isArray(a) || Array.isArray(b)) {
+            if (
+                !Array.isArray(a) ||
+                !Array.isArray(b) ||
+                Object.getPrototypeOf(a) !== Array.prototype ||
+                Object.getPrototypeOf(b) !== Array.prototype ||
+                a.length !== b.length ||
+                a.length > 10000
+            ) {
+                return false;
+            }
+
+            const ak = Reflect.ownKeys(a);
+            const bk = Reflect.ownKeys(b);
+
+            if (ak.length !== a.length + 1 || bk.length !== b.length + 1) {
+                return false;
+            }
+
+            for (let index = 0; index < a.length; index++) {
+                const av = Object.getOwnPropertyDescriptor(a, String(index));
+                const bv = Object.getOwnPropertyDescriptor(b, String(index));
+
+                if (
+                    !av ||
+                    !bv ||
+                    !av.enumerable ||
+                    !bv.enumerable ||
+                    !('value' in av) ||
+                    !('value' in bv) ||
+                    !same(av.value, bv.value, depth + 1)
+                ) {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        if (!isPlainConfigRecord(a) || !isPlainConfigRecord(b)) {
+            return false;
+        }
+
+        const ak = Object.keys(a);
+        const bk = Object.keys(b);
+
+        if (ak.length !== bk.length) {
+            return false;
+        }
+
+        for (const key of ak) {
+            const av = Object.getOwnPropertyDescriptor(a, key);
+            const bv = Object.getOwnPropertyDescriptor(b, key);
+
+            if (
+                !av ||
+                !bv ||
+                !('value' in av) ||
+                !('value' in bv) ||
+                !same(av.value, bv.value, depth + 1)
+            ) {
+                return false;
+            }
+        }
+
+        return true;
+    };
+
+    return same(left, right, 0);
+}
+
+/** Sidecar is a read-only server observation, not an authentication or sandbox proof. */
+export function parseConfigView(fields: unknown, sidecar?: PluginDisplaySidecar): PluginConfigView {
+    if (sidecar === undefined) {
+        return { fields: parseConfigFields(fields), displayTexts: [], readOnly: false };
+    }
+
+    if (
+        !isPlainConfigRecord(sidecar) ||
+        Object.keys(sidecar).length !== 5 ||
+        Object.keys(sidecar).some(
+            (key) => !['version', 'generation', 'source', 'snapshot', 'entries'].includes(key),
+        ) ||
+        !['version', 'generation', 'source', 'snapshot', 'entries'].every((key) =>
+            Object.hasOwn(sidecar, key),
+        ) ||
+        sidecar.version !== 1 ||
+        !isPluginGeneration(sidecar.generation) ||
+        (sidecar.source !== 'schema' && sidecar.source !== 'ui') ||
+        !Array.isArray(fields) ||
+        fields.length > 64 ||
+        !Array.isArray(sidecar.snapshot) ||
+        !sameConfigSnapshot(fields, sidecar.snapshot) ||
+        !Array.isArray(sidecar.entries) ||
+        !sameConfigSnapshot(sidecar.entries, sidecar.entries) ||
+        sidecar.entries.length < 1 ||
+        sidecar.entries.length > fields.length
+    ) {
+        return unsupportedConfig();
+    }
+
+    const marked = new Set<number>();
+
+    for (const entry of sidecar.entries) {
+        if (
+            !isPlainConfigRecord(entry) ||
+            Object.keys(entry).length !== 2 ||
+            !Object.hasOwn(entry, 'index') ||
+            !Object.hasOwn(entry, 'kind') ||
+            entry.kind !== 'plainText' ||
+            !Number.isSafeInteger(entry.index) ||
+            entry.index < 0 ||
+            entry.index >= fields.length ||
+            marked.has(entry.index)
+        ) {
+            return unsupportedConfig();
+        }
+
+        marked.add(entry.index);
+    }
+
+    const seen = new Set<string>();
+    const editable: PluginConfigField[] = [];
+    const displayTexts: string[] = [];
+
+    for (let index = 0; index < fields.length; index++) {
+        const field: unknown = fields[index];
+
+        if (
+            !isPlainConfigRecord(field) ||
+            !Object.hasOwn(field, 'key') ||
+            typeof field.key !== 'string' ||
+            !field.key.trim() ||
+            field.key.length > 128 ||
+            [...field.key].some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127) ||
+            DANGEROUS_CONFIG_KEYS.has(field.key) ||
+            seen.has(field.key)
+        ) {
+            return unsupportedConfig();
+        }
+
+        seen.add(field.key);
+
+        if (marked.has(index)) {
+            if (
+                Object.keys(field).length !== 4 ||
+                !Object.hasOwn(field, 'type') ||
+                !Object.hasOwn(field, 'label') ||
+                field.type !== 'text' ||
+                field.label !== '' ||
+                typeof field.default !== 'string' ||
+                field.default.length > 16384 ||
+                !Object.hasOwn(field, 'default')
+            ) {
+                return unsupportedConfig();
+            }
+
+            displayTexts.push(field.default);
+        } else {
+            editable.push(...parseConfigFields([field]));
+        }
+    }
+
+    return { fields: editable, displayTexts, readOnly: true };
+}
+
 export function parseConfigValue(fields: PluginConfigField[], value: unknown): PluginConfigValue {
     if (!isPlainConfigRecord(value) || Object.keys(value).length !== fields.length) {
         return unsupportedConfig();
@@ -342,6 +535,27 @@ export function parseConfigEnvelope(
         (value.source === 'schema' || value.source === 'ui' || value.source === 'none') &&
         (value.source === 'none' ? value.fields === null : Array.isArray(value.fields))
     ) {
+        if (Object.hasOwn(value, 'displaySidecar')) {
+            const sidecar = value.displaySidecar;
+
+            if (
+                value.source === 'none' ||
+                !isPlainConfigRecord(sidecar) ||
+                sidecar.generation !== value.generation ||
+                sidecar.source !== value.source
+            ) {
+                return unsupportedConfig();
+            }
+
+            parseConfigView(value.fields, sidecar as unknown as PluginDisplaySidecar);
+            return {
+                source: value.source,
+                fields: value.fields,
+                generation: value.generation,
+                displaySidecar: sidecar,
+            };
+        }
+
         return { source: value.source, fields: value.fields, generation: value.generation };
     }
 

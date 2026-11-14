@@ -41,7 +41,12 @@ import {
     type NetworkReconcileResult,
     type NetworkShutdownResult,
 } from './network';
-import { PluginHost, PluginHostError, type PluginStatus } from './plugin-host';
+import {
+    PluginHost,
+    PluginHostError,
+    type PluginDisplaySidecar,
+    type PluginStatus,
+} from './plugin-host';
 import { ReactionStore } from './reaction-store';
 import { sameSelfSentMessage, selfSentEventKey, SELF_SENT_ECHO_WINDOW_MS } from './self-sent-event';
 import type { ApiResponse, JsonObject, JsonValue, MessageMeta, OneBotConfig } from './types';
@@ -182,7 +187,11 @@ export class OneBotInstance {
     /** Configuration is available only to explicitly enabled plugins. */
     getPluginConfigSchema(
         id: string,
-    ): Promise<{ fields: JsonValue[] | null; source: 'schema' | 'ui' | 'none' }> {
+    ): Promise<{
+        fields: JsonValue[] | null;
+        source: 'schema' | 'ui' | 'none';
+        displaySidecar?: PluginDisplaySidecar;
+    }> {
         if (this.disposeRequested) {
             return Promise.reject(new PluginHostError('CLOSED'));
         }

@@ -57,7 +57,10 @@ export interface PluginConfigBuilder {
 
 interface BuilderDependencies {
     /** Existing host copier checks bytes, depth, nodes, proxy traps and JSON. */
-    copySchema(input: unknown): JsonValue;
+    copySchema(
+        input: unknown,
+        onTopLevelItem?: (original: unknown, copied: JsonValue, index: number) => void,
+    ): JsonValue;
     invalid(): never;
     unsupported(feature: string): never;
 }
@@ -88,8 +91,14 @@ const MAX_OPTIONS = 256;
 const MAX_STRING = 16384;
 
 /** Inputs are copied before inspection, so their accessors and proxies are never invoked. */
-export function createConfigBuilder(deps: BuilderDependencies): PluginConfigBuilder {
+export function createConfigBuilder(deps: BuilderDependencies): {
+    builder: PluginConfigBuilder;
+    getDisplayKind(value: unknown): 'plainText' | undefined;
+} {
+    const origins = new WeakMap<object, 'plainText'>();
     const invalid = deps.invalid;
+    const getDisplayKind = (value: unknown): 'plainText' | undefined =>
+        value !== null && typeof value === 'object' ? origins.get(value) : undefined;
     const isRecord = (value: JsonValue | undefined): value is JsonObject =>
         value !== undefined && value !== null && typeof value === 'object' && !Array.isArray(value);
     const isOptionValue = (value: JsonValue | undefined): value is OptionValue =>
@@ -191,9 +200,12 @@ export function createConfigBuilder(deps: BuilderDependencies): PluginConfigBuil
         return value;
     }
 
-    function snapshot(input: unknown): JsonValue {
+    function snapshot(
+        input: unknown,
+        onTopLevelItem?: (original: unknown, copied: JsonValue, index: number) => void,
+    ): JsonValue {
         try {
-            return deps.copySchema(input);
+            return deps.copySchema(input, onTopLevelItem);
         } catch {
             return invalid();
         }
@@ -261,7 +273,13 @@ export function createConfigBuilder(deps: BuilderDependencies): PluginConfigBuil
         }
 
         const key = `_${kind}_${randomUUID().replaceAll('-', '')}`;
-        return item(kind, key, '', content, undefined, undefined);
+        const output = item(kind, key, '', content, undefined, undefined);
+
+        if (kind === 'text') {
+            origins.set(output, 'plainText');
+        }
+
+        return output;
     }
 
     const builder: PluginConfigBuilder = {
@@ -282,7 +300,17 @@ export function createConfigBuilder(deps: BuilderDependencies): PluginConfigBuil
                 invalid();
             }
 
-            const copy = snapshot(items);
+            const originsToPublish: object[] = [];
+            const copy = snapshot(items, (original, copied) => {
+                if (
+                    getDisplayKind(original) === 'plainText' &&
+                    copied !== null &&
+                    typeof copied === 'object' &&
+                    !Array.isArray(copied)
+                ) {
+                    originsToPublish.push(copied);
+                }
+            });
 
             if (!Array.isArray(copy)) {
                 return invalid();
@@ -292,8 +320,14 @@ export function createConfigBuilder(deps: BuilderDependencies): PluginConfigBuil
                 checkItem(part);
             }
 
-            return freeze(copy) as PluginConfigItem[];
+            const frozen = freeze(copy) as PluginConfigItem[];
+
+            for (const part of originsToPublish) {
+                origins.set(part, 'plainText');
+            }
+
+            return frozen;
         },
     };
-    return Object.freeze(builder);
+    return { builder: Object.freeze(builder), getDisplayKind };
 }
