@@ -1421,9 +1421,9 @@ remain to be recovered and independently verified.
   modified promise species and same-tick lease termination remain outside these
   local guarantees. No peer authentication, online state, QQ interoperability or
   Bridge integration is established by this owner. The existing socket-backed raw
-  client remains single-request and may close on push; the separate caller-fed
-  multiplex client can be exercised with this owner but is not yet connected to a
-  socket or the application event pipeline.
+  client remains single-request and may close on push. The separate multiplex
+  client and its injected-stream adapter can be exercised with this owner, but
+  are not yet connected to the application event pipeline.
 - `src/direct/wt-qr-flow.ts` coordinates a reference-style fetch and poll on
   one caller-supplied connected socket, with explicit timestamp, response and
   context verification and business-body boundaries. It closes on confirmation,
@@ -1519,6 +1519,18 @@ remain to be recovered and independently verified.
   not peer or message authentication. This client does not open a socket or attach pushes to
   Bridge or OneBot. A synthetic fixture can give its classifier a test D2 key;
   the session owner does not yet supply its private post-login key to the classifier.
+- `src/direct/raw-multiplex-stream.ts` adapts a caller-supplied, already-established
+  byte stream to that client without opening or connecting a socket. It requires
+  exclusive ownership and uses the shared direct-socket ownership registry for
+  the exact stream object in this module instance. Closing is logical first;
+  physical close and successful listener cleanup determine when the shared claim
+  can be released. A pending write uses a separate stream-owned copy; cleanup of
+  that copy depends on the stream honoring its callback contract. A write returning
+  `false` is accepted once, but a subsequent write while `writableNeedDrain` is
+  true fails closed rather than waiting or retrying. Callback success is local
+  stream behavior, not evidence of remote receipt. Callers must preserve their own
+  error handling for registration failures, nonconforming streams and post-close
+  errors. No live connection, QQ interaction or application wiring was tested.
 - `src/direct/sso-register.ts` encodes the reference PC registration and SSO
   heartbeat bodies, and classifies a registration response using its command,
   SSO return code and exact `register success` message. Account and sequence

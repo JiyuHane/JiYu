@@ -297,6 +297,19 @@ observations assume the reported paths and calls complete normally, registers an
 slots remain stable, indices and memory ranges are valid, and there is no harmful
 aliasing or concurrent mutation. No target code was executed; the static source data bytes were not inspected.
 
+A separate bounded scan of four-byte-aligned words in this sample's `.text`
+range `[0x4b300, 0x907cf4)` found 28 AArch64 direct `BL` encodings targeting
+exact address `0x2f91c8` and no direct `B` encoding to that address. In an
+independently disassembled window at `0x4309e8–0x4309f8`, instructions form
+`x19+0x9f0`, pass it in `x0` to `0x2f91c8`, and store the returned `x0` at
+`[x19+0x338]`. This differs from the `x19+0x4a0` argument expression at
+`0x2f3230`; it does not establish that the objects, state or execution paths
+are related. The same raw-encoding scan found no direct `B` or `BL` to exact
+addresses `0x2b6454` or `0x2f3a70`. It did not resolve indirect branches,
+control-flow reachability or function boundaries, and the scanned section can
+contain data as well as instructions. These bounded negative results do not
+establish the absence of a connection to signing or AES.
+
 The independent, internal [`mt19937-static-candidate.ts`](./src/experimental/mt19937-static-candidate.ts)
 models only synthetic 32-bit seeds and 624-slot states whose values have zero
 upper 32 bits, with an index from 0 through 623. It copies and freezes ordinary
