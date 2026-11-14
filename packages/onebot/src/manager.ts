@@ -213,9 +213,25 @@ export class OneBotManager {
 
         const listener = {
             started: (uin: string, bridge: BridgeInterface) => {
-                runWithoutRequestContext(() => this.onSessionStarted(uin, bridge));
+                if (this.disposed || this.sessionBinding !== binding) {
+                    return;
+                }
+
+                runWithoutRequestContext(() => {
+                    if (this.disposed || this.sessionBinding !== binding) {
+                        return;
+                    }
+
+                    this.onSessionStarted(uin, bridge);
+                });
             },
-            closed: (uin: string) => this.onSessionClosed(uin),
+            closed: (uin: string) => {
+                if (this.disposed || this.sessionBinding !== binding) {
+                    return;
+                }
+
+                this.onSessionClosed(uin);
+            },
             receiveHealthChanged: (uin: string, bridge: BridgeInterface) => {
                 if (this.disposed || this.sessionBinding !== binding) {
                     return;
