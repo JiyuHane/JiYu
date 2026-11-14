@@ -1146,6 +1146,7 @@ export class V12Transport {
                                 kind === 'busy' ||
                                 kind === 'contended' ||
                                 kind === 'blocked' ||
+                                kind === 'empty_unresolved' ||
                                 kind === 'epoch_invalid' ||
                                 kind === 'commit_rejected'
                             ) {

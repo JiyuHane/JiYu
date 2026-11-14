@@ -171,6 +171,42 @@ describe('HTTP poll capability routing without sockets', () => {
         expect(res.bodies).toHaveLength(0);
         await transport.close();
     });
+    it.each(['empty', 'timeout'] as const)(
+        'reports unresolved ordered %s as an error without claiming an empty queue',
+        async (reason) => {
+            const cap: V12HttpPollCapability = {
+                run: () => ({ kind: 'outcome', outcome: { kind: 'empty_unresolved', reason } }),
+            };
+            const { transport } = make({ httpPoll: cap });
+            const { res } = request(transport, poll(''));
+            await flush();
+            expect(res.status).toBe(200);
+            expect(res.json()).toEqual({
+                status: 'failed',
+                retcode: 20002,
+                data: null,
+                message: 'poll unavailable',
+                echo: '',
+            });
+            expect(res.destroyed).toBe(false);
+            await transport.close();
+        },
+    );
+    it('does not write an unresolved error after a header attempt', async () => {
+        const cap: V12HttpPollCapability = {
+            run(_input, { sink }) {
+                sink.writeHead();
+                return { kind: 'outcome', outcome: { kind: 'empty_unresolved', reason: 'empty' } };
+            },
+        };
+        const { transport } = make({ httpPoll: cap });
+        const { res } = request(transport, poll(''));
+        await flush();
+        expect(res.destroyed).toBe(true);
+        expect(res.writes).toBe(1);
+        expect(res.bodies).toHaveLength(0);
+        await transport.close();
+    });
     it('seals a retained sink at task settlement', async () => {
         let held!: import('../../src/v12-runtime/poll-transaction').PollSink;
         const cap: V12HttpPollCapability = {
