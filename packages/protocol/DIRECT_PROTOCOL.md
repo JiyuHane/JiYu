@@ -1446,6 +1446,29 @@ remain to be recovered and independently verified.
   have effects; both belong to the caller's transport trust boundary.
   Bounded candidate copies and synchronous validation do not bound total memory,
   concurrency or timer latency. No retries are performed.
+- `src/direct/guard-raw-transaction.ts` contains the single-transaction callback
+  guard used by borrowed registration. Optional synchronous context and result
+  disposers support future consumers: a result is transferred only after validation
+  and context disposal succeed. The producer must keep their mutable storage
+  separate, and remains responsible for allocations not returned to the guard,
+  retained copies, and external callback effects. A never-settling transport is
+  still an owner concern. A swallowed callback exception now conservatively
+  reports an unknown write state rather than trusting a claimed `not-written`.
+- `src/direct/raw-session-broker.ts` is an experimental local lease for one
+  caller-supplied raw client. It retires the exact client object for that module
+  instance, serializes lease transactions, and poisons on uncertain transport
+  failure, expiry or cancellation. This cannot enforce exclusivity against direct
+  client access, alternative wrappers or another module instance. The owner must
+  provide a truthful synchronous usability check and a trusted successful-settlement
+  quiescence contract; the broker does not authenticate the peer, verify callback
+  ordering or prove writes. It accepts same-realm standard AbortSignals whose
+  prototype and listener methods remain unchanged while in use. Timers are not
+  hard realtime and callback-owned late allocations require producer cleanup.
+  A synthetic integration test passes two registration transactions through the
+  same lease and production codecs; it does not exercise WT login. The module is
+  not yet attached to WT login or the application runtime: an owner must keep the
+  lease across login and registration, and explicitly poison it if an outer guard
+  later rejects a result the transport had reported as successful.
 - `src/direct/sso-register.ts` encodes the reference PC registration and SSO
   heartbeat bodies, and classifies a registration response using its command,
   SSO return code and exact `register success` message. Account and sequence

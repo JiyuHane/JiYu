@@ -4,7 +4,6 @@ import {
     Sso12PacketClient,
     type Sso12RawResult,
     type Sso12RawTransport,
-    type Sso12RawIdentity,
     type Sso12RawOptions,
 } from './sso12-packet-client';
 import { decodeServiceResponse, encodeServiceRequest } from './service-frame';
@@ -15,6 +14,7 @@ import {
     SSO_INFO_SYNC_COMMAND,
     type SsoRegisterOutcome,
 } from './sso-register';
+import { guardBorrowedTransport } from './guard-raw-transaction';
 import type { WtReferenceLoginResult } from './wt-reference-login-attempt';
 
 /** Synthetic reference exchange; neither the callback policy nor QQ-TEA authenticates a server. */
@@ -70,11 +70,6 @@ const sharedGetter = Object.getOwnPropertyDescriptor(
 const abortedGetter = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted')!.get!;
 const values = Uint8Array.prototype.values;
 const fill = Uint8Array.prototype.fill;
-const setBytes = Uint8Array.prototype.set;
-const arrayBufferLengthGetter = Object.getOwnPropertyDescriptor(
-    ArrayBuffer.prototype,
-    'byteLength',
-)!.get!;
 
 function wipe(value: Uint8Array | undefined): void {
     if (value) {
@@ -156,33 +151,6 @@ function bytes(value: unknown, max: number): Uint8Array {
     }
 
     return Uint8Array.from(new Uint8Array(storage, offsetGetter.call(value) as number, size));
-}
-
-/** Copy raw transport bytes without enumerating per-byte own properties. */
-function borrowedBytes(value: unknown, max: number): Uint8Array {
-    if (isProxy(value) || !ArrayBuffer.isView(value) || tagGetter.call(value) !== 'Uint8Array') {
-        throw new TypeError('invalid bytes');
-    }
-
-    values.call(value);
-    const size = lengthGetter.call(value) as number;
-
-    if (size > max) {
-        throw new TypeError('invalid bytes');
-    }
-
-    const storage = bufferGetter.call(value) as ArrayBuffer;
-    arrayBufferLengthGetter.call(storage); // Reject shared backing.
-    const start = offsetGetter.call(value) as number;
-    const result = new Uint8Array(size);
-
-    try {
-        setBytes.call(result, new Uint8Array(storage, start, size));
-        return result;
-    } catch (error) {
-        wipe(result);
-        throw error;
-    }
 }
 
 function text(value: unknown, nonempty: boolean, max = 4096): value is string {
@@ -410,7 +378,16 @@ async function registerFlow(
             };
         }
 
-        const transport = borrowed === undefined ? client! : guardBorrowedTransport(borrowed);
+        const transport: Sso12RawTransport =
+            borrowed === undefined
+                ? client!
+                : {
+                      transactRaw<C, T>(
+                          rawOptions: Sso12RawOptions<C, T>,
+                      ): Promise<Sso12RawResult<T>> {
+                          return guardBorrowedTransport<C, T>(borrowed)(rawOptions);
+                      },
+                  };
         const result = await runRegistration(transport, {
             timeoutMs: remaining,
             signal: controller.signal,
@@ -564,213 +541,6 @@ async function registerFlow(
             await client.whenClosed;
         }
     }
-}
-
-/** Locally binds callbacks and returned values; transport effects remain untrusted. */
-function guardBorrowedTransport(transport: Sso12RawTransport): Sso12RawTransport {
-    return {
-        async transactRaw<C, T>(
-            options: import('./sso12-packet-client').Sso12RawOptions<C, T>,
-        ): Promise<Sso12RawResult<T>> {
-            type Phase =
-                | 'new'
-                | 'building'
-                | 'built'
-                | 'verifying'
-                | 'verified'
-                | 'consuming'
-                | 'consumed'
-                | 'failed';
-            let phase: Phase = 'new';
-            let violation = false;
-            let finished = false;
-            let seen = false;
-            let identity: Sso12RawIdentity | undefined;
-            let verified: Uint8Array | undefined;
-            let frameCopy: Uint8Array | undefined;
-            let context: C;
-            let staged: T;
-            const token = Object.freeze({});
-            const contextToken = Object.freeze({});
-
-            const fail = (): never => {
-                violation = true;
-                phase = 'failed';
-                throw new Error('invalid borrowed raw transaction');
-            };
-
-            const enter = (expected: Phase, next: Phase): void => {
-                if (finished || violation || phase !== expected) {
-                    fail();
-                }
-
-                phase = next;
-            };
-
-            const readIdentity = (value: Sso12RawIdentity): Sso12RawIdentity => {
-                const identityRecord = record(value);
-                const uin = identityRecord.uin;
-                const sequence = identityRecord.sequence;
-
-                if (
-                    typeof uin !== 'string' ||
-                    typeof sequence !== 'number' ||
-                    !Number.isInteger(sequence) ||
-                    sequence < 0 ||
-                    sequence > 0xffffffff
-                ) {
-                    return fail();
-                }
-
-                return Object.freeze({ uin, sequence });
-            };
-
-            const contextValue = (): C => context;
-
-            const check = (value: Sso12RawIdentity): void => {
-                const current = readIdentity(value);
-
-                if (
-                    !identity ||
-                    current.uin !== identity.uin ||
-                    current.sequence !== identity.sequence
-                ) {
-                    fail();
-                }
-            };
-
-            try {
-                const result = await transport.transactRaw<object, object>({
-                    timeoutMs: options.timeoutMs,
-                    signal: options.signal,
-                    buildRequest: async (value) => {
-                        enter('new', 'building');
-                        identity = readIdentity(value);
-                        const built = await options.buildRequest(identity);
-
-                        if (finished || phase !== 'building' || violation) {
-                            return fail();
-                        }
-
-                        frameCopy = borrowedBytes(built.frame, 16 * 1024 * 1024);
-                        context = built.context;
-                        enter('building', 'built');
-                        return { frame: frameCopy, context: contextToken };
-                    },
-                    verifyCandidate: async (candidate, context, value) => {
-                        enter('built', 'verifying');
-                        seen = true;
-                        check(value);
-
-                        if (context !== contextToken) {
-                            fail();
-                        }
-
-                        verified = borrowedBytes(candidate, 16 * 1024 * 1024);
-                        const accepted = await options.verifyCandidate(
-                            verified,
-                            contextValue(),
-                            identity!,
-                        );
-
-                        if (finished || phase !== 'verifying') {
-                            return fail();
-                        }
-
-                        if (accepted !== true) {
-                            phase = 'failed';
-                            return false;
-                        }
-
-                        phase = 'verified';
-                        return true;
-                    },
-                    consumeCandidate: async (candidate, context, value) => {
-                        enter('verified', 'consuming');
-                        check(value);
-
-                        if (context !== contextToken) {
-                            fail();
-                        }
-
-                        const actual = borrowedBytes(candidate, 16 * 1024 * 1024);
-
-                        try {
-                            if (
-                                !verified ||
-                                actual.length !== verified.length ||
-                                !actual.every((v, i) => v === verified![i])
-                            ) {
-                                fail();
-                            }
-
-                            staged = await options.consumeCandidate(
-                                actual,
-                                contextValue(),
-                                identity!,
-                            );
-                        } finally {
-                            wipe(actual);
-                        }
-
-                        enter('consuming', 'consumed');
-                        return token;
-                    },
-                });
-                finished = true;
-                const snapshot = record(result);
-
-                if (
-                    !violation &&
-                    snapshot.kind === 'failure' &&
-                    typeof snapshot.code === 'string' &&
-                    (snapshot.writeState === 'unknown' ||
-                        (snapshot.writeState === 'not-written' && !seen))
-                ) {
-                    return {
-                        kind: 'failure',
-                        code: 'borrowed-transaction-failed',
-                        writeState: snapshot.writeState,
-                    };
-                }
-
-                const isConsumed = (): boolean => phase === 'consumed';
-
-                if (
-                    !violation &&
-                    snapshot.kind === 'response' &&
-                    isConsumed() &&
-                    snapshot.value === token &&
-                    snapshot.sequence === identity?.sequence &&
-                    snapshot.writeState === 'written' &&
-                    !options.signal?.aborted
-                ) {
-                    return {
-                        kind: 'response',
-                        sequence: snapshot.sequence as number,
-                        value: staged!,
-                        writeState: 'written',
-                    };
-                }
-
-                return {
-                    kind: 'failure',
-                    code: 'borrowed-transaction-failed',
-                    writeState: 'unknown',
-                };
-            } catch {
-                return {
-                    kind: 'failure',
-                    code: 'borrowed-transaction-failed',
-                    writeState: 'unknown',
-                };
-            } finally {
-                finished = true;
-                wipe(verified);
-                wipe(frameCopy);
-            }
-        },
-    };
 }
 
 function runRegistration(
