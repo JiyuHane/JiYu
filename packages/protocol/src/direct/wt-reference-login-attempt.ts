@@ -682,9 +682,16 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
     }
     private clearHeld(): void {
         if (this.held) {
-            this.held.tgtgtKey.fill(0);
-            this.held.noPicSig.fill(0);
-            this.held.temporaryA1.fill(0);
+            if (this.borrowed) {
+                wipeOwned(this.held.tgtgtKey);
+                wipeOwned(this.held.noPicSig);
+                wipeOwned(this.held.temporaryA1);
+            } else {
+                this.held.tgtgtKey.fill(0);
+                this.held.noPicSig.fill(0);
+                this.held.temporaryA1.fill(0);
+            }
+
             this.held = undefined;
         }
     }
@@ -694,10 +701,22 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
             this.lifetimeTimer = undefined;
         }
 
-        this.qrSig?.fill(0);
+        if (this.borrowed) {
+            if (this.qrSig) {
+                wipeOwned(this.qrSig);
+            }
+        } else {
+            this.qrSig?.fill(0);
+        }
+
         this.qrSig = undefined;
         this.clearHeld();
-        this.p.randomKey.fill(0);
+
+        if (this.borrowed) {
+            wipeOwned(this.p.randomKey);
+        } else {
+            this.p.randomKey.fill(0);
+        }
 
         try {
             if (this.borrowedAbortListener) {
@@ -714,6 +733,10 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
         this.client?.close();
 
         if (this.borrowed) {
+            // These are attempt-owned snapshots; the lease owner retains its own profile.
+            wipeOwned(this.p.guid);
+            wipeOwned(this.p.unknown21);
+            wipeOwned(this.p.peerPublicKey);
             // Release the closure reference; OpenSSL/JS private key erasure is not guaranteed.
             this.ecdh = undefined;
         }

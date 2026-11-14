@@ -10,6 +10,10 @@ import type { SsoResponse } from './sso';
 // Offline reference codecs only. No QQ version or server interoperability is established.
 // https://github.com/LagrangeDev/Lagrange.Core/blob/fe789c4a23796fbc82fa09e70a9c44c8a5cf2948/Lagrange.Core/Internal/Services/System/InfoSyncService.cs
 // https://github.com/LagrangeDev/Lagrange.Core/blob/fe789c4a23796fbc82fa09e70a9c44c8a5cf2948/Lagrange.Core/Internal/Services/System/SsoHeartBeatService.cs
+// PC service fields were also compared with the fixed LagrangeV2 source:
+// https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Services/System/InfoSyncService.cs
+// https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Services/System/SsoHeartBeatService.cs
+// Android uses different fields; serialization and live behavior remain unverified.
 export const SSO_INFO_SYNC_COMMAND = 'trpc.msg.register_proxy.RegisterProxy.SsoInfoSync';
 export const SSO_HEARTBEAT_COMMAND = 'trpc.qq_new_tech.status_svc.StatusService.SsoHeartBeat';
 const MAX_BYTES = 1024 * 1024;

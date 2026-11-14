@@ -1404,6 +1404,20 @@ remain to be recovered and independently verified.
   internals and copies retained by callbacks cannot be reliably erased. This is
   not yet wired into the application runtime or proof of V2/QQ interoperability.
   See the reference lifecycle notes below for other verification gaps.
+- `src/direct/wt-reference-session.ts` composes borrowed QR login and registration
+  as one local account owner on the same lease. Registration receives the confirmed
+  UIN and nonempty UID projected from that attempt's accepted tickets, not a
+  caller-supplied replacement. The UID is passed to an external reserve builder;
+  the resulting opaque bytes do not prove UID inclusion or a valid signature.
+  Successful local registration classification retains ticket material privately
+  until close, cancellation or lease termination, for future session operations;
+  those later operations are not implemented here. Failure poisons the lease;
+  idle close returns its control to the caller. Caller-held aliases, callbacks,
+  modified promise species and same-tick lease termination remain outside these
+  local guarantees. No peer authentication, online state, QQ interoperability or
+  Bridge integration is established by this owner. The current raw client is a
+  single-request transport, not a push multiplexer; a classified push can close it,
+  so retaining this lease does not yet provide a receive channel.
 - `src/direct/wt-qr-flow.ts` coordinates a reference-style fetch and poll on
   one caller-supplied connected socket, with explicit timestamp, response and
   context verification and business-body boundaries. It closes on confirmation,
@@ -1485,10 +1499,19 @@ remain to be recovered and independently verified.
 - `src/direct/sso-register.ts` encodes the reference PC registration and SSO
   heartbeat bodies, and classifies a registration response using its command,
   SSO return code and exact `register success` message. Account and sequence
-  binding remain the transport caller's responsibility. Explicit defaults follow
-  static analysis of the reference serializer; hand-derived vectors have not
-  been compared with the running reference or target. These codecs do not perform
-  registration, change online state, schedule heartbeats or validate server identity.
+  binding remain the transport caller's responsibility. PC service-level fields
+  were also checked against fixed LagrangeV2 commit `7011cdf`: its
+  [registration](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Services/System/InfoSyncService.cs#L7-L59)
+  and [heartbeat](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Services/System/SsoHeartBeatService.cs#L7-L22)
+  have matching PC field assignments. Android uses different assignments and is
+  not represented by this PC codec. The explicit-default wire behavior and
+  hand-derived vectors have not been compared with the running V2 serializer
+  or target. V2 places UID in the SSO reserve; this local registration flow passes
+  UID to a caller-supplied reserve builder and does not prove the builder includes
+  it. Local `missing-result` also remains distinct from V2's default empty response
+  message; both are non-success but are not identical response classifications.
+  These codecs do not perform registration, change online state, schedule
+  heartbeats or validate server identity.
 - `src/direct/key-exchange.ts` provides P-256 ECDH and AES-256-GCM primitives
   matching a public reference's key-exchange construction. Tests use synthetic
   vectors cross-checked with Node and .NET cryptography, not the target client.

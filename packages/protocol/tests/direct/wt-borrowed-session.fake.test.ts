@@ -261,7 +261,7 @@ function setup(
             subAppId: 43,
             clientVersion: 44,
             guid: Uint8Array.of(1, 2),
-            unknown21: new Uint8Array(21),
+            unknown21: new Uint8Array(21).fill(6),
             randomKey: new Uint8Array(16).fill(7),
             peerPublicKey: peer.publicKey,
             ssoVersion: 'v',
@@ -282,22 +282,55 @@ function setup(
         ...overrides,
     };
     const attempt = createBorrowedWtReferenceLoginAttempt(wrapLease(lease), options);
-    return { client, broker, lease, attempt, verified };
+    return { client, broker, lease, attempt, verified, options };
+}
+
+// Test-only reflection retains the actual attempt-owned arrays, not copies of them.
+function profileReferences(fixture: ReturnType<typeof setup>) {
+    const names = ['guid', 'unknown21', 'peerPublicKey', 'randomKey'] as const;
+    const internal = Reflect.get(fixture.attempt, 'p') as Record<
+        (typeof names)[number],
+        Uint8Array
+    >;
+    return names.map((name) => {
+        const actual = internal[name];
+        const caller = fixture.options.profile[name];
+        const original = Uint8Array.from(caller);
+        expect(actual).not.toBe(caller);
+        expect(actual.buffer).not.toBe(caller.buffer);
+        expect(actual).toEqual(original);
+        expect(actual.some((byte) => byte !== 0)).toBe(true);
+        return { name, actual, caller, original };
+    });
+}
+
+function expectWiped(references: ReturnType<typeof profileReferences>) {
+    for (const { actual, caller, original } of references) {
+        expect(actual.length).toBe(original.length);
+        expect(actual.every((byte) => byte === 0)).toBe(true);
+        expect(caller).toEqual(original);
+    }
 }
 
 async function confirm(attempt: ReturnType<typeof createBorrowedWtReferenceLoginAttempt>) {
     const qr = await attempt.fetch(fetchFields);
     expect(qr.qrUrl).toBe('https://example.invalid/qr');
     expect(await attempt.poll()).toEqual({ status: 'confirmed' });
+    return qr;
 }
 
 const nextTurn = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 describe('borrowed WT session through an in-memory broker', () => {
     it('uses one lease and distinct sequences for QR, login and registration', async () => {
-        const { client, broker, lease, attempt, verified } = setup();
-        await confirm(attempt);
+        const fixture = setup();
+        const { client, broker, lease, attempt, verified, options } = fixture;
+        const references = profileReferences(fixture);
+        const qr = await confirm(attempt);
         const login = await attempt.login(loginFields);
+        expectWiped(references);
+        expect(qr.image).toEqual(Uint8Array.of(7, 8));
+        expect(attempt.getState()).toBe('tickets');
         expect(login).toMatchObject({
             status: 'tickets',
             uin: '123',
@@ -308,10 +341,16 @@ describe('borrowed WT session through an in-memory broker', () => {
             throw new Error('expected synthetic ticket projection');
         }
 
+        expect(login.tickets).toEqual({
+            d2: Uint8Array.of(9),
+            d2Key: key,
+            a1: Uint8Array.of(12),
+            a2: Uint8Array.of(11),
+        });
         const signed: Array<{ uin: string; uid: string; sequence: number; command: string }> = [];
         const register = await referenceRegisterOnTransport(lease, {
             login,
-            profile: { subAppId: 43, guid: Uint8Array.of(1, 2), version: 'header-v' },
+            profile: { subAppId: 43, guid: options.profile.guid, version: 'header-v' },
             registration: {
                 uid: login.uidProjection.uid,
                 version: 'build-v',
@@ -420,14 +459,144 @@ describe('borrowed WT session through an in-memory broker', () => {
     });
 
     it('rejects a first-frame policy denial before login and poisons before returning', async () => {
-        const { client, lease, attempt } = setup({ verifyRaw: () => false });
+        const fixture = setup({ verifyRaw: () => false });
+        const { client, lease, attempt } = fixture;
+        const references = profileReferences(fixture);
         await expect(attempt.fetch(fetchFields)).rejects.toThrow();
+        expectWiped(references);
+        expect(attempt.getState()).toBe('failed');
+        await expect(attempt.fetch(fetchFields)).rejects.toThrow();
+        expectWiped(references);
         expect(await lease.whenClosed).toBe('poisoned');
         expect(client.close).toHaveBeenCalledTimes(1);
         expect(client.calls).toBe(1);
         lease.poison();
         expect(client.close).toHaveBeenCalledTimes(1);
         attempt.close();
+    });
+
+    it.each(['abort', 'close'] as const)(
+        'wipes attempt-owned profile snapshots on %s',
+        async (mode) => {
+            const controller = new AbortController();
+            const fixture = setup({ signal: controller.signal });
+            const { client, lease, attempt } = fixture;
+            const references = profileReferences(fixture);
+            const qr = await attempt.fetch(fetchFields);
+
+            if (mode === 'abort') {
+                controller.abort();
+                expect(attempt.getState()).toBe('failed');
+                expect(await lease.whenClosed).toBe('poisoned');
+            } else {
+                attempt.close();
+                expect(attempt.getState()).toBe('closed');
+                expect(client.close).not.toHaveBeenCalled();
+            }
+
+            expectWiped(references);
+            expect(qr.image).toEqual(Uint8Array.of(7, 8));
+            await expect(attempt.poll()).rejects.toThrow();
+            expectWiped(references);
+            lease.release();
+            client.close();
+        },
+    );
+
+    it('continues wiping independent snapshots if one buffer is detached', () => {
+        const fixture = setup();
+        const { client, lease, attempt } = fixture;
+        const references = profileReferences(fixture);
+        const guid = references.find((entry) => entry.name === 'guid')!;
+        const unknown = references.find((entry) => entry.name === 'unknown21')!;
+        Object.defineProperty(unknown.actual, 'fill', {
+            value: () => {
+                throw new Error('synthetic overridden fill');
+            },
+        });
+        structuredClone(guid.actual.buffer, { transfer: [guid.actual.buffer] });
+        attempt.close();
+        expect(guid.actual.byteLength).toBe(0);
+        expect(guid.caller).toEqual(guid.original);
+        expectWiped(references.filter((entry) => entry.name !== 'guid'));
+        lease.release();
+        client.close();
+    });
+
+    // These mutations require test-only reflection into private attempt state.
+    it('keeps successful tickets while independently wiping damaged cleanup buffers', async () => {
+        let damage = () => {};
+
+        const fixture = setup({
+            verifyContext: ({ operation }) => {
+                if (operation === 'login') {
+                    damage();
+                }
+
+                return true;
+            },
+        });
+        const { client, lease, attempt } = fixture;
+        const references = profileReferences(fixture);
+        const random = references.find((entry) => entry.name === 'randomKey')!;
+        const qr = await confirm(attempt);
+        const held = Reflect.get(attempt, 'held') as {
+            tgtgtKey: Uint8Array;
+            noPicSig: Uint8Array;
+            temporaryA1: Uint8Array;
+        };
+        const { tgtgtKey, noPicSig, temporaryA1 } = held;
+        expect(tgtgtKey.some((byte) => byte !== 0)).toBe(true);
+        expect(noPicSig.some((byte) => byte !== 0)).toBe(true);
+        expect(temporaryA1.some((byte) => byte !== 0)).toBe(true);
+        Object.defineProperty(noPicSig, 'fill', {
+            value: () => {
+                throw new Error('synthetic overridden fill');
+            },
+        });
+
+        damage = () => {
+            structuredClone(random.actual.buffer, { transfer: [random.actual.buffer] });
+            structuredClone(tgtgtKey.buffer, { transfer: [tgtgtKey.buffer] });
+        };
+
+        const login = await attempt.login(loginFields);
+        expect(login.status).toBe('tickets');
+        expect(attempt.getState()).toBe('tickets');
+        expect(qr.image).toEqual(Uint8Array.of(7, 8));
+        expect(random.actual.byteLength).toBe(0);
+        expect(random.caller).toEqual(random.original);
+        expect(tgtgtKey.byteLength).toBe(0);
+        expect(noPicSig.every((byte) => byte === 0)).toBe(true);
+        expect(temporaryA1.every((byte) => byte === 0)).toBe(true);
+        expectWiped(references.filter((entry) => entry.name !== 'randomKey'));
+
+        if (login.status !== 'tickets') {
+            throw new Error('expected synthetic tickets');
+        }
+
+        expect(login.tickets.d2).toEqual(Uint8Array.of(9));
+        Object.values(login.tickets).forEach((value) => value.fill(0));
+        lease.release();
+        client.close();
+    });
+
+    it('finishes cancellation when the reflected QR signature is detached', async () => {
+        const controller = new AbortController();
+        const fixture = setup({ signal: controller.signal });
+        const { client, lease, attempt } = fixture;
+        const references = profileReferences(fixture);
+        const qr = await attempt.fetch(fetchFields);
+        const qrSig = Reflect.get(attempt, 'qrSig') as Uint8Array;
+        expect(qrSig.length).toBeGreaterThan(0);
+        structuredClone(qrSig.buffer, { transfer: [qrSig.buffer] });
+        expect(() => controller.abort()).not.toThrow();
+        expect(attempt.getState()).toBe('failed');
+        expect(await lease.whenClosed).toBe('poisoned');
+        expect(qr.image).toEqual(Uint8Array.of(7, 8));
+        expectWiped(references);
+        await expect(attempt.poll()).rejects.toThrow('attempt state violation');
+        client.close();
     });
 
     it.each(['bad-frame', 'wrong-account', 'identity', 'swapped', 'sequence'] as const)(
