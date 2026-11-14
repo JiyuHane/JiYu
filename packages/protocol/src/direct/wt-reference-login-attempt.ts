@@ -14,6 +14,7 @@ import {
 } from './wt-oicq';
 import { encodeWtLoginRequestBody, type WtLoginRequestBody } from './wt-login-request';
 import { decodeWtLoginResponse } from './wt-login-response';
+import { projectWtLoginUid, type WtLoginUidProjection } from './wt-login-keystore';
 
 type Operation = 'fetch' | 'poll' | 'login';
 type FetchFields = Extract<WtQrFrameOperation, { type: 'fetch' }>['fields'];
@@ -43,6 +44,8 @@ export type WtReferenceLoginResult =
           /** Confirmed UIN accepted by the caller's context policy; not server authentication. */
           readonly uin: string;
           tickets: { d2: Uint8Array; d2Key: Uint8Array; a1: Uint8Array; a2: Uint8Array };
+          /** Parsed response data only, not authentication or evidence of online state. */
+          uidProjection?: WtLoginUidProjection;
       }
     | { status: 'verification-required' | 'nonzero' | 'incomplete'; state: number }
     | { status: 'error'; state: number; code: number };
@@ -142,6 +145,8 @@ export interface WtReferenceLoginAttemptOptions {
     timeoutMs: number;
     attemptTimeoutMs: number;
     initialSequence?: number;
+    /** Opt in to parsing UID from accepted login tickets; strings cannot be wiped. */
+    enableUidProjection?: boolean;
     /** Cancels the whole attempt, including while confirmation is held. */
     signal?: AbortSignal;
     getTimestamp: () => number;
@@ -196,6 +201,7 @@ export class WtReferenceLoginAttempt {
     private readonly verifier: WtReferenceLoginAttemptOptions['verifyRaw'];
     private readonly contextVerifier: WtReferenceLoginAttemptOptions['verifyContext'];
     private readonly slicer: WtReferenceLoginAttemptOptions['sliceBusiness'];
+    private readonly enableUidProjection: boolean;
     private readonly signal?: AbortSignal;
     private readonly controller = new AbortController();
     private readonly onAbort = () => this.fail();
@@ -220,7 +226,9 @@ export class WtReferenceLoginAttempt {
             typeof options.buildReserved !== 'function' ||
             typeof options.verifyRaw !== 'function' ||
             typeof options.verifyContext !== 'function' ||
-            typeof options.sliceBusiness !== 'function'
+            typeof options.sliceBusiness !== 'function' ||
+            (options.enableUidProjection !== undefined &&
+                typeof options.enableUidProjection !== 'boolean')
         ) {
             throw new TypeError('invalid attempt configuration');
         }
@@ -305,6 +313,7 @@ export class WtReferenceLoginAttempt {
         this.verifier = options.verifyRaw;
         this.contextVerifier = options.verifyContext;
         this.slicer = options.sliceBusiness;
+        this.enableUidProjection = options.enableUidProjection === true;
         this.signal = options.signal;
         this.client = new Sso12PacketClient({
             socket: options.socket,
@@ -905,11 +914,15 @@ export class WtReferenceLoginAttempt {
                             const login = parsed as ReturnType<typeof decodeWtLoginResponse>;
 
                             if (login.status === 'tickets') {
+                                const uidProjection = this.enableUidProjection
+                                    ? projectWtLoginUid(login.innerTlvs)
+                                    : undefined;
                                 return stage({
                                     type: 'login',
                                     result: {
                                         status: 'tickets',
                                         uin: this.held!.decimal,
+                                        ...(uidProjection === undefined ? {} : { uidProjection }),
                                         tickets: {
                                             d2: Uint8Array.from(login.tickets.d2),
                                             d2Key: Uint8Array.from(login.tickets.d2Key),
@@ -1000,6 +1013,8 @@ function scrubResult(value: ExchangeResult): void {
         value.held.temporaryA1.fill(0);
     } else if (value.type === 'login' && value.result.status === 'tickets') {
         Object.values(value.result.tickets).forEach((bytes) => bytes.fill(0));
+        // Drop the reference; JavaScript strings themselves cannot be wiped.
+        delete value.result.uidProjection;
     }
 }
 

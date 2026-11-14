@@ -1381,8 +1381,16 @@ remain to be recovered and independently verified.
   output is copied before the callback's input buffer is cleared, including when
   it aliases that input. Callback-visible verification copies are independently
   cleared best-effort. Neither behavior establishes server authentication. The
-  result does not mark online status or attach to Bridge. See the reference lifecycle notes below for the
-  synthetic coverage and remaining verification gaps.
+  result does not mark online status or attach to Bridge. An optional
+  `enableUidProjection` setting projects inner TLV `0x543` only after the caller's
+  raw and context policies accept the response. It is disabled by default, so the
+  original result shape and handling remain unchanged. When enabled, `tickets`
+  results include `uidProjection`, distinguishing an absent TLV from a present
+  empty UID; malformed selected data fails the attempt. The confirmed UIN and UID
+  remain subject to the caller's identity and authentication policy, and the UID
+  string cannot be reliably erased. The fake transport exercises the actual local
+  codecs, but does not establish real transport or server behavior. See the
+  reference lifecycle notes below for other coverage and verification gaps.
 - `src/direct/wt-qr-flow.ts` coordinates a reference-style fetch and poll on
   one caller-supplied connected socket, with explicit timestamp, response and
   context verification and business-body boundaries. It closes on confirmation,
