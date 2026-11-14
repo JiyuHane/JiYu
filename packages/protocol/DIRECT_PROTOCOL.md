@@ -957,6 +957,15 @@ remain to be recovered and independently verified.
   path and its documented conditions; keys, extra bytes and random bytes are
   supplied by the caller. It neither signs nor sends an SSO request, and the
   result is not proof of a valid QR login.
+- `src/direct/target-wt-inner-writer-candidate.ts` prefixes four explicitly
+  supplied opaque writer outputs with `BE16(4)` and concatenates them in caller
+  order. It models only the recorded four-object normal-success writer sequence
+  at `0x3469090` and `0x3468660`; the inputs are caller assertions, not verified
+  node encodings or four established TLVs. Empty fragments are a local simulation
+  choice. The 16 MiB aggregate limit, copying and unsafe-view rejection are local
+  policies, not target limits. Inputs must remain stable until snapshotted; the
+  output belongs to the caller and cleanup is best effort. This helper does not
+  invoke target writers, encrypt, sign, send, authenticate or establish login.
 - `src/direct/target-wt-login-node.ts` encodes the two observed node forms
   `0x016a` and `0x0318` from explicitly supplied opaque bytes. A node includes
   its BE16 tag and BE16 value length but no entry count. Its per-value limit is
