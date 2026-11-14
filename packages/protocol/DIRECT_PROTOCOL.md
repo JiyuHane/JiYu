@@ -1389,8 +1389,21 @@ remain to be recovered and independently verified.
   empty UID; malformed selected data fails the attempt. The confirmed UIN and UID
   remain subject to the caller's identity and authentication policy, and the UID
   string cannot be reliably erased. The fake transport exercises the actual local
-  codecs, but does not establish real transport or server behavior. See the
-  reference lifecycle notes below for other coverage and verification gaps.
+  codecs, but does not establish real transport or server behavior. The separate
+  `createBorrowedWtReferenceLoginAttempt` accepts an owner-supplied raw session
+  lease rather than a socket. Its QR fetch, poll and login share that lease and
+  ECDH context; after a successful ticket result the owner can pass the lease and
+  ticket data to borrowed registration. A synthetic test exercises this handoff
+  with production codecs, not a live peer. The owner must retain exclusive lease
+  control throughout the attempt and registration and provide trusted transport
+  quiescence and response-verification policies. Attempt failure or in-flight
+  close poisons the lease; successful completion and idle close leave it with the
+  owner. `whenClosed` notification is asynchronous and is not a synchronous
+  connection-state barrier; a foreign lease or owner that terminates it during
+  the commit window can defeat that observation. JavaScript strings, crypto
+  internals and copies retained by callbacks cannot be reliably erased. This is
+  not yet wired into the application runtime or proof of V2/QQ interoperability.
+  See the reference lifecycle notes below for other verification gaps.
 - `src/direct/wt-qr-flow.ts` coordinates a reference-style fetch and poll on
   one caller-supplied connected socket, with explicit timestamp, response and
   context verification and business-body boundaries. It closes on confirmation,
@@ -1464,11 +1477,11 @@ remain to be recovered and independently verified.
   ordering or prove writes. It accepts same-realm standard AbortSignals whose
   prototype and listener methods remain unchanged while in use. Timers are not
   hard realtime and callback-owned late allocations require producer cleanup.
-  A synthetic integration test passes two registration transactions through the
-  same lease and production codecs; it does not exercise WT login. The module is
-  not yet attached to WT login or the application runtime: an owner must keep the
-  lease across login and registration, and explicitly poison it if an outer guard
-  later rejects a result the transport had reported as successful.
+  Synthetic tests exercise both two registrations and a WT fetch/poll/login followed
+  by registration through one lease and production codecs. The application runtime
+  is not yet attached: an owner must keep the lease across login and registration,
+  and explicitly poison it if an outer registration guard later rejects a result
+  the transport had reported as successful.
 - `src/direct/sso-register.ts` encodes the reference PC registration and SSO
   heartbeat bodies, and classifies a registration response using its command,
   SSO return code and exact `register success` message. Account and sequence

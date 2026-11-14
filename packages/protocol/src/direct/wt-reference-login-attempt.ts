@@ -1,6 +1,14 @@
 import type { Socket } from 'node:net';
-import { isProxy } from 'node:util/types';
-import { Sso12PacketClient, type Sso12PacketClientOptions } from './sso12-packet-client';
+import { addAbortListener } from 'node:events';
+import { isPromise, isProxy } from 'node:util/types';
+import {
+    Sso12PacketClient,
+    type Sso12PacketClientOptions,
+    type Sso12RawOptions,
+    type Sso12RawTransport,
+} from './sso12-packet-client';
+import type { RawSessionLease } from './raw-session-broker';
+import { guardBorrowedTransport } from './guard-raw-transaction';
 import { decodeServiceResponse, encodeServiceRequest } from './service-frame';
 import { decodeSsoResponse, encodeSso12Request } from './sso';
 import { createWtEcdh } from './wt-ecdh';
@@ -186,13 +194,45 @@ export interface WtReferenceLoginAttemptOptions {
     };
 }
 
+export type BorrowedWtReferenceLoginAttemptOptions = Omit<
+    WtReferenceLoginAttemptOptions,
+    'socket' | 'initialSequence'
+>;
+
+/** Operations for a single account attempt, not an authenticated or registered session. */
+export interface BorrowedWtReferenceLoginAttempt {
+    getState(): State;
+    fetch(fields: FetchFields): Promise<{ image: Uint8Array; qrUrl: string }>;
+    poll(): Promise<{
+        status: 'confirmed' | 'wait' | 'confirm' | 'expired' | 'canceled' | 'invalid' | 'unknown';
+        code?: number;
+    }>;
+    login(fields: LoginFields): Promise<WtReferenceLoginResult>;
+    close(): void;
+}
+
+const borrowedPorts = new WeakMap<
+    object,
+    { lease: RawSessionLease; closed: PromiseLike<unknown> }
+>();
+const promiseThen = Promise.prototype.then;
+
+function observeClosure(value: PromiseLike<unknown>): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+        const promise = isPromise(value) ? value : Promise.resolve(value);
+        promiseThen.call(promise, resolve, reject);
+    });
+}
+
 /** Reference-only attempt. External callbacks can retain or act on copies; JS/crypto erasure is best effort.
  * QQ-TEA does not authenticate. Parsed tickets do not register or establish online state. */
-export class WtReferenceLoginAttempt {
-    private readonly client: Sso12PacketClient;
-    private readonly socket: Socket;
+export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt {
+    private readonly client?: Sso12PacketClient;
+    private readonly socket?: Socket;
+    private readonly borrowed?: RawSessionLease;
+    private readonly transport: Sso12RawTransport;
     private readonly p: WtReferenceLoginAttemptOptions['profile'];
-    private readonly ecdh = createWtEcdh();
+    private ecdh: ReturnType<typeof createWtEcdh> | undefined = createWtEcdh();
     private readonly timeout: number;
     private readonly deadline: number;
     private lifetimeTimer?: ReturnType<typeof setTimeout>;
@@ -203,16 +243,33 @@ export class WtReferenceLoginAttempt {
     private readonly slicer: WtReferenceLoginAttemptOptions['sliceBusiness'];
     private readonly enableUidProjection: boolean;
     private readonly signal?: AbortSignal;
+    private borrowedAbortListener?: ReturnType<typeof addAbortListener>;
     private readonly controller = new AbortController();
     private readonly onAbort = () => this.fail();
     private state: State = 'new';
     private busy = false;
     private qrSig?: Uint8Array;
     private held?: Held;
+    private borrowedPoisoned = false;
 
-    constructor(options: WtReferenceLoginAttemptOptions) {
+    constructor(options: WtReferenceLoginAttemptOptions);
+    constructor(
+        supplied: WtReferenceLoginAttemptOptions | BorrowedWtReferenceLoginAttemptOptions,
+        port: object | undefined = undefined,
+    ) {
+        const borrowedPort = port === undefined ? undefined : borrowedPorts.get(port);
+        const borrowed = borrowedPort?.lease;
         const started = performance.now();
-        options = snapshotRecord(options) as WtReferenceLoginAttemptOptions;
+        const record = snapshotRecord(supplied);
+
+        if (
+            borrowed &&
+            (Object.hasOwn(record, 'socket') || Object.hasOwn(record, 'initialSequence'))
+        ) {
+            throw new TypeError('invalid borrowed attempt configuration');
+        }
+
+        const options = record as WtReferenceLoginAttemptOptions;
 
         if (
             !options.profile ||
@@ -235,7 +292,14 @@ export class WtReferenceLoginAttempt {
 
         // Validate the genuine AbortSignal internal slot before claiming the caller's socket.
         if (options.signal !== undefined) {
-            if (isProxy(options.signal)) {
+            if (
+                isProxy(options.signal) ||
+                (borrowed &&
+                    (Object.getPrototypeOf(options.signal) !== AbortSignal.prototype ||
+                        Object.hasOwn(options.signal, 'aborted') ||
+                        Object.hasOwn(options.signal, 'addEventListener') ||
+                        Object.hasOwn(options.signal, 'removeEventListener')))
+            ) {
                 throw new TypeError('invalid attempt signal');
             }
 
@@ -304,8 +368,9 @@ export class WtReferenceLoginAttempt {
             randomKey: randomBytes,
             peerPublicKey: peerBytes,
         };
-        this.ecdh.deriveTeaKey(this.p.peerPublicKey).fill(0);
-        this.socket = options.socket;
+        this.ecdh!.deriveTeaKey(this.p.peerPublicKey).fill(0);
+        this.socket = borrowed ? undefined : options.socket;
+        this.borrowed = borrowed;
         this.timeout = options.timeoutMs;
         this.deadline = started + options.attemptTimeoutMs;
         this.clock = options.getTimestamp;
@@ -315,19 +380,26 @@ export class WtReferenceLoginAttempt {
         this.slicer = options.sliceBusiness;
         this.enableUidProjection = options.enableUidProjection === true;
         this.signal = options.signal;
-        this.client = new Sso12PacketClient({
-            socket: options.socket,
-            uin,
-            encryption: { type: 'zero' },
-            subAppId,
-            guid: this.p.guid,
-            version: ssoVersion,
-            a2: new Uint8Array(),
-            buildReserved: this.signer,
-            classifyIncoming: () => 'response',
-            initialSequence: options.initialSequence,
-            defaultTimeoutMs: this.timeout,
-        });
+
+        if (borrowed) {
+            this.transport = borrowed;
+        } else {
+            this.client = new Sso12PacketClient({
+                socket: options.socket,
+                uin,
+                encryption: { type: 'zero' },
+                subAppId,
+                guid: this.p.guid,
+                version: ssoVersion,
+                a2: new Uint8Array(),
+                buildReserved: this.signer,
+                classifyIncoming: () => 'response',
+                initialSequence: options.initialSequence,
+                defaultTimeoutMs: this.timeout,
+            });
+            this.transport = this.client;
+        }
+
         this.lifetimeTimer = setTimeout(
             this.onAbort,
             Math.max(1, Math.ceil(this.deadline - performance.now())),
@@ -335,7 +407,11 @@ export class WtReferenceLoginAttempt {
 
         try {
             if (this.signal) {
-                addListener.call(this.signal, 'abort', this.onAbort, { once: true });
+                if (borrowed) {
+                    this.borrowedAbortListener = addAbortListener(this.signal, this.onAbort);
+                } else {
+                    addListener.call(this.signal, 'abort', this.onAbort, { once: true });
+                }
             }
 
             if (
@@ -349,11 +425,22 @@ export class WtReferenceLoginAttempt {
             throw new Error('invalid attempt signal');
         }
 
-        void this.client.whenClosed.then(() => {
+        const stopped = (): void => {
             if (this.state !== 'tickets' && this.state !== 'closed') {
                 this.fail();
             }
-        });
+        };
+
+        if (borrowed) {
+            try {
+                void observeClosure(borrowedPort!.closed).then(stopped, stopped);
+            } catch {
+                this.fail();
+                throw new TypeError('invalid borrowed lease');
+            }
+        } else {
+            void this.client!.whenClosed.then(stopped);
+        }
     }
 
     getState(): State {
@@ -502,7 +589,17 @@ export class WtReferenceLoginAttempt {
 
                 this.active();
                 this.state = value.result.status === 'tickets' ? 'tickets' : 'failed';
+
+                if (this.state === 'failed') {
+                    this.poisonBorrowed();
+                }
+
                 this.clean();
+
+                if (this.borrowed && value.result.status === 'tickets') {
+                    this.assertBorrowedCommit();
+                }
+
                 const output = value.result;
                 value = undefined;
                 return output;
@@ -524,19 +621,31 @@ export class WtReferenceLoginAttempt {
     }
 
     close(): void {
+        const wasBusy = this.busy;
         this.state = 'closed';
+
+        if (wasBusy) {
+            this.poisonBorrowed();
+        }
+
         this.clean();
     }
     private enter(expected: State): void {
         if (this.busy) {
+            // A borrowed success is not committed until cleanup and its reentry check finish.
+            if (this.borrowed && this.state === 'tickets') {
+                this.state = 'failed';
+            }
+
             this.fail();
             throw new Error('attempt single-flight violation');
         }
 
         if (
             this.state !== expected ||
-            this.socket.destroyed ||
+            this.socket?.destroyed ||
             this.controller.signal.aborted ||
+            (this.borrowed && this.signal && signalAborted.call(this.signal)) ||
             performance.now() >= this.deadline
         ) {
             this.fail();
@@ -549,10 +658,25 @@ export class WtReferenceLoginAttempt {
         if (
             this.state === 'failed' ||
             this.state === 'closed' ||
-            this.socket.destroyed ||
+            this.socket?.destroyed ||
             this.controller.signal.aborted ||
+            (this.borrowed && this.signal && signalAborted.call(this.signal)) ||
             performance.now() >= this.deadline
         ) {
+            throw new Error('attempt stopped');
+        }
+    }
+    private assertBorrowedCommit(): void {
+        if (
+            this.state !== 'tickets' ||
+            (this.signal && signalAborted.call(this.signal)) ||
+            performance.now() >= this.deadline
+        ) {
+            if (this.state !== 'closed') {
+                this.state = 'failed';
+            }
+
+            this.poisonBorrowed();
             throw new Error('attempt stopped');
         }
     }
@@ -576,7 +700,10 @@ export class WtReferenceLoginAttempt {
         this.p.randomKey.fill(0);
 
         try {
-            if (this.signal) {
+            if (this.borrowedAbortListener) {
+                this.borrowedAbortListener[Symbol.dispose]();
+                this.borrowedAbortListener = undefined;
+            } else if (this.signal && !this.borrowed) {
                 removeListener.call(this.signal, 'abort', this.onAbort);
             }
         } catch {
@@ -584,11 +711,30 @@ export class WtReferenceLoginAttempt {
         }
 
         this.controller.abort();
-        this.client.close();
+        this.client?.close();
+
+        if (this.borrowed) {
+            // Release the closure reference; OpenSSL/JS private key erasure is not guaranteed.
+            this.ecdh = undefined;
+        }
+    }
+    private poisonBorrowed(): void {
+        if (!this.borrowed || this.borrowedPoisoned) {
+            return;
+        }
+
+        this.borrowedPoisoned = true;
+
+        try {
+            this.borrowed.poison();
+        } catch {
+            // A foreign lease may throw; the attempt remains terminal.
+        }
     }
     private fail(): void {
         if (this.state !== 'closed' && this.state !== 'tickets') {
             this.state = 'failed';
+            this.poisonBorrowed();
             this.clean();
         }
     }
@@ -599,12 +745,21 @@ export class WtReferenceLoginAttempt {
         let context: Context | undefined;
         let outgoingFrame: Uint8Array | undefined;
         let staged: ExchangeResult | undefined;
+        let finished = false;
+
+        const exchangeActive = (): void => {
+            this.active();
+
+            if (finished) {
+                throw new Error('transaction stopped');
+            }
+        };
 
         const stage = (value: ExchangeResult): ExchangeResult => {
             staged = value;
 
             try {
-                this.active();
+                exchangeActive();
             } catch (error) {
                 scrubResult(value);
                 staged = undefined;
@@ -614,7 +769,7 @@ export class WtReferenceLoginAttempt {
             return value;
         };
 
-        const result = await this.client.transactRaw<Context, ExchangeResult>({
+        const rawOptions: Sso12RawOptions<Context, ExchangeResult> = {
             timeoutMs: this.timeout,
             signal: this.controller.signal,
             buildRequest: async ({ sequence }) => {
@@ -636,7 +791,7 @@ export class WtReferenceLoginAttempt {
                                 clientVersion: this.p.clientVersion,
                                 body: business,
                                 randomKey: this.p.randomKey,
-                                ecdh: this.ecdh,
+                                ecdh: this.ecdh!,
                                 peerPublicKey: this.p.peerPublicKey,
                                 randomSource: login.randomSource,
                             });
@@ -647,7 +802,7 @@ export class WtReferenceLoginAttempt {
                         const timestamp = this.clock();
                         this.active();
                         oicq = buildWtQrOicq(
-                            { ...this.p, timestamp, ecdh: this.ecdh },
+                            { ...this.p, timestamp, ecdh: this.ecdh! },
                             input as WtQrFrameOperation,
                         );
                     }
@@ -686,7 +841,7 @@ export class WtReferenceLoginAttempt {
                         uin: account,
                         body: inner,
                     });
-                    this.active();
+                    exchangeActive();
                     context = {
                         requestFrame: Uint8Array.from(outgoingFrame),
                         requestOicq: oicq,
@@ -761,14 +916,14 @@ export class WtReferenceLoginAttempt {
                         throw new Error('binding');
                     }
 
-                    const key = this.ecdh.deriveTeaKey(this.p.peerPublicKey);
+                    const key = this.ecdh!.deriveTeaKey(this.p.peerPublicKey);
                     let wt: ReturnType<typeof decodeWtOicqResponse>;
 
                     try {
                         wt = decodeWtOicqResponse(sso.body, {
                             sharedKey: key,
                             randomKey: this.p.randomKey,
-                            ecdh: this.ecdh,
+                            ecdh: this.ecdh!,
                         });
                         owned.push(wt.body);
                     } finally {
@@ -963,6 +1118,11 @@ export class WtReferenceLoginAttempt {
                                 Object.values(parsed.tickets).forEach((v) => v.fill(0));
                             } else if (parsed.status === 'success') {
                                 parsed.qrSig.fill(0);
+
+                                if (this.borrowed) {
+                                    wipeOwned(parsed.image);
+                                    wipeOwned(parsed.d1);
+                                }
                             } else {
                                 parsed.remaining.fill(0);
                             }
@@ -976,10 +1136,31 @@ export class WtReferenceLoginAttempt {
                     }
                 }
             },
-        });
-        context?.requestFrame.fill(0);
-        context?.requestOicq.fill(0);
-        outgoingFrame?.fill(0);
+        };
+        let result;
+
+        try {
+            result = this.borrowed
+                ? await guardBorrowedTransport<Context, ExchangeResult>(this.transport, {
+                      disposeContext: (value) => {
+                          wipeOwned(value.requestFrame);
+                          wipeOwned(value.requestOicq);
+                      },
+                      disposeResult: scrubResult,
+                  })(rawOptions)
+                : await this.transport.transactRaw(rawOptions);
+        } catch (error) {
+            if (staged) {
+                scrubResult(staged);
+            }
+
+            throw error;
+        } finally {
+            finished = true;
+            context?.requestFrame.fill(0);
+            context?.requestOicq.fill(0);
+            outgoingFrame?.fill(0);
+        }
 
         if (result.kind !== 'response') {
             if (staged) {
@@ -1000,6 +1181,61 @@ export class WtReferenceLoginAttempt {
         }
 
         return result.value;
+    }
+}
+
+/**
+ * Borrow a caller-owned lease for one WT attempt. The owner must exclusively hold
+ * the lease across all stages and registration, allocate sequences, and establish
+ * successful transport quiescence. Local identity and callback binding do not
+ * authenticate the peer. A failed attempt poisons the lease; success and idle
+ * close leave it to the owner. In-flight close aborts and poisons it. Aborting
+ * can itself cause the underlying broker/client to close. A broker fence can hide
+ * a late callback result from the guard; producer-local finally blocks handle
+ * intermediate owned bytes, but external side effects and retained copies remain.
+ * Promise constructor/species or global-intrinsic tampering and promises hidden
+ * inside foreign thenables are outside observation guarantees.
+ */
+export function createBorrowedWtReferenceLoginAttempt(
+    lease: RawSessionLease,
+    options: BorrowedWtReferenceLoginAttemptOptions,
+): BorrowedWtReferenceLoginAttempt {
+    let closed: PromiseLike<unknown>;
+
+    try {
+        if (
+            !lease ||
+            typeof lease !== 'object' ||
+            isProxy(lease) ||
+            typeof lease.transactRaw !== 'function' ||
+            typeof lease.poison !== 'function'
+        ) {
+            throw new TypeError();
+        }
+
+        closed = lease.whenClosed;
+
+        if (!closed || (typeof closed !== 'object' && typeof closed !== 'function')) {
+            throw new TypeError();
+        }
+    } catch {
+        throw new TypeError('invalid borrowed lease');
+    }
+
+    // Attach both handlers even if option validation later throws. Genuine promises
+    // are observed without reading an own `then`; foreign thenables remain untrusted.
+    const observed = observeClosure(closed);
+    void promiseThen.call(observed, undefined, () => undefined);
+    const port = {};
+    borrowedPorts.set(port, { lease, closed: observed });
+
+    try {
+        return Reflect.construct(WtReferenceLoginAttempt, [
+            options,
+            port,
+        ]) as WtReferenceLoginAttempt;
+    } finally {
+        borrowedPorts.delete(port);
     }
 }
 
