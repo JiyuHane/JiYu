@@ -33,3 +33,17 @@ export interface NTLoginForwardRequest {
     type?: pb<4, uint_32>;
     secBuffer?: pb<5, bytes>;
 }
+
+// Field declarations independently derived from LagrangeV2; original authors retain ownership.
+// https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/System/ThirdPartyLoginResponse.cs
+export interface DirectThirdPartyLoginResponse {
+    commonInfo?: pb<9, DirectThirdPartyCommonInfo>;
+}
+
+export interface DirectThirdPartyCommonInfo {
+    rspNT?: pb<11, DirectThirdPartyRspNT>;
+}
+
+export interface DirectThirdPartyRspNT {
+    uid?: pb<1, string>;
+}

@@ -1288,6 +1288,24 @@ remain to be recovered and independently verified.
   enumeration, or any effects and retained copies owned by the injected transport.
   Pure fake-transport fixtures test the local mapping and actual reserve-builder
   composition; no server, signing, target client or online behavior is exercised.
+- `src/direct/wt-login-keystore.ts` projects the UID from inner WT TLV `0x543`
+  using the `9 → 11 → 1` message path declared by [LagrangeV2 ThirdPartyLoginResponse](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/System/ThirdPartyLoginResponse.cs)
+  and its [login handler](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Logic/WtExchangeLogic.cs).
+  Absent TLV and present TLV with an absent or empty UID remain distinct; neither
+  outcome establishes login or authentication. This is an independent partial
+  projection, not a complete keystore or a target-build observation. Local limits
+  include 1024 entries and 65535 total encoded bytes, with duplicate `0x543`,
+  malformed UTF-8 and unsupported wire types rejected. Proton strips a leading
+  UTF-8 BOM while the referenced .NET decoder preserves it. Other malformed-data
+  handling is also intentionally stricter and is not asserted equivalent. Array
+  slots and each entry's `tag` and `value` must be own data properties; proxied
+  objects and shared, resizable, detached or out-of-bounds byte storage are
+  rejected. Those checks
+  assume ordinary untampered JavaScript intrinsics. The selected bytes are copied
+  and the owned snapshot cleared best-effort; JavaScript UID strings and
+  runtime-internal copies cannot be explicitly erased. Synthetic
+  fixtures join WT decoding, this projection and reserve construction without
+  logging in or connecting. The authors of LagrangeV2 retain their rights.
 - `src/direct/service-frame.ts` implements the outer request and response layouts
   described by [ServicePacker](https://github.com/LagrangeDev/Lagrange.Core/blob/fe789c4a23796fbc82fa09e70a9c44c8a5cf2948/Lagrange.Core/Internal/Packets/Struct/ServicePacker.cs),
   including flags for no encryption, D2 key, and the zero key. Request and
