@@ -178,7 +178,8 @@ function validOrderedEvent(event: unknown, self: OrderedSelf): boolean {
     }
 
     return (
-        event.detail_type === 'group_member_decrease' &&
+        (event.detail_type === 'group_member_decrease' ||
+            event.detail_type === 'group_member_increase') &&
         event.sub_type === '' &&
         exact(event, fields)
     );

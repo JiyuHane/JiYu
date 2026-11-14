@@ -60,8 +60,13 @@ Unresolved or zero sender/operator IDs are rejected. A valid v11
 with an empty subtype because the upstream event may be a decoder fallback or a
 locally synthesized result of leaving. The upstream actor can likewise be
 synthesized; the mapping only preserves the v11 fields, not proof of a QQ-side
-event or its time. Other notices, requests and self-sent events are not yet
-translated to v12. Unsupported actions, parameters
+event or its time. A `group_increase` can map to `notice.group_member_increase`
+when v11 reports the separate inviter as unknown (`invitor_id: 0` and
+`invitor_status: 'unknown'`). This means the inviter is unresolved, not that
+there was no inviter. Known inviters are not translated by this subset; the
+subtype stays empty because upstream reasons can be defaults or inferred from
+actor equality. Self-join user identity may come from account context. Other
+notices, requests and self-sent events are not yet translated to v12. Unsupported actions, parameters
 and message segments return explicit errors. File APIs, HTTP event
 polling and HTTP Webhook are not implemented by this listener. Capability and
 error details remain authoritative at runtime.

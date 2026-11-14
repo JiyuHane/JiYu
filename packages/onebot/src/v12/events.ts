@@ -25,6 +25,65 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
     }
 
     if (input.post_type === 'notice') {
+        if (input.notice_type === 'group_increase') {
+            if (input.sub_type !== 'approve' && input.sub_type !== 'invite') {
+                return null;
+            }
+
+            const fields = [
+                'time',
+                'self_id',
+                'post_type',
+                'notice_type',
+                'sub_type',
+                'group_id',
+                'operator_id',
+                'user_id',
+                'invitor_id',
+                'invitor_status',
+            ];
+            const groupId = fromV11AccountId(input.group_id);
+            const operatorId = fromV11AccountId(input.operator_id);
+            const userId = fromV11AccountId(input.user_id);
+            const knownInvitor = fromV11AccountId(input.invitor_id);
+            const unknownInvitor = input.invitor_status === 'unknown' && input.invitor_id === 0;
+
+            if (
+                Reflect.ownKeys(input).some(
+                    (key) => typeof key !== 'string' || !fields.includes(key),
+                ) ||
+                groupId === null ||
+                operatorId === null ||
+                userId === null ||
+                typeof input.time !== 'number' ||
+                !Number.isFinite(input.time) ||
+                input.time < 0 ||
+                (!unknownInvitor && !(input.invitor_status === 'known' && knownInvitor !== null))
+            ) {
+                throw new Error('invalid or unsupported V11 group increase event');
+            }
+
+            // An independently known inviter is not represented by the standard fields.
+            if (!unknownInvitor) {
+                return null;
+            }
+
+            // Unknown includes absent or unresolved inviter identity, not absence of an
+            // inviter. V11 admission types may be defaults or actor-comparison fallbacks,
+            // and the self-join decoder can synthesize user_id from its account context.
+            return {
+                id: randomUUID(),
+                time: input.time,
+                type: 'notice',
+                detail_type: 'group_member_increase',
+                sub_type: '',
+                self: { ...self },
+                group_id: groupId,
+                user_id: userId,
+                operator_id: operatorId,
+            };
+        }
+
         if (input.notice_type === 'group_decrease') {
             // V11 leave can be a decoder default or a locally synthesized event;
             // the original reason and operator provenance are no longer available.

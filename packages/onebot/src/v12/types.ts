@@ -75,5 +75,21 @@ export interface V12GroupMemberDecreaseEvent {
     operator_id: string;
 }
 
+export interface V12GroupMemberIncreaseEvent {
+    id: string;
+    time: number;
+    type: 'notice';
+    detail_type: 'group_member_increase';
+    /** V11 admission types may originate from defaults or actor-based fallbacks. */
+    sub_type: '';
+    self: V12Self;
+    group_id: string;
+    user_id: string;
+    operator_id: string;
+}
+
 export type V12ConvertedEvent =
-    V12MessageEvent | V12GroupMessageDeleteEvent | V12GroupMemberDecreaseEvent;
+    | V12MessageEvent
+    | V12GroupMessageDeleteEvent
+    | V12GroupMemberDecreaseEvent
+    | V12GroupMemberIncreaseEvent;
