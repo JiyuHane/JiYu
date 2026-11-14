@@ -933,17 +933,64 @@ describe('community plugin index', () => {
         );
         expect(() => parseConfigFields([accessor])).toThrow();
         expect(getter).not.toHaveBeenCalled();
-        expect(() =>
+        expect(
             parseConfigFields([
                 { key: 'x', label: 'X', type: 'string', reactive: false, hidden: false },
             ]),
-        ).toThrow();
+        ).toMatchObject([{ reactive: false, hidden: false }]);
         expect(() =>
             parseConfigFields([
                 { key: 'x', label: 'X', type: 'string', reactive: false },
                 { key: 'x', label: 'X', type: 'boolean' },
             ]),
         ).toThrow();
+    });
+    it('treats only own enumerable hidden false metadata as a static no-op', () => {
+        const fields = parseConfigFields([
+            { key: 's', label: 'String', type: 'string', hidden: false },
+            { key: 't', label: 'Text', type: 'text', hidden: false },
+            { key: 'n', label: 'Number', type: 'number', hidden: false },
+            { key: 'b', label: 'Boolean', type: 'boolean', hidden: false, reactive: false },
+            { key: 'legacy', label: 'Legacy', type: 'string' },
+        ]);
+        const expected = { s: '', t: 'text', n: 0, b: false, legacy: 'value' };
+        expect(fields).toHaveLength(5);
+        expect(fields[0]).toHaveProperty('hidden', false);
+        expect(fields[4]).not.toHaveProperty('hidden');
+        expect(parseConfigValue(fields, expected)).toEqual(expected);
+        expect(configDraftToValue(fields, { ...expected, n: '0' })).toEqual(expected);
+        expect(() => parseConfigValue(fields, { ...expected, hidden: false })).toThrow();
+
+        const base = { key: 'x', label: 'X', type: 'string' };
+
+        for (const hidden of [true, undefined, null, 0, 'false', {}, []]) {
+            expect(() => parseConfigFields([{ ...base, hidden }])).toThrow();
+        }
+
+        const getter = vi.fn(() => false);
+        const accessor = Object.defineProperty({ ...base }, 'hidden', {
+            enumerable: true,
+            get: getter,
+        });
+        expect(() => parseConfigFields([accessor])).toThrow();
+        expect(getter).not.toHaveBeenCalled();
+        const nonEnumerable = Object.defineProperty({ ...base }, 'hidden', {
+            enumerable: false,
+            value: false,
+        });
+        expect(() => parseConfigFields([nonEnumerable])).toThrow();
+        expect(() => parseConfigFields([{ ...base, hidden: false, unknown: false }])).toThrow();
+        expect(() => parseConfigFields([{ ...base, hidden: false, reactive: true }])).toThrow();
+        expect(() => parseConfigFields([{ ...base, hidden: false }, base])).toThrow();
+    });
+    it('preserves a real config value whose key is hidden', () => {
+        const fields = parseConfigFields([
+            { key: 'hidden', label: 'Hidden value', type: 'boolean', hidden: false },
+            { key: 'message', label: 'Message', type: 'string', hidden: false },
+        ]);
+        const value = { hidden: true, message: 'visible' };
+        expect(parseConfigValue(fields, value)).toEqual(value);
+        expect(configDraftToValue(fields, value)).toEqual(value);
     });
     it('rejects numeric precision loss, negative zero and nonzero underflow before posting', () => {
         const fields = parseConfigFields([{ key: 'n', label: '数字', type: 'number' }]);

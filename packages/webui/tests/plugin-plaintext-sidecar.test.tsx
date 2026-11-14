@@ -39,7 +39,7 @@ async function fixture() {
         `
         export let plugin_config_schema;
         export function plugin_init(c) {
-            plugin_config_schema = c.NapCatConfig.combine(c.NapCatConfig.plainText('<img src=x onerror=alert(1)>'), c.NapCatConfig.boolean('enabled', 'Enabled', false, undefined, false));
+            plugin_config_schema = c.NapCatConfig.combine(c.NapCatConfig.plainText('<img src=x onerror=alert(1)>'), { ...c.NapCatConfig.boolean('enabled', 'Enabled', false, undefined, false), hidden: false });
         }
         export function plugin_get_config() { return { enabled:false }; }
         export function plugin_set_config() { throw Error('WRITE_MUST_NOT_RUN'); }
@@ -94,8 +94,9 @@ describe('plainText sidecar read-only integration', () => {
             };
             const view = parseConfigView(envelope.fields, envelope.displaySidecar);
             expect(view.readOnly).toBe(true);
+            expect(envelope.displaySidecar.snapshot).toEqual(envelope.fields);
             expect(view.fields).toMatchObject([
-                { key: 'enabled', type: 'boolean', reactive: false },
+                { key: 'enabled', type: 'boolean', reactive: false, hidden: false },
             ]);
             expect(view.displayTexts).toEqual(['<img src=x onerror=alert(1)>']);
             const html = renderToStaticMarkup(<PluginPlainTextView texts={view.displayTexts} />);
@@ -274,6 +275,23 @@ describe('plainText sidecar read-only integration', () => {
         const dynamic = [fields[0], { ...fields[1], reactive: true }];
         expect(() =>
             parseConfigView(dynamic, { ...sidecar, snapshot: structuredClone(dynamic) }),
+        ).toThrow();
+        for (const invalidField of [
+            { ...fields[1], hidden: true },
+            { ...fields[1], hidden: false, unknown: false },
+        ]) {
+            const invalid = [fields[0], invalidField];
+            expect(() =>
+                parseConfigView(invalid, { ...sidecar, snapshot: structuredClone(invalid) }),
+            ).toThrow();
+        }
+
+        const markedWithHidden = [{ ...fields[0], hidden: false }, fields[1]];
+        expect(() =>
+            parseConfigView(markedWithHidden, {
+                ...sidecar,
+                snapshot: structuredClone(markedWithHidden),
+            }),
         ).toThrow();
         const legacy = parseConfigView([{ key: 'enabled', label: 'Enabled', type: 'boolean' }]);
         expect(legacy).toMatchObject({ readOnly: false, fields: [{ key: 'enabled' }] });

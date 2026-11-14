@@ -210,7 +210,9 @@ export function parseConfigFields(fields: unknown): PluginConfigField[] {
             !isPlainConfigRecord(field) ||
             Object.keys(field).some(
                 (key) =>
-                    !['key', 'label', 'type', 'default', 'description', 'reactive'].includes(key),
+                    !['key', 'label', 'type', 'default', 'description', 'reactive', 'hidden'].includes(
+                        key,
+                    ),
             ) ||
             typeof field.key !== 'string' ||
             !field.key.trim() ||
@@ -224,6 +226,7 @@ export function parseConfigFields(fields: unknown): PluginConfigField[] {
             typeof field.type !== 'string' ||
             !['string', 'text', 'number', 'boolean'].includes(field.type) ||
             (Object.hasOwn(field, 'reactive') && field.reactive !== false) ||
+            (Object.hasOwn(field, 'hidden') && field.hidden !== false) ||
             (field.description !== undefined &&
                 (typeof field.description !== 'string' || field.description.length > 1024))
         ) {

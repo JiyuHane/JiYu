@@ -214,6 +214,7 @@ export interface PluginConfigField {
     description?: string;
     default?: PluginConfigScalar;
     reactive?: false;
+    hidden?: false;
 }
 export interface PluginDisplaySidecar {
     version: 1;
