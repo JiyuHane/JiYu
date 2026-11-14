@@ -164,7 +164,7 @@ function validRequest(value: OneBot12JsonValue): value is OneBot12ActionRequest 
     );
 }
 
-function validResponse(value: OneBot12JsonValue): value is OneBot12ActionResponse {
+function validResponseShape(value: OneBot12JsonValue): value is OneBot12ActionResponse {
     return (
         record(value) &&
         (value.status === 'ok' || value.status === 'failed') &&
@@ -174,6 +174,11 @@ function validResponse(value: OneBot12JsonValue): value is OneBot12ActionRespons
         typeof value.message === 'string' &&
         (!Object.hasOwn(value, 'echo') || typeof value.echo === 'string')
     );
+}
+
+// SDK acceptance policy: an ok response must carry a zero retcode.
+function validResponse(value: OneBot12JsonValue): value is OneBot12ActionResponse {
+    return validResponseShape(value) && (value.status !== 'ok' || value.retcode === 0);
 }
 
 function validEvent(value: OneBot12JsonValue): value is OneBot12Event {
@@ -401,6 +406,11 @@ function decode(text: string): unknown {
 
 export function parseOneBot12ActionRequestJson(text: string): OneBot12ActionRequest {
     return parseOneBot12ActionRequest(decode(text));
+}
+
+/** @internal Classifies response shape only; never use to accept an action response. */
+export function parseOneBot12ActionResponseShapeJson(text: string): OneBot12ActionResponse {
+    return parse(decode(text), validResponseShape, 'action response');
 }
 
 /** Validates retcode's original JSON number before accepting the response. */

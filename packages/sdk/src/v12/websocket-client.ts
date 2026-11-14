@@ -8,6 +8,7 @@ import {
 } from './client-types.js';
 import {
     parseOneBot12ActionResponseJson,
+    parseOneBot12ActionResponseShapeJson,
     parseOneBot12Event,
     parseOneBot12EventJson,
     serializeOneBot12ActionRequest,
@@ -424,9 +425,9 @@ export class OneBot12WebSocketClient {
 
             let responseLike = false;
 
-            if (Object.hasOwn(frame, 'status') || Object.hasOwn(frame, 'retcode')) {
+            if (event && (Object.hasOwn(frame, 'status') || Object.hasOwn(frame, 'retcode'))) {
                 try {
-                    parseOneBot12ActionResponseJson(data);
+                    parseOneBot12ActionResponseShapeJson(data);
                     responseLike = true;
                 } catch {
                     // An event may itself carry response-shaped extension fields.

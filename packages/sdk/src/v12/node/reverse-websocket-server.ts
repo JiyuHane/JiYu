@@ -14,6 +14,7 @@ import {
 import type { OneBot12RequestOptions } from '../client-types.js';
 import {
     parseOneBot12ActionResponseJson,
+    parseOneBot12ActionResponseShapeJson,
     parseOneBot12Event,
     parseOneBot12EventJson,
     serializeOneBot12ActionRequest,
@@ -335,17 +336,20 @@ export class OneBot12ReverseWebSocketSession {
             }
         }
 
-        if (responseCandidate) {
-            try {
-                response = parseOneBot12ActionResponseJson(text);
-            } catch {
-                /* Classified below. */
-            }
-        }
+        if (event && responseCandidate) {
+            let responseLike = false;
 
-        if (event && response) {
-            this.failProtocol('Ambiguous OneBot 12 event and response');
-            return;
+            try {
+                parseOneBot12ActionResponseShapeJson(text);
+                responseLike = true;
+            } catch {
+                /* An event may carry incomplete response-shaped extensions. */
+            }
+
+            if (responseLike) {
+                this.failProtocol('Ambiguous OneBot 12 event and response');
+                return;
+            }
         }
 
         if (event) {
@@ -377,6 +381,12 @@ export class OneBot12ReverseWebSocketSession {
         }
 
         if (responseCandidate) {
+            try {
+                response = parseOneBot12ActionResponseJson(text);
+            } catch {
+                /* Classified below. */
+            }
+
             if (!hasEcho || typeof frame.echo !== 'string') {
                 this.failProtocol('Missing or invalid OneBot 12 response echo');
                 return;

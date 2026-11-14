@@ -24,9 +24,15 @@ if (response.status === 'failed') {
 HTTP actions use a JSON `POST` to `/`. Business failures are returned as
 OneBot response objects; HTTP, protocol, timeout and cancellation failures
 throw `OneBot12ClientError`. Supply `self` explicitly in request options when
-an implementation serves multiple accounts. The client never automatically
-retries an action. A timeout or disconnected transport does not prove that an
-action's side effects did not occur.
+an implementation serves multiple accounts. As a local consistency policy, the
+SDK rejects an action response claiming `status: "ok"` with a nonzero `retcode`;
+it does not report that response as a successful action. HTTP and ordinary
+correlated WebSocket responses report `invalid_response`. A WebSocket frame that
+also has a complete event shape remains an ambiguous protocol error instead of
+being delivered as either kind. The SDK still accepts `status: "failed"` with
+`retcode: 0` for compatibility, and preserves valid response extensions. The
+client never automatically retries an action. A timeout or disconnected transport
+does not prove that an action's side effects did not occur.
 
 ### Polling events on a supporting implementation
 
