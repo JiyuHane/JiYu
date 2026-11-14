@@ -170,6 +170,40 @@ reached, that call has the same `GetEnv` ABI shape. It is not established that
 this saved pointer is the value in global `0x9a6a28`. Flattened control flow
 also prevents assuming that surrounding blocks execute in address order.
 
+#### Conditional use of the SecInfo candidate
+
+A separately checked dispatcher path stores the return from `0x33ec58` at
+`[sp+0x338]` after `0x2fe5d0`. Under the inspected state values, a nonzero
+re-read reaches `0x2fe6a8–0x2fe6bc`, which reloads that value as the first
+argument and calls `0x33f568` with two static addresses as the next arguments.
+A zero re-read follows another inspected route without that local call; its
+later behavior is unknown. This inference requires a stable saved slot and
+state and normally returning AAPCS64-conforming callees. The static argument
+contents were not examined.
+
+Within `0x33f568`, a conditional path obtains an object from `0x33e1d4` and
+checks it and the original arguments. Subsequent branches require the low bits
+returned by `0x33e644` and then `0x33e878` to be zero before `0x33f834–0x33f848`
+reloads the object and three original arguments and calls its function-table
+slot `+0x108`. If the object is a valid standard 64-bit `JNIEnv`, that slot has
+`GetMethodID`'s ABI position. This is a conditional ABI comparison, not proof of
+its identity or execution. Another `0x33e878` call affects later return selection,
+so the helper's return is not established to equal the indirect call's result.
+
+A nonzero `0x33f568` return can select a path at `0x2fe880` that re-reads
+`[sp+0x338]` and `[sp+0x348]` and passes them to `0x340340`. In a conditional
+block at `0x3404d8–0x3404fc`, that helper passes the saved arguments and a
+pointer to a 32-byte local structure copy to a `0x33e1d4` result's function-table
+slot `+0xe8`.
+The helper also saves argument registers and constructs the local structure
+from a register-save area, consistent with an AAPCS64 `va_list` candidate. If
+that structure is a valid `va_list` and the receiver a standard `JNIEnv`, the
+slot resembles `NewObjectV`; neither identity nor the structure's lifetime is
+established. A subsequent `0x33e878` result affects return selection. These
+conditional observations assume stable registers, stack slots and dispatcher
+states, valid pointers and normal calls. They do not establish registration,
+method names, actual reachability, or a connection to AES or signing.
+
 ### AES evidence and limits
 
 Four 256-byte windows in `.rodata` were independently compared, byte for byte,
