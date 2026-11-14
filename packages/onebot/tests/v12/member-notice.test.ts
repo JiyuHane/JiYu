@@ -177,8 +177,25 @@ describe('v11 group decrease to v12 member decrease', () => {
         expect(() => convertV11Event({ ...leave, [Symbol('extra')]: 1 }, self)).toThrow();
     });
 
+    it.each(['kick', 'kick_me'] as const)('maps %s to the complete v12 event', (sub_type) => {
+        const input = { ...leave, sub_type };
+        const before = structuredClone(input);
+        expect(convertV11Event(input, self)).toEqual({
+            id: expect.any(String),
+            time: 1700000000.5,
+            type: 'notice',
+            detail_type: 'group_member_decrease',
+            sub_type: '',
+            self,
+            group_id: '43',
+            user_id: '42',
+            operator_id: '42',
+        });
+        expect(input).toEqual(before);
+    });
+
     it('returns null for unsupported and unknown decrease subtypes', () => {
-        for (const sub_type of ['kick', 'kick_me', 'disband', '', 'future', undefined, null, 0]) {
+        for (const sub_type of ['disband', '', 'future', undefined, null, 0]) {
             expect(convertV11Event({ ...leave, sub_type }, self)).toBeNull();
         }
 

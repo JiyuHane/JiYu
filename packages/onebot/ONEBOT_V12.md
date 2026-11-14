@@ -56,11 +56,13 @@ otherwise the subtype is empty rather than asserting an administrator action.
 The message ID is the value exposed by v11, not proof that it identifies a QQ
 history entry: the existing upstream resolver may hash a missing sequence.
 Unresolved or zero sender/operator IDs are rejected. A valid v11
-`group_decrease` with subtype `leave` also maps to `notice.group_member_decrease`,
-with an empty subtype because the upstream event may be a decoder fallback or a
-locally synthesized result of leaving. The upstream actor can likewise be
-synthesized; the mapping only preserves the v11 fields, not proof of a QQ-side
-event or its time. A `group_increase` can map to `notice.group_member_increase`
+`group_decrease` with subtype `leave`, `kick` or `kick_me` also maps to
+`notice.group_member_decrease`, with an empty subtype. An upstream leave may be a
+decoder fallback or a locally synthesized result, and an unknown decrease reason
+can default to `kick`; the mapping therefore does not assert a QQ-side reason.
+The upstream actor can likewise be synthesized; the mapping only preserves the
+v11 fields, not proof of a QQ-side event or its time. Other decrease subtypes,
+including `disband`, remain unsupported. A `group_increase` can map to `notice.group_member_increase`
 when v11 reports the separate inviter as unknown (`invitor_id: 0` and
 `invitor_status: 'unknown'`). This means the inviter is unresolved, not that
 there was no inviter. Known inviters are not translated by this subset; the

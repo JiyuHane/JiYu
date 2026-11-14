@@ -112,9 +112,14 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
         }
 
         if (input.notice_type === 'group_decrease') {
-            // V11 leave can be a decoder default or a locally synthesized event;
-            // the original reason and operator provenance are no longer available.
-            if (input.sub_type !== 'leave') {
+            // V11 leave may be a decoder default or locally synthesized; kick and
+            // kick_me can also originate from an unknown decoder decrease type.
+            // Preserve the observed actors without asserting the original reason.
+            if (
+                input.sub_type !== 'leave' &&
+                input.sub_type !== 'kick' &&
+                input.sub_type !== 'kick_me'
+            ) {
                 return null;
             }
 
