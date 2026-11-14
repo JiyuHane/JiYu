@@ -1571,6 +1571,23 @@ remain to be recovered and independently verified.
   still lose these business details when its borrowed attempt poisons the lease
   before the session resumes. The exact-result final-delivery deadline fence does
   not extend to legacy registration, heartbeat or alive outcomes.
+- `src/msg-push/index.ts` also exposes `parseDirectMsgPushOrThrow` for callers
+  holding a decrypted push body and its metadata. It accepts no fabricated PID,
+  requires a matching identity UIN, the known MsgPush command and a zero return
+  code as local policy, and reuses the existing synchronous context, registry,
+  filtering and optional deduplication. A dedup instance must be scoped to one
+  account/session: its keys do not include the account UIN. An empty or unsupported
+  message can yield no events; that is not proof of delivery. Identity and
+  deduplication can have synchronous effects that are not rolled back on an
+  exception. The standalone parser has no body-size limit of its own; callers must
+  bound input and decoding work separately. The input body is borrowed and callers
+  own input and output lifetimes; binary results must not be assumed independent
+  of the input. The direct parser
+  avoids raw payload previews in its own warnings and error traces, but reused
+  identity services and other existing diagnostics may still record identifiers;
+  callers must also handle thrown errors and logging policy appropriately. This
+  parser itself neither dispatches events nor connects the direct session to
+  Bridge, OneBot or a real QQ peer.
 - `src/direct/raw-multiplex-stream.ts` adapts a caller-supplied, already-established
   byte stream to that client without opening or connecting a socket. It requires
   exclusive ownership and uses the shared direct-socket ownership registry for

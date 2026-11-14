@@ -45,6 +45,14 @@ export interface MsgPushContext {
 }
 
 export function buildContext(pkt: PacketInfo, identity: IdentityService): MsgPushContext | null {
+    return buildContextFromPushFields(pkt, identity);
+}
+
+/** The shared live push context implementation, without transport-specific fields. */
+export function buildContextFromPushFields(
+    pkt: Pick<PacketInfo, 'uin' | 'body'>,
+    identity: IdentityService,
+): MsgPushContext | null {
     if (pkt.body.length === 0) {
         return null;
     }

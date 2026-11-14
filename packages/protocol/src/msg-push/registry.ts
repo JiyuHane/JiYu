@@ -47,16 +47,44 @@ export class MsgPushRegistry {
         }
     }
 
-    private runDecoder(ctx: MsgPushContext): QQEventVariant[] {
+    /** Preserve the original exception while omitting its possibly sensitive text from trace. */
+    decodeOrThrowRedacted(ctx: MsgPushContext): QQEventVariant[] {
+        try {
+            return this.runDecoder(ctx, true);
+        } catch (e) {
+            try {
+                log.trace(() => [
+                    'packet_branch branch=decoder_exception msgType=%d subType=%d',
+                    ctx.head.msgType,
+                    ctx.head.subType,
+                ]);
+            } catch {
+                // Preserve the original decoder error if a log subscriber fails.
+            }
+
+            throw e;
+        }
+    }
+
+    private runDecoder(ctx: MsgPushContext, redactTrace = false): QQEventVariant[] {
         const decoder = this.decoders_.get(ctx.head.msgType as PkgType);
 
         if (!decoder) {
-            unknownLog.trace(() => [
-                'packet_branch branch=decoder_unregistered msgType=%d subType=%d messageSeq=%d',
-                ctx.head.msgType,
-                ctx.head.subType,
-                ctx.head.sequence,
-            ]);
+            if (redactTrace) {
+                unknownLog.trace(() => [
+                    'packet_branch branch=decoder_unregistered msgType=%d subType=%d',
+                    ctx.head.msgType,
+                    ctx.head.subType,
+                ]);
+            } else {
+                unknownLog.trace(() => [
+                    'packet_branch branch=decoder_unregistered msgType=%d subType=%d messageSeq=%d',
+                    ctx.head.msgType,
+                    ctx.head.subType,
+                    ctx.head.sequence,
+                ]);
+            }
+
             // Unrecognized PkgType: either we don't care about this notify, or
             // the QQ NT client added a new variant. Surface at debug so a
             // protocol change can be spotted without spamming production logs.

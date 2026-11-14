@@ -5,6 +5,9 @@ import type { PushMsg } from '@snowluma/proto-defs/message';
 import type { SsoHeartbeatResponse, SsoRegisterResponse } from '@snowluma/proto-defs/sso-register';
 import { protobuf_encode } from '@snowluma/proton';
 import { describe, expect, it } from 'vitest';
+import type { QQEventVariant } from '../../src/events';
+import { IdentityService } from '../../src/identity-service';
+import { parseDirectMsgPushOrThrow } from '../../src/msg-push';
 import { qqTeaDecrypt, qqTeaEncrypt } from '../../src/direct/qq-tea';
 import { decodeServiceResponse } from '../../src/direct/service-frame';
 import { SSO_HEARTBEAT_COMMAND, SSO_INFO_SYNC_COMMAND } from '../../src/direct/sso-register';
@@ -162,8 +165,34 @@ function pushBody(sequence: number, account: string) {
     });
 }
 
-function push(sequence: number, account: string, key: Uint8Array) {
-    return response(sequence, pushCommand, pushBody(sequence, account), account, key);
+function textPushBody(sequence: number, account: string, kind: 'friend' | 'group', text: string) {
+    return protobuf_encode<PushMsg>({
+        message: {
+            responseHead: {
+                fromUin: 456,
+                fromUid: 'synthetic-sender',
+                toUin: Number(account),
+                ...(kind === 'group' ? { grp: { groupUin: 789 } } : {}),
+            },
+            contentHead: {
+                msgType: kind === 'group' ? 82 : 166,
+                sequence,
+                ntMsgSeq: sequence + 1000,
+                timestamp: 1700000000,
+                msgId: 99,
+            },
+            body: { richText: { elems: [{ text: { str: text } }] } },
+        },
+    });
+}
+
+function push(
+    sequence: number,
+    account: string,
+    key: Uint8Array,
+    body: Uint8Array = pushBody(sequence, account),
+) {
+    return response(sequence, pushCommand, body, account, key);
 }
 
 // replyWt's login response hard-codes 123 in its OICQ header and outer service account.
@@ -279,6 +308,7 @@ type Settings = {
     ticketD2?: Uint8Array;
     peerD2?: Uint8Array;
     suppliedPush?: Uint8Array;
+    makePushBody?: (sequence: number, account: string) => Uint8Array;
     pushSequence?: 'same' | 'different';
     fragmented?: boolean;
     ticketMode?: 'valid' | 'wrong-ticket' | 'missing-d2';
@@ -439,7 +469,9 @@ function setup(settings: Settings = {}) {
 
                 if (calls === 3 && !settings.loginBusinessError && !settings.skipLoginPush) {
                     const seq = settings.pushSequence === 'different' ? wt.seq + 100 : wt.seq;
-                    const notification = settings.suppliedPush ?? push(seq, account, peerD2);
+                    const notification =
+                        settings.suppliedPush ??
+                        push(seq, account, peerD2, settings.makePushBody?.(seq, account));
                     const joined = Buffer.concat([candidate, notification]);
 
                     if (settings.fragmented) {
@@ -490,8 +522,18 @@ function setup(settings: Settings = {}) {
                     stream.emit(
                         'data',
                         Buffer.concat([
-                            push(request.sequence, account, peerD2),
-                            push(request.sequence + 1, account, peerD2),
+                            push(
+                                request.sequence,
+                                account,
+                                peerD2,
+                                settings.makePushBody?.(request.sequence, account),
+                            ),
+                            push(
+                                request.sequence + 1,
+                                account,
+                                peerD2,
+                                settings.makePushBody?.(request.sequence + 1, account),
+                            ),
                             candidate,
                         ]),
                     );
@@ -543,7 +585,261 @@ function setup(settings: Settings = {}) {
     };
 }
 
+// This collector exercises direct parsing only; it is not a Bridge or OneBot pipeline.
+function directCollector(account: string) {
+    const identity = IdentityService.memory(account);
+    const bodies: Array<{ bytes: Uint8Array; sequence: number }> = [];
+    const events: Array<{ transportSequence: number; event: QQEventVariant }> = [];
+    let parseCalls = 0;
+
+    return {
+        bodies,
+        events,
+        getParseCalls: () => parseCalls,
+        handle(
+            body: Uint8Array,
+            meta: { uin: string; sequence: number; command: string; retCode: number },
+        ) {
+            bodies.push({ bytes: Uint8Array.from(body), sequence: meta.sequence });
+
+            if (meta.command !== pushCommand || meta.retCode !== 0) {
+                return;
+            }
+
+            parseCalls++;
+
+            for (const event of parseDirectMsgPushOrThrow({ ...meta, body }, identity)) {
+                events.push({ transportSequence: meta.sequence, event });
+            }
+        },
+    };
+}
+
 describe('WT multiplex body delivery through synthetic peers', () => {
+    it('decodes queued friend and group text after registration despite raw mutation and matching SSO sequences', async () => {
+        const collector = directCollector('123');
+        const makeBody = (sequence: number, account: string) =>
+            textPushBody(
+                sequence + 100,
+                account,
+                sequence === 52 ? 'friend' : 'group',
+                sequence === 52 ? 'synthetic friend' : 'synthetic group',
+            );
+        const f = setup({
+            holdRegister: true,
+            fragmented: true,
+            registrationPushes: true,
+            makePushBody: makeBody,
+            rawHook: (frame) => {
+                frame.fill(0);
+            },
+            bodyHandler: collector.handle,
+        });
+
+        try {
+            await f.confirm();
+            const work = f.session.loginAndRegister(loginFields);
+            await deadline(f.registerEntered.promise, 'registration gate');
+            expect(collector.events).toEqual([]);
+            expect(collector.bodies).toEqual([]);
+            f.allowRegister.resolve();
+            expect(await deadline(work, 'registration')).toEqual({ status: 'success' });
+            await waitFor(() => collector.events.length === 3, 'friend and group delivery');
+            expect(collector.bodies).toEqual(
+                [52, 53, 54].map((sequence) => ({
+                    bytes: makeBody(sequence, '123'),
+                    sequence,
+                })),
+            );
+            expect(collector.events).toMatchObject([
+                {
+                    transportSequence: 52,
+                    event: {
+                        kind: 'friend_message',
+                        selfUin: 123,
+                        senderUin: 456,
+                        senderUid: 'synthetic-sender',
+                        msgSeq: 152,
+                        elements: [{ type: 'text', text: 'synthetic friend' }],
+                    },
+                },
+                {
+                    transportSequence: 53,
+                    event: {
+                        kind: 'group_message',
+                        selfUin: 123,
+                        senderUin: 456,
+                        groupId: 789,
+                        msgSeq: 153,
+                        elements: [{ type: 'text', text: 'synthetic group' }],
+                    },
+                },
+                {
+                    transportSequence: 54,
+                    event: {
+                        kind: 'group_message',
+                        selfUin: 123,
+                        senderUin: 456,
+                        groupId: 789,
+                        msgSeq: 154,
+                        elements: [{ type: 'text', text: 'synthetic group' }],
+                    },
+                },
+            ]);
+            const registration = f.requests.find(
+                (request) => request.command === SSO_INFO_SYNC_COMMAND,
+            );
+            expect(registration?.sequence).toBe(53);
+            expect(collector.events[1]?.transportSequence).toBe(registration?.sequence);
+            expect(f.failures).toEqual([]);
+        } finally {
+            await f.cleanup();
+        }
+    });
+
+    it('isolates direct collectors across two synthetic accounts and fences delivery after close', async () => {
+        const a = directCollector('123');
+        const b = directCollector('234');
+        const bodyA = (sequence: number, account: string) =>
+            textPushBody(sequence + 100, account, 'friend', 'account A');
+        const bodyB = (sequence: number, account: string) =>
+            textPushBody(sequence + 200, account, 'group', 'account B');
+        const keyA = new Uint8Array(16).fill(0x21);
+        const keyB = new Uint8Array(16).fill(0x43);
+        const first = setup({
+            account: '123',
+            ticketD2: keyA,
+            makePushBody: bodyA,
+            bodyHandler: a.handle,
+        });
+        const second = setup({
+            account: '234',
+            ticketD2: keyB,
+            makePushBody: bodyB,
+            bodyHandler: b.handle,
+        });
+
+        try {
+            await Promise.all([first.confirm(), second.confirm()]);
+            expect(
+                await Promise.all([
+                    deadline(first.session.loginAndRegister(loginFields), 'account A registration'),
+                    deadline(
+                        second.session.loginAndRegister(loginFields),
+                        'account B registration',
+                    ),
+                ]),
+            ).toEqual([{ status: 'success' }, { status: 'success' }]);
+            await waitFor(() => a.events.length === 1 && b.events.length === 1, 'both accounts');
+            expect(a.events[0]).toMatchObject({
+                transportSequence: 52,
+                event: {
+                    kind: 'friend_message',
+                    selfUin: 123,
+                    msgSeq: 152,
+                    elements: [{ type: 'text', text: 'account A' }],
+                },
+            });
+            expect(b.events[0]).toMatchObject({
+                transportSequence: 52,
+                event: {
+                    kind: 'group_message',
+                    selfUin: 234,
+                    groupId: 789,
+                    msgSeq: 252,
+                    elements: [{ type: 'text', text: 'account B' }],
+                },
+            });
+            expect(() =>
+                parseDirectMsgPushOrThrow(
+                    {
+                        uin: '123',
+                        sequence: 52,
+                        command: pushCommand,
+                        retCode: 0,
+                        body: bodyA(52, '123'),
+                    },
+                    IdentityService.memory('234'),
+                ),
+            ).toThrow();
+            first.session.close();
+            await deadline(first.session.whenClosed, 'account A closed');
+            first.stream.emit('data', push(220, '123', keyA, bodyA(220, '123')));
+            second.stream.emit('data', push(221, '234', keyB, bodyB(221, '234')));
+            await waitFor(() => b.events.length === 2, 'account B stays active');
+            await turn();
+            expect(a.events).toHaveLength(1);
+            expect(b.events[1]).toMatchObject({
+                transportSequence: 221,
+                event: { kind: 'group_message', selfUin: 234, msgSeq: 421 },
+            });
+        } finally {
+            await Promise.all([first.cleanup(), second.cleanup()]);
+        }
+    });
+
+    it('does not parse rejected retCode or unknown command and closes on the unknown frame', async () => {
+        const collector = directCollector('123');
+        const key = new Uint8Array(16).fill(10);
+        const f = setup({ skipLoginPush: true, bodyHandler: collector.handle });
+
+        try {
+            await f.confirm();
+            expect(await deadline(f.session.loginAndRegister(loginFields), 'registration')).toEqual(
+                { status: 'success' },
+            );
+            const body = textPushBody(301, '123', 'friend', 'not delivered');
+            f.stream.emit('data', response(201, pushCommand, body, '123', key, 42));
+            await waitFor(() => collector.bodies.length === 1, 'nonzero retCode observed');
+            expect(collector.getParseCalls()).toBe(0);
+            expect(collector.events).toEqual([]);
+            f.stream.emit('data', response(202, 'synthetic.unknown', body, '123', key));
+            await deadline(f.session.whenClosed, 'unknown command closes');
+            expect(collector.bodies).toHaveLength(1);
+            expect(collector.getParseCalls()).toBe(0);
+            expect(collector.events).toEqual([]);
+        } finally {
+            await f.cleanup();
+        }
+    });
+
+    it('rejects body delivery when close occurs while the raw verifier is pending', async () => {
+        const collector = directCollector('123');
+        const entered = deferred<void>();
+        const release = deferred<boolean>();
+        const f = setup({
+            skipLoginPush: true,
+            bodyHandler: collector.handle,
+            verifyHook: () => {
+                entered.resolve();
+                return release.promise;
+            },
+        });
+
+        try {
+            await f.confirm();
+            expect(await deadline(f.session.loginAndRegister(loginFields), 'registration')).toEqual(
+                { status: 'success' },
+            );
+            const key = new Uint8Array(16).fill(10);
+            f.stream.emit(
+                'data',
+                push(205, '123', key, textPushBody(305, '123', 'friend', 'closed')),
+            );
+            await deadline(entered.promise, 'verifier entered');
+            f.session.close();
+            release.resolve(true);
+            await deadline(f.session.whenClosed, 'closed during verifier');
+            await turn();
+            expect(collector.bodies).toEqual([]);
+            expect(collector.getParseCalls()).toBe(0);
+            expect(collector.events).toEqual([]);
+        } finally {
+            release.resolve(true);
+            await f.cleanup();
+        }
+    });
+
     it('rejects body decoding when a deep-import expected.sequence getter revokes the capability', () => {
         const token = createReferenceKeyCapability();
         const attempt = {};
