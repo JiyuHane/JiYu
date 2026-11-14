@@ -1580,13 +1580,17 @@ remain to be recovered and independently verified.
   message can yield no events; that is not proof of delivery. Identity and
   deduplication can have synchronous effects that are not rolled back on an
   exception. The standalone parser has no body-size limit of its own; callers must
-  bound input and decoding work separately. Nested quoted elements currently have
-  no independent recursion-depth or cumulative decode-work limit; the rich-card
-  output budget is reset at each nested element conversion rather than shared for
-  the whole message. An outer byte limit is not a direct bound on JavaScript stack
-  usage or expanded card output. The input body is borrowed and callers own input
-  and output lifetimes; binary results must not be assumed independent of the
-  input. The direct parser
+  bound input and decoding work separately. Rich and light cards now share the
+  existing 8 MiB decoded-output budget across the root and its nested quoted
+  elements, in the decoder's existing parent-before-child processing order.
+  Cards exceeding the remaining budget use the existing ignored-card and fallback
+  behavior, including its debug diagnostic; this intentionally changes large
+  nested messages on legacy and history paths too. The budget does not limit
+  markdown, total work, memory usage or recursion depth. Nested quoted elements
+  still have no independent depth or cumulative decode-work limit, and an outer
+  byte limit is not a direct JavaScript stack bound. The input body is borrowed
+  and callers own input and output lifetimes; binary results must not be assumed
+  independent of the input. The direct parser
   avoids raw payload previews in its own warnings and error traces, but reused
   identity services and other existing diagnostics may still record identifiers;
   callers must also handle thrown errors and logging policy appropriately. This

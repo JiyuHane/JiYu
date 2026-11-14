@@ -77,6 +77,10 @@ interface DecodedCards {
     light?: DecodedCardPayload;
 }
 
+interface RichCardBudget {
+    remainingOutputBytes: number;
+}
+
 function invalidCard(inputBytes: number, error: string, budgetBytes = 0): DecodedCardPayload {
     return { element: null, error, inputBytes, budgetBytes };
 }
@@ -248,22 +252,30 @@ function decodeLightAppCard(
     };
 }
 
-function decodeCardsOnce(elems: ElemDecoded[]): Map<ElemDecoded, DecodedCards> {
+function decodeCardsOnce(
+    elems: ElemDecoded[],
+    budget: RichCardBudget,
+): Map<ElemDecoded, DecodedCards> {
     const decoded = new Map<ElemDecoded, DecodedCards>();
-    let remainingOutputBytes = MAX_RICH_CARD_MESSAGE_OUTPUT_BYTES;
 
     for (const elem of elems) {
         const cards: DecodedCards = {};
-        const rich = decodeRichMsgCard(elem, remainingOutputBytes);
+        const rich = decodeRichMsgCard(elem, budget.remainingOutputBytes);
 
         if (rich) {
-            remainingOutputBytes = Math.max(0, remainingOutputBytes - rich.budgetBytes);
+            budget.remainingOutputBytes = Math.max(
+                0,
+                budget.remainingOutputBytes - rich.budgetBytes,
+            );
         }
 
-        const light = decodeLightAppCard(elem, remainingOutputBytes);
+        const light = decodeLightAppCard(elem, budget.remainingOutputBytes);
 
         if (light) {
-            remainingOutputBytes = Math.max(0, remainingOutputBytes - light.budgetBytes);
+            budget.remainingOutputBytes = Math.max(
+                0,
+                budget.remainingOutputBytes - light.budgetBytes,
+            );
         }
 
         if (rich) {
@@ -644,6 +656,8 @@ export function hasDecodableContent(body: PushMsgBody | undefined): boolean {
 
 export function decodeRichBody(body: PushMsgBody | undefined, isGroup: boolean): MessageElement[] {
     const elements: MessageElement[] = [];
+    // Quotes belong to this message's card budget, including every nested srcMsg.
+    const budget: RichCardBudget = { remainingOutputBytes: MAX_RICH_CARD_MESSAGE_OUTPUT_BYTES };
     logUnknownWireFields(body, 'body');
 
     if (body?.richText) {
@@ -651,7 +665,7 @@ export function decodeRichBody(body: PushMsgBody | undefined, isGroup: boolean):
         logUnknownWireFields(rt, 'body.richText');
 
         if (rt.elems) {
-            elements.push(...convertElements(rt.elems as ElemDecoded[], isGroup));
+            elements.push(...convertElements(rt.elems as ElemDecoded[], isGroup, budget));
         }
 
         extractRichtextExtras(rt, elements, isGroup);
@@ -664,7 +678,11 @@ export function decodeRichBody(body: PushMsgBody | undefined, isGroup: boolean):
     return elements;
 }
 
-function convertElements(elems: ElemDecoded[], isGroup: boolean): MessageElement[] {
+function convertElements(
+    elems: ElemDecoded[],
+    isGroup: boolean,
+    budget: RichCardBudget,
+): MessageElement[] {
     const result: MessageElement[] = [];
     // [#146/#337] Rich cards and bot markdown arrive beside a plain compatibility
     // `text` element for older clients. That sibling has no independent wire
@@ -672,7 +690,7 @@ function convertElements(elems: ElemDecoded[], isGroup: boolean): MessageElement
     // Mirror that rule only after the rich payload decodes successfully, so a
     // malformed payload fails open and preserves its readable fallback text.
     // Structural @/reply/face elements are not plain text and always survive.
-    const decodedCards = decodeCardsOnce(elems);
+    const decodedCards = decodeCardsOnce(elems, budget);
     const decodedBigFaces = decodeBigFacesOnce(elems);
     const decodedMarkdown = decodeMarkdownElementsOnce(elems);
     const decodedInlineKeyboards = decodeInlineKeyboardsOnce(elems);
@@ -756,7 +774,7 @@ function convertElements(elems: ElemDecoded[], isGroup: boolean): MessageElement
                     }
 
                     if (decoded.length) {
-                        reply.replyElements = convertElements(decoded, isGroup);
+                        reply.replyElements = convertElements(decoded, isGroup, budget);
                     }
                 }
 
