@@ -40,7 +40,15 @@ import {
 } from './modules/message-actions';
 import { handleGroupAddRequest } from './modules/request-actions';
 import type { ReactionStore } from './reaction-store';
-import { captureSource, tryCaptureSource, type V12Source } from './v12-runtime/source-generation';
+import {
+    bindOrderedContext,
+    captureSource,
+    claimOrderedScope,
+    reserveOrderedContext,
+    tryCaptureSource,
+    withOrderedScope,
+    type V12Source,
+} from './v12-runtime/source-generation';
 import {
     hasAuthoritativeSequence,
     type JsonObject,
@@ -72,15 +80,35 @@ export interface OneBotInstanceContext {
     ): void | Promise<void>;
 }
 
+/** Bind the normal dispatcher without placing ordered metadata in its arguments. */
+export function scopeInstanceContextDispatch(
+    context: OneBotInstanceContext,
+    instance: object,
+    dispatch: OneBotInstanceContext['dispatchEvent'],
+): OneBotInstanceContext['dispatchEvent'] {
+    return (event, source, startedAt, sourceTicket) => {
+        const admission = claimOrderedScope(context, 'context', event);
+        const invoke = () =>
+            sourceTicket === undefined
+                ? dispatch(event, source, startedAt)
+                : dispatch(event, source, startedAt, sourceTicket);
+        return admission
+            ? withOrderedScope(instance, 'instance', event, admission, invoke)
+            : invoke();
+    };
+}
+
 function selfSentHandler(ref: OneBotInstanceContext): (event: JsonObject) => Promise<void> {
     const ticket = tryCaptureSource(ref);
 
     return async (event) => {
-        if (ticket === undefined) {
-            await ref.dispatchEvent(event, 'send');
-        } else {
-            await ref.dispatchEvent(event, 'send', undefined, ticket);
-        }
+        const pending = reserveOrderedContext(ref);
+        const admission = bindOrderedContext(ref, pending, ticket, true);
+        await withOrderedScope(ref, 'context', event, admission, () =>
+            ticket === undefined
+                ? ref.dispatchEvent(event, 'send')
+                : ref.dispatchEvent(event, 'send', undefined, ticket),
+        );
     };
 }
 

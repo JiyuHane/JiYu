@@ -13,15 +13,23 @@ import type { JsonObject } from '../types';
 import { safeV12Error, V12_ADAPTER_NAME, type V12ManagedConfig } from './identity';
 import {
     captureBinding,
+    claimOrderedScope,
+    failOrderedAdmission,
     receiveSourceEvent,
+    registerOrderedRuntime,
+    revokeOrderedTarget,
+    skipOrderedAdmission,
     verifySource,
     type V12Source,
 } from './source-generation';
 import type { DispatchPayload } from '../event-filter';
 import {
     enqueuePollEvent,
+    failOrderedPollIngress,
+    hasOrderedPollOwner,
     invalidatePollOwner,
     invalidateStalePollOwner,
+    recordPreparedScopeLoss,
     registerPollHost,
     type PollGate,
 } from './poll-owner';
@@ -81,6 +89,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             getStatus: options.getStatus,
             getSentMessageTime: options.getSentMessageTime,
         });
+        registerOrderedRuntime(this, (source) => recordPreparedScopeLoss(this, source));
     }
 
     protected bindingSignature(config: V12ManagedConfig): string {
@@ -335,7 +344,17 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     }
 
     onEvent(event: JsonObject, payload?: DispatchPayload): void | Promise<void> {
+        const admission = claimOrderedScope(this, 'runtime', event);
+
+        if (!admission || admission.kind === 'failed') {
+            failOrderedPollIngress(this);
+        } else if (admission.kind === 'eligible' && admission.target !== this) {
+            failOrderedAdmission(admission);
+            failOrderedPollIngress(this);
+        }
+
         if (!this.isEnabled || !this.accepting) {
+            failOrderedAdmission(admission);
             return;
         }
 
@@ -348,19 +367,34 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
 
             if (converted) {
                 try {
-                    // This FIFO is conversion/enqueue completion order, not source
-                    // admission order or verified OneBot oldest-to-newest order.
-                    enqueuePollEvent(this, converted, source);
+                    if (admission?.kind === 'eligible' && admission.target === this) {
+                        admission.lease.resolve(converted);
+                    } else if (
+                        (!admission || admission.kind === 'disabled') &&
+                        !hasOrderedPollOwner(this)
+                    ) {
+                        // Only an unprepared legacy input may use completion-order FIFO.
+                        // A proven pre-ready input never enters a later consumer group.
+                        enqueuePollEvent(this, converted, source);
+                    }
                 } catch {
+                    failOrderedAdmission(admission);
                     // The optional poll path must never suppress existing fanout.
                 }
 
                 this.publish(converted);
+            } else if (admission) {
+                skipOrderedAdmission(admission);
             }
         } catch (error) {
             if (error instanceof V12UnsupportedEventError) {
+                if (admission) {
+                    skipOrderedAdmission(admission);
+                }
+
                 this.log.warn('v12 unsupported event: self_sent_message');
             } else {
+                failOrderedAdmission(admission);
                 this.log.warn('v12 event conversion failed: %s', this.cleanError(error));
             }
         }
@@ -527,6 +561,8 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     }
 
     private revokePoll(): void {
+        revokeOrderedTarget(this);
+
         try {
             invalidatePollOwner(this);
         } catch {

@@ -12,7 +12,16 @@ import {
 import { backfillReplyTarget } from './modules/message-actions';
 import { deliverPttTransText, pttTransKey } from './modules/ptt-trans-waiter';
 import type { MessageMeta } from './types';
-import { tryCaptureSource, type V12Source } from './v12-runtime/source-generation';
+import {
+    bindOrderedContext,
+    failOrderedAdmission,
+    reserveOrderedContext,
+    skipOrderedAdmission,
+    tryCaptureSource,
+    withOrderedScope,
+    type OrderedAdmission,
+    type V12Source,
+} from './v12-runtime/source-generation';
 
 const moduleLog = createLogger('Event');
 
@@ -36,6 +45,7 @@ export function registerEventPipeline(ctx: OneBotInstanceContext): EventPipeline
     let accepting = true;
 
     const track = (
+        kind: EventKind,
         event: QQEventVariant,
         start: (state: EventTraceState) => void | Promise<void>,
     ): Promise<void> => {
@@ -43,55 +53,73 @@ export function registerEventPipeline(ctx: OneBotInstanceContext): EventPipeline
             return Promise.resolve();
         }
 
+        const pending = reserveOrderedContext(ctx);
         const sourceTicket = tryCaptureSource(ctx);
-        return runWithTraceRequest(() => {
-            const state: EventTraceState = {
-                sourceTicket,
-                startedAt: Date.now(),
-                handedOff: false,
-                terminalEmitted: false,
-            };
-            log.trace(() => [
-                'event_input kind=%s event=%s',
-                event.kind,
-                renderParamsVerbose(event),
-            ]);
+        const admission = bindOrderedContext(
+            ctx,
+            pending,
+            sourceTicket,
+            kind !== 'ptt_trans_result',
+        );
 
-            let operation: Promise<void>;
+        try {
+            return runWithTraceRequest(() => {
+                const state: EventTraceState = {
+                    admission,
+                    sourceTicket,
+                    startedAt: Date.now(),
+                    handedOff: false,
+                    terminalEmitted: false,
+                };
+                log.trace(() => [
+                    'event_input kind=%s event=%s',
+                    event.kind,
+                    renderParamsVerbose(event),
+                ]);
 
-            try {
-                operation = Promise.resolve(start(state));
-            } catch (error) {
-                operation = Promise.reject(error);
-            }
+                let operation: Promise<void>;
 
-            const tracked = operation.then(
-                () => undefined,
-                (error) => {
-                    if (!state.handedOff && !state.terminalEmitted) {
-                        traceEventTerminal(
-                            log,
+                try {
+                    operation = Promise.resolve(start(state));
+                } catch (error) {
+                    operation = Promise.reject(error);
+                }
+
+                const tracked = operation.then(
+                    () => {
+                        failOrderedAdmission(admission);
+                    },
+                    (error) => {
+                        failOrderedAdmission(admission);
+
+                        if (!state.handedOff && !state.terminalEmitted) {
+                            traceEventTerminal(
+                                log,
+                                event.kind,
+                                state,
+                                'failed',
+                                'pipeline_threw',
+                                error,
+                            );
+                        }
+
+                        log.error(
+                            'event pipeline handler failed kind=%s: %s',
                             event.kind,
-                            state,
-                            'failed',
-                            'pipeline_threw',
-                            error,
+                            error instanceof Error ? (error.stack ?? error.message) : String(error),
                         );
-                    }
-
-                    log.error(
-                        'event pipeline handler failed kind=%s: %s',
-                        event.kind,
-                        error instanceof Error ? (error.stack ?? error.message) : String(error),
-                    );
-                },
-            );
-            inFlight.add(tracked);
-            void tracked.then(() => {
-                inFlight.delete(tracked);
+                    },
+                );
+                inFlight.add(tracked);
+                void tracked.then(() => {
+                    inFlight.delete(tracked);
+                });
+                return tracked;
             });
-            return tracked;
-        });
+        } catch (error) {
+            failOrderedAdmission(admission);
+            throw error;
+        }
     };
 
     for (const kind of Object.keys(EVENT_PIPELINE) as EventKind[]) {
@@ -104,7 +132,7 @@ export function registerEventPipeline(ctx: OneBotInstanceContext): EventPipeline
         const handle = entry.handle as PipelineHandler<EventKind>;
         disposers.push(
             ctx.bridge.events.on(kind, (event) =>
-                track(event, (state) => handle(ctx, log, event, state)),
+                track(kind, event, (state) => handle(ctx, log, event, state)),
             ),
         );
     }
@@ -157,6 +185,7 @@ type PipelineDisposition<K extends EventKind> =
 type PipelineRegistry = { [K in EventKind]: PipelineDisposition<K> };
 
 interface EventTraceState {
+    admission: OrderedAdmission;
     sourceTicket: V12Source | undefined;
     startedAt: number;
     handedOff: boolean;
@@ -183,6 +212,7 @@ async function convertAndDispatch(
     let preparedEvent = event;
 
     if (event.kind === 'friend_message' && (await isFriendMessageRecalled(ctx, log, event))) {
+        skipOrderedAdmission(state.admission);
         traceEventTerminal(log, event.kind, state, 'dropped', 'recalled_before_backfill');
         return;
     }
@@ -218,6 +248,7 @@ async function convertAndDispatch(
     }
 
     if (!converted) {
+        skipOrderedAdmission(state.admission);
         traceEventTerminal(log, event.kind, state, 'dropped', 'converter_returned_null');
         return;
     }
@@ -235,15 +266,16 @@ async function convertAndDispatch(
     // Backfill can await several network/media operations. Re-check immediately
     // before dispatch so a recall that arrived during that gap wins the race.
     if (event.kind === 'friend_message' && (await isFriendMessageRecalled(ctx, log, event))) {
+        skipOrderedAdmission(state.admission);
         traceEventTerminal(log, event.kind, state, 'dropped', 'recalled_after_backfill');
         return;
     }
 
-    if (state.sourceTicket === undefined) {
-        await ctx.dispatchEvent(converted, 'bridge', state.startedAt);
-    } else {
-        await ctx.dispatchEvent(converted, 'bridge', state.startedAt, state.sourceTicket);
-    }
+    await withOrderedScope(ctx, 'context', converted, state.admission, () =>
+        state.sourceTicket === undefined
+            ? ctx.dispatchEvent(converted, 'bridge', state.startedAt)
+            : ctx.dispatchEvent(converted, 'bridge', state.startedAt, state.sourceTicket),
+    );
 
     state.handedOff = true;
 }

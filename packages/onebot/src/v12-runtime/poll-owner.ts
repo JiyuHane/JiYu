@@ -185,7 +185,7 @@ function validOrderedEvent(event: unknown, self: OrderedSelf): boolean {
     );
 }
 
-type PollGapReason = IngressFailure | 'committed_unsent' | 'delivery_unknown';
+type PollGapReason = IngressFailure | 'committed_unsent' | 'delivery_unknown' | 'scope_lost';
 type Counter =
     'accepted' | 'full' | 'invalid' | 'too_large' | 'closing_discard' | 'postcommit_unknown';
 type Counters = Record<Counter, number>;
@@ -206,6 +206,7 @@ type GateState = {
     history: V12Source[];
     historyOverflow: boolean;
     transition: object;
+    scopeCheck: { reentered: boolean } | null;
 };
 const gateStates = new WeakMap<PollGate, GateState>();
 
@@ -213,7 +214,13 @@ function gateState(gate: PollGate): GateState {
     let state = gateStates.get(gate);
 
     if (!state) {
-        state = { gap: null, history: [], historyOverflow: false, transition: {} };
+        state = {
+            gap: null,
+            history: [],
+            historyOverflow: false,
+            transition: {},
+            scopeCheck: null,
+        };
         gateStates.set(gate, state);
     }
 
@@ -246,9 +253,20 @@ export type PollActivation =
     | { status: 'ready'; owner: PollOwner }
     | { status: 'unavailable' | 'cleanup_pending' | 'degraded' };
 
-/** Trusted in-process seam only; it is not connected to pipeline or HTTP. */
+/** A single admission reserved before invoking a source supplier. */
+export interface OrderedReservation {
+    bind(
+        source: V12Source | undefined,
+    ): { kind: 'ready'; parent: IngressParent } | { kind: 'old' | 'failed' };
+    fail(): void;
+}
+
+/** Trusted in-process seam only; it is not connected to production HTTP. */
 export interface OrderedPollOwner {
     start(request: PollRequest, sink: PollSink): { result: Promise<PollOutcome>; cancel(): void };
+    reserve(): OrderedReservation | null;
+    matchesTarget(runtime: object): boolean;
+    failIngress(): void;
     begin(source: V12Source | undefined): IngressParent | null;
     invalidate(): void;
 }
@@ -308,6 +326,13 @@ function activate(
         return { status: 'unavailable' };
     }
 
+    const gate = gateState(slot.gate);
+
+    if (gate.scopeCheck) {
+        gate.scopeCheck.reentered = true;
+        return { status: 'cleanup_pending' };
+    }
+
     if (slot.retiring || slot.gate.uncertain) {
         return { status: 'cleanup_pending' };
     }
@@ -350,6 +375,7 @@ function activate(
         !slot.retiring &&
         !slot.owner &&
         !slot.gate.uncertain &&
+        state.scopeCheck === null &&
         slot.gate.claim === claim &&
         slot.revision === revision &&
         state.transition === transition;
@@ -417,6 +443,7 @@ function activate(
             slot.revision !== revision ||
             state.transition !== transition ||
             state.gap !== gap ||
+            state.scopeCheck !== null ||
             slot.retiring ||
             slot.owner ||
             slot.gate.uncertain
@@ -501,6 +528,123 @@ export function invalidateStalePollOwner(runtime: object): void {
     }
 }
 
+/** Internal ordered scope guard; never selected from an action request. */
+export function hasOrderedPollOwner(runtime: object): boolean {
+    return slots.get(runtime)?.owner?.ordered === true;
+}
+
+export function failOrderedPollIngress(runtime: object): void {
+    const owner = slots.get(runtime)?.owner;
+
+    if (owner?.ordered) {
+        owner.failUnsequenced();
+    }
+}
+
+/** Record a lost prepared scope without attributing an unverified source to a new epoch. */
+export function recordPreparedScopeLoss(runtime: object, source: V12Source | undefined): void {
+    const slot = slots.get(runtime);
+
+    if (!slot) {
+        return;
+    }
+
+    const gate = slot.gate;
+    const state = gateState(gate);
+
+    const uncertain = () => {
+        slot.cleanupUncertain = true;
+        gate.uncertain = true;
+
+        try {
+            if (slot.owner?.ownsGate()) {
+                slot.owner.invalidate();
+            }
+        } catch {
+            /* uncertainty remains sticky */
+        }
+    };
+
+    if (state.scopeCheck) {
+        state.scopeCheck.reentered = true;
+        uncertain();
+        return;
+    }
+
+    // Lock before any host callback; neither activation nor commit can pass it.
+    const check = { reentered: false };
+    state.scopeCheck = check;
+    const transition = {};
+    state.transition = transition;
+    const owner = slot.owner;
+    const claim = gate.claim;
+    const revision = slot.revision;
+    const oldGap = state.gap;
+    const stable = () =>
+        state.scopeCheck === check &&
+        !check.reentered &&
+        state.transition === transition &&
+        !gate.uncertain &&
+        slot.owner === owner &&
+        gate.claim === claim &&
+        slot.revision === revision &&
+        state.gap === oldGap &&
+        !slot.retiring &&
+        !slot.activating;
+
+    try {
+        if (
+            !source ||
+            sameSourceEpoch(source, source) !== 'same' ||
+            !stable() ||
+            (owner ? !owner.ownsGate() || !owner.matchesScopeSource(source) : claim !== null) ||
+            (oldGap && sameSourceEpoch(oldGap.source, source) !== 'same')
+        ) {
+            uncertain();
+            return;
+        }
+
+        const binding = slot.host.captureBinding();
+
+        if (!binding || !stable() || !sourceHasBinding(source, binding)) {
+            uncertain();
+            return;
+        }
+
+        const verified = slot.host.verify(source);
+
+        if (!verified || !stable()) {
+            uncertain();
+            return;
+        }
+
+        const finalBinding = slot.host.captureBinding();
+
+        if (finalBinding !== binding || !stable()) {
+            uncertain();
+            return;
+        }
+
+        if (!oldGap) {
+            state.gap = { source, reason: 'scope_lost' };
+        }
+
+        owner?.invalidate();
+    } catch {
+        uncertain();
+    } finally {
+        if (check.reentered) {
+            uncertain();
+        }
+
+        if (state.scopeCheck === check) {
+            state.scopeCheck = null;
+        } else {
+            uncertain();
+        }
+    }
+}
+
 /** Called after conversion, before normal WS fanout; metadata stays out of payloads. */
 export function enqueuePollEvent(
     runtime: object,
@@ -562,6 +706,9 @@ class Owner implements PollOwner {
     });
     readonly orderedFacade: OrderedPollOwner = Object.freeze({
         start: (request: PollRequest, sink: PollSink) => this.start(request, sink),
+        reserve: () => this.reserve(),
+        matchesTarget: (runtime: object) => slots.get(runtime) === this.slot && this.valid(),
+        failIngress: () => this.failUnsequenced(),
         begin: (source: V12Source | undefined) => this.begin(source),
         invalidate: () => this.invalidate(),
     });
@@ -714,7 +861,17 @@ class Owner implements PollOwner {
     }
 
     failUnsequenced(): void {
-        this.onGap('child_failed');
+        try {
+            this.onGap('child_failed');
+        } catch {
+            this.markUncertain();
+
+            try {
+                this.invalidate();
+            } catch {
+                /* keep the stronger gate lock */
+            }
+        }
     }
 
     private verifyInput(source: V12Source): boolean {
@@ -755,44 +912,85 @@ class Owner implements PollOwner {
     }
 
     private begin(source: V12Source | undefined): IngressParent | null {
+        const reservation = this.reserve();
+
+        if (!reservation) {
+            return null;
+        }
+
+        const result = reservation.bind(source);
+        return result.kind === 'ready' ? result.parent : null;
+    }
+
+    private reserve(): OrderedReservation | null {
         if (!this.ordered || !this.sequencer || !this.attached()) {
             return null;
         }
 
-        // Linearize admission before any host-provided verification callback.
+        // Reserve before the caller can invoke any source getter or verification.
         const parent = this.sequencer.admit();
 
         if (!parent || !this.attached()) {
             return null;
         }
 
-        const relation = sameSourceEpoch(this.source, source);
+        let used = false;
+        return Object.freeze({
+            bind: (source: V12Source | undefined) => {
+                if (used) {
+                    if (this.attached()) {
+                        this.onGap('late_candidate');
+                    }
 
-        if (relation === 'invalid') {
-            this.failParent(parent);
-            return null;
-        }
+                    return { kind: 'failed' as const };
+                }
 
-        if (relation === 'different') {
-            const state = gateState(this.slot.gate);
-            const knownOld =
-                !state.historyOverflow &&
-                state.history.some((entry) => sameSourceEpoch(entry, source) === 'same');
+                used = true;
 
-            if (!knownOld || !this.verifyInput(this.source)) {
+                if (!this.attached()) {
+                    return { kind: 'failed' as const };
+                }
+
+                const relation = sameSourceEpoch(this.source, source);
+
+                if (relation === 'invalid') {
+                    this.failParent(parent);
+                    return { kind: 'failed' as const };
+                }
+
+                if (relation === 'different') {
+                    const state = gateState(this.slot.gate);
+                    const knownOld =
+                        !state.historyOverflow &&
+                        state.history.some((entry) => sameSourceEpoch(entry, source) === 'same');
+
+                    if (!knownOld || !this.verifyInput(this.source)) {
+                        this.failParent(parent);
+                        return { kind: 'failed' as const };
+                    }
+
+                    return parent.seal() ? { kind: 'old' as const } : { kind: 'failed' as const };
+                }
+
+                if (!source || !this.verifyInput(source)) {
+                    this.failParent(parent);
+                    return { kind: 'failed' as const };
+                }
+
+                return { kind: 'ready' as const, parent: this.boundParent(parent, source) };
+            },
+            fail: () => {
+                if (used) {
+                    return;
+                }
+
+                used = true;
                 this.failParent(parent);
-                return null;
-            }
+            },
+        });
+    }
 
-            parent.seal();
-            return null;
-        }
-
-        if (!source || !this.verifyInput(source)) {
-            this.failParent(parent);
-            return null;
-        }
-
+    private boundParent(parent: IngressParent, source: V12Source): IngressParent {
         let open = true;
         return Object.freeze({
             child: () => {
@@ -897,7 +1095,29 @@ class Owner implements PollOwner {
         return this.slot.gate.claim === this.claim;
     }
 
+    private gateAllows(): boolean {
+        const state = gateState(this.slot.gate);
+
+        if (state.scopeCheck) {
+            state.scopeCheck.reentered = true;
+            return false;
+        }
+
+        return state.gap === null;
+    }
+
+    matchesScopeSource(source: V12Source): boolean {
+        return (
+            sameSourceEpoch(this.source, source) === 'same' &&
+            sourceHasBinding(source, this.binding)
+        );
+    }
+
     valid(): boolean {
+        if (!this.gateAllows()) {
+            return false;
+        }
+
         if (this.checking) {
             return false;
         }
@@ -910,9 +1130,8 @@ class Owner implements PollOwner {
                 !this.slot.gate.uncertain &&
                 this.ownsGate() &&
                 this.slot.owner === this &&
-                (!this.ordered ||
-                    (gateState(this.slot.gate).gap === null &&
-                        this.sequencer?.stats().state === 'active')) &&
+                this.gateAllows() &&
+                (!this.ordered || this.sequencer?.stats().state === 'active') &&
                 this.slot.host.captureBinding() === this.binding &&
                 this.slot.host.verify(this.source) &&
                 !this.retired &&
@@ -922,9 +1141,8 @@ class Owner implements PollOwner {
                 !this.slot.gate.uncertain &&
                 this.ownsGate() &&
                 this.slot.owner === this &&
-                (!this.ordered ||
-                    (gateState(this.slot.gate).gap === null &&
-                        this.sequencer?.stats().state === 'active')) &&
+                this.gateAllows() &&
+                (!this.ordered || this.sequencer?.stats().state === 'active') &&
                 this.attached()
             );
         } catch {

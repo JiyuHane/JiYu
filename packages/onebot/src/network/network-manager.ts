@@ -3,7 +3,13 @@ import { errorMessage } from '@snowluma/common/errors';
 import { assertValidOneBotConfig } from '../config';
 import { buildDispatchPayload } from '../event-filter';
 import { safeV12Error, V12_ADAPTER_NAME, type V12ManagedConfig } from '../v12-runtime/identity';
-import { receiveSourceEvent, type V12Source } from '../v12-runtime/source-generation';
+import {
+    claimOrderedScope,
+    failOrderedAdmission,
+    receiveSourceEvent,
+    withOrderedScope,
+    type V12Source,
+} from '../v12-runtime/source-generation';
 import type {
     HttpClientNetwork,
     HttpServerNetwork,
@@ -320,19 +326,28 @@ export class OneBotNetworkManager {
     }
 
     emitEvent(event: JsonObject, source?: V12Source): Promise<void> {
+        const admission = claimOrderedScope(this, 'manager', event);
+
         if (!this.accepting) {
+            failOrderedAdmission(admission);
             return Promise.reject(
                 new Error('network manager is shutting down; event dispatch rejected'),
             );
         }
 
-        const operation = this.emitEventNow(event, source);
+        const operation = admission
+            ? withOrderedScope(this, 'manager-run', event, admission, () =>
+                  this.emitEventNow(event, source),
+              )
+            : this.emitEventNow(event, source);
         this.inFlightEmits.add(operation);
         void operation.then(
             () => {
+                failOrderedAdmission(admission);
                 this.inFlightEmits.delete(operation);
             },
             () => {
+                failOrderedAdmission(admission);
                 this.inFlightEmits.delete(operation);
             },
         );
@@ -340,6 +355,8 @@ export class OneBotNetworkManager {
     }
 
     private async emitEventNow(event: JsonObject, source: V12Source | undefined): Promise<void> {
+        const admission = claimOrderedScope(this, 'manager-run', event);
+
         // Notify debug taps first — before the adapter check — so the debug stream
         // sees every event even when no adapter is connected. A diagnostic tap is
         // isolated, but its failure is always logged with the root message.
@@ -356,9 +373,15 @@ export class OneBotNetworkManager {
             }
         }
 
-        const active = [...this.adapters.values()]
-            .map(({ adapter }) => adapter)
-            .filter((adapter) => adapter.isActive);
+        const snapshot = [...this.adapters.values()];
+        const active = snapshot.map(({ adapter }) => adapter).filter((adapter) => adapter.isActive);
+
+        if (
+            admission?.kind === 'eligible' &&
+            !active.some((adapter) => adapter === admission.target)
+        ) {
+            failOrderedAdmission(admission);
+        }
 
         if (active.length === 0) {
             log.trace('report_terminal outcome=no_active_targets');
@@ -374,15 +397,25 @@ export class OneBotNetworkManager {
         const tasks = active.map((adapter) =>
             Promise.resolve()
                 .then(() => {
-                    if (source !== undefined) {
-                        const receive = adapter[receiveSourceEvent];
+                    const invoke = () => {
+                        if (source !== undefined) {
+                            const receive = adapter[receiveSourceEvent];
 
-                        if (typeof receive === 'function') {
-                            return receive.call(adapter, event, payload, source);
+                            if (typeof receive === 'function') {
+                                return receive.call(adapter, event, payload, source);
+                            }
                         }
-                    }
 
-                    return adapter.onEvent(event, payload);
+                        return adapter.onEvent(event, payload);
+                    };
+
+                    const target =
+                        admission &&
+                        (admission.kind === 'eligible' || admission.kind === 'not_eligible') &&
+                        admission.target === adapter;
+                    return target && admission
+                        ? withOrderedScope(adapter, 'runtime', event, admission, invoke)
+                        : invoke();
                 })
                 .catch((error) => {
                     const safe = this.redactReconcileError(error);

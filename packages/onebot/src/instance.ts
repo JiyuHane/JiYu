@@ -12,7 +12,11 @@ import { lstatSync, mkdirSync, realpathSync } from 'node:fs';
 import { ApiHandler, type ActionObserver } from './api-handler';
 import type { ConverterContext } from './event-converter';
 import { registerEventPipeline, type EventPipelineHandle } from './event-pipeline';
-import { buildApiContext, type OneBotInstanceContext } from './instance-context';
+import {
+    buildApiContext,
+    scopeInstanceContextDispatch,
+    type OneBotInstanceContext,
+} from './instance-context';
 import { TempSessionStore } from './temp-session-store';
 import { RKeyCache } from './instance-rkey';
 import type { GlobalSettings } from './global-config';
@@ -51,12 +55,22 @@ import { ReactionStore } from './reaction-store';
 import { sameSelfSentMessage, selfSentEventKey, SELF_SENT_ECHO_WINDOW_MS } from './self-sent-event';
 import type { ApiResponse, JsonObject, JsonValue, MessageMeta, OneBotConfig } from './types';
 import { V12Runtime } from './v12-runtime/runtime';
-import { createPollGate, invalidatePollOwner } from './v12-runtime/poll-owner';
+import {
+    createPollGate,
+    failOrderedPollIngress,
+    invalidatePollOwner,
+} from './v12-runtime/poll-owner';
 import { V12_ADAPTER_NAME } from './v12-runtime/identity';
 import {
     captureBinding,
     captureSource,
+    claimOrderedScope,
+    excludedOrderedContext,
+    failOrderedAdmission,
+    revokeOrderedContext,
+    skipOrderedAdmission,
     SourceGeneration,
+    withOrderedScope,
     type V12Source,
 } from './v12-runtime/source-generation';
 
@@ -340,6 +354,7 @@ export class OneBotInstance {
                     ? this.dispatchEvent(event, source, startedAt)
                     : this.dispatchEvent(event, source, startedAt, sourceTicket),
         };
+        ctx.dispatchEvent = scopeInstanceContextDispatch(ctx, this, ctx.dispatchEvent);
         this.ctx = ctx;
 
         this.apiHandler = new ApiHandler(buildApiContext(ctx), uinNum > 0 ? uinNum : undefined);
@@ -379,10 +394,17 @@ export class OneBotInstance {
     /** Bridge session edge → OneBot notice. Awaited so offline can leave
      *  adapters before this generation is disposed. */
     emitBotStatus(subType: 'online' | 'offline'): Promise<void> {
+        if (subType === 'offline') {
+            revokeOrderedContext(this.ctx);
+        }
+
         this.sourceGeneration?.setOnline(!this.disposeRequested && subType === 'online');
         this.v12Online = subType === 'online';
         this.v12Adapter?.statusUpdate();
-        return this.dispatchEvent(makeBotStatusEvent(parseInt(this.uin, 10) || 0, subType));
+        const event = makeBotStatusEvent(parseInt(this.uin, 10) || 0, subType);
+        return withOrderedScope(this, 'instance', event, excludedOrderedContext(this.ctx), () =>
+            this.dispatchEvent(event),
+        );
     }
 
     /**
@@ -458,6 +480,8 @@ export class OneBotInstance {
     /** Drop listeners and sockets without waiting for shutdown to finish.
      *  Used when dispose() does not settle and a replacement session must bind. */
     forceRelease(): void {
+        revokeOrderedContext(this.ctx);
+
         try {
             this.quiesce();
         } catch (error) {
@@ -481,6 +505,7 @@ export class OneBotInstance {
             return;
         }
 
+        revokeOrderedContext(this.ctx);
         this.disposeRequested = true;
         this.sourceGeneration?.setOnline(false);
         this.acceptingActions = false;
@@ -620,72 +645,105 @@ export class OneBotInstance {
         startedAt = Date.now(),
         sourceTicket?: V12Source,
     ): Promise<void> {
-        if (!(await this.cacheMessageEvent(event))) {
-            this.traceEventHandoffTerminal(event, startedAt, 'suppressed', 'private_recall');
-            return;
+        const admission = claimOrderedScope(this, 'instance', event);
+
+        if (!admission && this.v12Adapter) {
+            failOrderedPollIngress(this.v12Adapter);
         }
 
-        if (source === 'bridge') {
-            if (this.isDuplicateSelfSentEcho(event)) {
-                this.log.trace(
-                    'duplicate self-message echo suppressed message_id=%d message_seq=%d',
-                    toInt(event.message_id),
-                    toInt(event.message_seq),
-                );
-                this.traceEventHandoffTerminal(
-                    event,
-                    startedAt,
-                    'suppressed',
-                    'duplicate_self_echo',
-                );
+        try {
+            if (!(await this.cacheMessageEvent(event))) {
+                if (admission) {
+                    skipOrderedAdmission(admission);
+                }
+
+                this.traceEventHandoffTerminal(event, startedAt, 'suppressed', 'private_recall');
                 return;
             }
 
-            if (event.post_type === 'message_sent') {
+            if (source === 'bridge') {
+                if (this.isDuplicateSelfSentEcho(event)) {
+                    if (admission) {
+                        skipOrderedAdmission(admission);
+                    }
+
+                    this.log.trace(
+                        'duplicate self-message echo suppressed message_id=%d message_seq=%d',
+                        toInt(event.message_id),
+                        toInt(event.message_seq),
+                    );
+                    this.traceEventHandoffTerminal(
+                        event,
+                        startedAt,
+                        'suppressed',
+                        'duplicate_self_echo',
+                    );
+                    return;
+                }
+
+                if (event.post_type === 'message_sent') {
+                    this.rememberSelfSentEvent(event);
+                }
+            } else {
                 this.rememberSelfSentEvent(event);
             }
-        } else {
-            this.rememberSelfSentEvent(event);
-        }
 
-        // The send path already logged the real peer and payload. Logging its
-        // synthetic event here would produce a second, less accurate "received"
-        // line whose private user_id points at the bot itself.
-        if (source === 'bridge') {
-            await this.logReceivedMessage(event);
-        }
-
-        // Built-in `#sl` only consumes events observed from QQ. Action-originated
-        // messages must not recursively trigger the command handler.
-        if (source === 'bridge' && this.handleStatusCommand(event)) {
-            this.traceEventHandoffTerminal(event, startedAt, 'suppressed', 'status_command');
-            return;
-        }
-
-        this.traceEventHandoffTerminal(event, startedAt, 'reporting_started');
-
-        try {
-            const result = this.pluginHost?.dispatch(event);
-
-            if (result && result.dropped > 0) {
-                this.log.warn('plugin event admission dropped=%d', result.dropped);
+            // The send path already logged the real peer and payload. Logging its
+            // synthetic event here would produce a second, less accurate "received"
+            // line whose private user_id points at the bot itself.
+            if (source === 'bridge') {
+                await this.logReceivedMessage(event);
             }
-        } catch {
-            // A plugin failure must not prevent the v11 network handoff.
-            this.log.warn('plugin event admission failed');
-        }
 
-        try {
-            if (sourceTicket === undefined) {
-                await this.networkManager.emitEvent(event);
-            } else {
-                await this.networkManager.emitEvent(event, sourceTicket);
+            // Built-in `#sl` only consumes events observed from QQ. Action-originated
+            // messages must not recursively trigger the command handler.
+            if (source === 'bridge' && this.handleStatusCommand(event)) {
+                if (admission) {
+                    skipOrderedAdmission(admission);
+                }
+
+                this.traceEventHandoffTerminal(event, startedAt, 'suppressed', 'status_command');
+                return;
             }
-        } catch (err) {
-            this.log.warn(
-                'emitEvent failed: %s',
-                err instanceof Error ? (err.stack ?? err.message) : String(err),
-            );
+
+            this.traceEventHandoffTerminal(event, startedAt, 'reporting_started');
+
+            try {
+                const result = this.pluginHost?.dispatch(event);
+
+                if (result && result.dropped > 0) {
+                    this.log.warn('plugin event admission dropped=%d', result.dropped);
+                }
+            } catch {
+                // A plugin failure must not prevent the v11 network handoff.
+                this.log.warn('plugin event admission failed');
+            }
+
+            try {
+                const invoke = () =>
+                    sourceTicket === undefined
+                        ? this.networkManager.emitEvent(event)
+                        : this.networkManager.emitEvent(event, sourceTicket);
+
+                if (admission) {
+                    await withOrderedScope(
+                        this.networkManager,
+                        'manager',
+                        event,
+                        admission,
+                        invoke,
+                    );
+                } else {
+                    await invoke();
+                }
+            } catch (err) {
+                this.log.warn(
+                    'emitEvent failed: %s',
+                    err instanceof Error ? (err.stack ?? err.message) : String(err),
+                );
+            }
+        } finally {
+            failOrderedAdmission(admission);
         }
     }
 
@@ -855,6 +913,7 @@ export class OneBotInstance {
 
                 try {
                     if (this.v12Adapter) {
+                        revokeOrderedContext(this.ctx);
                         invalidatePollOwner(this.v12Adapter);
                     }
                 } catch {
@@ -1063,7 +1122,10 @@ export class OneBotInstance {
     }
     private startHeartbeat(): void {
         this.heartbeatTimer = setInterval(() => {
-            this.dispatchEvent(this.makeHeartbeatEvent());
+            const event = this.makeHeartbeatEvent();
+            withOrderedScope(this, 'instance', event, excludedOrderedContext(this.ctx), () =>
+                this.dispatchEvent(event),
+            );
         }, OneBotInstance.HEARTBEAT_INTERVAL);
         this.heartbeatTimer.unref();
     }
