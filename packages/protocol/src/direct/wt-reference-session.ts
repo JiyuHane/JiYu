@@ -12,6 +12,10 @@ import {
     type SsoReferenceRegisterBorrowedOptions,
 } from './sso-reference-register-flow';
 import type { SsoRegisterOutcome } from './sso-register';
+import {
+    referenceHeartbeatOnTransport,
+    type SsoHeartbeatOutcome,
+} from './sso-reference-heartbeat-flow';
 
 type AttemptOptions = BorrowedWtReferenceLoginAttemptOptions;
 type RegisterOptions = SsoReferenceRegisterBorrowedOptions;
@@ -38,6 +42,8 @@ export interface WtReferenceSession {
     fetch(fields: FetchFields): ReturnType<BorrowedWtReferenceLoginAttempt['fetch']>;
     poll(): ReturnType<BorrowedWtReferenceLoginAttempt['poll']>;
     loginAndRegister(fields: LoginFields): Promise<WtReferenceSessionResult>;
+    /** A single explicit exchange; a missing interval is not a zero interval. */
+    heartbeat(): Promise<SsoHeartbeatOutcome>;
     close(): void;
 }
 
@@ -143,11 +149,12 @@ function text(value: unknown, nonempty: boolean, max = 4096): value is string {
  * whenClosed is asynchronous, not a synchronous revocation fence; no protection
  * against arbitrary same-process effects, peer authentication, or online state is
  * implied. Signer/verifier callbacks can retain data or cause external effects.
- * UID is passed to the registration signer; its opaque output is not proof the
+ * UID is passed to the registration and heartbeat signer; its output is not proof the
  * UID was encoded or the signature is valid. JS strings cannot be erased.
  * Success is only the local response classification. The internal ticket and
- * profile snapshots remain owned until close, cancellation or lease termination,
- * for future operations; this API exposes no ticket access or message operation.
+ * profile snapshots remain owned until close, cancellation or lease termination.
+ * Heartbeat is caller-driven: no timer or interval unit is inferred, and a missing
+ * interval remains distinct from zero. This API exposes no tickets or messaging.
  * Idle close after success leaves the lease with its caller, which should close
  * this owner before releasing it. In-flight or abandoned post-write close,
  * failure and cancellation poison the lease. Erasure is best effort.
@@ -169,6 +176,9 @@ export function createWtReferenceSession(
     let abortListener: ReturnType<typeof addAbortListener> | undefined;
     let retained: Extract<WtReferenceLoginResult, { status: 'tickets' }> | undefined;
     const controller = new AbortController();
+    // The attempt controller is aborted on login success; later operations need
+    // their own lifetime, which ends only with this owner.
+    const sessionController = new AbortController();
     const owned: Uint8Array[] = [];
 
     const wipeAll = (): void => {
@@ -205,6 +215,8 @@ export function createWtReferenceSession(
     };
 
     const cleanup = (): void => {
+        sessionController.abort();
+
         if (abortListener) {
             try {
                 abortListener[Symbol.dispose]();
@@ -348,9 +360,10 @@ export function createWtReferenceSession(
             if (
                 state === 'failed' ||
                 state === 'closed' ||
-                controller.signal.aborted ||
-                (signal && aborted.call(signal)) ||
-                performance.now() >= deadline
+                sessionController.signal.aborted ||
+                (state !== 'success' &&
+                    (controller.signal.aborted || performance.now() >= deadline)) ||
+                (signal && aborted.call(signal))
             ) {
                 throw new Error('session stopped');
             }
@@ -533,6 +546,64 @@ export function createWtReferenceSession(
                         delete login.uidProjection;
                     }
 
+                    busy = false;
+                }
+            },
+            async heartbeat() {
+                enter('success');
+
+                try {
+                    const login = retained;
+
+                    if (
+                        login?.uidProjection?.status !== 'present' ||
+                        !text(login.uidProjection.uid, true)
+                    ) {
+                        throw new Error('missing retained login');
+                    }
+
+                    const uid = login.uidProjection.uid;
+                    const result = await referenceHeartbeatOnTransport(lease, {
+                        login,
+                        profile: { guid, subAppId: profile.subAppId, version: profile.ssoVersion },
+                        uid,
+                        timeoutMs: timeout as number,
+                        signal: sessionController.signal,
+                        buildReserved: signer,
+                        verifyRaw: verifier,
+                    });
+                    active();
+
+                    if (
+                        state !== 'success' ||
+                        retained !== login ||
+                        login.uidProjection?.status !== 'present' ||
+                        login.uidProjection.uid !== uid
+                    ) {
+                        throw new Error('session stopped');
+                    }
+
+                    if (result.kind !== 'response') {
+                        throw new Error('heartbeat transport failed');
+                    }
+
+                    if (result.value.status === 'sso-error') {
+                        fail();
+                        return result.value;
+                    }
+
+                    if (
+                        result.value.status !== 'success' &&
+                        result.value.status !== 'missing-interval'
+                    ) {
+                        throw new Error('invalid heartbeat outcome');
+                    }
+
+                    return result.value;
+                } catch {
+                    fail();
+                    throw new Error('session heartbeat failed');
+                } finally {
                     busy = false;
                 }
             },

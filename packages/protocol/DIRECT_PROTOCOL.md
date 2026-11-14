@@ -1410,9 +1410,12 @@ remain to be recovered and independently verified.
   caller-supplied replacement. The UID is passed to an external reserve builder;
   the resulting opaque bytes do not prove UID inclusion or a valid signature.
   Successful local registration classification retains ticket material privately
-  until close, cancellation or lease termination, for future session operations;
-  those later operations are not implemented here. Failure poisons the lease;
-  idle close returns its control to the caller. Caller-held aliases, callbacks,
+  until close, cancellation or lease termination. A caller-driven `heartbeat()`
+  uses those same private credentials and the lease; it reports a local interval,
+  missing interval or SSO error, and does not establish online state. Transport
+  failures and SSO errors poison the lease; a missing interval remains distinct
+  from zero and does not by itself poison it. Idle close returns control of the
+  lease to the caller. Caller-held aliases, callbacks,
   modified promise species and same-tick lease termination remain outside these
   local guarantees. No peer authentication, online state, QQ interoperability or
   Bridge integration is established by this owner. The current raw client is a
@@ -1512,6 +1515,20 @@ remain to be recovered and independently verified.
   message; both are non-success but are not identical response classifications.
   These codecs do not perform registration, change online state, schedule
   heartbeats or validate server identity.
+- `src/direct/sso-reference-heartbeat-flow.ts` composes one borrowed protocol-12
+  heartbeat using an owner-supplied account, credentials, signer and raw-response
+  verifier. It validates local command, sequence and account binding and retains
+  an observed interval as `bigint`, without inferring its unit; absent and zero
+  are distinct. This is a local contract, not an exact reproduction of V2's
+  missing-value or integer-cast semantics. Fixed V2
+  [schedules SSO heartbeat](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Logic/WtExchangeLogic.cs#L384-L422)
+  immediately after its registration success and every 270 seconds thereafter;
+  it discards the response instead of scheduling from its interval field. V2's
+  callback also does not implement this owner's fail-and-poison response policy.
+  Its separate two-second `Heartbeat.Alive` is not this transaction. Jiyu's reference
+  owner currently starts neither timer, and its one-request transport does not
+  handle asynchronous pushes. External signer output remains opaque, and QQ peer
+  authentication and real wire compatibility remain unverified.
 - `src/direct/key-exchange.ts` provides P-256 ECDH and AES-256-GCM primitives
   matching a public reference's key-exchange construction. Tests use synthetic
   vectors cross-checked with Node and .NET cryptography, not the target client.
