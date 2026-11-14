@@ -1531,9 +1531,18 @@ remain to be recovered and independently verified.
   consumption, before the matching barrier releases later frames. Registration
   must finish successfully before locally classified push frames are released
   from the bounded FIFO to the caller's verifier and handler. Those callbacks
-  receive temporary copies of the original encrypted frame, not a decoded message;
-  this API does not expose the D2 key for caller-side decoding. The deep-importable
-  capability helpers are an internal ownership convention, not isolation from
+  receive temporary copies of the original encrypted frame. An optional
+  `onPushBody` callback receives the independently decrypted SSO business body
+  after the raw verifier and handler succeed; this is a byte payload, not yet a
+  Bridge or OneBot event. Its metadata includes the SSO return code unchanged.
+  The caller supplies `maxPushBodyBytes` from 1 through 16 MiB when enabling it.
+  That limit is checked after SSO parsing and decompression, whose separate
+  16 MiB output cap is not a limit on total process memory. Callback copies are
+  wiped best-effort after settlement or termination; an independently closing
+  transport may be observed in a subsequent microtask. Parser-internal or
+  engine-held temporary copies and copies retained by callers are not guaranteed
+  to be erased. The API does not expose the D2 key for caller-side decoding. The
+  deep-importable capability helpers are an internal ownership convention, not isolation from
   other code in the same process. The legacy borrowed attempt API still returns
   tickets. The classifier and caller-provided verification are local policies;
   QQ-TEA does not authenticate the peer. This composition does not create a

@@ -255,3 +255,65 @@ export function decodeReferenceFrame(
         fill.call(outer.body, 0);
     }
 }
+
+/** Re-decode one already verified push with the same active capability. The returned
+ * body is an independent temporary copy; this operation does not authenticate QQ-TEA. */
+export function decodeReferencePushBody(
+    token: object,
+    frame: Uint8Array,
+    transportUin: string,
+    expected: Readonly<{ uin: string; sequence: number; command: string }>,
+    maxBodyBytes: number,
+): { body: Uint8Array; retCode: number } {
+    const value = slot(token);
+
+    if (
+        value.phase !== 'active' ||
+        !value.key ||
+        value.transportUin !== transportUin ||
+        value.confirmedUin !== expected.uin ||
+        expected.command !== 'trpc.msg.olpush.OlPushService.MsgPush' ||
+        !Number.isSafeInteger(maxBodyBytes) ||
+        maxBodyBytes < 1 ||
+        maxBodyBytes > 16 * 1024 * 1024
+    ) {
+        throw new Error('invalid push capability or binding');
+    }
+
+    const outer = decodeServiceResponse(frame, value.key);
+
+    try {
+        if (
+            outer.protocol !== 12 ||
+            outer.encryption !== 'd2' ||
+            outer.uin !== value.confirmedUin
+        ) {
+            throw new Error('push account or protocol mismatch');
+        }
+
+        const sso = decodeSsoResponse(outer.body);
+
+        try {
+            if (
+                sso.sequence >>> 0 !== expected.sequence ||
+                sso.command !== expected.command ||
+                sso.body.byteLength > maxBodyBytes ||
+                value.phase !== 'active' ||
+                !value.key ||
+                value.transportUin !== transportUin ||
+                value.confirmedUin !== outer.uin
+            ) {
+                throw new Error('push metadata or body limit mismatch');
+            }
+
+            return { body: Uint8Array.from(sso.body), retCode: sso.retCode };
+        } finally {
+            fill.call(sso.body, 0);
+            fill.call(sso.cookie, 0);
+            fill.call(sso.reserved, 0);
+            fill.call(sso.headerExtension, 0);
+        }
+    } finally {
+        fill.call(outer.body, 0);
+    }
+}

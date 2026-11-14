@@ -17,6 +17,7 @@ import {
     createReferenceKeyCapability,
     consumeReferenceBusinessFailure,
     decodeReferenceFrame,
+    decodeReferencePushBody,
     referenceExpectedUin,
     referenceKeyState,
     revokeReferenceKey,
@@ -25,6 +26,7 @@ import type { Sso12CloseReason } from './sso12-packet-client';
 
 const PUSH_COMMAND = 'trpc.msg.olpush.OlPushService.MsgPush';
 const MAX_TIMER = 0x7fffffff;
+const nativeFill = Uint8Array.prototype.fill;
 type PushMeta = Readonly<{ uin: string; sequence: number; command: string }>;
 type Operation = 'fetch' | 'poll' | 'login-register' | 'heartbeat' | 'alive';
 
@@ -46,6 +48,15 @@ export interface WtMultiplexReferenceOptions {
     /** Invoked serially only after registration. The temporary copy is wiped at settlement
      * or earlier on termination; an outstanding callback must not rely on its contents then. */
     onPush(frame: Uint8Array, meta: PushMeta): void | Promise<void>;
+    /** Required when onPushBody is set. Bounds the one in-flight delivered body,
+     * separately from maxPushBytes; SSO inflation itself is capped at 16 MiB. */
+    maxPushBodyBytes?: number;
+    /** Runs after onPush settles successfully and the session is still live.
+     * The independent body is wiped on settlement or earlier upon termination. */
+    onPushBody?(
+        body: Uint8Array,
+        meta: Readonly<PushMeta & { retCode: number }>,
+    ): void | Promise<void>;
 }
 
 export interface WtMultiplexReference extends WtReferenceSession {
@@ -64,7 +75,15 @@ export interface WtMultiplexReference extends WtReferenceSession {
  * stable throughout construction; proxies and accessor properties are unsupported.
  * Callback effects and retained copies cannot be revoked; buffer wiping is best effort.
  * Temporary verification and delivery copies can be wiped on termination before an
- * outstanding callback settles. Timers and callback boundaries are not hard real time.
+ * outstanding callback settles. Independent stream closure is observed through the
+ * whenClosed microtask or a subsequent liveness check, not necessarily in the same
+ * stack as the close event. Timers and callback boundaries are not hard real time.
+ * For an opted-in push: verify raw, decode and check metadata, deliver raw, then
+ * recheck liveness and deliver body. Failure closes the session and skips subsequent
+ * callbacks; effects of callbacks already invoked cannot be rolled back. The body
+ * limit accounts for one in-flight independent body, in addition to the bounded raw
+ * queue and verification copy. The SSO parser may allocate up to its own 16 MiB
+ * inflation limit before the smaller body limit is checked.
  */
 export function createWtMultiplexReference(
     stream: RawMultiplexByteStream,
@@ -85,6 +104,8 @@ export function createWtMultiplexReference(
         leaseTimeoutMs,
         verifyPushRaw,
         onPush,
+        maxPushBodyBytes,
+        onPushBody,
     } = options;
 
     if (
@@ -103,7 +124,13 @@ export function createWtMultiplexReference(
         maxPushBytes < 14 ||
         maxPushBytes > 16 * 1024 * 1024 * 64 ||
         typeof verifyPushRaw !== 'function' ||
-        typeof onPush !== 'function'
+        typeof onPush !== 'function' ||
+        (onPushBody !== undefined && typeof onPushBody !== 'function') ||
+        (onPushBody !== undefined && maxPushBodyBytes === undefined) ||
+        (maxPushBodyBytes !== undefined &&
+            (!Number.isSafeInteger(maxPushBodyBytes) ||
+                maxPushBodyBytes < 1 ||
+                maxPushBodyBytes > 16 * 1024 * 1024))
     ) {
         throw new TypeError('invalid multiplex reference options');
     }
@@ -139,13 +166,16 @@ export function createWtMultiplexReference(
     let inCallback = false;
     let queuedBytes = 0;
     let activeCopy: Uint8Array | undefined;
+    let activeBody: Uint8Array | undefined;
     const verificationCopies = new Set<Uint8Array>();
     let abortListener: ReturnType<typeof addAbortListener> | undefined;
     const queue: Array<{ frame: Uint8Array; size: number; meta: PushMeta }> = [];
 
     const wipe = (value: Uint8Array | undefined): void => {
         try {
-            value?.fill(0);
+            if (value) {
+                nativeFill.call(value, 0);
+            }
         } catch {
             /* best effort */
         }
@@ -162,6 +192,7 @@ export function createWtMultiplexReference(
         expected = undefined;
         revokeReferenceKey(token);
         wipe(activeCopy);
+        wipe(activeBody);
 
         for (const copy of verificationCopies) {
             wipe(copy);
@@ -327,11 +358,42 @@ export function createWtMultiplexReference(
                                 throw new Error('push verification failed');
                             }
 
+                            let bodyMeta: Readonly<PushMeta & { retCode: number }> | undefined;
+
+                            if (onPushBody) {
+                                const decoded = decodeReferencePushBody(
+                                    token,
+                                    item.frame,
+                                    transportUin,
+                                    item.meta,
+                                    maxPushBodyBytes!,
+                                );
+                                activeBody = decoded.body;
+                                bodyMeta = Object.freeze({
+                                    ...item.meta,
+                                    retCode: decoded.retCode,
+                                });
+
+                                if (!live(current) || referenceKeyState(token) !== 'active') {
+                                    break;
+                                }
+                            }
+
                             await onPush(item.frame, item.meta);
+
+                            if (onPushBody && activeBody && bodyMeta) {
+                                if (!live(current) || referenceKeyState(token) !== 'active') {
+                                    break;
+                                }
+
+                                await onPushBody(activeBody, bodyMeta);
+                            }
                         } finally {
                             verificationCopies.delete(verificationCopy);
                             wipe(verificationCopy);
                             inCallback = false;
+                            wipe(activeBody);
+                            activeBody = undefined;
                             wipe(item.frame);
                             activeCopy = undefined;
 
