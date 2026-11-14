@@ -1420,9 +1420,10 @@ remain to be recovered and independently verified.
   returns control of the lease to the caller. Caller-held aliases, callbacks,
   modified promise species and same-tick lease termination remain outside these
   local guarantees. No peer authentication, online state, QQ interoperability or
-  Bridge integration is established by this owner. The current raw client is a
-  single-request transport, not a push multiplexer; a classified push can close it,
-  so retaining this lease does not yet provide a receive channel.
+  Bridge integration is established by this owner. The existing socket-backed raw
+  client remains single-request and may close on push; the separate caller-fed
+  multiplex client can be exercised with this owner but is not yet connected to a
+  socket or the application event pipeline.
 - `src/direct/wt-qr-flow.ts` coordinates a reference-style fetch and poll on
   one caller-supplied connected socket, with explicit timestamp, response and
   context verification and business-body boundaries. It closes on confirmation,
@@ -1501,6 +1502,23 @@ remain to be recovered and independently verified.
   is not yet attached: an owner must keep the lease across login and registration,
   and explicitly poison it if an outer registration guard later rejects a result
   the transport had reported as successful.
+- `src/direct/raw-multiplex-client.ts` is an in-memory, caller-fed raw client that
+  separates explicitly classified push frames from single-flight responses. It
+  bounds frame, pending-classification and push storage; its writer, classifier,
+  push verifier and push handler are caller-provided. A response candidate waits
+  for the writer to finish successfully before transaction verification and
+  consumption; push handling can continue meanwhile. Push handlers are ordered
+  relative to each other, but can run before an earlier response finishes its
+  verification and consumption. Successful transaction settlement means that
+  transaction's callbacks and write have ended, not that
+  independent push handling is globally quiescent. A later push failure can close
+  the client, which the owner must observe through `whenClosed`. `end()` closes
+  immediately rather than draining already queued frames or callbacks; pending
+  transactions report failure with uncertain write state after a write attempt.
+  The configured classification and UIN/sequence comparisons are local policies,
+  not peer or message authentication. This client does not open a socket or attach pushes to
+  Bridge or OneBot. A synthetic fixture can give its classifier a test D2 key;
+  the session owner does not yet supply its private post-login key to the classifier.
 - `src/direct/sso-register.ts` encodes the reference PC registration and SSO
   heartbeat bodies, and classifies a registration response using its command,
   SSO return code and exact `register success` message. Account and sequence
