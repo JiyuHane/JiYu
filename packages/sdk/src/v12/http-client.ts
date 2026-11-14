@@ -51,13 +51,16 @@ function latestEventsParams(params: OneBot12LatestEventsParams): OneBot12JsonObj
         }
 
         const prototype = Object.getPrototypeOf(params);
+
         if (prototype !== Object.prototype && prototype !== null) {
             throw new TypeError();
         }
 
         const copy = Object.create(null) as OneBot12JsonObject;
+
         for (const key of Reflect.ownKeys(params)) {
             const descriptor = Object.getOwnPropertyDescriptor(params, key);
+
             if (
                 typeof key !== 'string' ||
                 !descriptor ||
@@ -78,8 +81,10 @@ function latestEventsParams(params: OneBot12LatestEventsParams): OneBot12JsonObj
             action: 'get_latest_events',
             params: copy,
         }).params;
+
         for (const key of ['limit', 'timeout'] as const) {
             const value = snapshot[key];
+
             if (
                 value !== undefined &&
                 (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0)
@@ -87,6 +92,7 @@ function latestEventsParams(params: OneBot12LatestEventsParams): OneBot12JsonObj
                 throw new TypeError();
             }
         }
+
         return snapshot;
     } catch {
         throw new OneBot12ClientError('invalid_options', 'Invalid get_latest_events parameters');
@@ -303,7 +309,11 @@ export class OneBot12HttpClient {
 
             if (reader) {
                 if (!completed) {
-                    void reader.cancel().catch(() => {});
+                    try {
+                        void Promise.resolve(reader.cancel()).catch(() => {});
+                    } catch {
+                        // A synchronous cancellation failure must not replace the request error.
+                    }
                 }
 
                 try {
@@ -325,12 +335,15 @@ export class OneBot12HttpClient {
             latestEventsParams(params),
             options,
         );
+
         if (response.status === 'failed') {
             return response as OneBot12LatestEventsResponse;
         }
+
         if (!Array.isArray(response.data) || !response.data.every(isPlatformEvent)) {
             throw new OneBot12ClientError('invalid_response', 'Invalid get_latest_events response');
         }
+
         return response as OneBot12LatestEventsResponse;
     }
 

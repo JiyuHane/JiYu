@@ -63,6 +63,7 @@ export function requestDeadline(
     const removeFallback = () => {
         if (listening) {
             listening = false;
+
             try {
                 signal?.removeEventListener('abort', abort);
             } catch {
@@ -81,6 +82,7 @@ export function requestDeadline(
             } else {
                 listening = true;
                 signal.addEventListener('abort', abort, { once: true });
+
                 if (signal.aborted) {
                     abort();
                 }
@@ -122,6 +124,14 @@ export function abortable<T>(
     failure: () => Error,
 ): Promise<T> {
     if (signal.aborted) {
+        // The caller may already have started work before observing the abort.
+        // Observe a later rejection without changing the cancellation result.
+        try {
+            void Promise.resolve(promise).catch(() => {});
+        } catch {
+            // A modified Promise can throw during observation; keep abort dominant.
+        }
+
         return Promise.reject(failure());
     }
 
