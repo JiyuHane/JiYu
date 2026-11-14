@@ -1,4 +1,4 @@
-import type { OrderedPollOwner } from './poll-owner';
+import { isCurrentOrderedFacade, type OrderedPollOwner } from './poll-owner';
 
 /** Internal-only source metadata. These symbols are not part of event payloads. */
 export const captureSource = Symbol('v12 source capture');
@@ -126,7 +126,7 @@ export type OrderedAdmission =
       }
     | { readonly kind: 'eligible'; readonly target: object; readonly lease: OrderedLease };
 type Ready = { readonly target: object; readonly owner: OrderedPollOwner; readonly cut: object };
-type ReadyCell = { ready: Ready | null; target: object };
+type ReadyCell = { ready: Ready | null; target: object; revision: object };
 // Internal weak registration identifies objects constructed by the runtime module;
 // this is neither instance ownership proof nor a same-process security boundary.
 const supportedRuntimes = new WeakSet<object>();
@@ -158,7 +158,7 @@ export function prepareOrderedContext(context: object, target: object): void {
     const cell = contexts.get(context);
 
     if (!cell) {
-        contexts.set(context, { ready: null, target });
+        contexts.set(context, { ready: null, target, revision: {} });
     } else if (cell.target !== target) {
         throw new Error('ordered context target mismatch');
     }
@@ -172,26 +172,33 @@ export function installOrderedReady(
 ): object | null {
     const cell = contexts.get(context);
 
-    if (!cell || cell.ready || cell.target !== target || !supportedRuntimes.has(target)) {
+    if (
+        !cell ||
+        cell.ready ||
+        cell.target !== target ||
+        !supportedRuntimes.has(target) ||
+        readyTargets.has(target)
+    ) {
         return null;
     }
 
-    try {
-        if (
-            !owner.matchesTarget(target) ||
-            contexts.get(context) !== cell ||
-            cell.ready ||
-            readyTargets.has(target)
-        ) {
-            return null;
-        }
-    } catch {
+    const revision = cell.revision;
+
+    if (
+        !isCurrentOrderedFacade(target, owner) ||
+        contexts.get(context) !== cell ||
+        cell.revision !== revision ||
+        cell.target !== target ||
+        cell.ready ||
+        readyTargets.has(target)
+    ) {
         return null;
     }
 
+    // No host or supplied-owner callback runs between the final checks and publication.
     const cut = {};
-    cell.target = target;
     cell.ready = Object.freeze({ target, owner, cut });
+    cell.revision = {};
     readyTargets.set(target, { context, cut });
     return cut;
 }
@@ -206,6 +213,7 @@ export function revokeOrderedReady(context: object, cut: object): boolean {
 
     const target = cell.ready.target;
     cell.ready = null;
+    cell.revision = {};
     const reverse = readyTargets.get(target);
 
     if (reverse?.context === context && reverse.cut === cut) {
@@ -217,7 +225,15 @@ export function revokeOrderedReady(context: object, cut: object): boolean {
 
 /** These revoke only the exact current pair; stale runtime cleanup cannot clear a new cut. */
 export function revokeOrderedContext(context: object): void {
-    const cut = contexts.get(context)?.ready?.cut;
+    const cell = contexts.get(context);
+
+    if (!cell) {
+        return;
+    }
+
+    // Also invalidate an in-flight installation before the ready pointer exists.
+    cell.revision = {};
+    const cut = cell.ready?.cut;
 
     if (cut) {
         revokeOrderedReady(context, cut);

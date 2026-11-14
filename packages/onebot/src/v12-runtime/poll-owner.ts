@@ -246,6 +246,7 @@ type Slot = {
     owner: Owner | null;
     retiring: boolean;
     activating: boolean;
+    facadeCheck: { reentered: boolean } | null;
     revision: object;
     cleanupUncertain: boolean;
     counters: Counters;
@@ -297,6 +298,7 @@ export function registerPollHost(runtime: object, host: Host, gate = createPollG
         owner: null,
         retiring: false,
         activating: false,
+        facadeCheck: null,
         revision: {},
         cleanupUncertain: false,
         counters: {
@@ -322,6 +324,66 @@ export function activateOrderedPollOwner(runtime: object): OrderedPollActivation
     return result.status === 'ready'
         ? { status: 'ready', owner: result.owner.orderedFacade }
         : result;
+}
+
+/** Internal fixture proof: compare the supplied reference without inspecting it. */
+export function isCurrentOrderedFacade(runtime: object, supplied: unknown): boolean {
+    const slot = slots.get(runtime);
+
+    if (!slot) {
+        return false;
+    }
+
+    if (slot.facadeCheck) {
+        slot.facadeCheck.reentered = true;
+        return false;
+    }
+
+    const owner = slot.owner;
+
+    if (!owner || !owner.ordered || owner.orderedFacade !== supplied) {
+        return false;
+    }
+
+    const gate = slot.gate;
+    const state = gateState(gate);
+
+    if (state.scopeCheck) {
+        state.scopeCheck.reentered = true;
+        return false;
+    }
+
+    const revision = slot.revision;
+    const claim = gate.claim;
+    const transition = state.transition;
+    const check = { reentered: false };
+    slot.facadeCheck = check;
+    const stable = () =>
+        slots.get(runtime) === slot &&
+        slot.owner === owner &&
+        slot.facadeCheck === check &&
+        !check.reentered &&
+        slot.revision === revision &&
+        slot.gate === gate &&
+        gate.claim === claim &&
+        claim !== null &&
+        owner.ownsGate() &&
+        state.transition === transition &&
+        state.scopeCheck === null &&
+        state.gap === null &&
+        !gate.uncertain &&
+        !slot.retiring &&
+        !slot.activating;
+
+    try {
+        return stable() && owner.valid() && stable();
+    } catch {
+        return false;
+    } finally {
+        if (slot.facadeCheck === check) {
+            slot.facadeCheck = null;
+        }
+    }
 }
 
 function activate(

@@ -54,6 +54,7 @@ import {
     prepareOrderedContext,
     receiveSourceEvent,
     reserveOrderedContext,
+    revokeOrderedContext,
     revokeOrderedReady,
     verifySource,
     SourceGeneration,
@@ -1281,6 +1282,128 @@ describe('ordered admission producer foundation (fake context, not full runtime 
         await first.runtime.close();
         await second.runtime.close();
     });
+    it('rejects fake and foreign facades without inspecting supplied objects', async () => {
+        vi.useFakeTimers();
+        const first = await setup();
+        const second = await setup();
+        const context = {};
+        prepareOrderedContext(context, first.runtime);
+        const verify = vi.spyOn(first.runtime, verifySource);
+        let reads = 0;
+        const malicious = new Proxy(
+            {},
+            {
+                get() {
+                    reads++;
+                    throw new Error('getter');
+                },
+                getPrototypeOf() {
+                    reads++;
+                    throw new Error('prototype');
+                },
+                ownKeys() {
+                    reads++;
+                    throw new Error('keys');
+                },
+                getOwnPropertyDescriptor() {
+                    reads++;
+                    throw new Error('descriptor');
+                },
+            },
+        );
+        const structural = {
+            matchesTarget() {
+                reads++;
+                return true;
+            },
+        };
+        expect(
+            installOrderedReady(context, first.runtime, malicious as typeof first.owner),
+        ).toBeNull();
+        expect(
+            installOrderedReady(context, first.runtime, structural as typeof first.owner),
+        ).toBeNull();
+        expect(installOrderedReady(context, first.runtime, second.owner)).toBeNull();
+        expect(reads).toBe(0);
+        expect(verify).not.toHaveBeenCalled();
+        expect(installOrderedReady(context, first.runtime, first.owner)).not.toBeNull();
+        first.owner.invalidate();
+        second.owner.invalidate();
+        await settle();
+        await first.runtime.close();
+        await second.runtime.close();
+    });
+    it('detects pre-ready context revocation during verification and ignores stale cuts', async () => {
+        vi.useFakeTimers();
+        const f = await setup();
+        const context = {};
+        prepareOrderedContext(context, f.runtime);
+        const original = f.runtime[verifySource].bind(f.runtime);
+        const verify = vi.spyOn(f.runtime, verifySource).mockImplementationOnce((source) => {
+            revokeOrderedContext(context);
+            return original(source);
+        });
+        expect(installOrderedReady(context, f.runtime, f.owner)).toBeNull();
+        expect(reserveOrderedContext(context).kind).toBe('not_eligible');
+        verify.mockImplementationOnce((source) => {
+            expect(revokeOrderedReady(context, {})).toBe(false);
+            return original(source);
+        });
+        expect(installOrderedReady(context, f.runtime, f.owner)).not.toBeNull();
+        f.owner.invalidate();
+        await settle();
+        await f.runtime.close();
+    });
+    it('rejects nested installation on a different context without damaging the owner', async () => {
+        vi.useFakeTimers();
+        const f = await setup();
+        const first = {};
+        const second = {};
+        prepareOrderedContext(first, f.runtime);
+        prepareOrderedContext(second, f.runtime);
+        const original = f.runtime[verifySource].bind(f.runtime);
+        let inner: object | null | undefined;
+        const verify = vi.spyOn(f.runtime, verifySource).mockImplementationOnce((source) => {
+            inner = installOrderedReady(second, f.runtime, f.owner);
+            return original(source);
+        });
+        expect(installOrderedReady(first, f.runtime, f.owner)).toBeNull();
+        expect(inner).toBeNull();
+        verify.mockRestore();
+        const cut = installOrderedReady(second, f.runtime, f.owner);
+        expect(cut).not.toBeNull();
+        expect(installOrderedReady(first, f.runtime, f.owner)).toBeNull();
+        expect(revokeOrderedReady(second, cut!)).toBe(true);
+        f.owner.invalidate();
+        await settle();
+        await f.runtime.close();
+    });
+    it('does not let a stale facade invalidate a replacement owner', async () => {
+        vi.useFakeTimers();
+        const f = await setup();
+        const context = {};
+        prepareOrderedContext(context, f.runtime);
+        const original = f.runtime[verifySource].bind(f.runtime);
+        const verify = vi.spyOn(f.runtime, verifySource).mockImplementationOnce((source) => {
+            f.owner.invalidate();
+            return original(source);
+        });
+        expect(installOrderedReady(context, f.runtime, f.owner)).toBeNull();
+        verify.mockRestore();
+        await settle();
+        const replacement = activateOrderedPollOwner(f.runtime);
+
+        if (replacement.status !== 'ready') {
+            throw new Error('replacement');
+        }
+
+        expect(installOrderedReady(context, f.runtime, f.owner)).toBeNull();
+        expect(installOrderedReady(context, f.runtime, replacement.owner)).not.toBeNull();
+        expect(pollOwnerStats(f.runtime)?.active).toBe(true);
+        replacement.owner.invalidate();
+        await settle();
+        await f.runtime.close();
+    });
     it('leaves disabled contexts on original behavior without scopes', () => {
         const context = {};
         expect(reserveOrderedContext(context).kind).toBe('disabled');
@@ -1293,4 +1416,48 @@ describe('ordered admission producer foundation (fake context, not full runtime 
             ),
         ).toBeNull();
     });
+});
+
+describe('isolated ESM cycle initialization', () => {
+    it.each(['source-first', 'owner-first'] as const)(
+        'initializes from %s after a fresh module reset',
+        async (order) => {
+            vi.useFakeTimers();
+            vi.resetModules();
+
+            if (order === 'source-first') {
+                await import('../../src/v12-runtime/source-generation');
+            } else {
+                await import('../../src/v12-runtime/poll-owner');
+            }
+
+            const source = await import('../../src/v12-runtime/source-generation');
+            const owner = await import('../../src/v12-runtime/poll-owner');
+            const runtime = {};
+            const binding = {};
+            const context = {};
+            const generation = new source.SourceGeneration();
+            generation.setOnline(true);
+            owner.registerPollHost(runtime, {
+                self: { platform: 'qq', user_id: '12345' },
+                captureBinding: () => binding,
+                captureSource: () => generation.capture(binding),
+                verify: (ticket) => generation.isCurrent(ticket, binding),
+            });
+            // Explicit synthetic registration emulates the trusted runtime constructor in this isolated module graph.
+            source.registerOrderedRuntime(runtime, () => {});
+            source.prepareOrderedContext(context, runtime);
+            const active = owner.activateOrderedPollOwner(runtime);
+
+            if (active.status !== 'ready') {
+                throw new Error('isolated owner');
+            }
+
+            const cut = source.installOrderedReady(context, runtime, active.owner);
+            expect(cut).not.toBeNull();
+            expect(source.revokeOrderedReady(context, cut!)).toBe(true);
+            active.owner.invalidate();
+            await settle();
+        },
+    );
 });
