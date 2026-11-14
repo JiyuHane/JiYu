@@ -49,6 +49,16 @@ export interface V12MessageEvent {
     group_id?: string;
 }
 
+export interface V12FriendIncreaseEvent {
+    id: string;
+    time: number;
+    type: 'notice';
+    detail_type: 'friend_increase';
+    sub_type: '';
+    self: V12Self;
+    user_id: string;
+}
+
 export interface V12GroupMessageDeleteEvent {
     id: string;
     time: number;
@@ -90,6 +100,7 @@ export interface V12GroupMemberIncreaseEvent {
 
 export type V12ConvertedEvent =
     | V12MessageEvent
+    | V12FriendIncreaseEvent
     | V12GroupMessageDeleteEvent
     | V12GroupMemberDecreaseEvent
     | V12GroupMemberIncreaseEvent;

@@ -157,6 +157,14 @@ function validOrderedEvent(event: unknown, self: OrderedSelf): boolean {
         });
     }
 
+    if (event.type === 'notice' && event.detail_type === 'friend_increase') {
+        return (
+            event.sub_type === '' &&
+            parseAccountId(event.user_id) !== null &&
+            exact(event, [...common, 'user_id'])
+        );
+    }
+
     if (
         event.type !== 'notice' ||
         parseAccountId(event.group_id) === null ||

@@ -65,9 +65,14 @@ when v11 reports the separate inviter as unknown (`invitor_id: 0` and
 `invitor_status: 'unknown'`). This means the inviter is unresolved, not that
 there was no inviter. Known inviters are not translated by this subset; the
 subtype stays empty because upstream reasons can be defaults or inferred from
-actor equality. Self-join user identity may come from account context. Other
-notices, requests and self-sent events are not yet translated to v12. Unsupported actions, parameters
-and message segments return explicit errors. File APIs, HTTP event
+actor equality. Self-join user identity may come from account context. A valid
+v11 `friend_add` maps to `notice.friend_increase` with an empty subtype and the
+same user ID as a string. The upstream new-friend decoder resolves the peer UIN
+with a routing fallback and may fall back to the packet header time; this mapping
+preserves the v11 fields without independently verifying QQ identity, event, or
+time. Canonical positive safe-integer IDs are required, including for string
+inputs. Other notices, requests and self-sent events are not yet translated to
+v12. Unsupported actions, parameters and message segments return explicit errors. File APIs, HTTP event
 polling and HTTP Webhook are not implemented by this listener. Capability and
 error details remain authoritative at runtime.
 

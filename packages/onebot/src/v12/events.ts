@@ -25,6 +25,33 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
     }
 
     if (input.post_type === 'notice') {
+        if (input.notice_type === 'friend_add') {
+            const fields = ['time', 'self_id', 'post_type', 'notice_type', 'user_id'];
+            const userId = fromV11AccountId(input.user_id);
+
+            if (
+                Reflect.ownKeys(input).some(
+                    (key) => typeof key !== 'string' || !fields.includes(key),
+                ) ||
+                userId === null ||
+                typeof input.time !== 'number' ||
+                !Number.isFinite(input.time) ||
+                input.time < 0
+            ) {
+                throw new Error('invalid or unsupported V11 friend add event');
+            }
+
+            return {
+                id: randomUUID(),
+                time: input.time,
+                type: 'notice',
+                detail_type: 'friend_increase',
+                sub_type: '',
+                self: { ...self },
+                user_id: userId,
+            };
+        }
+
         if (input.notice_type === 'group_increase') {
             if (input.sub_type !== 'approve' && input.sub_type !== 'invite') {
                 return null;
