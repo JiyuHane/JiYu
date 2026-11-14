@@ -17,7 +17,11 @@ which installation or QQ version loaded this particular file. The original
 binary is not included in this repository.
 
 REA's target-independent ELF and export inspections identified its format,
-build ID and `JNI_OnLoad` export at virtual address `0x62b3c`. REA 6.8.0's
+build ID and `JNI_OnLoad` export at virtual address `0x62b3c`. The ELF note
+inspection of this exact digest produced Evidence
+`ev_567ae1978c6312a1e902e44315d6cd6df175426b69b029e7857b9951cf148e6d`;
+program and section note tables can reference the same file range and are not
+independent samples. REA 6.8.0's
 native ELF decompiler was unavailable in the Windows analysis environment:
 its Windows Ghidra profile does not accept this ELF, its Kuna provider does not
 support Windows hosts, and no IDA provider was configured. The following
@@ -258,6 +262,26 @@ they concern the same live object or connect either path to signing. These
 observations assume the reported paths and calls complete normally, registers and
 slots remain stable, indices and memory ranges are valid, and there is no harmful
 aliasing or concurrent mutation. No target code was executed; the static source data bytes were not inspected.
+
+The independent, internal [`mt19937-static-candidate.ts`](./src/experimental/mt19937-static-candidate.ts)
+models only synthetic 32-bit seeds and 624-slot states whose values have zero
+upper 32 bits, with an index from 0 through 623. It copies and freezes ordinary
+arrays and returns fresh states; it reads no target data and has no runtime
+integration or package export. Inputs must be trusted ordinary synthetic data,
+without getters or proxies: accessing properties or array elements can invoke
+caller code, so this model is not an in-process sandbox for untrusted values.
+Rejecting other inputs is a model restriction, not an observed native check. In
+this domain, the inspected native index arithmetic reduces to modulo 624 without
+64-bit overflow, and its 32-bit writes
+zero-extend. The native `UBFX` extracts bits 11 through 42 into a zero-extended
+32-bit slice; simplifying it to a 32-bit right shift depends on the upper-word
+restriction. Native states with nonzero upper bits are outside the model. The
+correspondence also assumes valid memory, unchanged re-read indices, no harmful
+aliasing or concurrency, and the indicated dispatcher and call paths. It does
+not establish execution, a shared object with the conditional copy, signing or
+QQ interoperability. Tests use synthetic inputs, including the published 5489
+MT19937 sequence and independent NumPy reference values; these validate the
+model against reference values, not the native target or all possible states.
 
 A further bounded radare2 instruction trace provides **conditional** evidence
 for the rotated inputs. At `0x2f39bc–0x2f39fc`, a 32-bit `j` from
