@@ -1236,6 +1236,47 @@ remain to be recovered and independently verified.
   The external signer receives the full service command, account, unsigned
   32-bit sequence pattern, and a copy of the exact SSO body. Adapters targeting
   a signed-int32 API must preserve the sequence's bit pattern.
+- `src/direct/lagrange-v2-milky-signer.ts` independently adapts that callback to
+  the V2 Milky external signing-service contract using a caller-injected
+  asynchronous transport, not an offline signing algorithm. Its JSON data contract
+  follows the one observed
+  in [LagrangeV2 Milky Signer at commit 7011cdf](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Milky/Utility/Signer.cs#L572-L660).
+  Upstream authors retain their rights; no upstream implementation or command
+  list is copied. Its transport receives a plain object with numeric `uin`,
+  `command`, signed `seq`, lowercase hexadecimal `body` and `guid`, and `qua`.
+  The caller supplies the transport and is responsible for any serialization,
+  trust, timeouts, credentials and side effects. The module has no HTTP client,
+  endpoint, token injection, signing algorithm or successful-result fallback.
+  It does not inspect the upstream command whitelist; the reserve builder's
+  caller still chooses the per-command classification. The reference DTO is
+  neither a target-build observation nor evidence of interoperability.
+  Local restrictions are stricter than the cited implementation: an account is
+  bound at construction and must match each request, use canonical nonzero
+  decimal spelling and not exceed `Number.MAX_SAFE_INTEGER`; there is no zero
+  account fallback. A 16-byte GUID and a nonempty QUA are explicit profile
+  inputs. Command and QUA are nonempty and at most 65536 UTF-8 bytes each; the
+  body is at most 16 MiB and may be empty. An unsigned 32-bit sequence is mapped
+  to the signed 32-bit integer with the same bits; negative zero is rejected.
+  Configuration and request DTOs must be plain, non-proxy objects with data
+  properties, including unknown own fields; their descriptor inspection rejects
+  accessors without calling them. After transport resolution, response objects
+  are checked by the same descriptor rule. Promise/thenable assimilation can read
+  a returned object's `then` getter or proxy trap before that response check;
+  transport execution and those effects belong to the caller's trust boundary.
+  Byte inputs must be live, non-shared Uint8Array views;
+  proxied or overly deep prototype chains are rejected. Inputs are snapshotted
+  before transport invocation; callers must keep bytes stable until that point.
+  The response must contain `code`, `message` (string up to 65536 UTF-8 bytes or
+  null) and `value`; only integer code zero is accepted. The three required value
+  fields `sec_sign`, `sec_token`, and `sec_extra` must be even-length ASCII hex,
+  at most 65536 decoded bytes each. Uppercase is accepted; sign must be nonempty,
+  while token and extra may be empty. Unknown data fields are ignored. Results
+  are independent byte arrays. Fixed-stage errors omit transport exceptions and
+  response messages to avoid forwarding secrets; no original exception cause is
+  retained. These limits do not bound all engine allocations, arbitrary metadata
+  enumeration, or any effects and retained copies owned by the injected transport.
+  Pure fake-transport fixtures test the local mapping and actual reserve-builder
+  composition; no server, signing, target client or online behavior is exercised.
 - `src/direct/service-frame.ts` implements the outer request and response layouts
   described by [ServicePacker](https://github.com/LagrangeDev/Lagrange.Core/blob/fe789c4a23796fbc82fa09e70a9c44c8a5cf2948/Lagrange.Core/Internal/Packets/Struct/ServicePacker.cs),
   including flags for no encryption, D2 key, and the zero key. Request and
