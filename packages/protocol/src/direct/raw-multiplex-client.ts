@@ -29,6 +29,14 @@ export interface RawMultiplexClientOptions {
         frame: Uint8Array,
         identity: RawMultiplexIdentity,
     ): RawMultiplexRoute | Promise<RawMultiplexRoute>;
+    /**
+     * Synchronously select transactions whose following frames must wait for response
+     * verification and consumption. This is caller policy, not authentication; a
+     * misclassified response can activate it. A held writer must finish independently
+     * of following frame processing. Stage any required state before consume resolves;
+     * business-delivery gating and final commit of provisional state belong to the caller.
+     */
+    holdFollowingFrames?(identity: Sso12RawIdentity): boolean;
     verifyPush(frame: Uint8Array, route: RawMultiplexPushRoute): boolean | Promise<boolean>;
     onPush(frame: Uint8Array, route: RawMultiplexPushRoute): void | Promise<void>;
 }
@@ -53,6 +61,7 @@ const arrayBufferLengthGetter = Object.getOwnPropertyDescriptor(
 )!.get!;
 const nativeValues = Uint8Array.prototype.values;
 const nativeFill = Uint8Array.prototype.fill;
+const nativeThen = Promise.prototype.then;
 
 function wipe(bytes: Uint8Array | undefined): void {
     if (bytes) {
@@ -147,6 +156,7 @@ type Pending = {
     written: boolean;
     writeDone: boolean;
     responseSeen: boolean;
+    holdFollowingFrames: boolean;
     candidate?: Uint8Array;
     responseWorker: boolean;
     hasValue: boolean;
@@ -190,6 +200,7 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
         'maxPushBytes',
         'write',
         'classify',
+        'holdFollowingFrames',
         'verifyPush',
         'onPush',
     ]);
@@ -209,6 +220,8 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
         !uint(maxPushBytes, 14, MAX_FRAME * 64) ||
         typeof config.write !== 'function' ||
         typeof config.classify !== 'function' ||
+        (config.holdFollowingFrames !== undefined &&
+            typeof config.holdFollowingFrames !== 'function') ||
         typeof config.verifyPush !== 'function' ||
         typeof config.onPush !== 'function'
     ) {
@@ -217,6 +230,8 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
 
     const write = config.write as RawMultiplexClientOptions['write'];
     const classify = config.classify as RawMultiplexClientOptions['classify'];
+    const holdFollowingFrames = config.holdFollowingFrames as
+        RawMultiplexClientOptions['holdFollowingFrames'] | undefined;
     const verifyPush = config.verifyPush as RawMultiplexClientOptions['verifyPush'];
     const onPush = config.onPush as RawMultiplexClientOptions['onPush'];
     let closed = false;
@@ -425,6 +440,11 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
 
                 p.responseWorker = false;
 
+                if (p.holdFollowingFrames && p.hasValue && live(p)) {
+                    p.holdFollowingFrames = false;
+                    pump();
+                }
+
                 if (!closed) {
                     tryCommit();
                 }
@@ -491,7 +511,7 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
     };
 
     const pump = (): void => {
-        if (processing || closed) {
+        if (processing || closed || pending?.holdFollowingFrames) {
             return;
         }
 
@@ -501,7 +521,7 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
             let current: Incoming | undefined;
 
             try {
-                while (currentAlive() && incoming.length) {
+                while (currentAlive() && !pending?.holdFollowingFrames && incoming.length) {
                     if (++incomingTurns >= 32) {
                         incomingTurns = 0;
                         await yieldTurn();
@@ -600,6 +620,30 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
                         p.candidate = item.bytes;
                         current = undefined;
                         activeIncoming = undefined;
+
+                        if (holdFollowingFrames) {
+                            // Reserve the barrier before invoking caller code: it may reenter feed.
+                            p.holdFollowingFrames = true;
+                            const hold: unknown = holdFollowingFrames(p.identity);
+
+                            // Observe a mistaken native async policy even if it reentrantly
+                            // closed, without consulting a potentially overridden `then`.
+                            // Promise species and non-native thenables remain caller-owned.
+                            if (utilTypes.isPromise(hold)) {
+                                void nativeThen.call(hold, undefined, () => {});
+                            }
+
+                            if (!live(p) || p.candidate !== item.bytes) {
+                                break;
+                            }
+
+                            if (typeof hold !== 'boolean') {
+                                throw new Error('invalid response barrier result');
+                            }
+
+                            p.holdFollowingFrames = hold;
+                        }
+
                         runResponse(p);
                         continue;
                     }
@@ -783,6 +827,7 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
                     written: false,
                     writeDone: false,
                     responseSeen: false,
+                    holdFollowingFrames: false,
                     responseWorker: false,
                     hasValue: false,
                     value: undefined,

@@ -1509,8 +1509,14 @@ remain to be recovered and independently verified.
   for the writer to finish successfully before transaction verification and
   consumption; push handling can continue meanwhile. Push handlers are ordered
   relative to each other, but can run before an earlier response finishes its
-  verification and consumption. Successful transaction settlement means that
-  transaction's callbacks and write have ended, not that
+  verification and consumption. An optional, synchronous `holdFollowingFrames`
+  policy can instead hold later frames until a selected response's consumption
+  finishes. The caller must stage required state during consumption, keep business
+  delivery separately gated, and ensure its writer does not depend on a held frame.
+  A held partial frame or sustained input can delay settlement until timeout. The
+  barrier itself supplies neither a key nor authentication. Already queued or
+  running push callbacks are not paused by the barrier. Successful transaction
+  settlement means that transaction's callbacks and write have ended, not that
   independent push handling is globally quiescent. A later push failure can close
   the client, which the owner must observe through `whenClosed`. `end()` closes
   immediately rather than draining already queued frames or callbacks; pending
