@@ -1410,12 +1410,14 @@ remain to be recovered and independently verified.
   caller-supplied replacement. The UID is passed to an external reserve builder;
   the resulting opaque bytes do not prove UID inclusion or a valid signature.
   Successful local registration classification retains ticket material privately
-  until close, cancellation or lease termination. A caller-driven `heartbeat()`
-  uses those same private credentials and the lease; it reports a local interval,
-  missing interval or SSO error, and does not establish online state. Transport
-  failures and SSO errors poison the lease; a missing interval remains distinct
-  from zero and does not by itself poison it. Idle close returns control of the
-  lease to the caller. Caller-held aliases, callbacks,
+  until close, cancellation or lease termination. Caller-driven `heartbeat()` and
+  `alive()` use the same lease and confirmed account; heartbeat uses the retained
+  credentials and reports an interval, missing interval or SSO error. Neither
+  establishes online state. Transport failures and SSO errors poison the lease;
+  a missing heartbeat interval remains distinct from zero and does not by itself
+  poison it. `alive()` here is a post-registration manual subset: fixed V2 starts
+  its separate Alive timer after connection, potentially before login. Idle close
+  returns control of the lease to the caller. Caller-held aliases, callbacks,
   modified promise species and same-tick lease termination remain outside these
   local guarantees. No peer authentication, online state, QQ interoperability or
   Bridge integration is established by this owner. The current raw client is a
@@ -1526,9 +1528,28 @@ remain to be recovered and independently verified.
   it discards the response instead of scheduling from its interval field. V2's
   callback also does not implement this owner's fail-and-poison response policy.
   Its separate two-second `Heartbeat.Alive` is not this transaction. Jiyu's reference
-  owner currently starts neither timer, and its one-request transport does not
-  handle asynchronous pushes. External signer output remains opaque, and QQ peer
-  authentication and real wire compatibility remain unverified.
+  owner does not automatically start either timer, and its one-request transport
+  does not handle asynchronous pushes. External signer output remains opaque, and
+  QQ peer authentication and real wire compatibility remain unverified.
+- `src/direct/sso-reference-alive-flow.ts` builds one borrowed `Heartbeat.Alive`
+  request with protocol 13, no encryption and the four-byte body from
+  [fixed V2](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Services/System/AliveService.cs#L6-L18).
+  It accepts initial UIN `0` and an empty UID, so a caller may construct the
+  pre-login reference request without fabricating login credentials. Reserve bytes
+  still come from a caller callback. The local response policy requires protocol
+  13 and no encryption, but the upstream request definition does not establish
+  that server responses always have those properties. The verifier receives the
+  expected UIN, sequence and frames, but not the transport identity UIN; callers
+  needing that relationship must bind it separately. The helper does not own its
+  transport, schedule retries or establish authentication.
+- `src/direct/sso-heartbeat-scheduler.ts` is an explicitly started, caller-owned
+  SSO heartbeat scheduler with a fixed 270-second default period and injected timer
+  support. It skips overlapping ticks instead of allowing V2's possible overlapping
+  timer callbacks; it never treats the response interval as a scheduling unit.
+  Stop waits for in-flight work, so a callback that never settles can leave it
+  pending. An optional caller interrupt may stop the session; the scheduler itself
+  does not silently close or poison it. It does not schedule the separate Alive
+  flow or attach to the application runtime.
 - `src/direct/key-exchange.ts` provides P-256 ECDH and AES-256-GCM primitives
   matching a public reference's key-exchange construction. Tests use synthetic
   vectors cross-checked with Node and .NET cryptography, not the target client.

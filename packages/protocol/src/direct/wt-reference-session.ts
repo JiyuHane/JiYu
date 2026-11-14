@@ -16,6 +16,7 @@ import {
     referenceHeartbeatOnTransport,
     type SsoHeartbeatOutcome,
 } from './sso-reference-heartbeat-flow';
+import { referenceAliveOnTransport, type SsoAliveOutcome } from './sso-reference-alive-flow';
 
 type AttemptOptions = BorrowedWtReferenceLoginAttemptOptions;
 type RegisterOptions = SsoReferenceRegisterBorrowedOptions;
@@ -44,6 +45,8 @@ export interface WtReferenceSession {
     loginAndRegister(fields: LoginFields): Promise<WtReferenceSessionResult>;
     /** A single explicit exchange; a missing interval is not a zero interval. */
     heartbeat(): Promise<SsoHeartbeatOutcome>;
+    /** One explicit alive exchange after successful registration. */
+    alive(): Promise<SsoAliveOutcome>;
     close(): void;
 }
 
@@ -149,12 +152,15 @@ function text(value: unknown, nonempty: boolean, max = 4096): value is string {
  * whenClosed is asynchronous, not a synchronous revocation fence; no protection
  * against arbitrary same-process effects, peer authentication, or online state is
  * implied. Signer/verifier callbacks can retain data or cause external effects.
- * UID is passed to the registration and heartbeat signer; its output is not proof the
- * UID was encoded or the signature is valid. JS strings cannot be erased.
+ * UID is passed to the registration, heartbeat and alive signer; its output is not
+ * proof the UID was encoded or the signature is valid. JS strings cannot be erased.
  * Success is only the local response classification. The internal ticket and
  * profile snapshots remain owned until close, cancellation or lease termination.
- * Heartbeat is caller-driven: no timer or interval unit is inferred, and a missing
- * interval remains distinct from zero. This API exposes no tickets or messaging.
+ * Heartbeat and alive are caller-driven. No alive timer is started: V2 schedules
+ * its two-second alive after socket connect, not after login; without a long-lived
+ * push multiplexer this post-registration exchange is only a conservative subset.
+ * No heartbeat interval unit is inferred, and missing remains distinct from zero.
+ * This API exposes no tickets or messaging.
  * Idle close after success leaves the lease with its caller, which should close
  * this owner before releasing it. In-flight or abandoned post-write close,
  * failure and cancellation poison the lease. Erasure is best effort.
@@ -603,6 +609,63 @@ export function createWtReferenceSession(
                 } catch {
                     fail();
                     throw new Error('session heartbeat failed');
+                } finally {
+                    busy = false;
+                }
+            },
+            async alive() {
+                enter('success');
+
+                try {
+                    const login = retained;
+
+                    if (
+                        login?.uidProjection?.status !== 'present' ||
+                        !text(login.uidProjection.uid, true) ||
+                        !text(login.uin, true)
+                    ) {
+                        throw new Error('missing retained login');
+                    }
+
+                    const uin = login.uin;
+                    const uid = login.uidProjection.uid;
+                    const result = await referenceAliveOnTransport(lease, {
+                        uin,
+                        uid,
+                        timeoutMs: timeout as number,
+                        signal: sessionController.signal,
+                        buildReserved: signer,
+                        verifyRaw: verifier,
+                    });
+                    active();
+
+                    if (
+                        state !== 'success' ||
+                        retained !== login ||
+                        login.uin !== uin ||
+                        login.uidProjection?.status !== 'present' ||
+                        login.uidProjection.uid !== uid
+                    ) {
+                        throw new Error('session stopped');
+                    }
+
+                    if (result.kind !== 'response') {
+                        throw new Error('alive transport failed');
+                    }
+
+                    if (result.value.status === 'sso-error') {
+                        fail();
+                        return result.value;
+                    }
+
+                    if (result.value.status !== 'success') {
+                        throw new Error('invalid alive outcome');
+                    }
+
+                    return result.value;
+                } catch {
+                    fail();
+                    throw new Error('session alive failed');
                 } finally {
                     busy = false;
                 }
