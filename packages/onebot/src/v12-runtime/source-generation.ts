@@ -338,7 +338,9 @@ export function bindOrderedContext(
     }
 
     if (bound.kind === 'old') {
-        return notEligible(pending.ready.target, source, hasChild);
+        // The owner verified this source against its retired history and sealed the parent;
+        // an unclaimed old scope is not a loss in the current epoch.
+        return notEligible(pending.ready.target, source, false);
     }
 
     if (bound.kind !== 'ready') {

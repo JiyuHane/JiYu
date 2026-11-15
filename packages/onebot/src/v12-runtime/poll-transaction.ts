@@ -609,7 +609,10 @@ export class PollTransaction {
                 return await this.fallback(echo);
             }
 
-            const beforeCommit = this.check();
+            // isOpen() can synchronously change epoch or clock after their first
+            // samples. Recheck without reentering the sink; injected sampling may
+            // itself reenter, so this is not an atomic or hard real-time guarantee.
+            const beforeCommit = this.check() ?? this.check(false);
 
             if (beforeCommit) {
                 tokenOwned = false;
