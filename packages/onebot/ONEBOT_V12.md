@@ -41,7 +41,14 @@ configuration writers and backup restores do not share a revision lock.
 ## Supported behavior and limits
 
 The core currently handles `get_version`, `get_status`, `get_supported_actions`,
-`get_self_info`, `send_message` for private and group text messages, and `delete_message`.
+`get_self_info`, `send_message` for private and group text messages,
+`delete_message`, and `set_group_name`. The latter requires a canonical positive
+safe-integer group ID encoded as a string and a string group name, including an
+empty string; it forwards one request to the existing account-local v11 handler.
+Success requires that handler to return an explicit `ok`/zero retcode with null
+`data`. This is the handler's result, not independent confirmation of QQ-side
+state. A malformed response or failure leaves the outcome potentially uncertain;
+no automatic retry is attempted.
 Incoming friend/private and normal/group messages with text and v11 `at`
 segments are converted to v12 `text`, `mention` and `mention_all` segments;
 unsupported message semantics and media are not silently converted. The

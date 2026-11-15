@@ -10,6 +10,7 @@ This directory implements a per-account protocol translation core, not a OneBot 
 | `get_self_info`                                                                                | No parameters; validated account-local v11 login ID and nickname, with an empty `user_displayname`   |
 | `send_message`                                                                                 | Private and group; text only, accepted as string, one text segment, or an array of text segments     |
 | `delete_message`                                                                               | Existing account-local v11 nonzero signed 32-bit message IDs                                         |
+| `set_group_name`                                                                               | Validated string group ID and name; one account-local v11 call; outcome may be uncertain on failure |
 | Message events                                                                                 | Incoming v11 friend/private and normal/group text and `at` segments; no fabricated media IDs        |
 | Group notices                                                                                  | Valid v11 `group_recall`, `group_decrease/leave,kick,kick_me` and `group_increase` map to v12 notices |
 | Friend notices                                                                                 | Valid v11 `friend_add` maps to `notice.friend_increase` with empty subtype |

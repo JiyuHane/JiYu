@@ -33,6 +33,7 @@ const ACTIONS = [
     'get_status',
     'get_supported_actions',
     'get_self_info',
+    'set_group_name',
     'send_message',
     'delete_message',
 ] as const;
@@ -333,6 +334,20 @@ export class V12Dispatcher {
             return this.getSelfInfo(echo);
         }
 
+        if (action === 'set_group_name') {
+            if (extraKeys(params, ['group_id', 'group_name'])) {
+                return response(10004, 'unsupported parameter', null, echo);
+            }
+
+            const groupId = parseAccountId(params.group_id);
+
+            if (groupId === null || typeof params.group_name !== 'string') {
+                return response(10003, 'invalid group_id or group_name', null, echo);
+            }
+
+            return this.setGroupName(groupId, params.group_name, echo);
+        }
+
         if (action === 'delete_message') {
             if (extraKeys(params, ['message_id'])) {
                 return response(10004, 'unsupported parameter', null, echo);
@@ -424,6 +439,64 @@ export class V12Dispatcher {
             );
         } catch {
             return response(20002, 'self info unavailable', null, echo);
+        }
+    }
+
+    private async setGroupName(groupId: number, name: string, echo?: string): Promise<V12Response> {
+        const unknownOutcome = 'action outcome unavailable; do not retry automatically';
+        const invalidResult = () => response(20001, unknownOutcome, null, echo);
+
+        try {
+            const result: unknown = await this.options.api.handle('set_group_name', {
+                group_id: groupId,
+                group_name: name,
+            });
+
+            // After await's thenable assimilation, inspect only own data properties
+            // without invoking response getters or Proxy traps.
+            if (
+                isProxy(result) ||
+                typeof result !== 'object' ||
+                result === null ||
+                Array.isArray(result)
+            ) {
+                return invalidResult();
+            }
+
+            const status = Object.getOwnPropertyDescriptor(result, 'status');
+            const retcode = Object.getOwnPropertyDescriptor(result, 'retcode');
+
+            if (!status || !('value' in status) || !retcode || !('value' in retcode)) {
+                return invalidResult();
+            }
+
+            if (status.value === 'ok' && retcode.value === 0) {
+                const data = Object.getOwnPropertyDescriptor(result, 'data');
+                return data && 'value' in data && data.value === null
+                    ? response(0, '', null, echo)
+                    : invalidResult();
+            }
+
+            if (
+                status.value !== 'failed' ||
+                !Number.isSafeInteger(retcode.value) ||
+                retcode.value <= 0
+            ) {
+                return invalidResult();
+            }
+
+            if (retcode.value === 1400) {
+                return response(
+                    10003,
+                    'invalid action input; outcome may be uncertain; do not retry automatically',
+                    null,
+                    echo,
+                );
+            }
+
+            return response(retcode.value === 1404 ? 20001 : 20002, unknownOutcome, null, echo);
+        } catch {
+            return response(20002, unknownOutcome, null, echo);
         }
     }
 
