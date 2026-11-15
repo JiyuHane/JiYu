@@ -252,6 +252,9 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
         throw new Error('invalid V11 message event');
     }
 
+    // V11 message extras were previously ignored; do not invoke an auto_reply getter.
+    const autoReply =
+        detail === 'private' ? Object.getOwnPropertyDescriptor(input, 'auto_reply') : undefined;
     const message: V12MessageEvent['message'] = [];
     const alt: string[] = [];
 
@@ -311,6 +314,9 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
         alt_message: alt.join(''),
         user_id: userId,
         ...(groupId === null ? {} : { group_id: groupId }),
+        ...(autoReply?.enumerable && 'value' in autoReply && autoReply.value === true
+            ? { 'qq.auto_reply': true as const }
+            : {}),
     };
 }
 

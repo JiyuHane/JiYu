@@ -56,6 +56,14 @@ conversion preserves the v11 field, not an independently verified QQ mention:
 the upstream decoder can normalize an unresolved mention UIN to zero, which
 the v11 converter represents as `all`. The v12 `alt_message` renders mentions
 as `@<user_id>` or `@全体成员`, without reconstructing platform display names.
+For supported incoming private messages, an enumerable own v11 data property
+`auto_reply: true` is preserved as the optional own JSON field
+`qq.auto_reply: true`. Accessor and non-enumerable properties are ignored
+without invoking an `auto_reply` getter. This is a Jiyu
+QQ-specific extension, not a OneBot 12 standard field or confirmation of a
+successful send. Other values are ignored, and the field is omitted when absent;
+group messages never acquire it. This is partial event conversion support, not a
+claim that HTTP event polling or live QQ behavior has been verified.
 
 A valid v11 `group_recall` maps to `notice.group_message_delete` after account,
 time, field and identifier validation. It uses `recall` when sender and operator match;

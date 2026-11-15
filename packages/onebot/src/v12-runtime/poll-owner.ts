@@ -127,6 +127,12 @@ function validOrderedEvent(event: unknown, self: OrderedSelf): boolean {
             }
 
             fields.push('group_id');
+        } else if (Object.hasOwn(event, 'qq.auto_reply')) {
+            if (event['qq.auto_reply'] !== true) {
+                return false;
+            }
+
+            fields.push('qq.auto_reply');
         }
 
         if (!exact(event, fields)) {

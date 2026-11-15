@@ -47,6 +47,8 @@ export interface V12MessageEvent {
     alt_message: string;
     user_id: string;
     group_id?: string;
+    /** Jiyu QQ-specific private message marker, not a send confirmation. */
+    'qq.auto_reply'?: true;
 }
 
 export interface V12FriendIncreaseEvent {
