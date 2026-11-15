@@ -1626,7 +1626,10 @@ remain to be recovered and independently verified.
   connected to a production direct session. It does not authenticate the source,
   enforce strict mixed-event ordering, or await asynchronous subscribers and
   detached roster refreshes. Existing pipeline logs may contain event data.
-  The group-recall decoder preserves the first
+  A synthetic in-memory test composes the reference multiplexer's body callback,
+  this parser, the pipeline and the event bus for text messages. Its verifier is
+  a test stub; it does not prove authentication, production wiring, or the
+  ownership of other event types. The group-recall decoder preserves the first
   entry's existing behavior and then emits subsequent entries with nonzero
   sequence numbers in list order. Additional entries with an absent or zero
   sequence are skipped; the decoder attempts a single count-only warning. The
