@@ -1756,6 +1756,21 @@ remain to be recovered and independently verified.
   a local response-size limit; shared, resizable and detached buffers are rejected.
   Clearing temporary bytes does not guarantee erasure of strings or other copies.
   No transport, logout, server authentication or online-state transition is wired.
+- `src/direct/sso-reference-unregister-flow.ts` composes that codec with one
+  caller-supplied borrowed transport, opaque reserve builder and raw-frame verifier.
+  Its local policy requires a canonical positive UIN at most `0xffffffff` that
+  exactly matches the transport's self-reported UIN. The WT capability path where
+  raw UIN is `0` is not connected. Matching identity, passing a caller verifier or
+  obtaining a response does not authenticate a peer or establish a remote logout.
+  After outer and inner SSO parsing (including decompression), nonzero SSO retcodes
+  are returned without decoding protobuf; zero produces only an absent/present
+  message observation. The protobuf size cap applies after SSO decoding, not to
+  its earlier allocations or peak memory. The owner supplies exclusive access,
+  cross-call single-flight and failure poisoning; a pending noncooperative transport
+  or callback is not forcibly stopped by this helper's deadline or abort signal.
+  It does not open a connection, change the session state or close the transport;
+  a caller-supplied transport may have external effects. Only synthetic transports
+  have been exercised for this helper.
 - `src/direct/sso-reference-heartbeat-flow.ts` composes one borrowed protocol-12
   heartbeat using an owner-supplied account, credentials, signer and raw-response
   verifier. It validates local command, sequence and account binding and retains
