@@ -694,6 +694,17 @@ export class OneBotManager {
             return;
         }
 
+        const instanceAtEntry = this.instances.get(uin);
+
+        if (!instanceAtEntry) {
+            // Detach only the pending start observed before cancel can reenter.
+            const pending = this.pendingStarts.get(uin);
+
+            if (pending && this.pendingStarts.get(uin) === pending) {
+                this.pendingStarts.delete(uin);
+            }
+        }
+
         const migration = this.databaseMigrations.get(uin);
 
         if (migration) {
@@ -706,6 +717,11 @@ export class OneBotManager {
             migration.task.cancel();
         }
 
+        if (!instanceAtEntry) {
+            return;
+        }
+
+        // Instance-present cancel reentry and late closes remain outside this guard.
         const instance = this.instances.get(uin);
 
         if (!instance) {
