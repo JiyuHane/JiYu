@@ -655,15 +655,31 @@ export function safePluginHomepage(homepage: string): string | null {
 }
 
 export function filterPlugins(plugins: CommunityPlugin[], query: string): CommunityPlugin[] {
-    const needle = query.trim().toLocaleLowerCase();
+    const trimmed = query.trim();
+    const needle = trimmed.toLocaleLowerCase();
 
     if (!needle) {
         return plugins;
     }
 
-    return plugins.filter((plugin) =>
-        [plugin.id, plugin.name, plugin.description, plugin.author, ...(plugin.tags ?? [])].some(
-            (field) => field.toLocaleLowerCase().includes(needle),
-        ),
-    );
+    let normalizedNeedle: string | undefined;
+
+    return plugins.filter((plugin) => {
+        const fields = [
+            plugin.id,
+            plugin.name,
+            plugin.description,
+            plugin.author,
+            ...(plugin.tags ?? []),
+        ];
+
+        if (fields.some((field) => field.toLocaleLowerCase().includes(needle))) {
+            return true;
+        }
+
+        const fallbackNeedle = (normalizedNeedle ??= trimmed.normalize('NFKC').toLocaleLowerCase());
+        return fields.some((field) =>
+            field.normalize('NFKC').toLocaleLowerCase().includes(fallbackNeedle),
+        );
+    });
 }

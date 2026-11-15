@@ -60,8 +60,11 @@ permit action calls throughout cleanup. Already admitted work is drained before
 account stores are closed. Cleanup failure and incomplete resource ownership
 must remain observable rather than being reported as full process cleanup.
 
-Marketplace browsing does not install or start anything. The local-management
-path looks for manually placed direct subdirectories under
+Marketplace browsing does not install or start anything. The existing local
+search also uses Unicode compatibility normalization as a fallback, so a match
+can be broader than the text displayed; a search hit does not verify the plugin's
+identity or compatibility. The local-management path looks for manually placed
+direct subdirectories under
 `data/plugin-packages/<plugin-id>` relative to the Jiyu working directory;
 plugin state is kept separately under `data/plugins/<account-id>/<plugin-id>`.
 Only an explicit enable for a running account executes the selected local ESM
