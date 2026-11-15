@@ -54,7 +54,11 @@ A valid v11 `group_recall` maps to `notice.group_message_delete` after account,
 time, field and identifier validation. It uses `recall` when sender and operator match;
 otherwise the subtype is empty rather than asserting an administrator action.
 The message ID is the value exposed by v11, not proof that it identifies a QQ
-history entry: the existing upstream resolver may hash a missing sequence.
+history entry: the existing upstream resolver may hash a missing sequence. The
+protocol decoder retains the first recall entry's legacy behavior and processes
+subsequent entries with nonzero sequences in list order; it skips additional
+entries with absent or zero sequences and attempts a count-only warning. This
+local decoding behavior does not establish real-server batching or delivery.
 Unresolved or zero sender/operator IDs are rejected. A valid v11
 `group_decrease` with subtype `leave`, `kick` or `kick_me` also maps to
 `notice.group_member_decrease`, with an empty subtype. An upstream leave may be a
@@ -62,12 +66,15 @@ decoder fallback or a locally synthesized result, and an unknown decrease reason
 can default to `kick`; the mapping therefore does not assert a QQ-side reason.
 The upstream actor can likewise be synthesized; the mapping only preserves the
 v11 fields, not proof of a QQ-side event or its time. Other decrease subtypes,
-including `disband`, remain unsupported. A `group_increase` can map to `notice.group_member_increase`
-when v11 reports the separate inviter as unknown (`invitor_id: 0` and
-`invitor_status: 'unknown'`). This means the inviter is unresolved, not that
-there was no inviter. Known inviters are not translated by this subset; the
-subtype stays empty because upstream reasons can be defaults or inferred from
-actor equality. Self-join user identity may come from account context. A valid
+including `disband`, remain unsupported. A `group_increase` can map to
+`notice.group_member_increase`. When v11 reports a known, valid independent
+inviter, the event preserves it in the optional string extension
+`qq.invitor_id`; `operator_id` remains the original operator. An unknown inviter
+(`invitor_id: 0`, `invitor_status: 'unknown'`) omits the extension; that means
+unresolved, not that no inviter existed. The subtype stays empty because
+upstream reasons can be defaults or inferred from actor equality. The extension
+preserves v11 data, not independent proof of QQ identity. Self-join user
+identity may come from account context. A valid
 v11 `friend_add` maps to `notice.friend_increase` with an empty subtype and the
 same user ID as a string. The upstream new-friend decoder resolves the peer UIN
 with a routing fallback and may fall back to the packet header time; this mapping

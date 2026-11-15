@@ -90,11 +90,6 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
                 throw new Error('invalid or unsupported V11 group increase event');
             }
 
-            // An independently known inviter is not represented by the standard fields.
-            if (!unknownInvitor) {
-                return null;
-            }
-
             // Unknown includes absent or unresolved inviter identity, not absence of an
             // inviter. V11 admission types may be defaults or actor-comparison fallbacks,
             // and the self-join decoder can synthesize user_id from its account context.
@@ -108,6 +103,7 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
                 group_id: groupId,
                 user_id: userId,
                 operator_id: operatorId,
+                ...(knownInvitor === null ? {} : { 'qq.invitor_id': knownInvitor }),
             };
         }
 

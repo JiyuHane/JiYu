@@ -96,6 +96,8 @@ export interface V12GroupMemberIncreaseEvent {
     group_id: string;
     user_id: string;
     operator_id: string;
+    /** Independently supplied V11 inviter; not proof of QQ-side identity. */
+    'qq.invitor_id'?: string;
 }
 
 export type V12ConvertedEvent =

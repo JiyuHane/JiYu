@@ -185,9 +185,20 @@ function validOrderedEvent(event: unknown, self: OrderedSelf): boolean {
         );
     }
 
+    if (event.detail_type === 'group_member_increase') {
+        if (Object.hasOwn(event, 'qq.invitor_id')) {
+            fields.push('qq.invitor_id');
+
+            if (parseAccountId(event['qq.invitor_id']) === null) {
+                return false;
+            }
+        }
+
+        return event.sub_type === '' && exact(event, fields);
+    }
+
     return (
-        (event.detail_type === 'group_member_decrease' ||
-            event.detail_type === 'group_member_increase') &&
+        event.detail_type === 'group_member_decrease' &&
         event.sub_type === '' &&
         exact(event, fields)
     );
