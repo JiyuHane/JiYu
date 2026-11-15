@@ -695,12 +695,11 @@ export class OneBotManager {
         }
 
         const instanceAtEntry = this.instances.get(uin);
+        const pendingAtEntry = this.pendingStarts.get(uin);
 
         if (!instanceAtEntry) {
             // Detach only the pending start observed before cancel can reenter.
-            const pending = this.pendingStarts.get(uin);
-
-            if (pending && this.pendingStarts.get(uin) === pending) {
+            if (pendingAtEntry && this.pendingStarts.get(uin) === pendingAtEntry) {
                 this.pendingStarts.delete(uin);
             }
         }
@@ -721,19 +720,19 @@ export class OneBotManager {
             return;
         }
 
-        // Instance-present cancel reentry and late closes remain outside this guard.
-        const instance = this.instances.get(uin);
-
-        if (!instance) {
-            this.pendingStarts.delete(uin);
+        // Cancel may synchronously retire this instance and enqueue a newer start.
+        // This check covers that reentry point, not late close events generally.
+        if (this.instances.get(uin) !== instanceAtEntry) {
             return;
         }
 
         this.instances.delete(uin);
-        this.retiringInstances.add(instance);
-        this.trackLifecycle(`network shutdown UIN=${uin}`, this.emitOfflineThenDispose(instance), [
-            instance,
-        ]);
+        this.retiringInstances.add(instanceAtEntry);
+        this.trackLifecycle(
+            `network shutdown UIN=${uin}`,
+            this.emitOfflineThenDispose(instanceAtEntry),
+            [instanceAtEntry],
+        );
         log.info('session closed: UIN=%s', uin);
     }
 
