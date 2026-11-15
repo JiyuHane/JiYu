@@ -1595,7 +1595,15 @@ remain to be recovered and independently verified.
   identity services and other existing diagnostics may still record identifiers;
   callers must also handle thrown errors and logging policy appropriately. This
   parser itself neither dispatches events nor connects the direct session to
-  Bridge, OneBot or a real QQ peer.
+  Bridge, OneBot or a real QQ peer. The group-recall decoder preserves the first
+  entry's existing behavior and then emits subsequent entries with nonzero
+  sequence numbers in list order. Additional entries with an absent or zero
+  sequence are skipped; the decoder attempts a single count-only warning. The
+  first entry can still use the legacy zero-sequence fallback, so its downstream
+  message ID is not proof of a QQ history match. A decoder error can fail the
+  whole batch, and downstream failures can prevent later dispatch. Neither this
+  behavior nor synthetic tests prove that a real QQ server emits multiple entries
+  or that the resulting events were delivered.
 - `src/direct/raw-multiplex-stream.ts` adapts a caller-supplied, already-established
   byte stream to that client without opening or connecting a socket. It requires
   exclusive ownership and uses the shared direct-socket ownership registry for

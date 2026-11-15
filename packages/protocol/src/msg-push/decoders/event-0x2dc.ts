@@ -80,21 +80,50 @@ function decodeGroupRecall(ctx: MsgPushContext): QQEventVariant[] {
         return [];
     }
 
-    const recalled = notify.recall.recallMessages[0];
-    const ev: GroupRecallEvent = {
-        kind: 'group_recall',
-        time: recalled.time ?? ctx.head.timestamp,
-        selfUin: ctx.selfUin,
-        groupId: notify.groupUin ?? 0,
-        operatorUin: resolveUidToUin(
-            ctx.identity,
-            notify.groupUin ?? 0,
-            notify.recall.operatorUid || notify.operatorUid || '',
-        ),
-        authorUin: resolveUidToUin(ctx.identity, notify.groupUin ?? 0, recalled.authorUid ?? ''),
-        msgSeq: recalled.sequence ?? 0,
-    };
-    return [ev];
+    const recall = notify.recall;
+    const messages = notify.recall.recallMessages;
+    const events: GroupRecallEvent[] = [];
+    let skipped = 0;
+
+    for (const [index, recalled] of messages.entries()) {
+        // Keep the historical first-entry behavior; extra entries require a
+        // sequence so they cannot introduce a fabricated fallback message ID.
+        if (index > 0 && (recalled.sequence ?? 0) === 0) {
+            skipped++;
+            continue;
+        }
+
+        events.push({
+            kind: 'group_recall',
+            time: recalled.time ?? ctx.head.timestamp,
+            selfUin: ctx.selfUin,
+            groupId: notify.groupUin ?? 0,
+            operatorUin: resolveUidToUin(
+                ctx.identity,
+                notify.groupUin ?? 0,
+                recall.operatorUid || notify.operatorUid || '',
+            ),
+            authorUin: resolveUidToUin(
+                ctx.identity,
+                notify.groupUin ?? 0,
+                recalled.authorUid ?? '',
+            ),
+            msgSeq: recalled.sequence ?? 0,
+        });
+    }
+
+    if (skipped > 0) {
+        try {
+            unknownLog.warn(
+                'group recall skipped additional entries with missing sequence count=%d',
+                skipped,
+            );
+        } catch {
+            // A diagnostic failure must not suppress already-decoded events.
+        }
+    }
+
+    return events;
 }
 
 function decodeGroupGreyTip(ctx: MsgPushContext): QQEventVariant[] {
