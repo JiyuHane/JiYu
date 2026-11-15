@@ -39,6 +39,37 @@ presented as REA decompilation or execution traces.
 
 ### JNI registration candidate
 
+Within the declared `JNI_OnLoad` export range `[0x62b3c, 0x741e4)`, a
+read-only scan for the exact AArch64 instruction bytes `085d43f9`
+(`ldr x8, [x8, 0x6b8]`) found eight aligned sites. The adjacent linear
+instruction windows show the following table-address and count arguments
+before an indirect call, subject to the register and control-flow assumptions
+below:
+
+| Slot load | Candidate table VA | Count |
+| --- | --- | ---: |
+| `0x63c44` | `0x9a6510` | 4 |
+| `0x67d78` | `0x9a6580` | 5 |
+| `0x6a544` | `0x9a6640` | 3 |
+| `0x6b984` | `0x9a66a0` | 1 |
+| `0x70dc4` | `0x9a5948` | 1 |
+| `0x7201c` | `0x9a5968` | 1 |
+| `0x72660` | `0x9a5988` | 1 |
+| `0x73424` | `0x9a59a8` | 2 |
+
+These addresses are in `.bss` (`SHT_NOBITS`) at
+`[0x9a56d0, 0x9af010)`; their file representation does not supply initialized
+method-table contents. This scan covers only the exact instruction encoding in
+the declared export range, not other registers, addressing forms, indirect
+calls, a complete cross-reference set, or a control-flow graph. Radare2
+reported that relocations were not applied. Neither the table contents at
+runtime nor execution of these sites was observed. With a stable sample, the
+bounded byte search can be repeated without executing it:
+
+```sh
+radare2 -N -q -c 'e search.from=0x62b3c; e search.to=0x741e4; /x 085d43f9' /path/to/libfekit.so
+```
+
 Within bounded instructions of `JNI_OnLoad`, `0x6b8b8–0x6b8dc` writes a
 three-pointer table at `0x9a66a0`. The named values are the string `d` at
 `0x90e062`, signature `(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)[B`
@@ -176,8 +207,14 @@ output slot to zero, supplies its address and `0x00010006`, then calls that
 pointer's function-table slot `+0x30`. If the entry argument is a valid
 `JavaVM`, the saved register and slot remain unchanged, and this block is
 reached, that call has the same `GetEnv` ABI shape. It is not established that
-this saved pointer is the value in global `0x9a6a28`. Flattened control flow
-also prevents assuming that surrounding blocks execute in address order.
+this saved pointer is the value in global `0x9a6a28`. A separate registration
+candidate at `0x63c2c–0x63c48` reloads the first argument from the same
+`[x19+0x4e8]` base expression used for that output slot, and supplies table
+`0x9a6510` and count four to an indirect call through `+0x6b8`. Flattened
+control flow prevents assuming that the blocks execute in address order, that
+the base and slot remain unchanged, or that the earlier call succeeds and
+produces a valid `JNIEnv`. This is a local static correspondence, not a
+verified `GetEnv`-to-registration runtime path.
 
 #### Conditional use of the SecInfo candidate
 
