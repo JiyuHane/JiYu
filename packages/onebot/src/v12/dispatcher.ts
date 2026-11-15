@@ -501,32 +501,56 @@ export class V12Dispatcher {
     }
 
     private async callDelete(id: number, echo?: string): Promise<V12Response> {
+        const unknownOutcome = 'action outcome unavailable; do not retry automatically';
+        const invalidResult = () => response(20001, unknownOutcome, null, echo);
+
         try {
-            const result = await this.options.api.handle('delete_msg', { message_id: id });
+            const result: unknown = await this.options.api.handle('delete_msg', { message_id: id });
 
-            const failure = v11Failure(result, echo);
-
-            if (failure) {
-                return failure;
+            // Await may inspect a thenable; afterward inspect only own data properties.
+            if (
+                isProxy(result) ||
+                typeof result !== 'object' ||
+                result === null ||
+                Array.isArray(result)
+            ) {
+                return invalidResult();
             }
 
-            if (result.data !== null) {
+            const status = Object.getOwnPropertyDescriptor(result, 'status');
+            const retcode = Object.getOwnPropertyDescriptor(result, 'retcode');
+
+            if (!status || !('value' in status) || !retcode || !('value' in retcode)) {
+                return invalidResult();
+            }
+
+            if (status.value === 'ok' && retcode.value === 0) {
+                const data = Object.getOwnPropertyDescriptor(result, 'data');
+                return data && 'value' in data && data.value === null
+                    ? response(0, '', null, echo)
+                    : invalidResult();
+            }
+
+            if (
+                status.value !== 'failed' ||
+                !Number.isSafeInteger(retcode.value) ||
+                retcode.value <= 0
+            ) {
+                return invalidResult();
+            }
+
+            if (retcode.value === 1400) {
                 return response(
-                    20001,
-                    'action outcome unavailable; do not retry automatically',
+                    10003,
+                    'invalid action input; outcome may be uncertain; do not retry automatically',
                     null,
                     echo,
                 );
             }
 
-            return response(0, '', null, echo);
+            return response(retcode.value === 1404 ? 20001 : 20002, unknownOutcome, null, echo);
         } catch {
-            return response(
-                20002,
-                'action outcome unavailable; do not retry automatically',
-                null,
-                echo,
-            );
+            return response(20002, unknownOutcome, null, echo);
         }
     }
 

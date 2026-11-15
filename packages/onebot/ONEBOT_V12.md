@@ -48,7 +48,11 @@ empty string; it forwards one request to the existing account-local v11 handler.
 Success requires that handler to return an explicit `ok`/zero retcode with null
 `data`. This is the handler's result, not independent confirmation of QQ-side
 state. A malformed response or failure leaves the outcome potentially uncertain;
-no automatic retry is attempted.
+no automatic retry is attempted. `delete_message` likewise requires own data
+properties `status: 'ok'`, `retcode: 0` and `data: null`; a malformed handler
+response is not proof that a requested deletion did or did not happen. Its
+response inspection rejects a final Proxy value after JavaScript's `await` has
+performed thenable handling, which may itself execute a `then` getter.
 Incoming friend/private and normal/group messages with text and v11 `at`
 segments are converted to v12 `text`, `mention` and `mention_all` segments;
 unsupported message semantics and media are not silently converted. The
