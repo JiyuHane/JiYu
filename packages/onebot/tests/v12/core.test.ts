@@ -61,6 +61,7 @@ describe('V12 dispatcher with real v11 ApiHandler', () => {
             'get_status',
             'get_supported_actions',
             'get_self_info',
+            'get_user_info',
             'get_friend_list',
             'get_group_info',
             'get_group_list',

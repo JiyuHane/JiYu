@@ -33,6 +33,7 @@ const ACTIONS = [
     'get_status',
     'get_supported_actions',
     'get_self_info',
+    'get_user_info',
     'get_friend_list',
     'get_group_info',
     'get_group_list',
@@ -337,6 +338,21 @@ export class V12Dispatcher {
             return this.getSelfInfo(echo);
         }
 
+        if (action === 'get_user_info') {
+            if (extraKeys(params, ['user_id'])) {
+                return response(10004, 'unsupported parameter', null, echo);
+            }
+
+            const userId = parseAccountId(params.user_id);
+
+            // OidbUserInfoRequest.uin is uint32; the encoder truncates larger values.
+            if (userId === null || userId > 0xffffffff) {
+                return response(10003, 'invalid user_id', null, echo);
+            }
+
+            return this.getUserInfo(userId, echo);
+        }
+
         if (action === 'get_friend_list') {
             if (Object.keys(params).length !== 0) {
                 return response(10004, 'unsupported parameter', null, echo);
@@ -472,6 +488,95 @@ export class V12Dispatcher {
             );
         } catch {
             return response(20002, 'self info unavailable', null, echo);
+        }
+    }
+
+    private async getUserInfo(userId: number, echo?: string): Promise<V12Response> {
+        const invalid = () => response(20001, 'invalid user info result', null, echo);
+        const unavailable = () => response(20002, 'user info unavailable', null, echo);
+
+        try {
+            const result: unknown = await this.options.api.handle('get_stranger_info', {
+                user_id: userId,
+            });
+
+            // Await may inspect a thenable before these proxy and descriptor checks.
+            if (
+                isProxy(result) ||
+                typeof result !== 'object' ||
+                result === null ||
+                Array.isArray(result)
+            ) {
+                return invalid();
+            }
+
+            const status = Object.getOwnPropertyDescriptor(result, 'status');
+            const retcode = Object.getOwnPropertyDescriptor(result, 'retcode');
+
+            if (!status || !('value' in status) || !retcode || !('value' in retcode)) {
+                return invalid();
+            }
+
+            if (
+                status.value === 'failed' &&
+                Number.isSafeInteger(retcode.value) &&
+                retcode.value > 0
+            ) {
+                return retcode.value === 1400 || retcode.value === 1404 ? invalid() : unavailable();
+            }
+
+            if (status.value !== 'ok' || retcode.value !== 0) {
+                return invalid();
+            }
+
+            const data = Object.getOwnPropertyDescriptor(result, 'data');
+            const value: unknown = data && 'value' in data ? data.value : undefined;
+
+            if (
+                isProxy(value) ||
+                typeof value !== 'object' ||
+                value === null ||
+                Array.isArray(value)
+            ) {
+                return invalid();
+            }
+
+            const id = Object.getOwnPropertyDescriptor(value, 'user_id');
+            const nickname = Object.getOwnPropertyDescriptor(value, 'nickname');
+            const remark = Object.getOwnPropertyDescriptor(value, 'remark');
+
+            if (
+                !id ||
+                !('value' in id) ||
+                typeof id.value !== 'number' ||
+                !Number.isSafeInteger(id.value) ||
+                id.value <= 0 ||
+                id.value !== userId ||
+                !nickname ||
+                !('value' in nickname) ||
+                typeof nickname.value !== 'string' ||
+                nickname.value.length > 1024 ||
+                !remark ||
+                !('value' in remark) ||
+                typeof remark.value !== 'string' ||
+                remark.value.length > 1024
+            ) {
+                return invalid();
+            }
+
+            return response(
+                0,
+                '',
+                {
+                    user_id: String(id.value),
+                    user_name: nickname.value,
+                    user_displayname: '',
+                    user_remark: remark.value,
+                },
+                echo,
+            );
+        } catch {
+            return unavailable();
         }
     }
 

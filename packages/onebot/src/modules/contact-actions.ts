@@ -441,12 +441,8 @@ export async function getStrangerInfo(
         const p = await bridge.apis.contacts.fetchUserProfile(userId);
         const corp = await strangerCorpInfo(bridge, p);
         return formatStrangerInfo(p, corp);
-    } catch (error) {
-        log.warn(
-            'user profile refresh failed, checking cached profile: user=%d error=%s',
-            userId,
-            error instanceof Error ? error.message : String(error),
-        );
+    } catch {
+        log.warn('user profile refresh failed, checking cached profile: [redacted]');
         const p = bridge.identity.findUserProfile(userId);
 
         if (p) {

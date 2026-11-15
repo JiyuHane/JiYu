@@ -60,11 +60,13 @@ QQ 数字标识须为规范十进制字符串且数值在 1–4294967295 范围�
 可通过现有客户端的泛型 `request('send_message', ...)` 发送；
 成功响应或本地编解码通过均不保证实际送达或客户端显示。
 
-## OneBot 12 好友列表类型
+## OneBot 12 用户信息与好友列表类型
 
-`@harehane/sdk/v12` 导出 `OneBot12UserInfo` 和 `OneBot12FriendListResponse`，对应 [OneBot 12 `get_friend_list`](https://12.onebot.dev/interface/user/actions/#get_friend_list) 的数据结构。用户信息的 `user_id`、`user_name`、`user_displayname`、`user_remark` 均为字符串，并允许 JSON 扩展字段；响应的 `status: 'ok'` 分支包含用户信息数组，`status: 'failed'` 分支保留通用响应的 `data` 类型。
+`@harehane/sdk/v12` 导出 `OneBot12UserInfo`、`OneBot12UserInfoResponse` 和 `OneBot12FriendListResponse`，描述 [OneBot 12 `get_user_info`](https://12.onebot.dev/interface/user/actions/#get_user_info) 和 [`get_friend_list`](https://12.onebot.dev/interface/user/actions/#get_friend_list) 的数据结构。用户信息的 `user_id`、`user_name`、`user_displayname`、`user_remark` 均为字符串，并允许 JSON 扩展字段；响应的 `status: 'ok'` 分支分别包含单个用户信息和用户信息数组，`status: 'failed'` 分支保留通用响应的 `data` 类型。
 
-现有客户端可通过 `request('get_friend_list', {})` 发出请求，返回的是通用 `OneBot12ActionResponse`。通用解析器仅检查响应信封和 JSON 值，并不检查好友列表中的各字段；调用方使用这些类型前应自行校验返回数据，不能把类型断言当作校验。类型导出本身不增加服务端能力：调用需要部署支持此动作的对应新版本服务端。
+现有客户端可通过通用请求 `request('get_user_info', { user_id: '123' })` 或 `request('get_friend_list', {})` 发出请求，返回的是通用 `OneBot12ActionResponse`。通用响应编解码器仅校验响应信封和 JSON 值，不校验具体用户字段；调用方使用这些类型前应自行校验返回数据，类型断言不等于校验。类型导出本身不增加服务端能力：服务端需要实现对应 action。
+
+当前 Jiyu 的 `get_user_info` 仅接受数值为 1–4294967295 的规范十进制数字字符串；该限制用于保护底层 uint32 转换免于截断，不代表 OneBot 12 全规范或 QQ 的上限。v11 回退可能返回空的 `user_name` 和 `user_remark`；由于没有独立的 displayname 来源，`user_displayname` 为空字符串。成功响应不证明用户存在或双方互为好友。
 
 当前 Jiyu 的好友列表来源于 v11 好友 roster，可能使用缓存并追加设备伪联系人；上游没有独立的 displayname，因此此服务端将 `user_displayname` 固定为空字符串。具体内容与实时性取决于服务端及上游状态。
 

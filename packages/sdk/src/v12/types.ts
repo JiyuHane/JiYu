@@ -75,6 +75,11 @@ export interface OneBot12UserInfo extends OneBot12JsonObject {
 }
 
 /** Describes the response shape; the generic response parser does not validate user fields. */
+export type OneBot12UserInfoResponse =
+    | (OneBot12ActionResponse & { status: 'ok'; data: OneBot12UserInfo })
+    | (OneBot12ActionResponse & { status: 'failed'; data: OneBot12JsonValue });
+
+/** Describes the response shape; the generic response parser does not validate user fields. */
 export type OneBot12FriendListResponse =
     | (OneBot12ActionResponse & { status: 'ok'; data: OneBot12UserInfo[] })
     | (OneBot12ActionResponse & { status: 'failed' });

@@ -41,7 +41,7 @@ configuration writers and backup restores do not share a revision lock.
 ## Supported behavior and limits
 
 The core currently handles `get_version`, `get_status`, `get_supported_actions`,
-`get_self_info`, `get_friend_list`, `get_group_info`, `get_group_list`, `send_message` for private and group text messages and group
+`get_self_info`, `get_user_info`, `get_friend_list`, `get_group_info`, `get_group_list`, `send_message` for private and group text messages and group
 mentions, `delete_message`, and `set_group_name`. The latter requires a canonical positive
 safe-integer group ID encoded as a string and a string group name, including an
 empty string; it forwards one request to the existing account-local v11 handler.
@@ -131,6 +131,50 @@ info (including v11 errors 1400 and 1404) and fixed 20002 for other well-formed
 v11 failures or exceptions; the current transport may replace these failure
 messages with its generic side-effect uncertainty warning even for this read-only
 action. This action is an incremental addition, not full v12 support.
+
+`get_user_info` accepts only `user_id`: a canonical positive decimal string from
+`1` through `4294967295`. Numeric IDs, zero, leading zeroes, signs, whitespace
+and larger values are invalid. After ordinary snapshot, `self` and `echo`
+preflight, extra parameters take precedence with 10004; missing or invalid IDs
+return 10003. A valid request calls the account-local v11 `get_stranger_info`
+exactly once with `{user_id: number}` and does not retry automatically. The uint32
+ceiling protects the current local wire path from truncation: `OidbUserInfoRequest.uin`
+is `uint_32` and Proton encodes it using `>>> 0`. This guard applies only to this
+v12 action; direct v11 `get_stranger_info` retains its existing input behavior,
+including the possibility of truncation above the uint32 range. It is neither a
+global QQ ID limit nor a OneBot standard limit. See the [user action definition](https://12.onebot.dev/interface/user/actions/#get_user_info).
+
+After `await`, the dispatcher rejects Proxy or array envelopes and data, and reads
+only own data properties `status`, `retcode`, successful `data`, numeric positive
+safe-integer `user_id`, and primitive strings `nickname` and `remark`. The ID must
+match the request and each string must be at most 1,024 UTF-16 code units; empty
+strings are retained. It projects only `{user_id: String(id), user_name: nickname,
+user_displayname: '', user_remark: remark}` without enumerating unknown fields or
+invoking their getters. `user_displayname` is empty because there is no independent
+source, not proof the user left it unset. The string limit is local and separate
+from the transport's default 1 MiB output budget, which also includes JSON encoding,
+field names and echo. An oversized result may become a transport error or close the
+connection. Await's thenable assimilation can itself execute a `then` getter before
+inspection. Malformed results and v11 failures 1400/1404 produce fixed 20001;
+other valid positive v11 failure codes or exceptions produce fixed 20002. These
+messages contain no upstream data or exception details; existing transport failure
+message rewriting may apply.
+
+When v11 context lacks `getStrangerInfo`, or that provider returns null, v11
+synthesizes successful data with the requested ID and empty nickname and remark.
+The provider can fall back to cached profile or friend data after a profile fetch
+failure. Three dataline pseudo-contacts bypass the network lookup. Otherwise the
+profile fetch may access the network, and optional enterprise profile fetching is
+best effort. Missing or successful data does not establish user existence or
+friendship. A profile response without `uin` is filled with `requestedUin`; when
+`uin` is present, inconsistency is checked. Matching the resulting ID therefore
+cannot prove the server's identity assertion. Real QQ behavior is unverified.
+
+The shared v11 handler's targeted `get_stranger_info` input, terminal response and
+exception diagnostics are redacted, and the contact user-profile warning omits
+sensitive details. This is not global log sanitization: observers receive raw v11
+responses, and WebUI SSE, other services and logs can independently disclose data.
+The v11 response and observer semantics are unchanged.
 
 `get_friend_list` accepts no parameters and calls the account-local v11 handler
 once with `{}`. It maps each valid v11 numeric `user_id`, `nickname` and `remark`

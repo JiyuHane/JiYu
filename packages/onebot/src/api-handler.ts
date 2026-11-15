@@ -21,10 +21,19 @@ import {
 } from './streaming';
 const moduleLog = createLogger('Bridge.Action');
 
-function isSensitiveRosterAction(action: string): boolean {
+// List actions retain their existing input logging, while individual lookups
+// redact inputs as well as terminal responses and exception diagnostics.
+function hasSensitiveActionDiagnostics(action: string): boolean {
     return (
-        action === 'get_friend_list' || action === 'get_group_list' || action === 'get_group_info'
+        action === 'get_friend_list' ||
+        action === 'get_group_list' ||
+        action === 'get_group_info' ||
+        action === 'get_stranger_info'
     );
+}
+
+function hasSensitiveActionInput(action: string): boolean {
+    return action === 'get_group_info' || action === 'get_stranger_info';
 }
 
 function summarizeActionParams(action: string, params: JsonObject): string {
@@ -341,7 +350,7 @@ export class ApiHandler {
         this.log.debug(
             '%s params=%s',
             action,
-            action === 'get_group_info' ? '[redacted]' : summarizeActionParams(action, params),
+            hasSensitiveActionInput(action) ? '[redacted]' : summarizeActionParams(action, params),
         );
 
         let response: import('./types').ApiResponse;
@@ -375,14 +384,8 @@ export class ApiHandler {
             // `OidbError.message` already carries the QQ server code, so it needs no
             // special casing. warn (not error) keeps the log file useful without
             // drowning it in expected client-side failures.
-            if (isSensitiveRosterAction(action)) {
-                this.log.warn(
-                    action === 'get_friend_list'
-                        ? 'get_friend_list failed: [redacted]'
-                        : action === 'get_group_list'
-                          ? 'get_group_list failed: [redacted]'
-                          : 'get_group_info failed: [redacted]',
-                );
+            if (hasSensitiveActionDiagnostics(action)) {
+                this.log.warn(`${action} failed: [redacted]`);
             } else {
                 this.log.warn(
                     '%s failed: %s\n%s',
@@ -412,7 +415,7 @@ export class ApiHandler {
         this.log.trace(() => [
             'action_input action=%s params=%s',
             action,
-            action === 'get_group_info' ? '[redacted]' : renderParamsVerbose(params),
+            hasSensitiveActionInput(action) ? '[redacted]' : renderParamsVerbose(params),
         ]);
     }
 
@@ -434,7 +437,7 @@ export class ApiHandler {
             outcome,
             reason,
             Date.now() - startedAt,
-            isSensitiveRosterAction(action) ? '[redacted]' : renderParamsVerbose(response),
+            hasSensitiveActionDiagnostics(action) ? '[redacted]' : renderParamsVerbose(response),
         ]);
     }
 
@@ -452,14 +455,8 @@ export class ApiHandler {
             try {
                 cb({ action, params, response, ms });
             } catch (err) {
-                if (isSensitiveRosterAction(action)) {
-                    this.log.warn(
-                        action === 'get_friend_list'
-                            ? 'get_friend_list action observer error: [redacted]'
-                            : action === 'get_group_list'
-                              ? 'get_group_list action observer error: [redacted]'
-                              : 'get_group_info action observer error: [redacted]',
-                    );
+                if (hasSensitiveActionDiagnostics(action)) {
+                    this.log.warn(`${action} action observer error: [redacted]`);
                 } else {
                     this.log.warn(
                         'action observer error: %s',
