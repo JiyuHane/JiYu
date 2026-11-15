@@ -148,11 +148,46 @@ function nonemptyText(value: unknown, max: number): value is string {
  * may outlive the deadline; external callback effects and retained copies remain theirs.
  * Cleanup is best effort and does not promise erasure of codec-internal pooled allocations.
  */
-export async function referenceSendTextOnTransport(
+export function referenceSendTextOnTransport(
     transport: Sso12RawTransport,
     options: SsoReferenceSendTextOptions,
 ): Promise<SsoReferenceSendTextResult> {
+    if (new.target) {
+        throw new TypeError('referenceSendTextOnTransport is not a constructor');
+    }
+
+    return sendTextCore(transport, options);
+}
+
+/** Deep internal composition only; capability coordination is not peer authentication. */
+export function referenceSendTextWithCapability(
+    capability: { token: object; attempt: object; lease: Sso12RawTransport; run: object },
+    options: SsoReferenceSendTextOptions,
+): Promise<SsoReferenceSendTextResult> {
+    return sendTextCore(undefined, options, capability);
+}
+
+async function sendTextCore(
+    suppliedTransport: Sso12RawTransport | undefined,
+    options: SsoReferenceSendTextOptions,
+    capability?: { token: object; attempt: object; lease: Sso12RawTransport; run: object },
+): Promise<SsoReferenceSendTextResult> {
     const started = performance.now();
+    let binding:
+        { token: object; attempt: object; lease: Sso12RawTransport; run: object } | undefined;
+    let transport = suppliedTransport;
+
+    if (capability !== undefined) {
+        const input = record(capability, ['token', 'attempt', 'lease', 'run']);
+        binding = {
+            token: input.token as object,
+            attempt: input.attempt as object,
+            lease: input.lease as Sso12RawTransport,
+            run: input.run as object,
+        };
+        transport = binding.lease;
+    }
+
     let method: Sso12RawTransport['transactRaw'];
 
     try {
@@ -180,6 +215,9 @@ export async function referenceSendTextOnTransport(
     let abortListener: ReturnType<typeof addAbortListener> | undefined;
     let active = true;
     let timeout = 0;
+    let privateSession: typeof import('./wt-reference-session-private') | undefined;
+    let begun = false;
+    let actualUin: string | undefined;
     const controller = new AbortController();
     const abort = (): void => controller.abort();
 
@@ -316,6 +354,52 @@ export async function referenceSendTextOnTransport(
             throw new RangeError('send-text request exceeds size limit');
         }
 
+        if (binding) {
+            privateSession = await import('./wt-reference-session-private');
+
+            if (performance.now() >= started + timeout) {
+                controller.abort();
+            }
+
+            if (controller.signal.aborted) {
+                return {
+                    kind: 'failure',
+                    code: signal && aborted.call(signal) ? 'raw-cancelled' : 'raw-timeout',
+                    writeState: 'not-written',
+                };
+            }
+
+            privateSession.beginReferenceSend(
+                binding.token,
+                binding.attempt,
+                binding.lease,
+                binding.run,
+            );
+            begun = true;
+        }
+
+        const assertBinding = (identityUin: string): void => {
+            if (binding && privateSession) {
+                privateSession.assertReferenceSendIdentity(
+                    binding.token,
+                    binding.attempt,
+                    binding.lease,
+                    binding.run,
+                    identityUin,
+                    uin,
+                );
+                privateSession.assertReferenceSendKey(
+                    binding.token,
+                    binding.attempt,
+                    binding.lease,
+                    binding.run,
+                    key,
+                );
+            } else if (identityUin !== uin) {
+                throw new Error('invalid transport identity');
+            }
+        };
+
         const remaining = Math.max(1, Math.ceil(started + timeout - performance.now()));
 
         if (performance.now() >= started + timeout) {
@@ -348,19 +432,26 @@ export async function referenceSendTextOnTransport(
                 try {
                     assertActive();
 
-                    if (identity.uin !== uin) {
-                        throw new Error('invalid transport identity');
-                    }
-
+                    assertBinding(identity.uin);
+                    actualUin = identity.uin;
                     signerInput = Uint8Array.from(body);
                     owned.push(signerInput);
-                    const signed = await signer({
-                        uin,
-                        uid,
-                        sequence: identity.sequence,
-                        command: COMMAND,
-                        body: signerInput,
-                    });
+                    let signed: Uint8Array;
+
+                    try {
+                        signed = await signer({
+                            uin,
+                            uid,
+                            sequence: identity.sequence,
+                            command: COMMAND,
+                            body: signerInput,
+                        });
+                    } finally {
+                        if (binding) {
+                            assertBinding(identity.uin);
+                        }
+                    }
+
                     assertActive();
                     metadata = copyBytes(signed, MAX_FIELD);
                     const localGuid = copy(guid),
@@ -386,6 +477,11 @@ export async function referenceSendTextOnTransport(
                         body: inner,
                     });
                     assertActive();
+
+                    if (binding) {
+                        assertBinding(identity.uin);
+                    }
+
                     return { frame: requestFrame, context: null };
                 } finally {
                     [body, signerInput, metadata, inner, ...local].forEach(wipe);
@@ -401,13 +497,27 @@ export async function referenceSendTextOnTransport(
                     owned.push(requestCopy);
                     responseCopy = Uint8Array.from(candidate);
                     owned.push(responseCopy);
-                    const accepted = await verifier({
-                        uin,
-                        sequence: identity.sequence,
-                        command: COMMAND,
-                        requestFrame: requestCopy,
-                        responseFrame: responseCopy,
-                    });
+
+                    if (binding) {
+                        assertBinding(identity.uin);
+                    }
+
+                    let accepted: boolean;
+
+                    try {
+                        accepted = await verifier({
+                            uin,
+                            sequence: identity.sequence,
+                            command: COMMAND,
+                            requestFrame: requestCopy,
+                            responseFrame: responseCopy,
+                        });
+                    } finally {
+                        if (binding) {
+                            assertBinding(identity.uin);
+                        }
+                    }
+
                     assertActive();
                     return accepted === true;
                 } finally {
@@ -417,6 +527,11 @@ export async function referenceSendTextOnTransport(
             },
             consumeCandidate: (candidate, _context, identity) => {
                 assertActive();
+
+                if (binding) {
+                    assertBinding(identity.uin);
+                }
+
                 const outer = decodeServiceResponse(candidate, key);
 
                 try {
@@ -456,6 +571,10 @@ export async function referenceSendTextOnTransport(
                     }
                 } finally {
                     wipe(outer.body);
+
+                    if (binding) {
+                        assertBinding(identity.uin);
+                    }
                 }
             },
         });
@@ -467,6 +586,22 @@ export async function referenceSendTextOnTransport(
                 performance.now() >= started + timeout)
         ) {
             return { kind: 'failure', code: 'borrowed-transaction-failed', writeState: 'unknown' };
+        }
+
+        if (binding && result.kind === 'response') {
+            try {
+                if (actualUin === undefined) {
+                    throw new Error('invalid reference send binding');
+                }
+
+                assertBinding(actualUin);
+            } catch {
+                return {
+                    kind: 'failure',
+                    code: 'borrowed-transaction-failed',
+                    writeState: 'unknown',
+                };
+            }
         }
 
         return result;
@@ -483,5 +618,26 @@ export async function referenceSendTextOnTransport(
 
         wipe(requestFrame);
         owned.forEach(wipe);
+
+        if (begun && binding && privateSession) {
+            try {
+                privateSession.endReferenceSend(
+                    binding.token,
+                    binding.attempt,
+                    binding.lease,
+                    binding.run,
+                );
+            } catch {
+                // A different run may now own the slot. Preserve it and deliberately
+                // override any prior result or exception: after losing ownership the
+                // caller must treat a write as uncertain. This is capability-only.
+                // eslint-disable-next-line no-unsafe-finally -- uncertainty takes precedence over a prior result
+                return {
+                    kind: 'failure',
+                    code: 'borrowed-transaction-failed',
+                    writeState: 'unknown',
+                };
+            }
+        }
     }
 }

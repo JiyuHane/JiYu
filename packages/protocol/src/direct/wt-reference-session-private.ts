@@ -32,6 +32,8 @@ const set = Uint8Array.prototype.set;
 const typed = Object.getPrototypeOf(Uint8Array.prototype) as object;
 const byteLength = Object.getOwnPropertyDescriptor(typed, 'byteLength')!.get!;
 const buffer = Object.getOwnPropertyDescriptor(typed, 'buffer')!.get!;
+const resizable = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'resizable')?.get;
+const values = Uint8Array.prototype.values;
 
 function slot(token: object): Slot {
     const value = slots.get(token);
@@ -366,6 +368,53 @@ export function assertReferenceSendIdentity(
         value.transportUin !== identityUin ||
         value.confirmedUin !== confirmedUin
     ) {
+        throw new Error('invalid reference send binding');
+    }
+}
+
+/** Byte equality with the active slot only; it does not authenticate a key or peer. */
+export function assertReferenceSendKey(
+    token: object,
+    attempt: object,
+    lease: object,
+    run: object,
+    key: Uint8Array,
+): void {
+    const value = referenceSendSlot(token, attempt, lease, run);
+    let matches = false;
+
+    try {
+        if (
+            value.phase === 'active' &&
+            value.key &&
+            value.attempt === attempt &&
+            value.ownerLease === lease &&
+            value.sendRun === run &&
+            !isProxy(key) &&
+            isUint8Array(key)
+        ) {
+            values.call(key);
+            const storage = buffer.call(key) as ArrayBufferLike;
+
+            if (
+                !isSharedArrayBuffer(storage) &&
+                !(resizable && resizable.call(storage)) &&
+                byteLength.call(key) === 16
+            ) {
+                matches = true;
+
+                for (let index = 0; index < 16; index++) {
+                    if (key[index] !== value.key[index]) {
+                        matches = false;
+                    }
+                }
+            }
+        }
+    } catch {
+        matches = false;
+    }
+
+    if (!matches) {
         throw new Error('invalid reference send binding');
     }
 }

@@ -1608,11 +1608,21 @@ remain to be recovered and independently verified.
   slow paths differ and require separate verification.
 - `src/direct/sso-reference-send-text-flow.ts` composes these codecs with an
   injected borrowed transport and caller-supplied reserve and raw verification
-  policies. It is not wired to the production session or Bridge. As a local
-  policy it requires the transport identity UIN to equal the login UIN exactly;
-  unlike borrowed registration, a transport identity of `0` is not accepted for
-  another account. This comparison and a successful verifier do not authenticate
-  the peer or prove delivery. Outer SSO and inner message sequences remain
+  policies. It is not wired to the production session or Bridge. The public
+  `referenceSendTextOnTransport` requires the transport identity UIN to equal the
+  login UIN exactly; unlike borrowed registration, a transport identity of `0`
+  is not accepted for another account. A separate deep-importable composition
+  helper accepts the original transport identity alongside the confirmed account
+  only when an active local capability matches the exact attempt, lease, run,
+  account and D2 key bytes. It neither changes the raw transport identity nor
+  establishes the origin or authenticity of those values. That helper is not
+  yet called by the multiplex session. Its owner must handle failures and poison
+  the transport as appropriate; the helper does not do so or retry. The public
+  function now returns its asynchronous core's promise through a non-async wrapper:
+  normal direct construction still throws, but function-object reflection and use
+  as `Reflect.construct`'s `newTarget` can differ from the former async function.
+  This comparison and a successful verifier do not authenticate the peer or prove
+  delivery. Outer SSO and inner message sequences remain
   separate; the response's client sequence is not compared with the request's.
   A zero SSO code yields the decoded projection, not an asserted business
   success: `result` may be absent, zero or nonzero. The injected transport and
@@ -1620,6 +1630,12 @@ remain to be recovered and independently verified.
   they are trusted to handle it, not isolated from it. Its untrusted `errMsg` may
   contain private data; callers control its handling. The configured response
   limit is checked after SSO decoding, which can first inflate up to 16 MiB.
+  The internal helper snapshots its inputs before dynamically importing the
+  capability module, then rechecks cancellation and its elapsed deadline after
+  import. A non-settling import is not forcibly interrupted and retains those
+  owned copies until it settles. A loss of local run ownership during cleanup
+  yields an uncertain-write failure rather than a successful response or a claim
+  that no bytes were written; it does not release a different active run.
   Deadlines and cleanup do not force a non-settling transport or callback to
   finish; its owner remains responsible for exclusivity and poisoning on failure.
 - `src/msg-push/index.ts` also exposes `parseDirectMsgPushOrThrow` for callers
