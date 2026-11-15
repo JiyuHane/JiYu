@@ -2,6 +2,7 @@ export type {
     OneBot12ActionRequest,
     OneBot12ActionResponse,
     OneBot12Event,
+    OneBot12FriendListResponse,
     OneBot12JsonObject,
     OneBot12JsonValue,
     OneBot12LatestEventsParams,
@@ -14,6 +15,7 @@ export type {
     OneBot12PlatformEvent,
     OneBot12Self,
     OneBot12TextSegment,
+    OneBot12UserInfo,
 } from './types.js';
 export {
     ONEBOT12_JSON_MAX_BYTES,

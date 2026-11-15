@@ -60,6 +60,14 @@ QQ 数字标识须为规范十进制字符串且数值在 1–4294967295 范围�
 可通过现有客户端的泛型 `request('send_message', ...)` 发送；
 成功响应或本地编解码通过均不保证实际送达或客户端显示。
 
+## OneBot 12 好友列表类型
+
+`@harehane/sdk/v12` 导出 `OneBot12UserInfo` 和 `OneBot12FriendListResponse`，对应 [OneBot 12 `get_friend_list`](https://12.onebot.dev/interface/user/actions/#get_friend_list) 的数据结构。用户信息的 `user_id`、`user_name`、`user_displayname`、`user_remark` 均为字符串，并允许 JSON 扩展字段；响应的 `status: 'ok'` 分支包含用户信息数组，`status: 'failed'` 分支保留通用响应的 `data` 类型。
+
+现有客户端可通过 `request('get_friend_list', {})` 发出请求，返回的是通用 `OneBot12ActionResponse`。通用解析器仅检查响应信封和 JSON 值，并不检查好友列表中的各字段；调用方使用这些类型前应自行校验返回数据，不能把类型断言当作校验。类型导出本身不增加服务端能力：调用需要部署支持此动作的对应新版本服务端。
+
+当前 Jiyu 的好友列表来源于 v11 好友 roster，可能使用缓存并追加设备伪联系人；上游没有独立的 displayname，因此此服务端将 `user_displayname` 固定为空字符串。具体内容与实时性取决于服务端及上游状态。
+
 ## 快速开始
 
 ```ts

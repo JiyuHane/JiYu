@@ -50,6 +50,19 @@ export interface OneBot12ActionResponse extends OneBot12JsonObject {
     echo?: string;
 }
 
+/** User information returned by OneBot 12 user actions. */
+export interface OneBot12UserInfo extends OneBot12JsonObject {
+    user_id: string;
+    user_name: string;
+    user_displayname: string;
+    user_remark: string;
+}
+
+/** Describes the response shape; the generic response parser does not validate user fields. */
+export type OneBot12FriendListResponse =
+    | (OneBot12ActionResponse & { status: 'ok'; data: OneBot12UserInfo[] })
+    | (OneBot12ActionResponse & { status: 'failed' });
+
 export interface OneBot12EventBase extends OneBot12JsonObject {
     id: string;
     time: number;

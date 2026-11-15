@@ -33,6 +33,7 @@ const ACTIONS = [
     'get_status',
     'get_supported_actions',
     'get_self_info',
+    'get_friend_list',
     'set_group_name',
     'send_message',
     'delete_message',
@@ -334,6 +335,14 @@ export class V12Dispatcher {
             return this.getSelfInfo(echo);
         }
 
+        if (action === 'get_friend_list') {
+            if (Object.keys(params).length !== 0) {
+                return response(10004, 'unsupported parameter', null, echo);
+            }
+
+            return this.getFriendList(echo);
+        }
+
         if (action === 'set_group_name') {
             if (extraKeys(params, ['group_id', 'group_name'])) {
                 return response(10004, 'unsupported parameter', null, echo);
@@ -439,6 +448,121 @@ export class V12Dispatcher {
             );
         } catch {
             return response(20002, 'self info unavailable', null, echo);
+        }
+    }
+
+    private async getFriendList(echo?: string): Promise<V12Response> {
+        const invalid = () => response(20001, 'invalid friend list result', null, echo);
+        const unavailable = () => response(20002, 'friend list unavailable', null, echo);
+
+        try {
+            const result: unknown = await this.options.api.handle('get_friend_list', {});
+
+            // Await may inspect a thenable before these proxy and descriptor checks.
+            if (
+                isProxy(result) ||
+                typeof result !== 'object' ||
+                result === null ||
+                Array.isArray(result)
+            ) {
+                return invalid();
+            }
+
+            const status = Object.getOwnPropertyDescriptor(result, 'status');
+            const retcode = Object.getOwnPropertyDescriptor(result, 'retcode');
+
+            if (!status || !('value' in status) || !retcode || !('value' in retcode)) {
+                return invalid();
+            }
+
+            if (
+                status.value === 'failed' &&
+                Number.isSafeInteger(retcode.value) &&
+                retcode.value > 0
+            ) {
+                return retcode.value === 1400 || retcode.value === 1404 ? invalid() : unavailable();
+            }
+
+            if (status.value !== 'ok' || retcode.value !== 0) {
+                return invalid();
+            }
+
+            const data = Object.getOwnPropertyDescriptor(result, 'data');
+            const rows: unknown = data && 'value' in data ? data.value : undefined;
+
+            if (isProxy(rows) || !Array.isArray(rows)) {
+                return invalid();
+            }
+
+            const length = Object.getOwnPropertyDescriptor(rows, 'length');
+
+            if (
+                !length ||
+                !('value' in length) ||
+                typeof length.value !== 'number' ||
+                !Number.isSafeInteger(length.value) ||
+                length.value < 0 ||
+                length.value > 10000
+            ) {
+                return invalid();
+            }
+
+            const output: JsonObject[] = [];
+            let stringUnits = 0;
+
+            for (let i = 0; i < length.value; i += 1) {
+                const item = Object.getOwnPropertyDescriptor(rows, String(i));
+                const row: unknown = item && 'value' in item ? item.value : undefined;
+
+                if (isProxy(row) || typeof row !== 'object' || row === null || Array.isArray(row)) {
+                    return invalid();
+                }
+
+                const id = Object.getOwnPropertyDescriptor(row, 'user_id');
+                const nickname = Object.getOwnPropertyDescriptor(row, 'nickname');
+                const remark = Object.getOwnPropertyDescriptor(row, 'remark');
+
+                if (
+                    !id ||
+                    !('value' in id) ||
+                    typeof id.value !== 'number' ||
+                    !Number.isSafeInteger(id.value) ||
+                    id.value <= 0 ||
+                    !nickname ||
+                    !('value' in nickname) ||
+                    typeof nickname.value !== 'string' ||
+                    !remark ||
+                    !('value' in remark) ||
+                    typeof remark.value !== 'string' ||
+                    nickname.value.length > 1024 ||
+                    remark.value.length > 1024
+                ) {
+                    return invalid();
+                }
+
+                stringUnits += nickname.value.length + remark.value.length;
+
+                if (stringUnits > 262144) {
+                    return invalid();
+                }
+
+                // Define an own element directly; do not invoke inherited array setters.
+                Object.defineProperty(output, String(i), {
+                    value: {
+                        user_id: String(id.value),
+                        user_name: nickname.value,
+                        user_displayname: '',
+                        user_remark: remark.value,
+                    },
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                });
+            }
+
+            return response(0, '', output, echo);
+        } catch {
+            return unavailable();
         }
     }
 

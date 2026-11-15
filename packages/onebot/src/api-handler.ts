@@ -365,12 +365,17 @@ export class ApiHandler {
             // `OidbError.message` already carries the QQ server code, so it needs no
             // special casing. warn (not error) keeps the log file useful without
             // drowning it in expected client-side failures.
-            this.log.warn(
-                '%s failed: %s\n%s',
-                action,
-                error instanceof Error ? error.message : String(error),
-                error instanceof Error ? (error.stack ?? '') : '',
-            );
+            if (action === 'get_friend_list') {
+                this.log.warn('get_friend_list failed: [redacted]');
+            } else {
+                this.log.warn(
+                    '%s failed: %s\n%s',
+                    action,
+                    error instanceof Error ? error.message : String(error),
+                    error instanceof Error ? (error.stack ?? '') : '',
+                );
+            }
+
             const message = error instanceof Error ? error.message : String(error);
             const retcode =
                 error instanceof MessageElementValidationError
@@ -413,7 +418,7 @@ export class ApiHandler {
             outcome,
             reason,
             Date.now() - startedAt,
-            renderParamsVerbose(response),
+            action === 'get_friend_list' ? '[redacted]' : renderParamsVerbose(response),
         ]);
     }
 
@@ -431,10 +436,14 @@ export class ApiHandler {
             try {
                 cb({ action, params, response, ms });
             } catch (err) {
-                this.log.warn(
-                    'action observer error: %s',
-                    err instanceof Error ? err.message : String(err),
-                );
+                if (action === 'get_friend_list') {
+                    this.log.warn('get_friend_list action observer error: [redacted]');
+                } else {
+                    this.log.warn(
+                        'action observer error: %s',
+                        err instanceof Error ? err.message : String(err),
+                    );
+                }
             }
         }
     }

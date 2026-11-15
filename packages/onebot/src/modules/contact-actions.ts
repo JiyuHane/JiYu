@@ -63,11 +63,7 @@ export async function getFriendList(
             formatFriend(friend),
         );
     } catch (error) {
-        log.warn(
-            'friend list refresh failed: withProfile=%s error=%s',
-            withProfile,
-            error instanceof Error ? error.message : String(error),
-        );
+        log.warn('friend list refresh failed: withProfile=%s', withProfile);
 
         if (withProfile) {
             throw error;

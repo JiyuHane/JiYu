@@ -41,7 +41,7 @@ configuration writers and backup restores do not share a revision lock.
 ## Supported behavior and limits
 
 The core currently handles `get_version`, `get_status`, `get_supported_actions`,
-`get_self_info`, `send_message` for private and group text messages and group
+`get_self_info`, `get_friend_list`, `send_message` for private and group text messages and group
 mentions, `delete_message`, and `set_group_name`. The latter requires a canonical positive
 safe-integer group ID encoded as a string and a string group name, including an
 empty string; it forwards one request to the existing account-local v11 handler.
@@ -131,6 +131,39 @@ info (including v11 errors 1400 and 1404) and fixed 20002 for other well-formed
 v11 failures or exceptions; the current transport may replace these failure
 messages with its generic side-effect uncertainty warning even for this read-only
 action. This action is an incremental addition, not full v12 support.
+
+`get_friend_list` accepts no parameters and calls the account-local v11 handler
+once with `{}`. It maps each valid v11 numeric `user_id`, `nickname` and `remark`
+to string `user_id`, `user_name` and `user_remark`, respectively. It preserves
+order, duplicates and empty strings. `user_displayname` is always `''` because
+there is no independent display-name source; this does not mean the user left it
+unset. This is a v11 roster representation, not proof of real friendships or a
+complete, current list: the v11 action returns `[]` without a provider; its
+provider may fall back to cached entries on fetch failure and adds up to three
+virtual dataline devices when their IDs are not already present. Like
+`get_self_info`, the upstream representation may therefore include fallbacks.
+Although the action reports a read-only outcome, the v11 implementation may load
+or cache data or trigger network activity.
+
+The complete result is rejected with 20001 if its structure or any required
+field is invalid, or if it exceeds local limits of 10,000 entries, 1,024 UTF-16
+code units per nickname or remark, or 262,144 UTF-16 code units across both
+fields. These are local validation limits, not network response byte limits;
+the transport defaults to a separate 1 MiB output limit. JSON encoding, field
+names and echo also consume that budget: a successful core result can be replaced
+by transport error 20001, or the connection closed if the fallback with echo
+also exceeds the limit. The core reads only own data
+properties, rejects proxies and sparse arrays after the awaited result, and ignores
+unknown fields without accessing them. JavaScript's thenable assimilation during
+`await` may itself execute a `then` getter before those checks. Valid v11 failure
+codes 1400/1404 and malformed results map to fixed 20001; other valid failures
+and exceptions map to fixed 20002. No upstream error details are returned and no
+automatic retry is made. Existing transport failure-message rewriting may apply.
+The shared v11 handler redacts this action's terminal response and exception text
+in its own diagnostics, including for v11 callers, and the friend-list provider's
+fallback warning omits exception details. Action observers still receive the
+original response; other services, observers or debug streams may independently
+inspect or disclose it. These protections do not change v11 response contents.
 
 For group `send_message`, a v12 `mention` with `data.user_id` as a canonical
 positive decimal string in the UIN range 1 through 4294967295 maps to the
