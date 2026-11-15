@@ -1745,6 +1745,17 @@ remain to be recovered and independently verified.
   message; both are non-success but are not identical response classifications.
   These codecs do not perform registration, change online state, schedule
   heartbeats or validate server identity.
+- `src/direct/sso-unregister.ts` is an offline codec for the fixed LagrangeV2
+  [unregister request and response](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Services/System/SsoUnregisterService.cs#L9-L29).
+  Its request bytes are derived from the reference fields and generator source;
+  they have not been compared with a running reference serializer or QQ. The
+  response projection observes the top-level message field without classifying
+  success. It distinguishes an absent field from an explicitly empty string,
+  unlike the reference object's empty-string default. Unknown and wrong-wire
+  fields and invalid UTF-8 follow Proton's decoder behavior. The caller supplies
+  a local response-size limit; shared, resizable and detached buffers are rejected.
+  Clearing temporary bytes does not guarantee erasure of strings or other copies.
+  No transport, logout, server authentication or online-state transition is wired.
 - `src/direct/sso-reference-heartbeat-flow.ts` composes one borrowed protocol-12
   heartbeat using an owner-supplied account, credentials, signer and raw-response
   verifier. It validates local command, sequence and account binding and retains

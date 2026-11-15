@@ -1,4 +1,4 @@
-import type { pb, pb_optional, pb_repeated, uint_32, uint_64 } from '@snowluma/proton';
+import type { int_32, pb, pb_optional, pb_repeated, uint_32, uint_64 } from '@snowluma/proton';
 
 // Fixed public reference only; these declarations do not establish target compatibility.
 // https://github.com/LagrangeDev/Lagrange.Core/blob/fe789c4a23796fbc82fa09e70a9c44c8a5cf2948/Lagrange.Core/Internal/Packets/System/SsoInfoSync.cs
@@ -29,6 +29,17 @@ export interface SsoRegisterDevice {
     osVersion?: pb_optional<3, string>;
     brand?: pb_optional<4, string>;
     vendorOs?: pb_optional<5, string>;
+}
+
+// LagrangeV2 7011cdf reference-only unregister body; no registration fields are changed.
+export interface SsoUnregisterReferenceRequest {
+    regType?: pb_optional<1, int_32>;
+    device?: pb<2, SsoRegisterDevice>;
+    userTrigger?: pb_optional<3, int_32>;
+}
+
+export interface SsoUnregisterReferenceResponse {
+    message?: pb_optional<2, string>;
 }
 
 export interface SsoRegisterBusiness {
