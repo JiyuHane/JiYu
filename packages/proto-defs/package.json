@@ -32,6 +32,10 @@
       "types": "./src/direct-login.ts",
       "default": "./src/direct-login.ts"
     },
+    "./direct-send-message": {
+      "types": "./src/direct-send-message.ts",
+      "default": "./src/direct-send-message.ts"
+    },
     "./wt-qr": {
       "types": "./src/wt-qr.ts",
       "default": "./src/wt-qr.ts"

@@ -1571,6 +1571,20 @@ remain to be recovered and independently verified.
   still lose these business details when its borrowed attempt poisons the lease
   before the session resumes. The exact-result final-delivery deadline fence does
   not extend to legacy registration, heartbeat or alive outcomes.
+- `src/direct/send-message-response.ts` contains a reference-only projection of
+  `MessageSvc.PbSendMsg` response fields based on the LagrangeV2 schema and
+  sequence choice at commit `7011cdf87368cc0fb77273c1508e779a52328165`. Its
+  `int64` and `uint64` fields remain `bigint`, and it reports field presence
+  separately from the derived sequence fallback. Empty input yields absent
+  fields and a derived `0n`, not a successful receipt. Unknown fields are not
+  exposed; a known field using a different wire type may therefore appear absent.
+  Nonzero results are retained and Proton decoding errors propagate. This is not
+  strict validation of the response schema or UTF-8.
+  This isolated decoder is not connected to the existing Bridge sending path;
+  it authenticates neither the peer nor the response and proves no delivery.
+  The reference schema and local tests do not establish equivalent behavior of
+  the reference C# writer for negative `int64` values; its inspected fast and
+  slow paths differ and require separate verification.
 - `src/msg-push/index.ts` also exposes `parseDirectMsgPushOrThrow` for callers
   holding a decrypted push body and its metadata. It accepts no fabricated PID,
   requires a matching identity UIN, the known MsgPush command and a zero return
@@ -1603,7 +1617,10 @@ remain to be recovered and independently verified.
   message ID is not proof of a QQ history match. A decoder error can fail the
   whole batch, and downstream failures can prevent later dispatch. Neither this
   behavior nor synthetic tests prove that a real QQ server emits multiple entries
-  or that the resulting events were delivered.
+  or that the resulting events were delivered. Separately, the existing packet
+  pipeline's member-cache refresh is detached and best-effort: same-group events
+  can be coalesced, including a reentrant self-join that would otherwise request
+  a group-list refresh. It is not a drain or delivery barrier.
 - `src/direct/raw-multiplex-stream.ts` adapts a caller-supplied, already-established
   byte stream to that client without opening or connecting a socket. It requires
   exclusive ownership and uses the shared direct-socket ownership registry for
