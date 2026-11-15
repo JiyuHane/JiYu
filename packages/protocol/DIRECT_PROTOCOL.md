@@ -1758,10 +1758,15 @@ remain to be recovered and independently verified.
   No transport, logout, server authentication or online-state transition is wired.
 - `src/direct/sso-reference-unregister-flow.ts` composes that codec with one
   caller-supplied borrowed transport, opaque reserve builder and raw-frame verifier.
-  Its local policy requires a canonical positive UIN at most `0xffffffff` that
-  exactly matches the transport's self-reported UIN. The WT capability path where
-  raw UIN is `0` is not connected. Matching identity, passing a caller verifier or
-  obtaining a response does not authenticate a peer or establish a remote logout.
+  Its standalone entry requires a canonical positive UIN at most `0xffffffff`
+  that exactly matches the transport's self-reported UIN. A separate deep-internal
+  capability entry can bind a staged raw UIN of `0` to a confirmed account and key;
+  it shares the send operation's single-flight slot and rejects reused runs. This
+  entry is tested with manually staged synthetic capability state and is not connected
+  to the WT session or multiplexer. Its options are shallow-snapshotted before the
+  transport getter; nested records and bytes are inspected afterwards. Matching
+  identity, passing a caller verifier or obtaining a response does not authenticate
+  a peer or establish a remote logout.
   After outer and inner SSO parsing (including decompression), nonzero SSO retcodes
   are returned without decoding protobuf; zero produces only an absent/present
   message observation. The protobuf size cap applies after SSO decoding, not to

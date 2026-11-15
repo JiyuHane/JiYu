@@ -39,6 +39,30 @@ const resizable = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'resiza
 const values = Uint8Array.prototype.values;
 const fill = Uint8Array.prototype.fill;
 const aborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted')!.get!;
+type ReferenceUnregisterCapability = {
+    token: object;
+    attempt: object;
+    lease: Sso12RawTransport;
+    run: object;
+};
+const internalHolders = new WeakMap<object, { capability: ReferenceUnregisterCapability }>();
+
+/**
+ * Internal coordination only, sharing the send single-flight slot. The outer options
+ * own-data record is snapshotted before the transport getter; nested records and bytes
+ * are snapshotted afterwards. Without a signal, revocation alone may not prevent that
+ * getter from running. Neither capability nor observation authenticates a peer or
+ * establishes logout. The owner must poison on failure; cancellation does not stop
+ * external callbacks. Reentrant callers compete for the slot without FIFO guarantees.
+ */
+export function referenceUnregisterWithCapability(
+    capability: ReferenceUnregisterCapability,
+    options: SsoReferenceUnregisterOptions,
+): Promise<SsoReferenceUnregisterResult> {
+    const holder = {} as Sso12RawTransport;
+    internalHolders.set(holder, { capability });
+    return referenceUnregisterOnTransport(holder, options);
+}
 
 function wipe(value: Uint8Array | undefined): void {
     if (value) {
@@ -87,6 +111,26 @@ function record(value: unknown, allowed: readonly string[]): Record<string, unkn
     return result;
 }
 
+function preflightSignal(value: unknown): boolean {
+    if (
+        isProxy(value) ||
+        typeof value !== 'object' ||
+        value === null ||
+        Object.getPrototypeOf(value) !== AbortSignal.prototype ||
+        Object.hasOwn(value, 'aborted') ||
+        Object.hasOwn(value, 'addEventListener') ||
+        Object.hasOwn(value, 'removeEventListener')
+    ) {
+        throw new TypeError('invalid signal');
+    }
+
+    try {
+        return aborted.call(value) as boolean;
+    } catch {
+        throw new TypeError('invalid signal');
+    }
+}
+
 function copyBytes(value: unknown, max: number): Uint8Array {
     if (isProxy(value) || !isUint8Array(value)) {
         throw new TypeError('invalid bytes');
@@ -130,8 +174,8 @@ function nonemptyText(value: unknown, max: number): value is string {
  * opaque reserved bytes. The verifier is local policy, not proof of signature,
  * peer authentication or an actual write. Local policy requires login.uin to be a
  * canonical positive decimal at most 0xffffffff and to exactly match the transport's
- * self-reported UIN. This match does not authenticate a peer; the WT raw UIN-zero
- * capability is not wired here. An observed message is not business success or online
+ * self-reported UIN. This match does not authenticate a peer; the standalone entry
+ * does not accept the internal WT raw UIN-zero binding. An observed message is not business success or online
  * state. A never-settling
  * transport can leave this helper pending indefinitely; deadlines and abort do not
  * forcibly stop transport or callback effects. An owner broker may bound its own
@@ -148,6 +192,46 @@ export async function referenceUnregisterOnTransport(
     options: SsoReferenceUnregisterOptions,
 ): Promise<SsoReferenceUnregisterResult> {
     const started = performance.now();
+    const entry = internalHolders.get(transport);
+
+    if (entry) {
+        internalHolders.delete(transport);
+    }
+
+    let binding: ReferenceUnregisterCapability | undefined;
+    let capabilityInput: Record<string, unknown> | undefined;
+
+    if (entry) {
+        const input = record(entry.capability, ['token', 'attempt', 'lease', 'run']);
+        binding = {
+            token: input.token as object,
+            attempt: input.attempt as object,
+            lease: input.lease as Sso12RawTransport,
+            run: input.run as object,
+        };
+        transport = binding.lease;
+        const preflight = record(options, [
+            'login',
+            'profile',
+            'uid',
+            'timeoutMs',
+            'maxResponseBodyBytes',
+            'signal',
+            'buildReserved',
+            'verifyRaw',
+        ]);
+
+        if (preflight.signal !== undefined) {
+            if (preflightSignal(preflight.signal)) {
+                return { kind: 'failure', code: 'raw-cancelled', writeState: 'not-written' };
+            }
+        }
+
+        // Only the top-level data record is captured here. Nested records and
+        // bytes are inspected after the borrowed transport getter returns.
+        capabilityInput = preflight;
+    }
+
     let method: Sso12RawTransport['transactRaw'];
 
     try {
@@ -164,8 +248,14 @@ export async function referenceUnregisterOnTransport(
         throw new TypeError('invalid borrowed transport');
     }
 
+    if (capabilityInput?.signal !== undefined && preflightSignal(capabilityInput.signal)) {
+        return { kind: 'failure', code: 'raw-cancelled', writeState: 'not-written' };
+    }
+
+    let beforeTransport: (() => void) | undefined;
     const stable: Sso12RawTransport = {
         transactRaw<C, T>(rawOptions: Sso12RawOptions<C, T>): Promise<Sso12RawResult<T>> {
+            beforeTransport?.();
             return Reflect.apply(method, transport, [rawOptions]) as Promise<Sso12RawResult<T>>;
         },
     };
@@ -175,6 +265,12 @@ export async function referenceUnregisterOnTransport(
     let abortListener: ReturnType<typeof addAbortListener> | undefined;
     let active = true;
     let timeout = 0;
+    let privateSession: typeof import('./wt-reference-session-private') | undefined;
+    let begun = false;
+    let actualUin: string | undefined;
+    let responseReady = false;
+    let finalBinding: (() => void) | undefined;
+    let capabilityKey: Uint8Array | undefined;
     const controller = new AbortController();
     const abort = (): void => controller.abort();
 
@@ -187,19 +283,26 @@ export async function referenceUnregisterOnTransport(
         ) {
             throw new Error('transaction stopped');
         }
+
+        // A clock callback can abort while returning an in-range timestamp.
+        if (binding && (!active || controller.signal.aborted || (signal && aborted.call(signal)))) {
+            throw new Error('transaction stopped');
+        }
     };
 
     try {
-        const input = record(options, [
-            'login',
-            'profile',
-            'uid',
-            'timeoutMs',
-            'maxResponseBodyBytes',
-            'signal',
-            'buildReserved',
-            'verifyRaw',
-        ]);
+        const input =
+            capabilityInput ??
+            record(options, [
+                'login',
+                'profile',
+                'uid',
+                'timeoutMs',
+                'maxResponseBodyBytes',
+                'signal',
+                'buildReserved',
+                'verifyRaw',
+            ]);
         const login = record(input.login, ['status', 'uin', 'tickets', 'uidProjection']);
         const tickets = record(login.tickets, ['d2', 'd2Key', 'a1', 'a2']);
         const profile = record(input.profile, ['subAppId', 'guid', 'version']);
@@ -279,7 +382,7 @@ export async function referenceUnregisterOnTransport(
             }
         }
 
-        const remaining = Math.max(1, Math.ceil(started + timeout - performance.now()));
+        let remaining = Math.max(1, Math.ceil(started + timeout - performance.now()));
 
         if (performance.now() >= started + timeout) {
             controller.abort();
@@ -290,6 +393,94 @@ export async function referenceUnregisterOnTransport(
                 kind: 'failure',
                 code: signal && aborted.call(signal) ? 'raw-cancelled' : 'raw-timeout',
                 writeState: 'not-written',
+            };
+        }
+
+        if (binding) {
+            privateSession = await import('./wt-reference-session-private');
+            const beforeBegin = performance.now();
+
+            // Recheck after the clock: it may synchronously abort the captured signal.
+            if (controller.signal.aborted || (signal && aborted.call(signal))) {
+                return { kind: 'failure', code: 'raw-cancelled', writeState: 'not-written' };
+            }
+
+            if (beforeBegin >= started + timeout) {
+                return { kind: 'failure', code: 'raw-timeout', writeState: 'not-written' };
+            }
+
+            privateSession.beginReferenceSend(
+                binding.token,
+                binding.attempt,
+                binding.lease,
+                binding.run,
+            );
+            begun = true;
+            capabilityKey = key;
+            const now = performance.now();
+            remaining = Math.max(1, Math.ceil(started + timeout - now));
+
+            if (controller.signal.aborted || (signal && aborted.call(signal))) {
+                return { kind: 'failure', code: 'raw-cancelled', writeState: 'not-written' };
+            }
+
+            if (now >= started + timeout) {
+                return { kind: 'failure', code: 'raw-timeout', writeState: 'not-written' };
+            }
+
+            privateSession.assertReferenceSendKey(
+                binding.token,
+                binding.attempt,
+                binding.lease,
+                binding.run,
+                key,
+            );
+        }
+
+        const assertBinding = (identityUin: string): void => {
+            if (binding && privateSession) {
+                privateSession.assertReferenceSendIdentity(
+                    binding.token,
+                    binding.attempt,
+                    binding.lease,
+                    binding.run,
+                    identityUin,
+                    uin,
+                );
+                privateSession.assertReferenceSendKey(
+                    binding.token,
+                    binding.attempt,
+                    binding.lease,
+                    binding.run,
+                    key,
+                );
+            } else if (identityUin !== uin) {
+                throw new Error('invalid transaction identity');
+            }
+        };
+
+        if (binding && privateSession) {
+            beforeTransport = () => {
+                assertActive();
+                privateSession!.assertReferenceSendKey(
+                    binding!.token,
+                    binding!.attempt,
+                    binding!.lease,
+                    binding!.run,
+                    key,
+                );
+
+                if (controller.signal.aborted || (signal && aborted.call(signal))) {
+                    throw new Error('transaction stopped');
+                }
+            };
+
+            finalBinding = () => {
+                if (actualUin === undefined) {
+                    throw new Error('invalid reference unregister binding');
+                }
+
+                assertBinding(actualUin);
             };
         }
 
@@ -312,28 +503,58 @@ export async function referenceUnregisterOnTransport(
                 try {
                     assertActive();
 
-                    if (identity.uin !== uin) {
-                        throw new Error('invalid transaction identity');
+                    assertBinding(identity.uin);
+                    actualUin = identity.uin;
+                    body = encodeSsoUnregisterReference();
+
+                    if (binding) {
+                        assertBinding(identity.uin);
                     }
 
-                    body = encodeSsoUnregisterReference();
                     owned.push(body);
                     signerInput = Uint8Array.from(body);
                     owned.push(signerInput);
-                    const signed = await signer({
-                        uin,
-                        uid,
-                        sequence: identity.sequence,
-                        command: SSO_UNREGISTER_REFERENCE_COMMAND,
-                        body: signerInput,
-                    });
+
+                    if (binding) {
+                        assertActive();
+                        assertBinding(identity.uin);
+                    }
+
+                    let signed: Uint8Array;
+
+                    try {
+                        signed = await signer({
+                            uin,
+                            uid,
+                            sequence: identity.sequence,
+                            command: SSO_UNREGISTER_REFERENCE_COMMAND,
+                            body: signerInput,
+                        });
+                    } finally {
+                        if (binding) {
+                            assertBinding(identity.uin);
+                            assertActive();
+                            assertBinding(identity.uin);
+                        }
+                    }
+
                     assertActive();
+
+                    if (binding) {
+                        assertBinding(identity.uin);
+                    }
+
                     metadata = copyBytes(signed, MAX_FIELD);
                     const localGuid = copy(guid),
                         localKey = copy(key),
                         localD2 = copy(d2),
                         localA2 = copy(a2);
                     assertActive();
+
+                    if (binding) {
+                        assertBinding(identity.uin);
+                    }
+
                     inner = encodeSso12Request({
                         sequence: identity.sequence | 0,
                         subAppId: subAppId as number,
@@ -345,6 +566,11 @@ export async function referenceUnregisterOnTransport(
                         body: copy(body),
                     });
                     assertActive();
+
+                    if (binding) {
+                        assertBinding(identity.uin);
+                    }
+
                     requestFrame = encodeServiceRequest({
                         protocol: 12,
                         uin,
@@ -353,6 +579,11 @@ export async function referenceUnregisterOnTransport(
                         body: copy(inner),
                     });
                     assertActive();
+
+                    if (binding) {
+                        assertBinding(identity.uin);
+                    }
+
                     return { frame: requestFrame, context: null };
                 } finally {
                     [body, signerInput, metadata, inner, ...local].forEach(wipe);
@@ -368,14 +599,36 @@ export async function referenceUnregisterOnTransport(
                     owned.push(requestCopy);
                     responseCopy = Uint8Array.from(candidate);
                     owned.push(responseCopy);
-                    const accepted = await verifier({
-                        uin,
-                        sequence: identity.sequence,
-                        command: SSO_UNREGISTER_REFERENCE_COMMAND,
-                        requestFrame: requestCopy,
-                        responseFrame: responseCopy,
-                    });
+
+                    if (binding) {
+                        assertActive();
+                        assertBinding(identity.uin);
+                    }
+
+                    let accepted: boolean;
+
+                    try {
+                        accepted = await verifier({
+                            uin,
+                            sequence: identity.sequence,
+                            command: SSO_UNREGISTER_REFERENCE_COMMAND,
+                            requestFrame: requestCopy,
+                            responseFrame: responseCopy,
+                        });
+                    } finally {
+                        if (binding) {
+                            assertBinding(identity.uin);
+                            assertActive();
+                            assertBinding(identity.uin);
+                        }
+                    }
+
                     assertActive();
+
+                    if (binding) {
+                        assertBinding(identity.uin);
+                    }
+
                     return accepted === true;
                 } finally {
                     wipe(requestCopy);
@@ -384,6 +637,11 @@ export async function referenceUnregisterOnTransport(
             },
             consumeCandidate: (candidate, _context, identity) => {
                 assertActive();
+
+                if (binding) {
+                    assertBinding(identity.uin);
+                }
+
                 const outer = decodeServiceResponse(candidate, key);
 
                 try {
@@ -421,9 +679,16 @@ export async function referenceUnregisterOnTransport(
                     }
                 } finally {
                     wipe(outer.body);
+
+                    if (binding) {
+                        assertActive();
+                        assertBinding(identity.uin);
+                    }
                 }
             },
         });
+
+        responseReady = !!binding && result.kind === 'response';
 
         if (
             result.kind === 'response' &&
@@ -447,6 +712,54 @@ export async function referenceUnregisterOnTransport(
         }
 
         wipe(requestFrame);
-        owned.forEach(wipe);
+        owned.forEach((bytes) => {
+            if (bytes !== capabilityKey) {
+                wipe(bytes);
+            }
+        });
+
+        if (begun && binding && privateSession) {
+            let finalFailed = false;
+
+            if (responseReady) {
+                try {
+                    if (
+                        controller.signal.aborted ||
+                        (signal && aborted.call(signal)) ||
+                        performance.now() >= started + timeout ||
+                        controller.signal.aborted ||
+                        (signal && aborted.call(signal))
+                    ) {
+                        finalFailed = true;
+                    } else {
+                        finalBinding!();
+                    }
+                } catch {
+                    finalFailed = true;
+                }
+            }
+
+            wipe(capabilityKey);
+
+            try {
+                privateSession.endReferenceSend(
+                    binding.token,
+                    binding.attempt,
+                    binding.lease,
+                    binding.run,
+                );
+            } catch {
+                finalFailed = true;
+            }
+
+            if (finalFailed) {
+                // eslint-disable-next-line no-unsafe-finally -- a stale response must not escape
+                return {
+                    kind: 'failure',
+                    code: 'borrowed-transaction-failed',
+                    writeState: 'unknown',
+                };
+            }
+        }
     }
 }
