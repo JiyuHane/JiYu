@@ -1448,8 +1448,12 @@ remain to be recovered and independently verified.
   reference envelope account, command and local sequence before classification.
   It accepts a caller-provided ticket object and cannot prove that its ticket
   bytes originated from the stated UIN; the caller must maintain that association.
-  SSO header version and registration build version remain distinct. It closes
-  the claimed socket and does not retry, mark the account online, authenticate
+  The verifier receives a copy of the complete request frame, whose service header
+  can contain the D2 ticket. The injected transport likewise sees the wire frame.
+  Both belong to the caller's trust boundary; wiping the provided copy cannot
+  prevent them from retaining data. SSO header version and registration build
+  version remain distinct. It closes the claimed socket and does not retry,
+  mark the account online, authenticate
   the server or establish compatibility with the selected QQ build. Callback
   byte snapshots are wiped best-effort after completion or cancellation; the
   callback may retain copies or continue its own side effects. A synthetic
@@ -1604,7 +1608,9 @@ remain to be recovered and independently verified.
   the peer or prove delivery. Outer SSO and inner message sequences remain
   separate; the response's client sequence is not compared with the request's.
   A zero SSO code yields the decoded projection, not an asserted business
-  success: `result` may be absent, zero or nonzero. Its untrusted `errMsg` may
+  success: `result` may be absent, zero or nonzero. The injected transport and
+  raw-frame verifier see a request frame whose service header can contain D2;
+  they are trusted to handle it, not isolated from it. Its untrusted `errMsg` may
   contain private data; callers control its handling. The configured response
   limit is checked after SSO decoding, which can first inflate up to 16 MiB.
   Deadlines and cleanup do not force a non-settling transport or callback to

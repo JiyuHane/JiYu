@@ -587,6 +587,259 @@ describe('synthetic reference send-text over in-memory multiplex transport', () 
         }
     });
 
+    it('times out a pending signer without a late fake mux write', async () => {
+        const entered = deferred<void>();
+        const signerGate = deferred<Uint8Array>();
+        const builderSettled = deferred<'fulfilled' | 'rejected'>();
+        const options = config();
+        options.timeoutMs = 250;
+        const tickets = options.login.tickets;
+        const original = [tickets.d2, tickets.d2Key, tickets.a1, tickets.a2, options.profile.guid];
+        const snapshots = original.map((bytes) => Uint8Array.from(bytes));
+        let signerBody!: Uint8Array;
+        options.buildReserved = vi.fn(({ body }) => {
+            signerBody = body;
+            entered.resolve();
+            return signerGate.promise;
+        });
+        options.verifyRaw = vi.fn(options.verifyRaw);
+        const f = fixture();
+        let builder: Promise<unknown> | undefined;
+        const transport: Sso12RawTransport = {
+            transactRaw<C, T>(raw: Sso12RawOptions<C, T>) {
+                return f.transport.transactRaw({
+                    ...raw,
+                    buildRequest: (identity) => {
+                        const operation = Promise.resolve()
+                            .then(() => raw.buildRequest(identity))
+                            .then(
+                                (value) => {
+                                    builderSettled.resolve('fulfilled');
+                                    return value;
+                                },
+                                (error: unknown) => {
+                                    builderSettled.resolve('rejected');
+                                    throw error;
+                                },
+                            );
+                        builder = operation;
+                        void operation.then(
+                            () => {},
+                            () => {},
+                        );
+                        return operation;
+                    },
+                });
+            },
+        };
+        const timers: Array<ReturnType<typeof setTimeout>> = [];
+        const bounded = <T>(promise: Promise<T>): Promise<T> =>
+            Promise.race([
+                promise,
+                new Promise<T>((_resolve, reject) => {
+                    timers.push(setTimeout(() => reject(new Error('fixture watchdog')), 3000));
+                }),
+            ]);
+        let pending: ReturnType<typeof referenceSendTextOnTransport> | undefined;
+        let failed = false;
+        let failure: unknown;
+
+        try {
+            pending = referenceSendTextOnTransport(transport, options);
+            void pending.then(
+                () => {},
+                () => {},
+            );
+            await bounded(entered.promise);
+            expect(await bounded(pending)).toEqual({
+                kind: 'failure',
+                code: 'borrowed-transaction-failed',
+                writeState: 'not-written',
+            });
+            expect(await bounded(f.client.whenClosed)).toEqual({
+                kind: 'local',
+                code: 'raw-timeout',
+            });
+            expect(signerBody.length).toBeGreaterThan(0);
+            expect(signerBody.every((byte) => byte === 0)).toBe(true);
+            original.forEach((bytes, index) => expect(bytes).toEqual(snapshots[index]));
+            expect(f.writes).toHaveLength(0);
+            expect(options.verifyRaw).not.toHaveBeenCalled();
+            expect(Object.values(f.owner).every((fn) => fn.mock.calls.length === 0)).toBe(true);
+            signerGate.resolve(Uint8Array.of(8));
+            expect(await bounded(builderSettled.promise)).toBe('rejected');
+            await new Promise<void>((done) => setImmediate(done));
+            expect(f.writes).toHaveLength(0);
+            expect(options.verifyRaw).not.toHaveBeenCalled();
+            original.forEach((bytes, index) => expect(bytes).toEqual(snapshots[index]));
+        } catch (error) {
+            failed = true;
+            failure = error;
+        } finally {
+            signerGate.resolve(Uint8Array.of(8));
+            f.client.close();
+            const work: Promise<unknown>[] = [];
+
+            if (pending) {
+                work.push(pending);
+            }
+
+            if (builder) {
+                work.push(builder, builderSettled.promise);
+            }
+
+            try {
+                await bounded(Promise.allSettled(work));
+            } catch (error) {
+                if (!failed) {
+                    failed = true;
+                    failure = error;
+                } else {
+                    console.error('fixture cleanup failed after test failure', error);
+                }
+            } finally {
+                timers.forEach(clearTimeout);
+            }
+        }
+
+        if (failed) {
+            throw failure;
+        }
+    }, 10000);
+
+    it('waits for a noncooperative borrowed owner after cancellation and deadline', async () => {
+        const entered = deferred<void>();
+        const signerGate = deferred<Uint8Array>();
+        const ownerGate = deferred<void>();
+        const builderSettled = deferred<'fulfilled' | 'rejected'>();
+        const abort = new AbortController();
+        const options = config();
+        options.timeoutMs = 80;
+        options.signal = abort.signal;
+        const tickets = options.login.tickets;
+        const original = [tickets.d2, tickets.d2Key, tickets.a1, tickets.a2, options.profile.guid];
+        const snapshots = original.map((bytes) => Uint8Array.from(bytes));
+        let signerBody!: Uint8Array;
+        let observedSignal: AbortSignal | undefined;
+        let observedTimeout: number | undefined;
+        const write = vi.fn();
+        options.verifyRaw = vi.fn(options.verifyRaw);
+        options.buildReserved = vi.fn(({ body }) => {
+            signerBody = body;
+            entered.resolve();
+            return signerGate.promise;
+        });
+        let builder: Promise<unknown> | undefined;
+        const transport: Sso12RawTransport = {
+            transactRaw<C, T>(raw: Sso12RawOptions<C, T>) {
+                observedSignal = raw.signal;
+                observedTimeout = raw.timeoutMs;
+                const operation = Promise.resolve()
+                    .then(() => raw.buildRequest({ uin: '123', sequence: outerSequence }))
+                    .then(
+                        () => {
+                            write();
+                            builderSettled.resolve('fulfilled');
+                        },
+                        (error: unknown) => {
+                            builderSettled.resolve('rejected');
+                            throw error;
+                        },
+                    );
+                builder = operation;
+                void operation.then(
+                    () => {},
+                    () => {},
+                );
+                return ownerGate.promise.then(() => ({
+                    kind: 'failure' as const,
+                    code: 'fake-owner-release',
+                    writeState: 'unknown' as const,
+                }));
+            },
+        };
+        const timers: Array<ReturnType<typeof setTimeout>> = [];
+        const bounded = <T>(promise: Promise<T>): Promise<T> =>
+            Promise.race([
+                promise,
+                new Promise<T>((_resolve, reject) => {
+                    timers.push(setTimeout(() => reject(new Error('fixture watchdog')), 3000));
+                }),
+            ]);
+        let settled = false;
+        let failed = false;
+        let failure: unknown;
+        let pending: ReturnType<typeof referenceSendTextOnTransport> | undefined;
+
+        try {
+            pending = referenceSendTextOnTransport(transport, options);
+            void pending.then(
+                () => {
+                    settled = true;
+                },
+                () => {
+                    settled = true;
+                },
+            );
+            await bounded(entered.promise);
+            expect(observedTimeout).toBeGreaterThan(0);
+            expect(observedTimeout).toBeLessThanOrEqual(options.timeoutMs);
+            abort.abort();
+            await bounded(
+                new Promise<void>((resolve) => {
+                    timers.push(setTimeout(resolve, 160));
+                }),
+            );
+            expect(settled).toBe(false);
+            expect(observedSignal?.aborted).toBe(true);
+            ownerGate.resolve();
+            expect(await bounded(pending)).toEqual({
+                kind: 'failure',
+                code: 'borrowed-transaction-failed',
+                writeState: 'unknown',
+            });
+            expect(signerBody.length).toBeGreaterThan(0);
+            expect(signerBody.every((byte) => byte === 0)).toBe(true);
+            signerGate.resolve(Uint8Array.of(8));
+            expect(await bounded(builderSettled.promise)).toBe('rejected');
+            expect(write).not.toHaveBeenCalled();
+            expect(options.verifyRaw).not.toHaveBeenCalled();
+            original.forEach((bytes, index) => expect(bytes).toEqual(snapshots[index]));
+        } catch (error) {
+            failed = true;
+            failure = error;
+        } finally {
+            ownerGate.resolve();
+            signerGate.resolve(Uint8Array.of(8));
+            const work: Promise<unknown>[] = [];
+
+            if (pending) {
+                work.push(pending);
+            }
+
+            if (builder) {
+                work.push(builder, builderSettled.promise);
+            }
+
+            try {
+                await bounded(Promise.allSettled(work));
+            } catch (error) {
+                if (!failed) {
+                    failed = true;
+                    failure = error;
+                } else {
+                    console.error('fixture cleanup failed after test failure', error);
+                }
+            } finally {
+                timers.forEach(clearTimeout);
+            }
+        }
+
+        if (failed) {
+            throw failure;
+        }
+    }, 10000);
+
     it('preserves unknown write state after a fake write failure without retry', async () => {
         const f = fixture({
             write: () => {
@@ -599,6 +852,46 @@ describe('synthetic reference send-text over in-memory multiplex transport', () 
             expect(result).toMatchObject({ kind: 'failure', writeState: 'unknown' });
             expect(f.calls).toBe(1);
             expect(f.writes).toHaveLength(1);
+        } finally {
+            f.client.close();
+        }
+    });
+
+    it('reads the transport getter once before snapshot and preserves its receiver', async () => {
+        const f = fixture();
+        const options = config();
+        options.buildReserved = vi.fn(options.buildReserved);
+        options.verifyRaw = vi.fn(options.verifyRaw);
+        let reads = 0;
+        let receiver: Sso12RawTransport | undefined;
+        const transport: Sso12RawTransport = {
+            get transactRaw() {
+                reads++;
+                Object.defineProperty(options.login, 'uin', {
+                    value: '456',
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                });
+
+                return function <C, T>(this: Sso12RawTransport, raw: Sso12RawOptions<C, T>) {
+                    receiver = this;
+                    return f.transport.transactRaw(raw);
+                };
+            },
+        };
+
+        try {
+            expect(await referenceSendTextOnTransport(transport, options)).toMatchObject({
+                kind: 'failure',
+            });
+            expect(reads).toBe(1);
+            expect(receiver).toBe(transport);
+            expect(options.login.uin).toBe('456');
+            expect(f.calls).toBe(1);
+            expect(options.buildReserved).not.toHaveBeenCalled();
+            expect(options.verifyRaw).not.toHaveBeenCalled();
+            expect(f.writes).toHaveLength(0);
         } finally {
             f.client.close();
         }
