@@ -1571,6 +1571,16 @@ remain to be recovered and independently verified.
   still lose these business details when its borrowed attempt poisons the lease
   before the session resumes. The exact-result final-delivery deadline fence does
   not extend to legacy registration, heartbeat or alive outcomes.
+- `src/direct/send-message-request.ts` builds a reference-only, single-text
+  `MessageSvc.PbSendMsg` request body from an explicit route, text, client
+  sequence and random value. Its schema and default-field choices are inferred
+  from LagrangeV2 commit `7011cdf87368cc0fb77273c1508e779a52328165`, not from
+  captured QQ traffic or an execution of that reference implementation. Input
+  ranges and UTF-8 limits are local policy, not proven server constraints. The
+  request schema is for encoding; decoding it does not reliably distinguish an
+  absent required scalar from its default. The returned bytes use a dedicated
+  backing buffer, but the temporary Proton encoding is not securely erased. The
+  function neither signs nor sends the result and is not connected to Bridge.
 - `src/direct/send-message-response.ts` contains a reference-only projection of
   `MessageSvc.PbSendMsg` response fields based on the LagrangeV2 schema and
   sequence choice at commit `7011cdf87368cc0fb77273c1508e779a52328165`. Its
@@ -1609,7 +1619,14 @@ remain to be recovered and independently verified.
   identity services and other existing diagnostics may still record identifiers;
   callers must also handle thrown errors and logging policy appropriately. This
   parser itself neither dispatches events nor connects the direct session to
-  Bridge, OneBot or a real QQ peer. The group-recall decoder preserves the first
+  Bridge, OneBot or a real QQ peer. A caller that has already parsed events may
+  pass them to `IncomingPacketPipeline.processDecodedDirectEvents` with only
+  command and sequence trace metadata, without inventing a PID. The caller must
+  bind the correct account and manage body and event lifetimes; this entry is not
+  connected to a production direct session. It does not authenticate the source,
+  enforce strict mixed-event ordering, or await asynchronous subscribers and
+  detached roster refreshes. Existing pipeline logs may contain event data.
+  The group-recall decoder preserves the first
   entry's existing behavior and then emits subsequent entries with nonzero
   sequence numbers in list order. Additional entries with an absent or zero
   sequence are skipped; the decoder attempts a single count-only warning. The

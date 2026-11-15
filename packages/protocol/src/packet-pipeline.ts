@@ -29,6 +29,7 @@ type GroupMemberIdentityEvent = Extract<
 >;
 
 export type CmdParser = (pkt: PacketInfo, identity: IdentityService) => QQEventVariant[];
+export type PacketTrace = Pick<PacketInfo, 'serviceCmd' | 'seqId'>;
 
 class EnrichedDispatchError extends Error {
     constructor(readonly originalError: unknown) {
@@ -92,9 +93,33 @@ export class IncomingPacketPipeline {
         return this.processWithHandlers(pkt, [() => [...events]]);
     }
 
-    private processWithHandlers(
-        pkt: PacketInfo,
-        handlers: readonly CmdParser[] | undefined,
+    /**
+     * Dispatch already synchronously parsed events using only packet trace metadata.
+     * The caller owns the source's trust, identity/account binding to this pipeline,
+     * borrowed body and event lifetimes, and any parsing side effects. This method
+     * neither authenticates the source nor limits input sizes.
+     *
+     * Trace fields are copied without validation; their getters may run or throw
+     * before pipeline processing starts. The event array is copied, not its event
+     * objects, and pipeline enrichment can mutate them. Existing pipeline logs
+     * may include identifiers, event content or errors.
+     *
+     * The promise waits for the pipeline's existing enrichment tasks, not async
+     * event-bus subscribers or detached roster refreshes. Once processing starts,
+     * errors follow the same handling rules as process(); a resolved promise does
+     * not prove delivery or successful processing.
+     */
+    processDecodedDirectEvents(
+        trace: PacketTrace,
+        events: readonly QQEventVariant[],
+    ): Promise<void> {
+        const stableTrace = { serviceCmd: trace.serviceCmd, seqId: trace.seqId };
+        return this.processWithHandlers(stableTrace, [() => [...events]]);
+    }
+
+    private processWithHandlers<P extends PacketTrace>(
+        pkt: P,
+        handlers: readonly ((pkt: P, identity: IdentityService) => QQEventVariant[])[] | undefined,
     ): Promise<void> {
         const startedAt = Date.now();
 
@@ -295,7 +320,7 @@ export class IncomingPacketPipeline {
     }
 
     private traceEnrichmentStarted(
-        pkt: PacketInfo,
+        pkt: PacketTrace,
         event: QQEventVariant,
         enrichment: 'identity_refresh' | 'group_invite',
     ): void {
@@ -309,7 +334,7 @@ export class IncomingPacketPipeline {
     }
 
     private traceEnrichmentFailure(
-        pkt: PacketInfo,
+        pkt: PacketTrace,
         event: QQEventVariant,
         enrichment: 'identity_refresh' | 'group_invite',
         error: unknown,
@@ -324,7 +349,7 @@ export class IncomingPacketPipeline {
         ]);
     }
 
-    private traceDispatchFailure(pkt: PacketInfo, event: QQEventVariant, error: unknown): void {
+    private traceDispatchFailure(pkt: PacketTrace, event: QQEventVariant, error: unknown): void {
         this.packetLog.trace(() => [
             'packet_branch serviceCmd=%j seqId=%d branch=dispatch_exception eventKind=%j error=%j',
             pkt.serviceCmd,
@@ -335,7 +360,7 @@ export class IncomingPacketPipeline {
     }
 
     private traceDispatch(
-        pkt: PacketInfo,
+        pkt: PacketTrace,
         eventKind: QQEventVariant['kind'],
         mode: 'sync' | 'enriched' | 'derived',
     ): void {
@@ -349,7 +374,7 @@ export class IncomingPacketPipeline {
     }
 
     private dispatchEvent(
-        pkt: PacketInfo,
+        pkt: PacketTrace,
         event: QQEventVariant,
         mode: 'sync' | 'enriched',
     ): number {
@@ -470,7 +495,7 @@ export class IncomingPacketPipeline {
     }
 
     private async dispatchAfterIdentityRefresh(
-        pkt: PacketInfo,
+        pkt: PacketTrace,
         event: Extract<QQEventVariant, { kind: 'group_member_join' }>,
     ): Promise<number> {
         try {
@@ -499,7 +524,7 @@ export class IncomingPacketPipeline {
     }
 
     private async dispatchGroupInvite(
-        pkt: PacketInfo,
+        pkt: PacketTrace,
         event: Extract<QQEventVariant, { kind: 'group_invite' }>,
     ): Promise<number> {
         // A self-invite notice carries an inviter UID but no approval sequence.
