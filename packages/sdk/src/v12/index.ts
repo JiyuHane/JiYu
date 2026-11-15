@@ -6,9 +6,14 @@ export type {
     OneBot12JsonValue,
     OneBot12LatestEventsParams,
     OneBot12LatestEventsResponse,
+    OneBot12MentionAllSegment,
+    OneBot12MentionSegment,
+    OneBot12Message,
     OneBot12MessageSegment,
+    OneBot12OutgoingMessage,
     OneBot12PlatformEvent,
     OneBot12Self,
+    OneBot12TextSegment,
 } from './types.js';
 export {
     ONEBOT12_JSON_MAX_BYTES,

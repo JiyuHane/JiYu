@@ -15,6 +15,21 @@ export interface OneBot12MessageSegment extends OneBot12JsonObject {
     data: OneBot12JsonObject;
 }
 
+export interface OneBot12TextSegment extends OneBot12MessageSegment {
+    type: 'text';
+    data: OneBot12JsonObject & { text: string };
+}
+
+export interface OneBot12MentionSegment extends OneBot12MessageSegment {
+    type: 'mention';
+    data: OneBot12JsonObject & { user_id: string };
+}
+
+export interface OneBot12MentionAllSegment extends OneBot12MessageSegment {
+    type: 'mention_all';
+    data: OneBot12JsonObject;
+}
+
 /** Incoming messages are segment arrays; outgoing message parameters may also be a string or single segment. */
 export type OneBot12Message = OneBot12MessageSegment[];
 export type OneBot12OutgoingMessage = OneBot12Message | OneBot12MessageSegment | string;

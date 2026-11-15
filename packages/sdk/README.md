@@ -38,6 +38,28 @@ pnpm add @harehane/sdk
 
 从 `@snowluma/sdk` 迁移时，先安装新包，再将依赖与所有导入路径（包括 `/node` 等子路径）改为 `@harehane/sdk`；保留已有 `SnowLuma` 导出名。两个 npm 包名彼此独立，本仓库不会自动发布、提供或更新旧包，也不会自动重定向旧导入。参见[迁移说明](./VERSIONING.md#package-name-migration)。
 
+## OneBot 12 消息段类型
+
+`@harehane/sdk/v12` 可选导出 `OneBot12TextSegment`、`OneBot12MentionSegment`、
+`OneBot12MentionAllSegment`、`OneBot12Message` 和 `OneBot12OutgoingMessage`：
+
+```ts
+import type { OneBot12Message } from '@harehane/sdk/v12';
+
+const message: OneBot12Message = [
+  { type: 'text', data: { text: 'Hello ' } },
+  { type: 'mention', data: { user_id: '42' } },
+  { type: 'mention_all', data: {} },
+];
+```
+
+这些类型是可选的结构描述；通用 `OneBot12MessageSegment` 仍支持自定义段，
+`OneBot12OutgoingMessage` 仍支持字符串、单段或数组。`mention.data.user_id` 是字符串，
+具体允许的标识符和消息段由服务端决定；当前项目服务端仅在群聊支持 mention，
+QQ 数字标识须为规范十进制字符串且数值在 1–4294967295 范围内；这并非所有 OneBot 12 实现的限制。
+可通过现有客户端的泛型 `request('send_message', ...)` 发送；
+成功响应或本地编解码通过均不保证实际送达或客户端显示。
+
 ## 快速开始
 
 ```ts

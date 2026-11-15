@@ -597,19 +597,48 @@ export class V12Dispatcher {
                 return response(10006, 'invalid message segment', null, echo);
             }
 
-            if (segment.type !== 'text') {
+            if (
+                segment.type !== 'text' &&
+                segment.type !== 'mention' &&
+                segment.type !== 'mention_all'
+            ) {
                 return response(10005, 'unsupported message segment', null, echo);
             }
 
-            if (extraKeys(segment, ['type', 'data']) || extraKeys(segment.data, ['text'])) {
+            const allowedData =
+                segment.type === 'text' ? ['text'] : segment.type === 'mention' ? ['user_id'] : [];
+
+            if (extraKeys(segment, ['type', 'data']) || extraKeys(segment.data, allowedData)) {
                 return response(10007, 'unsupported message segment field', null, echo);
             }
 
-            if (typeof segment.data.text !== 'string') {
-                return response(10006, 'invalid text segment', null, echo);
-            }
+            if (segment.type === 'text') {
+                if (typeof segment.data.text !== 'string') {
+                    return response(10006, 'invalid text segment', null, echo);
+                }
 
-            message.push({ type: 'text', data: { text: segment.data.text } });
+                message.push({ type: 'text', data: { text: segment.data.text } });
+            } else if (segment.type === 'mention') {
+                const userId = parseAccountId(segment.data.user_id);
+
+                // MentionExtraSend.uin is uint32; larger IDs would be truncated downstream.
+                if (userId === null || userId > 0xffffffff) {
+                    return response(10006, 'invalid mention segment', null, echo);
+                }
+
+                // Check this segment before rejecting private mentions, preserving field errors.
+                if (params.detail_type === 'private') {
+                    return response(10005, 'unsupported message segment', null, echo);
+                }
+
+                message.push({ type: 'at', data: { qq: String(userId) } });
+            } else {
+                if (params.detail_type === 'private') {
+                    return response(10005, 'unsupported message segment', null, echo);
+                }
+
+                message.push({ type: 'at', data: { qq: 'all' } });
+            }
         }
 
         try {

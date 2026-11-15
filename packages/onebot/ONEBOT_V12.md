@@ -41,8 +41,8 @@ configuration writers and backup restores do not share a revision lock.
 ## Supported behavior and limits
 
 The core currently handles `get_version`, `get_status`, `get_supported_actions`,
-`get_self_info`, `send_message` for private and group text messages,
-`delete_message`, and `set_group_name`. The latter requires a canonical positive
+`get_self_info`, `send_message` for private and group text messages and group
+mentions, `delete_message`, and `set_group_name`. The latter requires a canonical positive
 safe-integer group ID encoded as a string and a string group name, including an
 empty string; it forwards one request to the existing account-local v11 handler.
 Success requires that handler to return an explicit `ok`/zero retcode with null
@@ -131,6 +131,32 @@ info (including v11 errors 1400 and 1404) and fixed 20002 for other well-formed
 v11 failures or exceptions; the current transport may replace these failure
 messages with its generic side-effect uncertainty warning even for this read-only
 action. This action is an incremental addition, not full v12 support.
+
+For group `send_message`, a v12 `mention` with `data.user_id` as a canonical
+positive decimal string in the UIN range 1 through 4294967295 maps to the
+account-local v11 `at` segment with `data.qq` as that string; `mention_all` with
+empty `data` maps to `at` with `qq: 'all'`. Leading zeroes, signs, whitespace,
+zero, numeric IDs, values above 4294967295 and `mention` user ID `'all'` are
+invalid. The mention limit prevents truncation in the downstream uint32 UIN
+encoding; it does not change the group target ID range. Mixed text and
+mentions retain their order, and the complete message is validated before one
+v11 handler call. For private sends both mention types return unsupported 10005
+without calling the v11 handler; this is an implementation limit, not a claim
+that the standard forbids private mentions.
+Each segment is processed in order: shape and, for known segment types, extra
+fields and required values are validated before the private-mention decision.
+Thus malformed fields return 10006 or 10007, while a valid private mention
+returns 10005 immediately without checking later segments. Unknown types return
+10005 as before. This is a local v11 representation mapping: the canonical
+numeric ID is passed to the existing v11 parser, not resolved by v12. If the
+v11 UID resolver returns no value, the resulting element may lack a UID. The
+element builder passes an empty UID to the encoder, which omits this default-valued
+field from protobuf; a resolver that ultimately rejects aborts the send path.
+If the v11 resolver returns the reserved string `'all'` for a
+numeric user, the existing element builder selects its mention-all path; this
+is a potential downstream behavior, not an assertion that the service returns
+that value. UID population, actual mention target, QQ rendering, permissions and
+successful delivery remain unverified.
 
 `send_message` reports the timestamp already stored by Jiyu. That record may
 come from the QQ response or a local-clock fallback and is not necessarily a
