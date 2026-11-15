@@ -105,6 +105,58 @@ function wipeOwned(bytes: Uint8Array): void {
     }
 }
 
+// Tracks only arrays allocated by this attempt or returned by its local decoders.
+// A callback may retain or detach a loan; wiping remains best effort.
+class OwnedScope {
+    private readonly values = new Set<Uint8Array>();
+    private revoked = false;
+
+    own<T extends Uint8Array>(bytes: T): T {
+        if (this.revoked) {
+            wipeOwned(bytes);
+            throw new Error('attempt stopped');
+        }
+
+        this.values.add(bytes);
+        return bytes;
+    }
+
+    ownMany(values: readonly Uint8Array[]): void {
+        if (this.revoked) {
+            for (const bytes of values) {
+                wipeOwned(bytes);
+            }
+
+            throw new Error('attempt stopped');
+        }
+
+        for (const bytes of values) {
+            this.values.add(bytes);
+        }
+    }
+
+    release(bytes: Uint8Array | undefined): void {
+        if (bytes) {
+            wipeOwned(bytes);
+            this.values.delete(bytes);
+        }
+    }
+
+    transfer(bytes: Uint8Array): void {
+        this.values.delete(bytes);
+    }
+
+    revoke(): void {
+        this.revoked = true;
+
+        for (const bytes of this.values) {
+            wipeOwned(bytes);
+        }
+
+        this.values.clear();
+    }
+}
+
 function snapshotRecord(value: object): object {
     if (!value || typeof value !== 'object' || isProxy(value)) {
         throw new Error('invalid record');
@@ -315,6 +367,7 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
     private readonly signal?: AbortSignal;
     private borrowedAbortListener?: ReturnType<typeof addAbortListener>;
     private readonly controller = new AbortController();
+    readonly #owned = new OwnedScope();
     private readonly onAbort = () => this.fail();
     private state: State = 'new';
     private busy = false;
@@ -439,7 +492,7 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
             randomKey: randomBytes,
             peerPublicKey: peerBytes,
         };
-        this.ecdh!.deriveTeaKey(this.p.peerPublicKey).fill(0);
+        wipeOwned(this.ecdh!.deriveTeaKey(this.p.peerPublicKey));
         this.socket = borrowed ? undefined : options.socket;
         this.borrowed = borrowed;
         this.timeout = options.timeoutMs;
@@ -527,6 +580,8 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
     async fetch(fields: FetchFields): Promise<{ image: Uint8Array; qrUrl: string }> {
         this.enter('new');
         let value: ExchangeResult | undefined;
+        let d1Bytes: Uint8Array | undefined;
+        let unusualBytes: Uint8Array | undefined;
 
         try {
             const { packageName, ptVersion, miscBitMap, ssoVersion, d1, unusualSig } =
@@ -539,9 +594,11 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
                     ptVersion,
                     miscBitMap,
                     ssoVersion,
-                    d1: snapshotBytes(d1, 0xffff),
+                    d1: (d1Bytes = this.#owned.own(snapshotBytes(d1, 0xffff))),
                     unusualSig:
-                        unusualSig === undefined ? undefined : snapshotBytes(unusualSig, 0xffff),
+                        unusualSig === undefined
+                            ? undefined
+                            : (unusualBytes = this.#owned.own(snapshotBytes(unusualSig, 0xffff))),
                 },
             };
             value = await this.exchange('fetch', operation);
@@ -551,6 +608,8 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
             }
 
             this.active();
+            this.#owned.transfer(value.sig);
+            this.#owned.transfer(value.image);
             this.qrSig = value.sig;
             this.state = 'qr-ready';
             const output = { image: value.image, qrUrl: value.url };
@@ -560,6 +619,9 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
             this.fail();
             throw new Error('attempt fetch failed');
         } finally {
+            this.#owned.release(d1Bytes);
+            this.#owned.release(unusualBytes);
+
             if (value) {
                 scrubResult(value);
             }
@@ -577,7 +639,7 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
         let sig: Uint8Array | undefined;
 
         try {
-            sig = Uint8Array.from(this.qrSig!);
+            sig = this.#owned.own(Uint8Array.from(this.qrSig!));
             value = await this.exchange('poll', { type: 'poll', qrSig: sig });
 
             if (value.type !== 'poll') {
@@ -587,8 +649,15 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
             this.active();
 
             if (value.held) {
+                this.#owned.transfer(value.held.tgtgtKey);
+                this.#owned.transfer(value.held.noPicSig);
+                this.#owned.transfer(value.held.temporaryA1);
                 this.held = value.held;
-                this.qrSig?.fill(0);
+
+                if (this.qrSig) {
+                    wipeOwned(this.qrSig);
+                }
+
                 this.qrSig = undefined;
                 this.state = 'confirmed-held';
                 value = undefined;
@@ -611,7 +680,7 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
             this.fail();
             throw new Error('attempt poll failed');
         } finally {
-            sig?.fill(0);
+            this.#owned.release(sig);
 
             if (value) {
                 scrubResult(value);
@@ -647,7 +716,7 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
                 appId: this.p.appId,
                 subAppId: this.p.subAppId,
                 appClientVersion: this.p.clientVersion,
-                guid: Uint8Array.from(this.p.guid),
+                guid: this.#owned.own(Uint8Array.from(this.p.guid)),
                 mainSigMap,
                 miscBitMap,
                 subSigMap,
@@ -656,12 +725,12 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
                 sdkVersion,
                 os,
                 deviceName,
-                apkSignature: snapshotBytes(apkSignature, 0xffff),
-                tlv124Value: snapshotBytes(tlv124Value, 12),
+                apkSignature: this.#owned.own(snapshotBytes(apkSignature, 0xffff)),
+                tlv124Value: this.#owned.own(snapshotBytes(tlv124Value, 12)),
                 randomSource,
-                temporaryA1: Uint8Array.from(h.temporaryA1),
-                noPicSig: Uint8Array.from(h.noPicSig),
-                tgtgtKey: Uint8Array.from(h.tgtgtKey),
+                temporaryA1: this.#owned.own(Uint8Array.from(h.temporaryA1)),
+                noPicSig: this.#owned.own(Uint8Array.from(h.noPicSig)),
+                tgtgtKey: this.#owned.own(Uint8Array.from(h.tgtgtKey)),
             };
 
             try {
@@ -680,6 +749,12 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
                     return output;
                 }
 
+                if (value.result.status === 'tickets') {
+                    for (const bytes of Object.values(value.result.tickets)) {
+                        this.#owned.transfer(bytes);
+                    }
+                }
+
                 this.state = value.result.status === 'tickets' ? 'tickets' : 'failed';
 
                 if (this.state === 'failed') {
@@ -688,17 +763,32 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
 
                 this.clean();
 
-                if (this.borrowed && value.result.status === 'tickets') {
-                    this.assertBorrowedCommit();
+                if (value.result.status === 'tickets') {
+                    if (this.borrowed) {
+                        this.assertBorrowedCommit();
+                    } else if (
+                        this.state !== 'tickets' ||
+                        (this.signal && signalAborted.call(this.signal)) ||
+                        performance.now() >= this.deadline
+                    ) {
+                        if (this.state === 'tickets') {
+                            this.state = 'failed';
+                        }
+
+                        throw new Error('attempt stopped');
+                    }
                 }
 
                 const output = value.result;
                 value = undefined;
                 return output;
             } finally {
-                login.temporaryA1.fill(0);
-                login.noPicSig.fill(0);
-                login.tgtgtKey.fill(0);
+                this.#owned.release(login.guid);
+                this.#owned.release(login.apkSignature);
+                this.#owned.release(login.tlv124Value);
+                this.#owned.release(login.temporaryA1);
+                this.#owned.release(login.noPicSig);
+                this.#owned.release(login.tgtgtKey);
             }
         } catch {
             this.fail();
@@ -713,6 +803,7 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
     }
 
     close(): void {
+        this.#owned.revoke();
         const port = terminalPorts.get(this);
 
         if (port) {
@@ -838,41 +929,28 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
     }
     private clearHeld(): void {
         if (this.held) {
-            if (this.borrowed) {
-                wipeOwned(this.held.tgtgtKey);
-                wipeOwned(this.held.noPicSig);
-                wipeOwned(this.held.temporaryA1);
-            } else {
-                this.held.tgtgtKey.fill(0);
-                this.held.noPicSig.fill(0);
-                this.held.temporaryA1.fill(0);
-            }
+            wipeOwned(this.held.tgtgtKey);
+            wipeOwned(this.held.noPicSig);
+            wipeOwned(this.held.temporaryA1);
 
             this.held = undefined;
         }
     }
     private clean(): void {
+        this.#owned.revoke();
+
         if (this.lifetimeTimer) {
             clearTimeout(this.lifetimeTimer);
             this.lifetimeTimer = undefined;
         }
 
-        if (this.borrowed) {
-            if (this.qrSig) {
-                wipeOwned(this.qrSig);
-            }
-        } else {
-            this.qrSig?.fill(0);
+        if (this.qrSig) {
+            wipeOwned(this.qrSig);
         }
 
         this.qrSig = undefined;
         this.clearHeld();
-
-        if (this.borrowed) {
-            wipeOwned(this.p.randomKey);
-        } else {
-            this.p.randomKey.fill(0);
-        }
+        wipeOwned(this.p.randomKey);
 
         try {
             if (this.borrowedAbortListener) {
@@ -918,6 +996,10 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
         }
     }
     private fail(): void {
+        if (this.state !== 'tickets') {
+            this.#owned.revoke();
+        }
+
         const port = terminalPorts.get(this);
 
         if (port) {
@@ -959,6 +1041,19 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
             staged = value;
 
             try {
+                if (value.type === 'fetch') {
+                    this.#owned.own(value.sig);
+                    this.#owned.own(value.image);
+                } else if (value.type === 'poll' && value.held) {
+                    this.#owned.own(value.held.tgtgtKey);
+                    this.#owned.own(value.held.noPicSig);
+                    this.#owned.own(value.held.temporaryA1);
+                } else if (value.type === 'login' && value.result.status === 'tickets') {
+                    for (const bytes of Object.values(value.result.tickets)) {
+                        this.#owned.own(bytes);
+                    }
+                }
+
                 exchangeActive();
             } catch (error) {
                 scrubResult(value);
@@ -973,7 +1068,7 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
             timeoutMs: this.timeout,
             signal: this.controller.signal,
             buildRequest: async ({ sequence }) => {
-                this.active();
+                exchangeActive();
                 let oicq: Uint8Array | undefined;
                 let inner: Uint8Array | undefined;
                 let metadata: Uint8Array | undefined;
@@ -982,33 +1077,37 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
                 try {
                     if (operation === 'login') {
                         const login = input as WtLoginRequestBody;
-                        const business = encodeWtLoginRequestBody(login);
+                        const business = this.#owned.own(encodeWtLoginRequestBody(login));
 
                         try {
                             this.active();
-                            oicq = encodeWtPcLoginOicqRequest({
-                                uin: this.held!.uin,
-                                clientVersion: this.p.clientVersion,
-                                body: business,
-                                randomKey: this.p.randomKey,
-                                ecdh: this.ecdh!,
-                                peerPublicKey: this.p.peerPublicKey,
-                                randomSource: login.randomSource,
-                            });
+                            oicq = this.#owned.own(
+                                encodeWtPcLoginOicqRequest({
+                                    uin: this.held!.uin,
+                                    clientVersion: this.p.clientVersion,
+                                    body: business,
+                                    randomKey: this.p.randomKey,
+                                    ecdh: this.ecdh!,
+                                    peerPublicKey: this.p.peerPublicKey,
+                                    randomSource: login.randomSource,
+                                }),
+                            );
                         } finally {
-                            business.fill(0);
+                            this.#owned.release(business);
                         }
                     } else {
                         const timestamp = this.clock();
                         this.active();
-                        oicq = buildWtQrOicq(
-                            { ...this.p, timestamp, ecdh: this.ecdh! },
-                            input as WtQrFrameOperation,
+                        oicq = this.#owned.own(
+                            buildWtQrOicq(
+                                { ...this.p, timestamp, ecdh: this.ecdh! },
+                                input as WtQrFrameOperation,
+                            ),
                         );
                     }
 
                     this.active();
-                    const signed = Buffer.from(oicq);
+                    const signed = this.#owned.own(Buffer.from(oicq));
 
                     try {
                         const reserved = await this.signer({
@@ -1017,33 +1116,37 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
                             command,
                             body: signed,
                         });
-                        this.active();
-                        metadata = snapshotBytes(reserved, 0xffff);
+                        exchangeActive();
+                        metadata = this.#owned.own(snapshotBytes(reserved, 0xffff));
                     } finally {
-                        wipeOwned(signed);
+                        this.#owned.release(signed);
                     }
 
                     this.active();
-                    inner = encodeSso12Request({
-                        sequence: sequence | 0,
-                        subAppId: this.p.subAppId,
-                        a2: new Uint8Array(),
-                        command,
-                        guid: this.p.guid,
-                        version: this.p.ssoVersion,
-                        reserved: metadata,
-                        body: oicq,
-                    });
-                    outgoingFrame = encodeServiceRequest({
-                        protocol: 12,
-                        encryption: { type: 'zero' },
-                        d2: new Uint8Array(),
-                        uin: account,
-                        body: inner,
-                    });
+                    inner = this.#owned.own(
+                        encodeSso12Request({
+                            sequence: sequence | 0,
+                            subAppId: this.p.subAppId,
+                            a2: new Uint8Array(),
+                            command,
+                            guid: this.p.guid,
+                            version: this.p.ssoVersion,
+                            reserved: metadata,
+                            body: oicq,
+                        }),
+                    );
+                    outgoingFrame = this.#owned.own(
+                        encodeServiceRequest({
+                            protocol: 12,
+                            encryption: { type: 'zero' },
+                            d2: new Uint8Array(),
+                            uin: account,
+                            body: inner,
+                        }),
+                    );
                     exchangeActive();
                     context = {
-                        requestFrame: Uint8Array.from(outgoingFrame),
+                        requestFrame: this.#owned.own(Uint8Array.from(outgoingFrame)),
                         requestOicq: oicq,
                         account,
                         command,
@@ -1052,22 +1155,27 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
                     transferred = true;
                     return { frame: outgoingFrame, context };
                 } finally {
-                    inner?.fill(0);
-                    metadata?.fill(0);
+                    this.#owned.release(inner);
+                    this.#owned.release(metadata);
 
                     if (!transferred) {
-                        oicq?.fill(0);
-                        outgoingFrame?.fill(0);
+                        this.#owned.release(oicq);
+                        this.#owned.release(outgoingFrame);
                         outgoingFrame = undefined;
                     }
                 }
             },
             verifyCandidate: async (frame, ctx, identity) => {
-                const requestFrame = Uint8Array.from(ctx.requestFrame),
-                    requestOicq = Uint8Array.from(ctx.requestOicq),
-                    responseFrame = Uint8Array.from(frame);
+                let requestFrame: Uint8Array | undefined;
+                let requestOicq: Uint8Array | undefined;
+                let responseFrame: Uint8Array | undefined;
 
                 try {
+                    exchangeActive();
+                    requestFrame = this.#owned.own(Uint8Array.from(ctx.requestFrame));
+                    requestOicq = this.#owned.own(Uint8Array.from(ctx.requestOicq));
+                    responseFrame = this.#owned.own(Uint8Array.from(frame));
+                    exchangeActive();
                     const valid = await this.verifier({
                         operation,
                         transportUin: identity.uin,
@@ -1078,16 +1186,16 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
                         requestOicq,
                         responseFrame,
                     });
-                    this.active();
+                    exchangeActive();
                     return valid === true;
                 } finally {
-                    wipeOwned(requestFrame);
-                    wipeOwned(requestOicq);
-                    wipeOwned(responseFrame);
+                    this.#owned.release(requestFrame);
+                    this.#owned.release(requestOicq);
+                    this.#owned.release(responseFrame);
                 }
             },
             consumeCandidate: async (frame, ctx, identity) => {
-                this.active();
+                exchangeActive();
 
                 if (
                     ctx.account !== account ||
@@ -1099,11 +1207,16 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
 
                 const owned: Uint8Array[] = [];
 
+                const register = (...values: Uint8Array[]): void => {
+                    owned.push(...values);
+                    this.#owned.ownMany(values);
+                };
+
                 try {
                     const outer = decodeServiceResponse(frame);
-                    owned.push(outer.body);
+                    register(outer.body);
                     const sso = decodeSsoResponse(outer.body);
-                    owned.push(sso.body, sso.cookie, sso.reserved, sso.headerExtension);
+                    register(sso.body, sso.cookie, sso.reserved, sso.headerExtension);
 
                     if (
                         outer.protocol !== 12 ||
@@ -1116,7 +1229,7 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
                         throw new Error('binding');
                     }
 
-                    const key = this.ecdh!.deriveTeaKey(this.p.peerPublicKey);
+                    const key = this.#owned.own(this.ecdh!.deriveTeaKey(this.p.peerPublicKey));
                     let wt: ReturnType<typeof decodeWtOicqResponse>;
 
                     try {
@@ -1125,9 +1238,9 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
                             randomKey: this.p.randomKey,
                             ecdh: this.ecdh!,
                         });
-                        owned.push(wt.body);
+                        register(wt.body);
                     } finally {
-                        key.fill(0);
+                        this.#owned.release(key);
                     }
 
                     if (
@@ -1143,7 +1256,7 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
                         operation === 'login' ? undefined : decodeWtCode2dResponse(wt.body);
 
                     if (code) {
-                        owned.push(code.body, code.unknown21);
+                        register(code.body, code.unknown21);
                     }
 
                     if (code && code.command !== (operation === 'fetch' ? 0x31 : 0x12)) {
@@ -1168,7 +1281,7 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
                     }
 
                     const business = Uint8Array.from(body.subarray(start, end));
-                    owned.push(business);
+                    register(business);
 
                     try {
                         let parsed:
@@ -1193,6 +1306,27 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
                         const businessUin = qr && qr.status === 'confirmed' ? qr.uin : undefined;
 
                         try {
+                            if ('outerTlvs' in parsed) {
+                                const bytes = parsed.outerTlvs.map((entry) => entry.value);
+
+                                if ('innerTlvs' in parsed) {
+                                    bytes.push(...parsed.innerTlvs.map((entry) => entry.value));
+                                }
+
+                                if (parsed.status === 'tickets') {
+                                    bytes.push(...Object.values(parsed.tickets));
+                                }
+
+                                register(...bytes);
+                            } else if (parsed.status === 'confirmed') {
+                                register(...Object.values(parsed.tickets));
+                            } else if (parsed.status === 'success') {
+                                register(parsed.qrSig, parsed.image, parsed.d1);
+                            } else {
+                                register(parsed.remaining);
+                            }
+
+                            exchangeActive();
                             const verified = await this.contextVerifier({
                                 operation,
                                 transportUin: identity.uin,
@@ -1209,7 +1343,7 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
                                 businessUin,
                                 businessAppId: qr?.appId,
                             });
-                            this.active();
+                            exchangeActive();
 
                             if (verified !== true) {
                                 throw new Error('context');
@@ -1335,43 +1469,16 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
                         } catch (error) {
                             this.revokeReferenceCapability();
                             throw error;
-                        } finally {
-                            if ('outerTlvs' in parsed) {
-                                parsed.outerTlvs.forEach((e) => e.value.fill(0));
-
-                                if ('innerTlvs' in parsed) {
-                                    parsed.innerTlvs.forEach((e) => e.value.fill(0));
-                                }
-
-                                if (parsed.status === 'tickets') {
-                                    Object.values(parsed.tickets).forEach((v) => v.fill(0));
-                                }
-                            } else if (parsed.status === 'confirmed') {
-                                Object.values(parsed.tickets).forEach((v) => v.fill(0));
-                            } else if (parsed.status === 'success') {
-                                parsed.qrSig.fill(0);
-
-                                if (this.borrowed) {
-                                    wipeOwned(parsed.image);
-                                    wipeOwned(parsed.d1);
-                                }
-                            } else {
-                                parsed.remaining.fill(0);
-                            }
                         }
                     } finally {
-                        business.fill(0);
+                        this.#owned.release(business);
                     }
                 } catch (error) {
                     this.revokeReferenceCapability();
                     throw error;
                 } finally {
                     for (const bytes of owned) {
-                        if (this.borrowed) {
-                            wipeOwned(bytes);
-                        } else {
-                            bytes.fill(0);
-                        }
+                        this.#owned.release(bytes);
                     }
                 }
             },
@@ -1405,9 +1512,9 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
             throw error;
         } finally {
             finished = true;
-            context?.requestFrame.fill(0);
-            context?.requestOicq.fill(0);
-            outgoingFrame?.fill(0);
+            this.#owned.release(context?.requestFrame);
+            this.#owned.release(context?.requestOicq);
+            this.#owned.release(outgoingFrame);
         }
 
         if (result.kind !== 'response') {
@@ -1441,8 +1548,10 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
  * authenticate the peer. A failed attempt poisons the lease; success and idle
  * close leave it to the owner. In-flight close aborts and poisons it. Aborting
  * can itself cause the underlying broker/client to close. A broker fence can hide
- * a late callback result from the guard; producer-local finally blocks handle
- * intermediate owned bytes, but external side effects and retained copies remain.
+ * a late callback result from the guard. Attempt-visible owned arrays are wiped on
+ * cleanup and again on callback settlement; external copies and helper internals
+ * remain outside that guarantee. A non-settling transport may not observe its
+ * transaction deadline until another existing teardown path runs.
  * Promise constructor/species or global-intrinsic tampering and promises hidden
  * inside foreign thenables are outside observation guarantees.
  */
@@ -1508,14 +1617,14 @@ export function createBorrowedWtReferenceLoginAttempt(
 
 function scrubResult(value: ExchangeResult): void {
     if (value.type === 'fetch') {
-        value.sig.fill(0);
-        value.image.fill(0);
+        wipeOwned(value.sig);
+        wipeOwned(value.image);
     } else if (value.type === 'poll' && value.held) {
-        value.held.tgtgtKey.fill(0);
-        value.held.noPicSig.fill(0);
-        value.held.temporaryA1.fill(0);
+        wipeOwned(value.held.tgtgtKey);
+        wipeOwned(value.held.noPicSig);
+        wipeOwned(value.held.temporaryA1);
     } else if (value.type === 'login' && value.result.status === 'tickets') {
-        Object.values(value.result.tickets).forEach((bytes) => bytes.fill(0));
+        Object.values(value.result.tickets).forEach(wipeOwned);
         // Drop the reference; JavaScript strings themselves cannot be wiped.
         delete value.result.uidProjection;
     }

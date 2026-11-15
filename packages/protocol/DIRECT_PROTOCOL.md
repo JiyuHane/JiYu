@@ -1380,8 +1380,18 @@ remain to be recovered and independently verified.
   UIN associated with that attempt, rather than substituting the initial transport
   UIN; the account remains subject to the caller's verification policy. Signer
   output is copied before the callback's input buffer is cleared, including when
-  it aliases that input. Callback-visible verification copies are independently
-  cleared best-effort. Neither behavior establishes server authentication. The
+  it aliases that input. The attempt tracks its own temporary byte arrays, including
+  signer and verifier loans and locally decoded tickets. Local close, abort or
+  failure revokes and best-effort wipes registered arrays even if a callback is
+  still pending; that callback must not rely on a loan remaining intact afterwards.
+  Late settlement triggers another best-effort wipe. A ticket result is transferred
+  out of this tracking before final cleanup; if cleanup reenters close before
+  delivery, the existing failure path wipes it afterwards, not necessarily before
+  the reentrant close returns. The registry is local ownership bookkeeping, not
+  isolation from arbitrary same-process mutation. Constructor failures, helper-internal
+  buffers, detached loans, copies made by callbacks, strings and JS/crypto internals
+  are outside this guarantee. Existing timeout checks do not force a noncooperative
+  transport or callback to settle. These behaviors do not establish server authentication. The
   result does not mark online status or attach to Bridge. An optional
   `enableUidProjection` setting projects inner TLV `0x543` only after the caller's
   raw and context policies accept the response. It is disabled by default, so the
