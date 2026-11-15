@@ -24,7 +24,16 @@ program and section note tables can reference the same file range and are not
 independent samples. REA 6.8.0's
 native ELF decompiler was unavailable in the Windows analysis environment:
 its Windows Ghidra profile does not accept this ELF, its Kuna provider does not
-support Windows hosts, and no IDA provider was configured. The following
+support Windows hosts, and no IDA provider was configured. A later REA 6.8.0
+`inspect_native_exports` inventory for the same digest reports 2,025 defined,
+visible dynamic exports and `JNI_OnLoad` at `0x62b3c` with declared size 71,336
+bytes (parent Evidence `ev_8efef99bbff0e21a44b63bbfe5f4f97dc2443815a564f2810b1e60e8ed15c78e`).
+Exact-name filtering found no defined visible export named `AES_encrypt`,
+`AES_decrypt`, `AES_set_encrypt_key`, `EVP_EncryptInit_ex`, or
+`EVP_aes_128_cbc`. This covers the dynamic export table only: it does not
+exclude inlined, local, hidden, differently named or imported AES functions,
+and a declared symbol size does not establish a complete function boundary or
+execution. The following
 instruction observations were made with read-only radare2 and are not
 presented as REA decompilation or execution traces.
 
