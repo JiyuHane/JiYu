@@ -255,8 +255,8 @@ function decodeLightAppCard(
 function decodeCardsOnce(
     elems: ElemDecoded[],
     budget: RichCardBudget,
-): Map<ElemDecoded, DecodedCards> {
-    const decoded = new Map<ElemDecoded, DecodedCards>();
+): (DecodedCards | undefined)[] {
+    const decoded: (DecodedCards | undefined)[] = [];
 
     for (const elem of elems) {
         const cards: DecodedCards = {};
@@ -287,10 +287,11 @@ function decodeCardsOnce(
         }
 
         if (!rich && !light) {
+            decoded.push(undefined);
             continue;
         }
 
-        decoded.set(elem, cards);
+        decoded.push(cards);
 
         for (const [source, card] of Object.entries(cards)) {
             if (card?.error) {
@@ -695,9 +696,7 @@ function convertElements(
     const decodedMarkdown = decodeMarkdownElementsOnce(elems);
     const decodedInlineKeyboards = decodeInlineKeyboardsOnce(elems);
     const hasRichContent =
-        [...decodedCards.values()].some((cards) =>
-            Boolean(cards.rich?.element || cards.light?.element),
-        ) ||
+        decodedCards.some((cards) => Boolean(cards?.rich?.element || cards?.light?.element)) ||
         [...decodedMarkdown.values()].some(
             (element) => element?.type === 'markdown' || element?.type === 'flash_file',
         );
@@ -715,7 +714,7 @@ function convertElements(
     let sawReply = false;
     let dropNextBlankText = false;
 
-    for (const elem of elems) {
+    for (const [index, elem] of elems.entries()) {
         const resultCountBeforeElement = result.length;
         const precedingBigFace = previousBigFace;
         const decodedBigFace = decodedBigFaces.get(elem);
@@ -1021,7 +1020,7 @@ function convertElements(
         }
 
         // RichMsg
-        const cards = decodedCards.get(elem);
+        const cards = decodedCards[index];
 
         if (cards?.rich?.element) {
             result.push(cards.rich.element);

@@ -5,6 +5,7 @@ import { getLogLevel, setLogLevel, subscribeLogs } from '@snowluma/common/logger
 import { protobuf_decode, protobuf_encode } from '@snowluma/proton';
 import type { MarkdownData } from '@snowluma/proto-defs/action';
 import type { Elem, InlineKeyboardExtra } from '@snowluma/proto-defs/element';
+import type { RichText } from '@snowluma/proto-defs/message';
 import type { MessageElement } from '../../src/events';
 import { decodeRichBody } from '../../src/msg-push/rich-body-decoder';
 
@@ -317,6 +318,111 @@ describe('decodeRichBody synthetic nested card message budget', () => {
 
         expectJson(elements[0], payload);
     });
+
+    it('decodes repeated direct-input card objects per occurrence like real repeated protobuf elements', () => {
+        const payload = sizedJson('same-direct-light', CARD_BYTES);
+        const shared = light(payload);
+        const data = shared.lightApp!.data!;
+        const dataBefore = Buffer.from(data);
+        const elems = [shared, shared, shared];
+        const richText: RichText = { elems };
+        const body = { richText };
+        const encodedBefore = protobuf_encode<RichText>(richText);
+        const wire = protobuf_decode<RichText>(encodedBefore);
+        const wireElems = wire.elems!;
+        expect(wireElems).toHaveLength(3);
+        expect(wireElems[0]).not.toBe(wireElems[1]);
+        expect(wireElems[1]).not.toBe(wireElems[2]);
+        expect(wireElems[0]).not.toBe(shared);
+
+        const direct = captureLogs(() => decodeRichBody(body, true));
+        const roundTrip = captureLogs(() => decodeRichBody({ richText: wire }, true));
+
+        for (const outcome of [direct, roundTrip]) {
+            expect(outcome.value.map((element) => element.type)).toEqual(['json', 'json']);
+            expectJson(outcome.value[0], payload);
+            expectJson(outcome.value[1], payload);
+            const errors = cardErrors(outcome.logs, 'message_output_budget_exceeded');
+            expect(errors).toHaveLength(1);
+            expect(errors[0].message).toBe(
+                `wire light card ignored inputBytes=${data.length} reason=message_output_budget_exceeded`,
+            );
+        }
+
+        expect(body.richText).toBe(richText);
+        expect(richText.elems).toBe(elems);
+        expect(elems.every((elem) => elem === shared)).toBe(true);
+        expect(shared.lightApp!.data).toBe(data);
+        expect(Buffer.from(data)).toEqual(dataBefore);
+        expect(protobuf_encode<RichText>(richText)).toEqual(encodedBefore);
+    }, 15000);
+
+    it('keeps occurrence indices aligned across consecutive non-card objects and preserves unknown fields', () => {
+        const payload = sizedJson('same-card-with-gaps', CARD_BYTES);
+        const shared = light(payload);
+        const unknown: Elem & { syntheticUnknown: string } = {
+            face: { index: 8 },
+            syntheticUnknown: 'synthetic-value',
+        };
+        const elems: Elem[] = [
+            shared,
+            {},
+            { face: { index: 7 } },
+            unknown,
+            shared,
+            { text: { str: 'compatibility fallback' } },
+            shared,
+        ];
+        const { value, logs } = captureLogs(() => decodeRichBody({ richText: { elems } }, true));
+        expect(value.map((element) => element.type)).toEqual(['json', 'face', 'face', 'json']);
+        expectJson(value[0], payload);
+        expect(value[1]).toEqual({ type: 'face', faceId: 7 });
+        expect(value[2]).toEqual({ type: 'face', faceId: 8 });
+        expectJson(value[3], payload);
+        expect(cardErrors(logs, 'message_output_budget_exceeded')).toHaveLength(1);
+        expect(
+            logs.filter((entry) =>
+                entry.message.includes(
+                    'wire element ignored fields=syntheticUnknown reason=no MessageElement decoder',
+                ),
+            ),
+        ).toHaveLength(1);
+        expect(unknown.syntheticUnknown).toBe('synthetic-value');
+    }, 15000);
+
+    it('retains rich-before-light results separately for each occurrence of a mixed card', () => {
+        const richPayload = sizedJson('mixed-rich', CARD_BYTES - 64);
+        const lightPayload = sizedJson('mixed-light', 128);
+        const shared: Elem = {
+            richMsg: { serviceId: 1, template1: compressed(richPayload) },
+            lightApp: { data: compressed(lightPayload) },
+        };
+        const { value, logs } = captureLogs(() =>
+            decodeRichBody({ richText: { elems: [shared, { face: { index: 9 } }, shared] } }, true),
+        );
+        expect(value.map((element) => element.type)).toEqual(['json', 'json', 'face', 'json']);
+        expectJson(value[0], richPayload);
+        expectJson(value[1], lightPayload);
+        expect(value[2]).toEqual({ type: 'face', faceId: 9 });
+        expectJson(value[3], richPayload);
+        const errors = cardErrors(logs, 'message_output_budget_exceeded');
+        expect(errors).toHaveLength(1);
+        expect(errors[0].message).toContain('wire light card ignored');
+    }, 15000);
+
+    it('prescans repeated parent cards before nested cards and retains nested fallback on failure', () => {
+        const payload = sizedJson('parent-alias', CARD_BYTES);
+        const shared = light(payload);
+        const child = quote(91, [light('{"tag":"nested"}'), { text: { str: 'nested fallback' } }]);
+        const { value, logs } = captureLogs(() =>
+            decodeRichBody({ richText: { elems: [child, shared, shared] } }, true),
+        );
+        expect(value.map((element) => element.type)).toEqual(['reply', 'json', 'json']);
+        expect(reply(value, 91)).toEqual([{ type: 'text', text: 'nested fallback' }]);
+        expectJson(value[1], payload);
+        expectJson(value[2], payload);
+        expect(cardErrors(logs, 'message_output_budget_exceeded')).toHaveLength(1);
+    }, 15000);
 
     it('preserves raw marker and unmarked cards, and the independent 4 MiB single-card limit', () => {
         const raw = '{"tag":"raw-雪"}';
