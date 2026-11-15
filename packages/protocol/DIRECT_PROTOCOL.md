@@ -1832,6 +1832,29 @@ remain to be recovered and independently verified.
   policy is not implemented here. Synthetic tests use a permissive verifier
   only for their in-process peer. Cancellation discards the retained handle, but
   JavaScript and the crypto provider do not guarantee secure memory erasure.
+- `src/direct/nt-linux-login-reference.ts` independently constructs an offline
+  Linux PC NT-login request body from the fixed LagrangeV2 `7011cdf` reference's
+  [common request](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Services/Login/NTLoginCommon.cs#L13-L29)
+  and [Linux head fields](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Services/Login/NTLoginCommon.cs#L105-L135).
+  It accepts caller-supplied session key and ticket, an opaque already-encoded
+  login body, Linux device/app metadata and a mandatory 12-byte nonce. Based on the
+  [reference GCM construction](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Utility/Cryptography/AesGcmProvider.cs#L11-L39),
+  it supports 16-, 24- and 32-byte keys, empty AAD and `nonce || ciphertext || tag`.
+  The caller must ensure nonce uniqueness per key; the helper neither generates
+  nor tracks nonces. Its account is a canonical positive decimal string within
+  signed 64-bit range and its app ID is limited to nonnegative signed 32-bit;
+  these are local restrictions, not claims about the whole reference or QQ. An
+  absent or undefined cookie creates an empty cookie message; explicit `null` is
+  rejected by this API. Empty body and supplied empty strings preserve the local
+  reference field-presence rules. The 1 MiB input/framing budget is not a peak
+  memory bound. Copied byte temporaries are wiped best-effort; caller inputs,
+  returned ticket bytes, strings and crypto/runtime copies remain outside that
+  claim. The existing exchange flow does not automatically feed this helper or
+  bind its returned material to this account, expiry or a trusted peer; GCM also
+  does not authenticate the outer ticket or establish server identity. Synthetic
+  tests exercise Node cryptography and Proton, not a running V2 implementation,
+  actual QQ login or the supplied native signing library. No response decoding,
+  session orchestration or production Bridge integration is provided here.
 - `src/direct/sso12-packet-client.ts` is a single-flight protocol-12 client for
   an already-connected socket, with caller-supplied account policy, classifier,
   signing metadata, device parameters and zero-key or D2-key encryption. It

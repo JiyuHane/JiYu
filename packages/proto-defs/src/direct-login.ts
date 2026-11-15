@@ -1,4 +1,4 @@
-import type { pb, bytes, int_64, uint_32 } from '@snowluma/proton';
+import type { pb, pb_optional, bytes, int_32, int_64, uint_32 } from '@snowluma/proton';
 
 // Field declarations only; no QQ build interoperability is implied.
 // https://github.com/LagrangeDev/Lagrange.Core/blob/fe789c4a23796fbc82fa09e70a9c44c8a5cf2948/Lagrange.Core/Internal/Packets/Login/NTEcdh.cs
@@ -32,6 +32,55 @@ export interface NTLoginForwardRequest {
     buffer?: pb<3, bytes>;
     type?: pb<4, uint_32>;
     secBuffer?: pb<5, bytes>;
+}
+
+// Independent Linux request-only reference schemas; upstream overall license undetermined.
+// https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/Login/NTLogin.cs
+// https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Services/Login/NTLoginCommon.cs#L11-L25
+// pb_optional preserves non-null reference values, including empty strings/bytes.
+export interface LinuxNTLoginReferenceUser {
+    account: pb_optional<1, string>;
+}
+
+export interface LinuxNTLoginReferenceClient {
+    deviceType: pb_optional<1, string>;
+    deviceName: pb_optional<2, string>;
+    platform: pb<3, int_32>;
+    guid: pb_optional<4, bytes>;
+}
+
+export interface LinuxNTLoginReferenceApp {
+    version: pb_optional<1, string>;
+    appId: pb<2, int_32>;
+    appName: pb_optional<3, string>;
+    qua: pb_optional<5, string>;
+}
+
+export interface LinuxNTLoginReferenceCookie {
+    cookieContent?: pb_optional<1, string>;
+}
+
+export interface LinuxNTLoginReferenceSdk {
+    version: pb<1, uint_32>;
+}
+
+export interface LinuxNTLoginReferenceHead {
+    user: pb<1, LinuxNTLoginReferenceUser>;
+    client: pb<2, LinuxNTLoginReferenceClient>;
+    app: pb<3, LinuxNTLoginReferenceApp>;
+    cookie: pb<5, LinuxNTLoginReferenceCookie>;
+    sdk: pb<7, LinuxNTLoginReferenceSdk>;
+}
+
+export interface LinuxNTLoginReferenceCommon {
+    head: pb<1, LinuxNTLoginReferenceHead>;
+    body: pb_optional<2, bytes>;
+}
+
+export interface LinuxNTLoginReferenceForward {
+    sessionTicket: pb<1, bytes>;
+    buffer: pb<3, bytes>;
+    type: pb<4, uint_32>;
 }
 
 // Field declarations independently derived from LagrangeV2; original authors retain ownership.
