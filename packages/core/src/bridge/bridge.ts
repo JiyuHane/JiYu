@@ -286,11 +286,16 @@ export class Bridge implements BridgeInterface {
     }
 
     rememberUploadedFile(meta: UploadedFileMeta): void {
-        if (!meta.fileId) {
+        const fileId = meta.fileId;
+
+        if (!fileId) {
             return;
         }
 
-        if (this.uploadedFileMeta_.size >= Bridge.UPLOADED_FILE_CACHE_MAX) {
+        if (
+            !this.uploadedFileMeta_.has(fileId) &&
+            this.uploadedFileMeta_.size >= Bridge.UPLOADED_FILE_CACHE_MAX
+        ) {
             // Map iteration order is insertion order — drop the oldest.
             const oldest = this.uploadedFileMeta_.keys().next().value;
 
@@ -299,7 +304,7 @@ export class Bridge implements BridgeInterface {
             }
         }
 
-        this.uploadedFileMeta_.set(meta.fileId, meta);
+        this.uploadedFileMeta_.set(fileId, meta);
     }
 
     recallUploadedFile(fileId: string): UploadedFileMeta | undefined {
