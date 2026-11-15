@@ -104,7 +104,15 @@ A connection alone does not establish that a particular account is online.
 
 JSON text is supported; MessagePack is not implemented. The codec's local
 resource policies limit a JSON message to 4 MiB, nesting to 64 levels, nodes to
-100,000 and number literals to 256 characters. Numbers that overflow, underflow
+100,000 and number literals to 256 characters. The depth limit counts the root
+value as depth 0, so an empty array or object at depth 64 is accepted, but any
+child of that container at depth 65 is rejected by snapshot validation. For
+valid JSON, the preliminary container scan counts the root container as 1 and
+allows up to 65 containers along a path; the deepest must be empty to pass the
+subsequent snapshot check. A path of 66 containers is rejected by the scan. The
+scan is not a syntax validator; JSON.parse checks syntax. This precise root-count
+convention was not previously specified clearly in this document and is an SDK
+policy, not a OneBot rule. Numbers that overflow, underflow
 nonzero values to zero, or cannot be represented safely as integers are
 rejected; ordinary floating-point values are rounded to IEEE 754 double
 precision rather than retaining every decimal digit. These are SDK policies,

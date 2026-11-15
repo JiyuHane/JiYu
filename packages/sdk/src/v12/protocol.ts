@@ -353,7 +353,9 @@ function checkNumberLiterals(text: string): void {
                 }
             }
         } else if (ch === '{' || ch === '[') {
-            if (++depth > ONEBOT12_JSON_MAX_DEPTH) {
+            // The root container counts as 1 here, but snapshot starts the root at depth 0.
+            // Snapshot remains authoritative for every value, including children at depth 65.
+            if (++depth > ONEBOT12_JSON_MAX_DEPTH + 1) {
                 throw new TypeError('OneBot 12 JSON exceeds SDK nesting limit');
             }
 
