@@ -1,4 +1,5 @@
 import { currentRequestId, runWithRequestId, subscribeLogs } from '@snowluma/common/logger';
+import type { BridgeInterface, BridgeSessionListener } from '@snowluma/core/bridge-interface';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -21,7 +22,19 @@ function fakeBridge(warmup?: Promise<{ friendsLoaded: boolean; groupsLoaded: boo
         identity: { nickname: 'test' },
         whenRosterWarmupSettled: () =>
             warmup ?? Promise.resolve({ friendsLoaded: false, groupsLoaded: false }),
-    };
+    } as unknown as BridgeInterface;
+}
+
+function bindClosed(manager: OneBotManager) {
+    let listener!: BridgeSessionListener;
+    manager.bind({
+        subscribeSessions: (next) => {
+            listener = next;
+
+            return () => {};
+        },
+    });
+    return (uin: string, bridge: BridgeInterface) => listener.closed!(uin, bridge, 0);
 }
 
 function fakeInstance(
@@ -115,15 +128,16 @@ describe('OneBotManager database preparation', () => {
             }));
             const manager = new OneBotManager({ createDatabaseMigrationTask: createTask });
             const lifecycle = manager as unknown as {
-                onSessionStarted(uin: string, bridge: never): void;
-                onSessionClosed(uin: string): void;
+                onSessionStarted(uin: string, bridge: BridgeInterface): void;
             };
+            const closed = bindClosed(manager);
+            const bridge = fakeBridge();
 
             try {
-                lifecycle.onSessionStarted('10001', fakeBridge() as never);
+                lifecycle.onSessionStarted('10001', bridge);
 
                 if (reason === 'logout') {
-                    lifecycle.onSessionClosed('10001');
+                    closed('10001', bridge);
                 } else {
                     await manager.dispose();
                 }
@@ -197,11 +211,12 @@ describe('OneBotManager database preparation', () => {
             },
         });
         const internals = manager as unknown as {
-            onSessionStarted(uin: string, bridge: never): void;
-            onSessionClosed(uin: string): void;
+            onSessionStarted(uin: string, bridge: BridgeInterface): void;
         };
+        const closed = bindClosed(manager);
+        const bridge = {} as BridgeInterface;
 
-        internals.onSessionStarted('10001', {} as never);
+        internals.onSessionStarted('10001', bridge);
         expect(manager.getConnectionStatuses()).toEqual([
             {
                 uin: '10001',
@@ -218,7 +233,7 @@ describe('OneBotManager database preparation', () => {
             },
         ]);
 
-        internals.onSessionClosed('10001');
+        closed('10001', bridge);
         callbacks.onReady();
         await Promise.resolve();
 
@@ -297,12 +312,12 @@ describe('OneBotManager database preparation', () => {
                 },
             });
             const internals = manager as unknown as {
-                onSessionStarted(uin: string, bridge: never): void;
-                onSessionClosed(uin: string): void;
+                onSessionStarted(uin: string, bridge: BridgeInterface): void;
             };
+            const closed = bindClosed(manager);
             const bridge = fakeBridge();
 
-            expect(() => internals.onSessionStarted('10001', bridge as never)).not.toThrow();
+            expect(() => internals.onSessionStarted('10001', bridge)).not.toThrow();
             expect(tasks[0].cancel).toHaveBeenCalledOnce();
             expect(manager.getConnectionStatuses()[0].databaseMigration).toMatchObject({
                 phase: 'failed',
@@ -313,7 +328,7 @@ describe('OneBotManager database preparation', () => {
             vi.advanceTimersByTime(5_000);
             expect(tasks).toHaveLength(2);
             expect(tasks[1].start).toHaveBeenCalledOnce();
-            internals.onSessionClosed('10001');
+            closed('10001', bridge);
         } finally {
             vi.useRealTimers();
         }
@@ -351,12 +366,12 @@ describe('OneBotManager database preparation', () => {
                 createInstance: () => instance,
             });
             const internals = manager as unknown as {
-                onSessionStarted(uin: string, bridge: never): void;
-                onSessionClosed(uin: string): void;
+                onSessionStarted(uin: string, bridge: BridgeInterface): void;
             };
+            const closed = bindClosed(manager);
             const bridge = fakeBridge();
 
-            internals.onSessionStarted('10001', bridge as never);
+            internals.onSessionStarted('10001', bridge);
             expect(() => callbacks.onReady()).not.toThrow();
             expect(tasks[0].cancel).toHaveBeenCalledOnce();
             expect(manager.getInstance('10001')).toBe(instance);
@@ -368,7 +383,7 @@ describe('OneBotManager database preparation', () => {
 
             vi.advanceTimersByTime(5_000);
             expect(tasks).toHaveLength(2);
-            internals.onSessionClosed('10001');
+            closed('10001', bridge);
         } finally {
             vi.useRealTimers();
         }
@@ -397,12 +412,12 @@ describe('OneBotManager database preparation', () => {
                 },
             });
             const internals = manager as unknown as {
-                onSessionStarted(uin: string, bridge: never): void;
-                onSessionClosed(uin: string): void;
+                onSessionStarted(uin: string, bridge: BridgeInterface): void;
             };
+            const closed = bindClosed(manager);
             const bridge = fakeBridge();
 
-            internals.onSessionStarted('10001', bridge as never);
+            internals.onSessionStarted('10001', bridge);
             expect(() => callbacks[0].onReady()).not.toThrow();
             expect(tasks[0].cancel).toHaveBeenCalledOnce();
             expect(tasks[0].beginMigration).not.toHaveBeenCalled();
@@ -416,7 +431,7 @@ describe('OneBotManager database preparation', () => {
             vi.advanceTimersByTime(5_000);
             expect(tasks).toHaveLength(2);
             expect(tasks[1].start).toHaveBeenCalledOnce();
-            internals.onSessionClosed('10001');
+            closed('10001', bridge);
         } finally {
             vi.useRealTimers();
         }
@@ -501,11 +516,12 @@ describe('OneBotManager database preparation', () => {
                 },
             });
             const internals = manager as unknown as {
-                onSessionStarted(uin: string, bridge: never): void;
-                onSessionClosed(uin: string): void;
+                onSessionStarted(uin: string, bridge: BridgeInterface): void;
             };
+            const closed = bindClosed(manager);
+            const bridge = {} as BridgeInterface;
 
-            internals.onSessionStarted('10001', {} as never);
+            internals.onSessionStarted('10001', bridge);
             callbacks[0].onFailed(new Error('private detail'));
             expect(manager.getConnectionStatuses()[0].databaseMigration).toMatchObject({
                 phase: 'failed',
@@ -527,7 +543,7 @@ describe('OneBotManager database preparation', () => {
             expect(manager.getConnectionStatuses()[0].databaseMigration).toBe(preparing);
             expect(tasks[1].cancel).not.toHaveBeenCalled();
 
-            internals.onSessionClosed('10001');
+            closed('10001', bridge);
             callbacks[1].onFailed(new Error('late failure'));
             vi.advanceTimersByTime(5_000);
             expect(tasks).toHaveLength(2);
@@ -681,9 +697,12 @@ describe('OneBotManager lifecycle failure accounting', () => {
         const instance = fakeInstance('10001', dispose, [], quiesce);
         const internals = manager as unknown as {
             instances: Map<string, OneBotInstance>;
+            instanceBindings: Map<string, { bridge: BridgeInterface; instance: OneBotInstance }>;
             trackLifecycle(label: string, operation: Promise<unknown>): void;
         };
+        const bridge = fakeBridge();
         internals.instances.set('10001', instance);
+        internals.instanceBindings.set('10001', { bridge, instance });
         internals.trackLifecycle('deferred startup', lifecycleGate);
 
         const disposing = manager.dispose();
@@ -883,22 +902,24 @@ describe('OneBotManager lifecycle failure accounting', () => {
         });
         const internals = manager as unknown as {
             retiringInstances: Set<OneBotInstance>;
-            onSessionStarted(uin: string, bridge: never): void;
-            onSessionClosed(uin: string): void;
+            onSessionStarted(uin: string, bridge: BridgeInterface): void;
             pendingStarts: Map<string, unknown>;
         };
+        const closed = bindClosed(manager);
+        const firstBridge = {} as BridgeInterface;
+        const retryBridge = {} as BridgeInterface;
         internals.retiringInstances.add(old);
-        internals.onSessionStarted('10001', {} as never);
+        internals.onSessionStarted('10001', firstBridge);
         await Promise.resolve();
         await Promise.resolve();
         await Promise.resolve();
         expect(internals.pendingStarts.has('10001')).toBe(false);
 
-        internals.onSessionStarted('10001', {} as never);
+        internals.onSessionStarted('10001', retryBridge);
         expect(internals.pendingStarts.has('10001')).toBe(true);
         // The replacement session disappears while the retry is pending; cancel
         // creation so the test never needs a concrete Bridge.
-        internals.onSessionClosed('10001');
+        closed('10001', retryBridge);
         finishRetry();
         await Promise.resolve();
         await Promise.resolve();
@@ -969,10 +990,14 @@ describe('OneBotManager lifecycle failure accounting', () => {
         const instance = fakeInstance('10001', dispose);
         const internals = manager as unknown as {
             instances: Map<string, OneBotInstance>;
+            instanceBindings: Map<string, { bridge: BridgeInterface; instance: OneBotInstance }>;
             retiringInstances: Set<OneBotInstance>;
-            onSessionClosed(uin: string): void;
+            onSessionClosed(uin: string, bridge: BridgeInterface): void;
         };
+        const closed = bindClosed(manager);
+        const bridge = fakeBridge();
         internals.instances.set('10001', instance);
+        internals.instanceBindings.set('10001', { bridge, instance });
 
         await manager.dispose();
         expect(dispose).toHaveBeenCalledOnce();
@@ -980,7 +1005,9 @@ describe('OneBotManager lifecycle failure accounting', () => {
         const lateDispose = vi.fn(async () => ({ closed: true, errors: [] }));
         const late = fakeInstance('10001', lateDispose);
         internals.instances.set('10001', late);
-        internals.onSessionClosed('10001');
+        internals.instanceBindings.set('10001', { bridge, instance: late });
+        closed('10001', bridge);
+        internals.onSessionClosed('10001', bridge);
 
         expect(lateDispose).not.toHaveBeenCalled();
         expect(internals.retiringInstances.has(late)).toBe(false);

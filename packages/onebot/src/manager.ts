@@ -125,6 +125,12 @@ export interface ConfigApplyResult {
 
 export class OneBotManager {
     private readonly instances = new Map<string, OneBotInstance>();
+    // Keep the factory argument, rather than reading mutable instance properties,
+    // as the authority for the active generation.
+    private readonly instanceBindings = new Map<
+        string,
+        { bridge: BridgeInterface; instance: OneBotInstance }
+    >();
     private readonly pendingLifecycle = new Set<Promise<void>>();
     private readonly retiringInstances = new Set<OneBotInstance>();
 
@@ -225,12 +231,12 @@ export class OneBotManager {
                     this.onSessionStarted(uin, bridge);
                 });
             },
-            closed: (uin: string) => {
+            closed: (uin: string, bridge: BridgeInterface) => {
                 if (this.disposed || this.sessionBinding !== binding) {
                     return;
                 }
 
-                this.onSessionClosed(uin);
+                this.onSessionClosed(uin, bridge);
             },
             receiveHealthChanged: (uin: string, bridge: BridgeInterface) => {
                 if (this.disposed || this.sessionBinding !== binding) {
@@ -381,6 +387,7 @@ export class OneBotManager {
         }
 
         this.instances.clear();
+        this.instanceBindings.clear();
 
         const attempt = (async () => {
             // Let already-tracked startup/session-close work settle first. Rejected
@@ -615,6 +622,7 @@ export class OneBotManager {
         }
 
         this.instances.set(uin, instance);
+        this.instanceBindings.set(uin, { bridge, instance });
         log.info('session started: UIN=%s', uin);
 
         this.trackLifecycle(
@@ -689,49 +697,53 @@ export class OneBotManager {
         );
     }
 
-    private onSessionClosed(uin: string): void {
+    private onSessionClosed(uin: string, bridge: BridgeInterface): void {
         if (this.disposed) {
             return;
         }
 
-        const instanceAtEntry = this.instances.get(uin);
+        const bindingAtEntry = this.instanceBindings.get(uin);
         const pendingAtEntry = this.pendingStarts.get(uin);
+        const migrationAtEntry = this.databaseMigrations.get(uin);
 
-        if (!instanceAtEntry) {
-            // Detach only the pending start observed before cancel can reenter.
-            if (pendingAtEntry && this.pendingStarts.get(uin) === pendingAtEntry) {
-                this.pendingStarts.delete(uin);
-            }
+        // Different generations can coexist in these slots. Detach only the
+        // matching snapshots before cancel, which may synchronously reenter.
+        if (pendingAtEntry?.bridge === bridge && this.pendingStarts.get(uin) === pendingAtEntry) {
+            this.pendingStarts.delete(uin);
         }
 
-        const migration = this.databaseMigrations.get(uin);
-
-        if (migration) {
+        if (
+            migrationAtEntry?.bridge === bridge &&
+            this.databaseMigrations.get(uin) === migrationAtEntry
+        ) {
             this.databaseMigrations.delete(uin);
 
-            if (migration.retryTimer) {
-                clearTimeout(migration.retryTimer);
+            if (migrationAtEntry.retryTimer) {
+                clearTimeout(migrationAtEntry.retryTimer);
             }
 
-            migration.task.cancel();
+            migrationAtEntry.task.cancel();
         }
 
-        if (!instanceAtEntry) {
+        if (
+            this.disposed ||
+            !bindingAtEntry ||
+            bindingAtEntry.bridge !== bridge ||
+            this.instanceBindings.get(uin) !== bindingAtEntry ||
+            this.instances.get(uin) !== bindingAtEntry.instance
+        ) {
             return;
         }
 
-        // Cancel may synchronously retire this instance and enqueue a newer start.
-        // This check covers that reentry point, not late close events generally.
-        if (this.instances.get(uin) !== instanceAtEntry) {
-            return;
-        }
-
+        // A nested close may already have retired this exact instance and
+        // installed or queued another generation while cancel was running.
         this.instances.delete(uin);
-        this.retiringInstances.add(instanceAtEntry);
+        this.instanceBindings.delete(uin);
+        this.retiringInstances.add(bindingAtEntry.instance);
         this.trackLifecycle(
             `network shutdown UIN=${uin}`,
-            this.emitOfflineThenDispose(instanceAtEntry),
-            [instanceAtEntry],
+            this.emitOfflineThenDispose(bindingAtEntry.instance),
+            [bindingAtEntry.instance],
         );
         log.info('session closed: UIN=%s', uin);
     }

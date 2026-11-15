@@ -250,7 +250,7 @@ describe('OneBotManager close reentry through migration cancellation', () => {
         });
     });
 
-    it('replaces a pending start already present at close entry during cancel reentry', async () => {
+    it('keeps a different-bridge pending start during cancel reentry', async () => {
         await withFixture(async (f) => {
             const a = bridge(41);
             const retiring = bridge(42);
@@ -284,13 +284,13 @@ describe('OneBotManager close reentry through migration cancellation', () => {
             expect(f.createInstance).toHaveBeenCalledTimes(2);
             expect(f.createInstance).toHaveBeenLastCalledWith(
                 UIN,
-                b,
+                older,
                 expect.anything(),
                 expect.anything(),
             );
             expect(f.createInstance).not.toHaveBeenCalledWith(
                 UIN,
-                older,
+                b,
                 expect.anything(),
                 expect.anything(),
             );
@@ -301,7 +301,7 @@ describe('OneBotManager close reentry through migration cancellation', () => {
         });
     });
 
-    it('propagates the original cancel error after detaching the entry pending start', async () => {
+    it('propagates the original cancel error while retaining another bridge pending start', async () => {
         await withFixture(async (f) => {
             const a = bridge(51);
             const retiring = bridge(52);
@@ -332,7 +332,7 @@ describe('OneBotManager close reentry through migration cancellation', () => {
 
             expect(caught).toBe(failure);
             expect(f.tasks[0].cancel).toHaveBeenCalledOnce();
-            // B can enter the pending handoff only if the older pending was detached.
+            // The pending start belongs to another bridge; B remains unaccepted.
             listener.started!(UIN, b);
             f.release();
             await vi.advanceTimersByTimeAsync(0);
@@ -341,13 +341,13 @@ describe('OneBotManager close reentry through migration cancellation', () => {
             expect(f.createInstance).toHaveBeenCalledTimes(2);
             expect(f.createInstance).toHaveBeenLastCalledWith(
                 UIN,
-                b,
+                older,
                 expect.anything(),
                 expect.anything(),
             );
             expect(f.createInstance).not.toHaveBeenCalledWith(
                 UIN,
-                older,
+                b,
                 expect.anything(),
                 expect.anything(),
             );

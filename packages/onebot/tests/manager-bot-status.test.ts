@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
+import type { BridgeInterface, BridgeSessionListener } from '@snowluma/core/bridge-interface';
 import type { OneBotInstance } from '../src/instance';
 import { OneBotManager, type DatabaseMigrationCallbacks } from '../src/manager';
 
@@ -11,7 +12,19 @@ function fakeBridge() {
         identity: { nickname: 'test' },
         whenRosterWarmupSettled: () =>
             Promise.resolve({ friendsLoaded: false, groupsLoaded: false }),
-    };
+    } as unknown as BridgeInterface;
+}
+
+function bindClosed(manager: OneBotManager) {
+    let listener!: BridgeSessionListener;
+    manager.bind({
+        subscribeSessions: (next) => {
+            listener = next;
+
+            return () => {};
+        },
+    });
+    return (uin: string, bridge: BridgeInterface) => listener.closed!(uin, bridge, 0);
 }
 
 describe('OneBotManager bot_status', () => {
@@ -113,11 +126,14 @@ describe('OneBotManager bot_status', () => {
         const manager = new OneBotManager();
         const internals = manager as unknown as {
             instances: Map<string, OneBotInstance>;
-            onSessionClosed(uin: string): void;
+            instanceBindings: Map<string, { bridge: BridgeInterface; instance: OneBotInstance }>;
         };
+        const closed = bindClosed(manager);
+        const bridge = fakeBridge();
         internals.instances.set('10001', instance);
+        internals.instanceBindings.set('10001', { bridge, instance });
 
-        internals.onSessionClosed('10001');
+        closed('10001', bridge);
         await Promise.resolve();
         expect(order).toEqual(['offline-start']);
         expect(dispose).not.toHaveBeenCalled();
@@ -142,16 +158,22 @@ describe('OneBotManager bot_status', () => {
             getConnectionStatuses: () => [],
         } as unknown as OneBotInstance;
         const manager = new OneBotManager();
-        (manager as unknown as { instances: Map<string, OneBotInstance> }).instances.set(
-            '10001',
-            instance,
-        );
+        const internals = manager as unknown as {
+            instances: Map<string, OneBotInstance>;
+            instanceBindings: Map<string, { bridge: BridgeInterface; instance: OneBotInstance }>;
+            onSessionClosed(uin: string, bridge: BridgeInterface): void;
+        };
+        const closed = bindClosed(manager);
+        const bridge = fakeBridge();
+        internals.instances.set('10001', instance);
+        internals.instanceBindings.set('10001', { bridge, instance });
 
         await manager.dispose();
         expect(emitBotStatus).not.toHaveBeenCalled();
         expect(dispose).toHaveBeenCalledOnce();
 
-        (manager as unknown as { onSessionClosed(uin: string): void }).onSessionClosed('10001');
+        closed('10001', bridge);
+        internals.onSessionClosed('10001', bridge);
         expect(emitBotStatus).not.toHaveBeenCalled();
     });
 });
