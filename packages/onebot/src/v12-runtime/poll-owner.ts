@@ -226,6 +226,51 @@ export interface PollGate {
     uncertain: boolean;
 }
 
+export type PollGateRegistryResult =
+    { kind: 'ready'; gate: PollGate } | { kind: 'invalid_uin' | 'capacity_exhausted' };
+
+export interface PollGateRegistry {
+    getOrCreate(uin: unknown): PollGateRegistryResult;
+}
+
+/**
+ * Internal admission container only, not a same-process security boundary.
+ * Capacity bounds registry entries, not total memory, tasks, or external references.
+ * With ordinary, unmodified built-ins, lookup and registration invoke no external
+ * callbacks. This does not resist malicious same-process mutation. Gates and their
+ * WeakMap history survive only while references remain live; this does not establish
+ * persistence across managers or processes. Callers must handle invalid/full
+ * explicitly and never pass an absent gate to a defaulting API.
+ */
+export function createPollGateRegistry(capacity: number): PollGateRegistry {
+    if (!Number.isSafeInteger(capacity) || capacity <= 0) {
+        throw new RangeError('capacity must be a positive safe integer');
+    }
+
+    const gates = new Map<string, PollGate>();
+    return {
+        getOrCreate(uin: unknown): PollGateRegistryResult {
+            if (typeof uin !== 'string' || uin.length > 16 || parseAccountId(uin) === null) {
+                return { kind: 'invalid_uin' };
+            }
+
+            const existing = gates.get(uin);
+
+            if (existing) {
+                return { kind: 'ready', gate: existing };
+            }
+
+            if (gates.size >= capacity) {
+                return { kind: 'capacity_exhausted' };
+            }
+
+            const gate = createPollGate();
+            gates.set(uin, gate);
+            return { kind: 'ready', gate };
+        },
+    };
+}
+
 type GateState = {
     gap: { source: V12Source; reason: PollGapReason } | null;
     history: V12Source[];
