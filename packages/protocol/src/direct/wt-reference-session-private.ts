@@ -1,6 +1,31 @@
 import { isProxy, isSharedArrayBuffer, isUint8Array } from 'node:util/types';
 import { decodeServiceResponse } from './service-frame';
 import { decodeSsoResponse } from './sso';
+import type { DirectSendMessageRequestInput } from './send-message-request';
+import type { SsoSendTextOutcome } from './sso-reference-send-text-flow';
+import type { RawSessionLease } from './raw-session-broker';
+import type { WtReferenceSession } from './wt-reference-session';
+
+export type ReferenceSessionSendInput = {
+    request: DirectSendMessageRequestInput;
+    maxResponseBodyBytes: number;
+};
+export type ReferenceSessionSendHandle = (
+    input: ReferenceSessionSendInput,
+) => Promise<Extract<SsoSendTextOutcome, { status: 'response' }>>;
+const sendImplementations = new WeakMap<ReferenceSessionSendHandle, ReferenceSessionSendHandle>();
+
+// The returned closure retains only itself, never the owner's implementation.
+function createSendHandle(): ReferenceSessionSendHandle {
+    const handle: ReferenceSessionSendHandle = (input) => {
+        const implementation = sendImplementations.get(handle);
+        return implementation
+            ? implementation(input)
+            : Promise.reject(new Error('session send revoked'));
+    };
+
+    return handle;
+}
 
 // A capability is scoped to one owner, not a security boundary against code in
 // this process. In particular, this module is reachable by a deep import.
@@ -10,6 +35,9 @@ type Slot = {
     attempt?: object;
     reservation?: object;
     ownerLease?: object;
+    sessionOwner?: WtReferenceSession;
+    sessionHandle?: ReferenceSessionSendHandle;
+    sessionHandleTaken?: boolean;
     sendRun?: object;
     usedSendRuns?: WeakSet<object>;
     businessOwner?: object;
@@ -66,6 +94,15 @@ export function reserveReferenceKeyCapability(token: object): object {
     const reservation = Object.freeze({});
     slot(token).reservation = reservation;
     return reservation;
+}
+
+/** Recheck the original reservation without invoking caller-provided properties. */
+export function assertReferenceKeyReservation(token: object, reservation: object): void {
+    const value = slot(token);
+
+    if (value.phase !== 'empty' || value.attempt || value.reservation !== reservation) {
+        throw new Error('reference capability reservation stopped');
+    }
 }
 
 export function bindReferenceKeyAttempt(token: object, attempt: object, reservation: object): void {
@@ -138,6 +175,81 @@ export function bindReferenceKeyAttemptOwnerLease(
     value.attempt = attempt;
     value.businessOwner = reservation;
     value.ownerLease = lease;
+}
+
+/** Publication is tied to the original reservation, attempt and borrowed lease. */
+export function publishReferenceSessionSend(
+    token: object,
+    reservation: object,
+    attempt: object,
+    lease: RawSessionLease,
+    owner: WtReferenceSession,
+    implementation: ReferenceSessionSendHandle,
+): void {
+    const value = slot(token);
+
+    if (
+        value.phase !== 'empty' ||
+        value.businessOwner !== reservation ||
+        value.attempt !== attempt ||
+        value.ownerLease !== lease ||
+        value.sessionOwner ||
+        value.sessionHandle
+    ) {
+        throw new Error('invalid reference session binding');
+    }
+
+    const handle = createSendHandle();
+    sendImplementations.set(handle, implementation);
+    value.sessionOwner = owner;
+    value.sessionHandle = handle;
+    value.sessionHandleTaken = false;
+}
+
+/** Wrong identity does not consume the one exact claim. */
+export function takeReferenceSessionSend(
+    token: object,
+    owner: WtReferenceSession,
+    lease: RawSessionLease,
+): ReferenceSessionSendHandle | undefined {
+    const value = slots.get(token);
+
+    if (
+        !value ||
+        value.phase === 'revoked' ||
+        value.sessionOwner !== owner ||
+        value.ownerLease !== lease ||
+        value.sessionHandleTaken ||
+        !value.sessionHandle
+    ) {
+        return undefined;
+    }
+
+    value.sessionHandleTaken = true;
+    return value.sessionHandle;
+}
+
+/** Exact owner binding remains available after the original attempt is closed. */
+export function assertReferenceSessionSendActive(
+    token: object,
+    owner: WtReferenceSession,
+    lease: RawSessionLease,
+    attempt: object,
+): void {
+    const value = slot(token);
+
+    if (
+        value.phase !== 'active' ||
+        !value.key ||
+        value.sessionOwner !== owner ||
+        value.ownerLease !== lease ||
+        value.attempt !== attempt ||
+        !value.sessionHandle ||
+        !value.sessionHandleTaken ||
+        !sendImplementations.has(value.sessionHandle)
+    ) {
+        throw new Error('invalid reference session binding');
+    }
 }
 
 /** One terminal business outcome, independent of key revocation. */
@@ -441,6 +553,14 @@ export function endReferenceSend(token: object, attempt: object, lease: object, 
 
 export function revokeReferenceKey(token: object): void {
     const value = slot(token);
+
+    if (value.sessionHandle) {
+        sendImplementations.delete(value.sessionHandle);
+    }
+
+    value.sessionHandle = undefined;
+    value.sessionOwner = undefined;
+    value.sessionHandleTaken = true;
 
     try {
         if (value.key) {

@@ -26,11 +26,18 @@ import {
     type SsoHeartbeatOutcome,
 } from './sso-reference-heartbeat-flow';
 import { referenceAliveOnTransport, type SsoAliveOutcome } from './sso-reference-alive-flow';
+import { encodeDirectSendMessageRequest } from './send-message-request';
 import {
     assertReferenceKeyCapabilityAvailable,
+    assertReferenceKeyReservation,
+    assertReferenceSessionSendActive,
+    publishReferenceSessionSend,
+    type ReferenceSessionSendInput,
+    type ReferenceSessionSendHandle,
     commitReferenceKey,
     discardReferenceBusinessFailure,
     reserveReferenceKeyCapability,
+    referenceKeyState,
     revokeReferenceKey,
     stageReferenceBusinessFailure,
 } from './wt-reference-session-private';
@@ -77,6 +84,11 @@ const values = Uint8Array.prototype.values;
 const fill = Uint8Array.prototype.fill;
 const aborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted')!.get!;
 const then = Promise.prototype.then;
+
+// A retained timer callback owns only this revocable box, not the session.
+function createTimerDispatch(gate: { run?: () => void }): () => void {
+    return () => gate.run?.();
+}
 
 function wipe(bytes: Uint8Array | undefined): void {
     if (bytes) {
@@ -215,12 +227,14 @@ function createSession(
     const reservation = capability ? reserveReferenceKeyCapability(capability) : undefined;
     claimed.add(lease);
     let attempt: BorrowedWtReferenceLoginAttempt | undefined;
+    let sendAttempt: BorrowedWtReferenceLoginAttempt | undefined;
     let state: WtReferenceSessionState = 'new';
     let busy = false;
     let poisoned = false;
     let epoch = 0;
     let terminalPort: object | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let timerGate: { run?: () => void } | undefined;
     let abortListener: ReturnType<typeof addAbortListener> | undefined;
     let retained: Extract<WtReferenceLoginResult, { status: 'tickets' }> | undefined;
     const controller = new AbortController();
@@ -253,6 +267,11 @@ function createSession(
         const stoppedAttempt = attempt;
         attempt = undefined;
 
+        if (timerGate) {
+            timerGate.run = undefined;
+            timerGate = undefined;
+        }
+
         if (timer !== undefined) {
             clearTimeout(timer);
             timer = undefined;
@@ -269,6 +288,8 @@ function createSession(
         if (capability) {
             revokeReferenceKey(capability);
         }
+
+        sendAttempt = undefined;
     };
 
     const cleanup = (): void => {
@@ -432,7 +453,33 @@ function createSession(
             aborted.call(signal);
         }
 
-        const deadline = performance.now() + (lifetime as number);
+        let deadline: number;
+
+        if (capability) {
+            const startingEpoch = epoch;
+
+            const checkBeforeAttempt = (): void => {
+                if (
+                    epoch !== startingEpoch ||
+                    state !== 'new' ||
+                    (signal && aborted.call(signal))
+                ) {
+                    throw new Error('session stopped during construction');
+                }
+
+                assertReferenceKeyReservation(capability, reservation!);
+
+                if (epoch !== startingEpoch || state !== 'new') {
+                    throw new Error('session stopped during construction');
+                }
+            };
+
+            checkBeforeAttempt();
+            deadline = performance.now() + (lifetime as number);
+            checkBeforeAttempt();
+        } else {
+            deadline = performance.now() + (lifetime as number);
+        }
 
         const active = (): void => {
             if (
@@ -495,6 +542,7 @@ function createSession(
 
         if (capability) {
             bindReferenceKeyCapability(attempt, capability, reservation!);
+            sendAttempt = attempt;
         }
 
         if (terminal && capability) {
@@ -524,8 +572,63 @@ function createSession(
             abortListener = addAbortListener(signal, fail);
         }
 
-        timer = setTimeout(fail, Math.max(1, Math.ceil(deadline - performance.now())));
+        let checkConstruction: (() => void) | undefined;
+
+        if (capability) {
+            const previousEpoch = epoch;
+            const originalAttempt = sendAttempt;
+
+            checkConstruction = (): void => {
+                const same = (): boolean =>
+                    epoch === previousEpoch &&
+                    state === 'new' &&
+                    !!originalAttempt &&
+                    attempt === originalAttempt &&
+                    sendAttempt === originalAttempt &&
+                    referenceKeyState(capability) === 'empty';
+
+                if (
+                    !same() ||
+                    aborted.call(sessionController.signal) ||
+                    (signal && aborted.call(signal)) ||
+                    !same()
+                ) {
+                    throw new Error('session stopped during construction');
+                }
+            };
+
+            checkConstruction();
+            const delay = Math.max(1, Math.ceil(deadline - performance.now()));
+            checkConstruction();
+            const gate = { run: fail as (() => void) | undefined };
+            timerGate = gate;
+
+            try {
+                timer = setTimeout(createTimerDispatch(gate), delay);
+                checkConstruction();
+            } catch (error) {
+                // Even a foreign timer function that retains its callback and
+                // throws before returning a handle loses the owner reference.
+                gate.run = undefined;
+                throw error;
+            }
+        } else {
+            timer = setTimeout(fail, Math.max(1, Math.ceil(deadline - performance.now())));
+        }
+
         const closed = lease.whenClosed;
+        checkConstruction?.();
+
+        if (
+            capability &&
+            (!isPromise(closed) ||
+                isProxy(closed) ||
+                Object.getPrototypeOf(closed) !== Promise.prototype ||
+                Object.hasOwn(closed, 'constructor'))
+        ) {
+            throw new TypeError('invalid lease closure promise');
+        }
+
         const observed = isPromise(closed) ? closed : Promise.resolve(closed);
         void then.call(
             observed,
@@ -546,7 +649,16 @@ function createSession(
                 }
             },
         );
+        checkConstruction?.();
+        const constructionEpoch = epoch;
         active();
+
+        if (
+            capability &&
+            (epoch !== constructionEpoch || state !== 'new' || attempt !== sendAttempt)
+        ) {
+            throw new Error('session stopped during construction');
+        }
 
         const finishBusiness = (
             operation: 'poll' | 'login-register',
@@ -618,7 +730,7 @@ function createSession(
 
         const signer = input.buildRegisterReserved as RegisterOptions['buildReserved'];
         const verifier = input.verifyRegisterRaw as RegisterOptions['verifyRaw'];
-        return {
+        const owner: WtReferenceSession = {
             getState: () => state,
             async fetch(fields) {
                 enter('new');
@@ -918,6 +1030,205 @@ function createSession(
                 }
             },
         };
+
+        if (capability) {
+            const originalAttempt = sendAttempt!;
+            let sendRun: object | undefined;
+
+            const send: ReferenceSessionSendHandle = async (
+                supplied: ReferenceSessionSendInput | undefined,
+            ) => {
+                // Gate before touching inputs, clocks, signals or transport accessors.
+                if (state !== 'success') {
+                    throw new Error('session not registered');
+                }
+
+                if (busy) {
+                    throw new Error('session single-flight violation');
+                }
+
+                busy = true;
+                const run = {};
+                sendRun = run;
+                const startEpoch = epoch;
+                const login = retained;
+                let uid: string | undefined;
+                let borrowed = false;
+
+                const check = (): void => {
+                    const identity = (): void => {
+                        if (
+                            epoch !== startEpoch ||
+                            state !== 'success' ||
+                            !busy ||
+                            sendRun !== run ||
+                            retained !== login ||
+                            sendAttempt !== originalAttempt ||
+                            login?.uidProjection?.status !== 'present' ||
+                            login.uidProjection.uid !== uid ||
+                            !text(uid, true)
+                        ) {
+                            throw new Error('session stopped');
+                        }
+
+                        assertReferenceSessionSendActive(capability, owner, lease, originalAttempt);
+                    };
+
+                    try {
+                        identity();
+                        active();
+                        identity();
+                    } catch {
+                        fail();
+                        throw new Error('session stopped');
+                    }
+                };
+
+                try {
+                    const input = record(supplied, ['request', 'maxResponseBodyBytes']);
+                    supplied = undefined;
+                    const request = record(input.request, [
+                        'route',
+                        'text',
+                        'clientSequence',
+                        'random',
+                    ]);
+                    input.request = undefined;
+                    const route = record(request.route, ['kind', 'peerUin', 'peerUid', 'groupUin']);
+                    request.route = route;
+                    const maxResponseBodyBytes = input.maxResponseBodyBytes;
+
+                    // Drop all foreign object references before the first await. The
+                    // real codec below still validates UTF-16 and encoded byte limits.
+                    if (
+                        Object.keys(input).length !== 2 ||
+                        Object.keys(request).length !== 4 ||
+                        typeof request.text !== 'string' ||
+                        request.text.length > 65536 ||
+                        typeof request.clientSequence !== 'bigint' ||
+                        request.clientSequence < 0n ||
+                        request.clientSequence > 0xffffffffffffffffn ||
+                        typeof request.random !== 'number' ||
+                        !Number.isInteger(request.random) ||
+                        request.random < 0 ||
+                        request.random > 0xffffffff ||
+                        (route.kind === 'private'
+                            ? Object.keys(route).length !== 3 ||
+                              typeof route.peerUin !== 'bigint' ||
+                              route.peerUin < 1n ||
+                              route.peerUin > 0x7fffffffffffffffn ||
+                              typeof route.peerUid !== 'string' ||
+                              route.peerUid.length > 1024
+                            : route.kind === 'group'
+                              ? Object.keys(route).length !== 2 ||
+                                typeof route.groupUin !== 'bigint' ||
+                                route.groupUin < 1n ||
+                                route.groupUin > 0x7fffffffffffffffn
+                              : true)
+                    ) {
+                        throw new TypeError('invalid send-text request');
+                    }
+
+                    if (
+                        typeof maxResponseBodyBytes !== 'number' ||
+                        !Number.isSafeInteger(maxResponseBodyBytes) ||
+                        maxResponseBodyBytes < 0 ||
+                        maxResponseBodyBytes > 65536
+                    ) {
+                        throw new TypeError('invalid response body limit');
+                    }
+
+                    const stableRequest =
+                        request as unknown as ReferenceSessionSendInput['request'];
+                    // Complete codec validation before the first suspension, so an
+                    // invalid request cannot leave the owner busy across a turn.
+                    const encoded = encodeDirectSendMessageRequest(stableRequest);
+                    let size: number;
+
+                    try {
+                        size = length.call(encoded) as number;
+                    } finally {
+                        wipe(encoded);
+                    }
+
+                    if (size > 65536) {
+                        throw new RangeError('send-text request exceeds size limit');
+                    }
+
+                    uid =
+                        login?.uidProjection?.status === 'present'
+                            ? login.uidProjection.uid
+                            : undefined;
+                    check();
+                    const sender = await import('./sso-reference-send-text-flow');
+                    check();
+                    const sendSignal = sessionController.signal;
+                    check();
+                    borrowed = true;
+                    const result = await sender.referenceSendTextWithCapability(
+                        { token: capability, attempt: originalAttempt, lease, run },
+                        {
+                            login: login!,
+                            profile: {
+                                guid,
+                                subAppId: profile.subAppId,
+                                version: profile.ssoVersion,
+                            },
+                            uid: uid!,
+                            request: stableRequest,
+                            maxResponseBodyBytes,
+                            timeoutMs: timeout as number,
+                            signal: sendSignal,
+                            buildReserved: signer,
+                            verifyRaw: verifier,
+                        },
+                    );
+                    check();
+
+                    if (result.kind !== 'response') {
+                        throw new Error('send transport failed');
+                    }
+
+                    if (result.value.status !== 'response') {
+                        throw new Error('send SSO failed');
+                    }
+
+                    return result.value;
+                } catch (error) {
+                    if (borrowed) {
+                        fail();
+                        throw new Error('session send failed');
+                    }
+
+                    throw error;
+                } finally {
+                    if (sendRun === run) {
+                        sendRun = undefined;
+                        busy = false;
+                    }
+                }
+            };
+
+            if (
+                epoch !== constructionEpoch ||
+                state !== 'new' ||
+                attempt !== originalAttempt ||
+                sendAttempt !== originalAttempt
+            ) {
+                throw new Error('session stopped during construction');
+            }
+
+            publishReferenceSessionSend(
+                capability,
+                reservation!,
+                originalAttempt,
+                lease,
+                owner,
+                send,
+            );
+        }
+
+        return owner;
     } catch {
         fail();
         throw new Error('invalid or stopped session');

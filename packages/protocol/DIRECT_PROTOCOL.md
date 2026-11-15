@@ -1558,14 +1558,30 @@ remain to be recovered and independently verified.
   the JavaScript engine and copies retained by callers are not guaranteed to be
   erased. The API does not expose the D2 key for caller-side decoding. The
   deep-importable capability helpers are an internal ownership convention, not isolation from
-  other code in the same process. Preparatory send-coordination helpers bind an
-  attempt to its registered borrowed lease and one locally active run; they reject
-  a stopped or busy attempt at binding and reject reuse of a completed run within
-  the same capability. These helpers are not yet used by the multiplex session's
-  public operations and do not send messages. Deep callers can register their own
-  objects, and direct low-level binding does not attach the attempt's lifecycle;
-  neither operation proves origin, peer identity or isolation. The legacy borrowed
-  attempt API still returns tickets. The classifier and caller-provided verification are local policies;
+  other code in the same process. Send-coordination helpers bind an attempt to its
+  registered borrowed lease and one locally active run; they reject a stopped or
+  busy attempt at binding and reject reuse of a completed run within the same
+  capability. The injected reference multiplex session uses a one-time local handle
+  to expose `sendText` after registration. It accepts explicit text, routing,
+  sequence, random and response-size inputs, and returns a local response projection;
+  this is not connected to the production Bridge or proof of message delivery.
+  SSO errors and uncertain transport failures close the reference owner and reject
+  rather than being reported as successful sends; the projected business result
+  can itself be absent or nonzero. Loading the session or multiplexer now loads
+  the request codec earlier than before, including its existing Proton dependency.
+  While that operation is in progress, queued push callbacks wait and are resumed
+  afterwards if the session remains active; close or failure can discard them.
+  Attempts to send from a running push callback are rejected rather than waiting
+  on themselves. The pre-existing operations retain their earlier
+  push callback timing. The handle's revoked-state checks and best-effort byte
+  wiping do not force an already running external callback to settle. A custom
+  lease's first `whenClosed` read occurs inside the borrowed attempt and can
+  assimilate an external thenable; the subsequent owner read is restricted to a
+  same-realm ordinary Promise. Those checks are local coordination, not isolation.
+  Deep callers can register their own objects, and direct low-level binding does
+  not attach the attempt's lifecycle; neither operation proves origin, peer identity
+  or isolation. The legacy borrowed attempt API still returns tickets. The classifier
+  and caller-provided verification are local policies;
   QQ-TEA does not authenticate the peer. This composition does not create a
   connection, implement the signing algorithm, attach events to Bridge or OneBot,
   or establish real QQ interoperability. A transport that closes independently
@@ -1615,9 +1631,10 @@ remain to be recovered and independently verified.
   helper accepts the original transport identity alongside the confirmed account
   only when an active local capability matches the exact attempt, lease, run,
   account and D2 key bytes. It neither changes the raw transport identity nor
-  establishes the origin or authenticity of those values. That helper is not
-  yet called by the multiplex session. Its owner must handle failures and poison
-  the transport as appropriate; the helper does not do so or retry. The public
+  establishes the origin or authenticity of those values. The reference multiplex
+  session calls this helper through its owner-specific handle; the production
+  Bridge does not. The owner must handle failures and poison the transport as
+  appropriate; the helper does not do so or retry. The public
   function now returns its asynchronous core's promise through a non-async wrapper:
   normal direct construction still throws, but function-object reflection and use
   as `Reflect.construct`'s `newTarget` can differ from the former async function.
@@ -1630,9 +1647,19 @@ remain to be recovered and independently verified.
   they are trusted to handle it, not isolated from it. Its untrusted `errMsg` may
   contain private data; callers control its handling. The configured response
   limit is checked after SSO decoding, which can first inflate up to 16 MiB.
-  The internal helper snapshots its inputs before dynamically importing the
-  capability module, then rechecks cancellation and its elapsed deadline after
-  import. A non-settling import is not forcibly interrupted and retains those
+  The internal helper first validates and shallowly snapshots its outer options
+  before reading the borrowed transport's method. When a signal is present, it
+  checks that captured signal on both sides of the method getter; nested objects
+  and byte arrays are copied after that getter, which can mutate them. With no
+  signal, a valid outer options object is re-read after the getter; invalid outer
+  options are rejected before it. An already-aborted captured signal may return
+  `raw-cancelled` before the helper validates the capability; a getter that throws
+  still reports an invalid borrowed transport, including if it also aborts. Only
+  token revocation without signal abort does not by itself prevent the getter.
+  The public helper retains its earlier getter order. After copying the remaining
+  inputs, the internal helper dynamically imports the capability module and
+  rechecks cancellation and elapsed deadline.
+  A non-settling import is not forcibly interrupted and retains those
   owned copies until it settles. A loss of local run ownership during cleanup
   yields an uncertain-write failure rather than a successful response or a claim
   that no bytes were written; it does not release a different active run. The

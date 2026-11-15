@@ -91,6 +91,27 @@ function record(value: unknown, allowed: readonly string[]): Record<string, unkn
     return result;
 }
 
+// Inspect a capability signal without consulting caller-provided accessors or proxy traps.
+function preflightSignal(value: unknown): boolean {
+    if (
+        isProxy(value) ||
+        typeof value !== 'object' ||
+        value === null ||
+        Object.getPrototypeOf(value) !== AbortSignal.prototype ||
+        Object.hasOwn(value, 'aborted') ||
+        Object.hasOwn(value, 'addEventListener') ||
+        Object.hasOwn(value, 'removeEventListener')
+    ) {
+        throw new TypeError('invalid signal');
+    }
+
+    try {
+        return aborted.call(value) as boolean;
+    } catch {
+        throw new TypeError('invalid signal');
+    }
+}
+
 function copyBytes(value: unknown, max: number): Uint8Array {
     if (isProxy(value) || !isUint8Array(value)) {
         throw new TypeError('invalid bytes');
@@ -141,8 +162,8 @@ function nonemptyText(value: unknown, max: number): value is string {
  * The response clientSequence is not compared to the request's clientSequence.
  * maxResponseBodyBytes is a post-decompression acceptance limit: decodeSsoResponse can
  * first inflate up to its fixed 16 MiB limit, even for a nonzero SSO return code.
- * Reading transport.transactRaw happens before the options snapshot and can invoke a
- * getter with side effects, including mutation of options.
+ * On this public entry, reading transport.transactRaw happens before the options
+ * snapshot and can invoke a getter with side effects, including mutation of options.
  * The owner controls exclusivity, transport settlement and poisoning, including an outer
  * guard rejection after a broker reports success. Non-settling transports and callbacks
  * may outlive the deadline; external callback effects and retained copies remain theirs.
@@ -176,6 +197,7 @@ async function sendTextCore(
     let binding:
         { token: object; attempt: object; lease: Sso12RawTransport; run: object } | undefined;
     let transport = suppliedTransport;
+    let capabilityInput: Record<string, unknown> | undefined;
 
     if (capability !== undefined) {
         const input = record(capability, ['token', 'attempt', 'lease', 'run']);
@@ -186,6 +208,27 @@ async function sendTextCore(
             run: input.run as object,
         };
         transport = binding.lease;
+        const preflight = record(options, [
+            'login',
+            'profile',
+            'uid',
+            'request',
+            'maxResponseBodyBytes',
+            'timeoutMs',
+            'signal',
+            'buildReserved',
+            'verifyRaw',
+        ]);
+
+        // The clock can synchronously close the owner and abort its signal.
+        // This early result precedes capability ownership validation.
+        if (preflight.signal !== undefined) {
+            if (preflightSignal(preflight.signal)) {
+                return { kind: 'failure', code: 'raw-cancelled', writeState: 'not-written' };
+            }
+
+            capabilityInput = preflight;
+        }
     }
 
     let method: Sso12RawTransport['transactRaw'];
@@ -202,6 +245,12 @@ async function sendTextCore(
         }
     } catch {
         throw new TypeError('invalid borrowed transport');
+    }
+
+    // The getter itself may abort or alter the caller's options. Check the
+    // captured signal again before any transaction or callback is entered.
+    if (capabilityInput?.signal !== undefined && preflightSignal(capabilityInput.signal)) {
+        return { kind: 'failure', code: 'raw-cancelled', writeState: 'not-written' };
     }
 
     const stable: Sso12RawTransport = {
@@ -230,20 +279,28 @@ async function sendTextCore(
         ) {
             throw new Error('transaction stopped');
         }
+
+        // The clock above can synchronously abort while still returning an
+        // in-range time. Do not enter a capability callback after that reentry.
+        if (binding && (!active || controller.signal.aborted || (signal && aborted.call(signal)))) {
+            throw new Error('transaction stopped');
+        }
     };
 
     try {
-        const input = record(options, [
-            'login',
-            'profile',
-            'uid',
-            'request',
-            'maxResponseBodyBytes',
-            'timeoutMs',
-            'signal',
-            'buildReserved',
-            'verifyRaw',
-        ]);
+        const input =
+            capabilityInput ??
+            record(options, [
+                'login',
+                'profile',
+                'uid',
+                'request',
+                'maxResponseBodyBytes',
+                'timeoutMs',
+                'signal',
+                'buildReserved',
+                'verifyRaw',
+            ]);
         const login = record(input.login, ['status', 'uin', 'tickets', 'uidProjection']);
         const tickets = record(login.tickets, ['d2', 'd2Key', 'a1', 'a2']);
         const profile = record(input.profile, ['subAppId', 'guid', 'version']);
@@ -589,6 +646,16 @@ async function sendTextCore(
         }
 
         if (binding && result.kind === 'response') {
+            // The final clock read above may synchronously abort after the
+            // preceding signal checks. Preserve uncertainty after a write.
+            if (controller.signal.aborted || (signal && aborted.call(signal))) {
+                return {
+                    kind: 'failure',
+                    code: 'borrowed-transaction-failed',
+                    writeState: 'unknown',
+                };
+            }
+
             try {
                 if (actualUin === undefined) {
                     throw new Error('invalid reference send binding');

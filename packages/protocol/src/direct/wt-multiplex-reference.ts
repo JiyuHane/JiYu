@@ -1,5 +1,7 @@
 import { addAbortListener } from 'node:events';
 import { isProxy } from 'node:util/types';
+import { encodeDirectSendMessageRequest } from './send-message-request';
+import type { SsoSendTextOutcome } from './sso-reference-send-text-flow';
 import type { RawMultiplexPushRoute } from './raw-multiplex-client';
 import {
     createRawMultiplexStream,
@@ -23,6 +25,9 @@ import {
     referenceKeyState,
     revokeReferenceKey,
     takeReferenceExactBusinessFailure,
+    takeReferenceSessionSend,
+    type ReferenceSessionSendHandle,
+    type ReferenceSessionSendInput,
 } from './wt-reference-session-private';
 import type { Sso12CloseReason, Sso12RawClient } from './sso12-packet-client';
 
@@ -30,7 +35,79 @@ const PUSH_COMMAND = 'trpc.msg.olpush.OlPushService.MsgPush';
 const MAX_TIMER = 0x7fffffff;
 const nativeFill = Uint8Array.prototype.fill;
 type PushMeta = Readonly<{ uin: string; sequence: number; command: string }>;
-type Operation = 'fetch' | 'poll' | 'login-register' | 'heartbeat' | 'alive';
+type Operation = 'fetch' | 'poll' | 'login-register' | 'heartbeat' | 'alive' | 'send-text';
+
+/** Snapshot only own data properties before any owner, clock, or callback is touched. */
+function sendRecord(value: unknown, keys: readonly string[]): Record<string, unknown> {
+    if (!value || typeof value !== 'object' || isProxy(value)) {
+        throw new TypeError('invalid send-text input');
+    }
+
+    const prototype = Object.getPrototypeOf(value) as unknown;
+    const actual = Reflect.ownKeys(value);
+
+    if ((prototype !== Object.prototype && prototype !== null) || actual.length !== keys.length) {
+        throw new TypeError('invalid send-text input');
+    }
+
+    const snapshot: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+
+    for (const key of actual) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+
+        if (
+            typeof key !== 'string' ||
+            !keys.includes(key) ||
+            !descriptor ||
+            !('value' in descriptor)
+        ) {
+            throw new TypeError('invalid send-text input');
+        }
+
+        snapshot[key] = descriptor.value;
+    }
+
+    return snapshot;
+}
+
+function snapshotSendInput(input: unknown): ReferenceSessionSendInput {
+    const outer = sendRecord(input, ['request', 'maxResponseBodyBytes']);
+    const request = sendRecord(outer.request, ['route', 'text', 'clientSequence', 'random']);
+    const routeValue = request.route;
+
+    if (!routeValue || typeof routeValue !== 'object' || isProxy(routeValue)) {
+        throw new TypeError('invalid send-text route');
+    }
+
+    const kind = Object.getOwnPropertyDescriptor(routeValue, 'kind');
+
+    if (!kind || !('value' in kind)) {
+        throw new TypeError('invalid send-text route');
+    }
+
+    const route = sendRecord(
+        routeValue,
+        kind.value === 'private' ? ['kind', 'peerUin', 'peerUid'] : ['kind', 'groupUin'],
+    );
+    request.route = route;
+    const limit = outer.maxResponseBodyBytes;
+
+    if (typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 0 || limit > 65536) {
+        throw new TypeError('invalid send-text body limit');
+    }
+
+    // The real codec performs all field, Unicode and numeric checks before live().
+    const stableRequest = request as unknown as ReferenceSessionSendInput['request'];
+    const body = encodeDirectSendMessageRequest(stableRequest);
+    const size = body.byteLength;
+    nativeFill.call(body, 0);
+
+    if (size > 65536) {
+        throw new RangeError('send-text request exceeds size limit');
+    }
+
+    return { request: stableRequest, maxResponseBodyBytes: limit };
+}
 
 export interface WtMultiplexReferenceOptions {
     exclusiveConnected: true;
@@ -64,6 +141,8 @@ export interface WtMultiplexReferenceOptions {
 export interface WtMultiplexReference extends WtReferenceSession {
     /** Stream logical closure; does not await listener release, physical closure or callbacks. */
     readonly whenClosed: Promise<Sso12CloseReason>;
+    /** Synthetic reference response projection, not evidence of message delivery. */
+    sendText(input: ReferenceSessionSendInput): Promise<SsoSendTextOutcome>;
 }
 
 /**
@@ -144,6 +223,7 @@ export function createWtMultiplexReference(
     const loginCommand = sessionOptions.profile.loginCommand;
     const wtSigner = sessionOptions.buildWtReserved;
     const registerSigner = sessionOptions.buildRegisterReserved;
+    const registerVerifier = sessionOptions.verifyRegisterRaw;
     const token = createReferenceKeyCapability();
     let expected:
         | {
@@ -155,11 +235,15 @@ export function createWtMultiplexReference(
               hold: boolean;
           }
         | undefined;
+    const currentExpected = () => expected;
     let mux: RawMultiplexStreamClient | undefined;
     let lease: RawSessionLease | undefined;
     let owner: WtReferenceSession | undefined;
+    let sendHandle: ReferenceSessionSendHandle | undefined;
     let operation: Operation | undefined;
     let busy = false;
+    let sendGate = false;
+    let sendVerified = false;
     let stopped = false;
     let externallyStopped = false;
     let registered = false;
@@ -217,6 +301,7 @@ export function createWtMultiplexReference(
         generation++;
         registered = false;
         expected = undefined;
+        sendHandle = undefined;
         revokeReferenceKey(token);
         wipe(activeCopy);
         wipe(activeBody);
@@ -341,6 +426,9 @@ export function createWtMultiplexReference(
         } else if (!wt && operation === 'heartbeat' && keyState === 'active') {
             uin = confirmed;
             command = SSO_HEARTBEAT_COMMAND;
+        } else if (!wt && operation === 'send-text' && keyState === 'active') {
+            uin = confirmed;
+            command = 'MessageSvc.PbSendMsg';
         } else if (!wt && operation === 'alive' && keyState === 'active') {
             uin = confirmed;
             command = SSO_REFERENCE_ALIVE_COMMAND;
@@ -360,7 +448,8 @@ export function createWtMultiplexReference(
     };
 
     const drain = (): void => {
-        if (delivering || !registered || !live()) {
+        // live() consults caller-observable clock/signal state and may reenter sendText.
+        if (sendGate || delivering || !registered || !live() || sendGate) {
             return;
         }
 
@@ -371,14 +460,18 @@ export function createWtMultiplexReference(
                 let turns = 0;
 
                 try {
-                    while (registered && live(current) && queue.length) {
+                    while (registered && !sendGate && live(current) && !sendGate && queue.length) {
                         if (++turns === 32) {
                             turns = 0;
                             await new Promise<void>((resolve) => setImmediate(resolve));
 
-                            if (!live(current)) {
+                            if (sendGate || !live(current) || sendGate) {
                                 break;
                             }
+                        }
+
+                        if (sendGate) {
+                            break;
                         }
 
                         const item = queue.shift()!;
@@ -451,7 +544,7 @@ export function createWtMultiplexReference(
                 } finally {
                     delivering = false;
 
-                    if (registered && queue.length && live(current)) {
+                    if (!sendGate && registered && queue.length && live(current) && !sendGate) {
                         drain();
                     }
                 }
@@ -651,6 +744,11 @@ export function createWtMultiplexReference(
             deadline: leaseDeadline,
             signal,
         });
+
+        if (typeof registerVerifier !== 'function' || isProxy(registerVerifier)) {
+            throw new TypeError('invalid register verifier');
+        }
+
         owner = createWtReferenceSessionWithCapability(
             lease,
             {
@@ -678,11 +776,51 @@ export function createWtMultiplexReference(
 
                     return result;
                 },
+                verifyRegisterRaw: (input) => {
+                    if (operation !== 'send-text') {
+                        return registerVerifier(input);
+                    }
+
+                    return (async () => {
+                        const current = generation;
+                        const request = expected;
+
+                        if (
+                            !sendGate ||
+                            !request ||
+                            request.command !== 'MessageSvc.PbSendMsg' ||
+                            input.uin !== request.uin ||
+                            input.sequence !== request.sequence ||
+                            input.command !== request.command ||
+                            !live(current) ||
+                            expected !== request
+                        ) {
+                            throw new Error('invalid send verifier binding');
+                        }
+
+                        const result = await registerVerifier(input);
+
+                        if (!live(current) || expected !== request || !sendGate) {
+                            throw new Error('send verifier stopped');
+                        }
+
+                        if (result === true) {
+                            sendVerified = true;
+                        }
+
+                        return result;
+                    })();
+                },
             },
             token,
             terminal,
             fence,
         );
+        sendHandle = takeReferenceSessionSend(token, owner, lease);
+
+        if (!sendHandle) {
+            throw new Error('missing reference send binding');
+        }
 
         if (signal) {
             abortListener = addAbortListener(signal, stopExternally);
@@ -956,8 +1094,147 @@ export function createWtMultiplexReference(
             }
         };
 
+        const sendText = async (
+            input: ReferenceSessionSendInput | undefined,
+        ): Promise<SsoSendTextOutcome> => {
+            if (busy || sendGate || inCallback) {
+                throw new Error('multiplex session busy');
+            }
+
+            // Establish local ownership before validation, clocks, or other reentrant calls.
+            busy = true;
+            sendGate = true;
+            operation = 'send-text';
+            const currentRun = {};
+            runId = currentRun;
+            const current = generation;
+            const startExternalEpoch = externalEpoch;
+            let entered = false;
+            let succeeded = false;
+
+            try {
+                const snapshot = snapshotSendInput(input);
+                input = undefined;
+
+                // A premature call is a caller-state error, not an owner failure.
+                if (!registered && !stopped) {
+                    throw new Error('multiplex session not registered');
+                }
+
+                entered = true;
+                const handle = sendHandle;
+
+                if (
+                    !handle ||
+                    !registered ||
+                    expected !== undefined ||
+                    claim !== undefined ||
+                    !live(current) ||
+                    !busy ||
+                    !sendGate ||
+                    runId !== currentRun ||
+                    operation !== 'send-text' ||
+                    sendHandle !== handle ||
+                    owner!.getState() !== 'success' ||
+                    referenceKeyState(token) !== 'active'
+                ) {
+                    throw new Error('invalid send session');
+                }
+
+                sendVerified = false;
+                const result = await handle(snapshot);
+                const responseExpected = currentExpected();
+
+                if (
+                    !result ||
+                    typeof result !== 'object' ||
+                    isProxy(result) ||
+                    Object.getOwnPropertyDescriptor(result, 'status')?.value !== 'response' ||
+                    !sendVerified ||
+                    !responseExpected ||
+                    responseExpected.command !== 'MessageSvc.PbSendMsg' ||
+                    !live(current) ||
+                    currentExpected() !== responseExpected ||
+                    !busy ||
+                    !sendGate ||
+                    runId !== currentRun ||
+                    operation !== 'send-text' ||
+                    sendHandle !== handle ||
+                    referenceKeyState(token) !== 'active' ||
+                    owner!.getState() !== 'success'
+                ) {
+                    throw new Error('send session stopped');
+                }
+
+                succeeded = true;
+                return result;
+            } catch (error) {
+                if (entered) {
+                    closeAll();
+                }
+
+                throw error;
+            } finally {
+                const owned = runId === currentRun;
+
+                if (owned) {
+                    expected = undefined;
+                    operation = undefined;
+                    runId = undefined;
+                    sendVerified = false;
+                    busy = false;
+                    sendGate = false;
+                }
+
+                if (stopped) {
+                    disposeAbortListener();
+                }
+
+                if (succeeded) {
+                    let fenceFailed = false;
+                    let fenceError: unknown;
+
+                    try {
+                        if (owned && registered && queue.length && live(current)) {
+                            drain();
+                        }
+
+                        // The wakeup and this clock/signal read may reenter close/abort.
+                        // Do not inspect or clear runId again: a later operation may own it.
+                        const now = performance.now();
+                        const aborted = signal?.aborted === true;
+
+                        if (
+                            !owned ||
+                            now >= leaseDeadline ||
+                            aborted ||
+                            stopped ||
+                            generation !== current ||
+                            externallyStopped ||
+                            externalEpoch !== startExternalEpoch ||
+                            streamClient.closed ||
+                            referenceKeyState(token) !== 'active'
+                        ) {
+                            fenceFailed = true;
+                            fenceError = new Error('send session stopped');
+                        }
+                    } catch (error) {
+                        fenceFailed = true;
+                        fenceError = error;
+                    }
+
+                    if (fenceFailed) {
+                        closeAll();
+                        // eslint-disable-next-line no-unsafe-finally -- A stopped result must not escape the final delivery fence.
+                        throw fenceError;
+                    }
+                }
+            }
+        };
+
         return Object.freeze({
             whenClosed: streamClient.whenClosed,
+            sendText,
             getState: () => {
                 live();
                 return owner!.getState();
