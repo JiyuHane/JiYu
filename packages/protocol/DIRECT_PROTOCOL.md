@@ -1595,6 +1595,20 @@ remain to be recovered and independently verified.
   The reference schema and local tests do not establish equivalent behavior of
   the reference C# writer for negative `int64` values; its inspected fast and
   slow paths differ and require separate verification.
+- `src/direct/sso-reference-send-text-flow.ts` composes these codecs with an
+  injected borrowed transport and caller-supplied reserve and raw verification
+  policies. It is not wired to the production session or Bridge. As a local
+  policy it requires the transport identity UIN to equal the login UIN exactly;
+  unlike borrowed registration, a transport identity of `0` is not accepted for
+  another account. This comparison and a successful verifier do not authenticate
+  the peer or prove delivery. Outer SSO and inner message sequences remain
+  separate; the response's client sequence is not compared with the request's.
+  A zero SSO code yields the decoded projection, not an asserted business
+  success: `result` may be absent, zero or nonzero. Its untrusted `errMsg` may
+  contain private data; callers control its handling. The configured response
+  limit is checked after SSO decoding, which can first inflate up to 16 MiB.
+  Deadlines and cleanup do not force a non-settling transport or callback to
+  finish; its owner remains responsible for exclusivity and poisoning on failure.
 - `src/msg-push/index.ts` also exposes `parseDirectMsgPushOrThrow` for callers
   holding a decrypted push body and its metadata. It accepts no fabricated PID,
   requires a matching identity UIN, the known MsgPush command and a zero return
