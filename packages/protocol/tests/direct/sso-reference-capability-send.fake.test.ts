@@ -25,6 +25,7 @@ import {
     createReferenceKeyCapability,
     endReferenceSend,
     reserveReferenceKeyCapability,
+    referenceKeyState,
     revokeReferenceKey,
     stageReferenceConfirmed,
     stageReferenceKey,
@@ -150,6 +151,10 @@ type IdentityObservation = { phase: 'build' | 'verify' | 'consume'; uin: string;
 function fixture() {
     const writes: Uint8Array[] = [];
     const identities: IdentityObservation[] = [];
+    const writePhases: ReturnType<typeof referenceKeyState>[] = [];
+    const rawResults: Sso12RawResult<unknown>[] = [];
+    let transactions = 0;
+    let afterBuild: ((frame: Uint8Array) => void) | undefined;
     const wrote = deferred<void>();
     const consumed = deferred<void>();
     const consumeEntered = deferred<void>();
@@ -186,6 +191,7 @@ function fixture() {
         maxPushFrames: 8,
         maxPushBytes: 262144,
         write: (frame) => {
+            writePhases.push(referenceKeyState(token));
             writes.push(Uint8Array.from(frame));
             wrote.resolve();
         },
@@ -201,11 +207,18 @@ function fixture() {
         poison: vi.fn(),
         close: vi.fn(),
         async transactRaw<C, T>(raw: Sso12RawOptions<C, T>): Promise<Sso12RawResult<T>> {
+            transactions++;
             const result = await client.transactRaw({
                 ...raw,
                 buildRequest: (identity) => {
                     identities.push({ phase: 'build', ...identity });
-                    return track(Promise.resolve().then(() => raw.buildRequest(identity)));
+                    return track(
+                        Promise.resolve().then(async () => {
+                            const built = await raw.buildRequest(identity);
+                            afterBuild?.(built.frame);
+                            return built;
+                        }),
+                    );
                 },
                 verifyCandidate: (bytes, context, identity) => {
                     identities.push({ phase: 'verify', ...identity });
@@ -230,6 +243,7 @@ function fixture() {
                     );
                 },
             });
+            rawResults.push(result);
             resultReady.resolve();
 
             if (holdResult) {
@@ -290,6 +304,12 @@ function fixture() {
         token,
         writes,
         identities,
+        writePhases,
+        rawResults,
+        transactionCount: () => transactions,
+        onAfterBuild: (callback: (frame: Uint8Array) => void) => {
+            afterBuild = callback;
+        },
         wrote,
         consumed,
         releaseResult,
@@ -708,6 +728,75 @@ describe('capability-bound reference send (synthetic memory only)', () => {
             expect(decoded.messageBody.richText.elems[0].text.text).toBe('synthetic text 中🙂');
             expect(decoded.random).toBe(0x12345678);
             retained.forEach((bytes, i) => expect(bytes).toEqual(snapshots[i]));
+        }));
+
+    // This probes only a cooperating fake lease that does not poison its mux on
+    // revocation; it says nothing about a production owner or signature authenticity.
+    it('records a write when the fake lease revokes after the guarded frame is built', () =>
+        withFixture(async (f) => {
+            f.activate();
+            const input = options();
+            input.buildReserved = vi.fn(input.buildReserved);
+            input.verifyRaw = vi.fn(input.verifyRaw);
+            const afterBuild = vi.fn((frame: Uint8Array) => {
+                expect(referenceKeyState(f.token)).toBe('active');
+                expect(frame.byteLength).toBeGreaterThanOrEqual(14);
+                expect(Buffer.from(frame).readUInt32BE(0)).toBe(frame.byteLength);
+                expect(inspectWritten(frame)).toMatchObject({ uin: '123', sequence, command });
+                revokeReferenceKey(f.token);
+                expect(referenceKeyState(f.token)).toBe('revoked');
+            });
+            f.onAfterBuild(afterBuild);
+            const setTimer = vi.spyOn(globalThis, 'setTimeout');
+            const clearTimer = vi.spyOn(globalThis, 'clearTimeout');
+
+            try {
+                const pending = send(f, input);
+                await reached(f.wrote.promise, pending);
+                expect(f.writePhases).toEqual(['revoked']);
+                expect(f.writes).toHaveLength(1);
+                expect(f.client.closed).toBe(false);
+                expect(f.lease.poison).not.toHaveBeenCalled();
+                expect(f.lease.close).not.toHaveBeenCalled();
+                f.feed();
+                expect(await bounded(pending)).toEqual({
+                    kind: 'failure',
+                    code: 'borrowed-transaction-failed',
+                    writeState: 'unknown',
+                });
+                expect(f.rawResults).toEqual([
+                    { kind: 'failure', code: 'frame-handler-failed', writeState: 'unknown' },
+                ]);
+                expect(await bounded(f.client.whenClosed)).toEqual({
+                    kind: 'handler-error',
+                    code: 'frame-handler-failed',
+                });
+                expect(afterBuild).toHaveBeenCalledOnce();
+                expect(input.buildReserved).toHaveBeenCalledOnce();
+                expect(input.verifyRaw).not.toHaveBeenCalled();
+                expect(f.identities).toEqual(
+                    ['build', 'verify'].map((phase) => ({ phase, uin: '0', sequence })),
+                );
+                expect(f.transactionCount()).toBe(1);
+                expect(f.writes).toHaveLength(1);
+                expect(f.lease.poison).not.toHaveBeenCalled();
+                expect(f.lease.close).not.toHaveBeenCalled();
+                expect(f.lease.release).not.toHaveBeenCalled();
+                const transactionTimers = setTimer.mock.calls
+                    .map((args, index) => ({
+                        delay: args[1],
+                        result: setTimer.mock.results[index],
+                    }))
+                    .filter(({ delay }) => typeof delay === 'number' && delay <= 3000);
+                expect(transactionTimers.length).toBeGreaterThan(0);
+
+                for (const timer of transactionTimers) {
+                    expect(clearTimer).toHaveBeenCalledWith(timer.result.value);
+                }
+            } finally {
+                setTimer.mockRestore();
+                clearTimer.mockRestore();
+            }
         }));
 
     it('revocation during pending signer prevents a later write and response', () =>

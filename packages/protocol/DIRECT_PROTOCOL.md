@@ -1635,9 +1635,15 @@ remain to be recovered and independently verified.
   import. A non-settling import is not forcibly interrupted and retains those
   owned copies until it settles. A loss of local run ownership during cleanup
   yields an uncertain-write failure rather than a successful response or a claim
-  that no bytes were written; it does not release a different active run.
-  Deadlines and cleanup do not force a non-settling transport or callback to
-  finish; its owner remains responsible for exclusivity and poisoning on failure.
+  that no bytes were written; it does not release a different active run. The
+  last build-time capability check and the borrowed transport's physical write
+  are not atomic. In a synthetic test, an injected lease revokes the capability
+  after the builder returns without poisoning or closing its multiplex client;
+  its in-memory write callback records one frame while revoked. After a synthetic
+  response is fed, the transaction returns failure with unknown write state. This
+  does not establish how a future session owner will handle that race. Deadlines
+  and cleanup do not force a non-settling transport or callback to finish; its
+  owner remains responsible for exclusivity and poisoning on failure.
 - `src/msg-push/index.ts` also exposes `parseDirectMsgPushOrThrow` for callers
   holding a decrypted push body and its metadata. It accepts no fabricated PID,
   requires a matching identity UIN, the known MsgPush command and a zero return
