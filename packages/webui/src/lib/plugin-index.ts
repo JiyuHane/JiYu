@@ -663,6 +663,7 @@ export function filterPlugins(plugins: CommunityPlugin[], query: string): Commun
     }
 
     let normalizedNeedle: string | undefined;
+    let localeIndependentNeedle: string | undefined;
 
     return plugins.filter((plugin) => {
         const fields = [
@@ -678,8 +679,20 @@ export function filterPlugins(plugins: CommunityPlugin[], query: string): Commun
         }
 
         const fallbackNeedle = (normalizedNeedle ??= trimmed.normalize('NFKC').toLocaleLowerCase());
+
+        if (
+            fields.some((field) =>
+                field.normalize('NFKC').toLocaleLowerCase().includes(fallbackNeedle),
+            )
+        ) {
+            return true;
+        }
+
+        const independentNeedle = (localeIndependentNeedle ??= trimmed
+            .normalize('NFKC')
+            .toLowerCase());
         return fields.some((field) =>
-            field.normalize('NFKC').toLocaleLowerCase().includes(fallbackNeedle),
+            field.normalize('NFKC').toLowerCase().includes(independentNeedle),
         );
     });
 }
