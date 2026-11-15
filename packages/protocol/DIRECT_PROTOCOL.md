@@ -1558,8 +1558,14 @@ remain to be recovered and independently verified.
   the JavaScript engine and copies retained by callers are not guaranteed to be
   erased. The API does not expose the D2 key for caller-side decoding. The
   deep-importable capability helpers are an internal ownership convention, not isolation from
-  other code in the same process. The legacy borrowed attempt API still returns
-  tickets. The classifier and caller-provided verification are local policies;
+  other code in the same process. Preparatory send-coordination helpers bind an
+  attempt to its registered borrowed lease and one locally active run; they reject
+  a stopped or busy attempt at binding and reject reuse of a completed run within
+  the same capability. These helpers are not yet used by the multiplex session's
+  public operations and do not send messages. Deep callers can register their own
+  objects, and direct low-level binding does not attach the attempt's lifecycle;
+  neither operation proves origin, peer identity or isolation. The legacy borrowed
+  attempt API still returns tickets. The classifier and caller-provided verification are local policies;
   QQ-TEA does not authenticate the peer. This composition does not create a
   connection, implement the signing algorithm, attach events to Bridge or OneBot,
   or establish real QQ interoperability. A transport that closes independently

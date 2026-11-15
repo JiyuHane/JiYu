@@ -9,6 +9,9 @@ type Slot = {
     phase: 'empty' | 'tentative' | 'active' | 'revoked';
     attempt?: object;
     reservation?: object;
+    ownerLease?: object;
+    sendRun?: object;
+    usedSendRuns?: WeakSet<object>;
     businessOwner?: object;
     businessFinalized?: boolean;
     businessFailure?: {
@@ -23,6 +26,7 @@ type Slot = {
     key?: Uint8Array;
 };
 const slots = new WeakMap<object, Slot>();
+const borrowedAttempts = new WeakMap<object, object>();
 const fill = Uint8Array.prototype.fill;
 const set = Uint8Array.prototype.set;
 const typed = Object.getPrototypeOf(Uint8Array.prototype) as object;
@@ -72,6 +76,66 @@ export function bindReferenceKeyAttempt(token: object, attempt: object, reservat
     value.reservation = undefined;
     value.attempt = attempt;
     value.businessOwner = reservation;
+}
+
+function isReferenceObject(value: unknown): value is object {
+    return value !== null && typeof value === 'object' && !isProxy(value);
+}
+
+/** Internal coordination only: deep imports can register objects; this is not
+ * same-process isolation or proof of an attempt's origin or peer identity. */
+export function registerReferenceBorrowedAttempt(attempt: object, lease: object): void {
+    if (!isReferenceObject(attempt) || !isReferenceObject(lease) || borrowedAttempts.has(attempt)) {
+        throw new Error('invalid reference attempt binding');
+    }
+
+    borrowedAttempts.set(attempt, lease);
+}
+
+/** Bind the registered borrowed lease before owner callbacks. Deep direct calls do
+ * not register with the attempt's lifecycle and are not equivalent to the owner. */
+export function bindReferenceKeyAttemptOwnerLease(
+    token: object,
+    attempt: object,
+    reservation: object,
+    lease: object,
+): void {
+    if (
+        !isReferenceObject(token) ||
+        !isReferenceObject(attempt) ||
+        !isReferenceObject(reservation) ||
+        !isReferenceObject(lease) ||
+        borrowedAttempts.get(attempt) !== lease
+    ) {
+        throw new Error('invalid reference attempt binding');
+    }
+
+    // This deep-importable entry point also rejects stopped or in-flight
+    // attempts without evaluating an accessor. It is not a security boundary.
+    const state = Object.getOwnPropertyDescriptor(attempt, 'state');
+    const busy = Object.getOwnPropertyDescriptor(attempt, 'busy');
+
+    if (
+        !state ||
+        !('value' in state) ||
+        state.value !== 'new' ||
+        !busy ||
+        !('value' in busy) ||
+        busy.value !== false
+    ) {
+        throw new Error('invalid reference attempt binding');
+    }
+
+    const value = slot(token);
+
+    if (value.phase !== 'empty' || value.attempt || value.reservation !== reservation) {
+        throw new Error('reference capability already bound or stopped');
+    }
+
+    value.reservation = undefined;
+    value.attempt = attempt;
+    value.businessOwner = reservation;
+    value.ownerLease = lease;
 }
 
 /** One terminal business outcome, independent of key revocation. */
@@ -242,6 +306,90 @@ export function commitReferenceKey(token: object): void {
     value.phase = 'active';
 }
 
+/** Internal single-flight coordination, not a same-process or peer security boundary. */
+function referenceSendSlot(token: object, attempt: object, lease: object, run: object): Slot {
+    if (
+        !isReferenceObject(token) ||
+        !isReferenceObject(attempt) ||
+        !isReferenceObject(lease) ||
+        !isReferenceObject(run)
+    ) {
+        throw new Error('invalid reference send binding');
+    }
+
+    return slot(token);
+}
+
+export function beginReferenceSend(
+    token: object,
+    attempt: object,
+    lease: object,
+    run: object,
+): void {
+    const value = referenceSendSlot(token, attempt, lease, run);
+
+    if (
+        value.phase !== 'active' ||
+        !value.key ||
+        value.attempt !== attempt ||
+        value.ownerLease !== lease ||
+        value.sendRun !== undefined ||
+        value.usedSendRuns?.has(run)
+    ) {
+        throw new Error('invalid reference send binding');
+    }
+
+    const used = value.usedSendRuns ?? new WeakSet<object>();
+    used.add(run);
+    value.usedSendRuns = used;
+    value.sendRun = run;
+}
+
+export function assertReferenceSendIdentity(
+    token: object,
+    attempt: object,
+    lease: object,
+    run: object,
+    identityUin: string,
+    confirmedUin: string,
+): void {
+    const value = referenceSendSlot(token, attempt, lease, run);
+
+    if (
+        value.phase !== 'active' ||
+        !value.key ||
+        value.attempt !== attempt ||
+        value.ownerLease !== lease ||
+        value.sendRun !== run ||
+        typeof identityUin !== 'string' ||
+        typeof confirmedUin !== 'string' ||
+        value.transportUin !== identityUin ||
+        value.confirmedUin !== confirmedUin
+    ) {
+        throw new Error('invalid reference send binding');
+    }
+}
+
+export function endReferenceSend(token: object, attempt: object, lease: object, run: object): void {
+    const value = referenceSendSlot(token, attempt, lease, run);
+
+    if (value.phase === 'revoked') {
+        return;
+    }
+
+    if (
+        value.phase !== 'active' ||
+        !value.key ||
+        value.attempt !== attempt ||
+        value.ownerLease !== lease ||
+        value.sendRun !== run
+    ) {
+        throw new Error('invalid reference send binding');
+    }
+
+    value.sendRun = undefined;
+}
+
 export function revokeReferenceKey(token: object): void {
     const value = slot(token);
 
@@ -253,6 +401,9 @@ export function revokeReferenceKey(token: object): void {
         value.key = undefined;
         value.attempt = undefined;
         value.reservation = undefined;
+        value.ownerLease = undefined;
+        value.sendRun = undefined;
+        value.usedSendRuns = undefined;
         value.transportUin = undefined;
         value.confirmedUin = undefined;
         value.sequence = undefined;

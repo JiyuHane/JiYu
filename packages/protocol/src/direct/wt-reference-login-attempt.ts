@@ -31,7 +31,8 @@ import { encodeWtLoginRequestBody, type WtLoginRequestBody } from './wt-login-re
 import { decodeWtLoginResponse } from './wt-login-response';
 import { projectWtLoginUid, type WtLoginUidProjection } from './wt-login-keystore';
 import {
-    bindReferenceKeyAttempt,
+    bindReferenceKeyAttemptOwnerLease,
+    registerReferenceBorrowedAttempt,
     revokeReferenceKey,
     stageReferenceConfirmed,
     stageReferenceKey,
@@ -229,6 +230,7 @@ const borrowedPorts = new WeakMap<
     { lease: RawSessionLease; closed: PromiseLike<unknown> }
 >();
 const referenceCapabilities = new WeakMap<object, object>();
+const borrowedSources = new WeakMap<object, RawSessionLease>();
 const terminalPorts = new WeakMap<object, object>();
 
 export function bindReferenceTerminalPort(
@@ -249,11 +251,37 @@ export function bindReferenceKeyCapability(
     capability: object,
     reservation: object,
 ): void {
+    if (!attempt || typeof attempt !== 'object' || isProxy(attempt)) {
+        throw new Error('invalid reference attempt binding');
+    }
+
     if (referenceCapabilities.has(attempt)) {
         throw new Error('attempt capability already bound');
     }
 
-    bindReferenceKeyAttempt(capability, attempt, reservation);
+    const lease = borrowedSources.get(attempt);
+
+    if (!lease) {
+        throw new Error('invalid reference attempt binding');
+    }
+
+    // These own data properties are local coordination state, not an isolation
+    // boundary against code in this process. Do not invoke caller-supplied getters.
+    const state = Object.getOwnPropertyDescriptor(attempt, 'state');
+    const busy = Object.getOwnPropertyDescriptor(attempt, 'busy');
+
+    if (
+        !state ||
+        !('value' in state) ||
+        state.value !== 'new' ||
+        !busy ||
+        !('value' in busy) ||
+        busy.value !== false
+    ) {
+        throw new Error('invalid reference attempt binding');
+    }
+
+    bindReferenceKeyAttemptOwnerLease(capability, attempt, reservation, lease);
     referenceCapabilities.set(attempt, capability);
 }
 
@@ -1452,10 +1480,27 @@ export function createBorrowedWtReferenceLoginAttempt(
     borrowedPorts.set(port, { lease, closed: observed });
 
     try {
-        return Reflect.construct(WtReferenceLoginAttempt, [
+        const attempt = Reflect.construct(WtReferenceLoginAttempt, [
             options,
             port,
         ]) as WtReferenceLoginAttempt;
+
+        try {
+            borrowedSources.set(attempt, lease);
+            registerReferenceBorrowedAttempt(attempt, lease);
+        } catch (error) {
+            borrowedSources.delete(attempt);
+
+            try {
+                attempt.close();
+            } catch {
+                // Preserve the registration failure while attempting teardown.
+            }
+
+            throw error;
+        }
+
+        return attempt;
     } finally {
         borrowedPorts.delete(port);
     }
