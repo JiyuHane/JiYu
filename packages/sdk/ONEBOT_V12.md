@@ -34,6 +34,16 @@ being delivered as either kind. The SDK still accepts `status: "failed"` with
 client never automatically retries an action. A timeout or disconnected transport
 does not prove that an action's side effects did not occur.
 
+`maxResponseBytes` limits the UTF-8 body bytes delivered by Fetch, after any
+content decoding Fetch performs. With a non-identity `Content-Encoding`, the
+client ignores `Content-Length` for the preliminary size check and enforces the
+limit while reading the body. With no encoding or `identity`, the preliminary
+check relies on the declared length matching the delivered body: incorrect headers
+or a custom Fetch implementation that changes the body can cause early rejection.
+This limit does not bound encoded network traffic, bandwidth, or buffering already
+performed by Fetch; custom Fetch implementations may deliver bytes without
+decompression.
+
 ### Polling events on a supporting implementation
 
 `client.getLatestEvents({ limit, timeout }, options)` sends the OneBot 12

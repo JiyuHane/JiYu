@@ -213,8 +213,14 @@ export class OneBot12HttpClient {
             }
 
             const declared = response.headers.get('content-length');
+            const encoding = response.headers.get('content-encoding');
 
-            if (declared && /^\d+$/.test(declared) && Number(declared) > this.maxResponseBytes) {
+            if (
+                (encoding === null || encoding.trim().toLowerCase() === 'identity') &&
+                declared &&
+                /^\d+$/.test(declared) &&
+                Number(declared) > this.maxResponseBytes
+            ) {
                 void response.body?.cancel().catch(() => {});
                 throw new OneBot12ClientError('limit', 'OneBot 12 response exceeds the byte limit');
             }
