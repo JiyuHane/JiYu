@@ -1295,9 +1295,10 @@ remain to be recovered and independently verified.
   outcome establishes login or authentication. This is an independent partial
   projection, not a complete keystore or a target-build observation. Local limits
   include 1024 entries and 65535 total encoded bytes, with duplicate `0x543`,
-  malformed UTF-8 and unsupported wire types rejected. Proton strips a leading
-  UTF-8 BOM while the referenced .NET decoder preserves it. Other malformed-data
-  handling is also intentionally stricter and is not asserted equivalent. Array
+  malformed UTF-8 and unsupported wire types rejected. Proton preserves a leading
+  U+FEFF in protobuf string values, matching the statically inspected referenced
+  .NET decoder's handling of UTF-8 BOM bytes. Local malformed-data handling remains
+  intentionally stricter and is not asserted equivalent. Array
   slots and each entry's `tag` and `value` must be own data properties; proxied
   objects and shared, resizable, detached or out-of-bounds byte storage are
   rejected. Those checks

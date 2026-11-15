@@ -56,14 +56,14 @@ export class MiscApi {
         const decoded = protobuf_decode<MiniAppShareResp>(result.responseData);
         const jsonStr = decoded?.body?.jsonStr;
 
-        if (!jsonStr) {
+        if (!jsonStr || jsonStr === '\ufeff') {
             throw new Error('mini app share json empty');
         }
 
-        const parsed = JSON.parse(jsonStr) as Record<
-            string,
-            JsonObject | string | number | boolean | null
-        >;
+        // Proton used to strip one leading BOM while decoding this protobuf string.
+        const parsed = JSON.parse(
+            jsonStr.startsWith('\ufeff') ? jsonStr.slice(1) : jsonStr,
+        ) as Record<string, JsonObject | string | number | boolean | null>;
 
         return {
             data: {

@@ -70,6 +70,11 @@ backing buffer is needed. Later encodes do not overwrite previously returned byt
 
 ## SnowLuma wire compatibility
 
+- String values preserve every decoded U+FEFF, including at the start of a field;
+  UTF-8 `EF BB BF` is part of the protobuf value, not a file signature. Invalid
+  UTF-8 continues to decode with replacement characters. This corrects earlier
+  decoders that discarded a leading U+FEFF; bytes previously decoded and stored
+  without it cannot be reconstructed by this change.
 - Plain `pb<>` scalars omit default values (`0`, `0n`, `false`, empty strings and
   empty bytes), including fields marked with TypeScript `?`. Missing optional
   singular fields decode to `null`.

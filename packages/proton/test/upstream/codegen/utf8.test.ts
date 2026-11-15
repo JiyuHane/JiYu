@@ -7,20 +7,26 @@ const code = generateCode(
     schemaRegistry(`
   interface Text { value: pb<1,string>; }
   interface Nested { texts: pb_repeated<1,Text>; }
+  interface Entry { key: pb<1,string>; value: pb<2,string>; }
+  interface Entries { entries: pb_repeated<1,Entry>; }
 `),
 );
-const { encode, decode, encodeNested, decodeNested } = new Function(`${code}
+const { encode, decode, encodeNested, decodeNested, encodeEntries, decodeEntries } =
+    new Function(`${code}
   return {
     encode: protobuf_encode_Text, decode: protobuf_decode_Text,
     encodeNested: protobuf_encode_Nested, decodeNested: protobuf_decode_Nested,
+    encodeEntries: protobuf_encode_Entries, decodeEntries: protobuf_decode_Entries,
   };`)() as {
-    decode(bytes: Uint8Array): { value: string };
-    encode(value: { value: string }): Uint8Array;
-    encodeNested(value: { texts: { value: string }[] }): Uint8Array;
-    decodeNested(bytes: Uint8Array): { texts: { value: string }[] };
-};
+        decode(bytes: Uint8Array): { value: string };
+        encode(value: { value: string }): Uint8Array;
+        encodeNested(value: { texts: { value: string }[] }): Uint8Array;
+        decodeNested(bytes: Uint8Array): { texts: { value: string }[] };
+        encodeEntries(value: { entries: { key: string; value: string }[] }): Uint8Array;
+        decodeEntries(bytes: Uint8Array): { entries: { key: string; value: string }[] };
+    };
 const encoder = new TextEncoder();
-const decoder = new TextDecoder();
+const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
 
 function wire(payload: Uint8Array): Uint8Array {
     const prefix = [10];
@@ -157,6 +163,38 @@ describe('UTF-8 codecs', () => {
         }
     });
 
+    it('preserves leading BOM bytes and replacement behavior at exact payload boundaries', () => {
+        // Decoder selects the short path through 32 bytes, long from 33;
+        // long decoding tries the strict decoder from 128 bytes.
+        for (const length of [31, 32, 33, 127, 128]) {
+            for (const suffix of [[], [0xff], [0xe1, 0x80]]) {
+                const payload = Uint8Array.from([
+                    0xef,
+                    0xbb,
+                    0xbf,
+                    ...Array(length - 3 - suffix.length).fill(0x41),
+                    ...suffix,
+                ]);
+                expect(payload.length).toBe(length);
+                expect(decode(wire(payload)).value).toBe(decoder.decode(payload));
+                expect(decode(wire(payload)).value.startsWith('\ufeff')).toBe(true);
+            }
+        }
+
+        for (const [hex, expected] of [
+            ['efbbbf41', '\ufeffA'],
+            ['efbbbfefbbbf41', '\ufeff\ufeffA'],
+            ['41efbbbf42', 'A\ufeffB'],
+            ['efbbbfff', '\ufeff\ufffd'],
+        ]) {
+            const payload = Uint8Array.from(Buffer.from(hex, 'hex'));
+            expect(decode(wire(payload)).value).toBe(expected);
+            expect(decode(wire(payload)).value).toBe(decoder.decode(payload));
+        }
+
+        expect(Buffer.from(encode({ value: '\ufeffA' })).toString('hex')).toBe('0a04efbbbf41');
+    });
+
     it('keeps nested and repeated strings independent', () => {
         const texts = [
             '',
@@ -166,6 +204,8 @@ describe('UTF-8 codecs', () => {
             '中文🚀',
             'a\ufeffb',
             '\ufeffx',
+            '\ufeff\ufeffx',
+            ...[31, 32, 33, 127, 128].map((length) => '\ufeff' + 'a'.repeat(length - 3)),
             '中文🚀'.repeat(64),
         ].map((value) => ({ value }));
         expect(decodeNested(encodeNested({ texts }))).toEqual({
@@ -176,6 +216,38 @@ describe('UTF-8 codecs', () => {
         const second = wire(encoder.encode('next'));
         const nested = Uint8Array.from([10, first.length, ...first, 10, second.length, ...second]);
         expect(decodeNested(nested)).toEqual({ texts: [{ value: '�' }, { value: 'next' }] });
+    });
+
+    it('retains distinct BOM and plain keys in map-shaped repeated entries', () => {
+        // Entry-shaped wire only; this does not assert map runtime semantics.
+        const entries = [
+            { key: '\ufeffk', value: '\ufeff' + 'x'.repeat(125) },
+            { key: 'k', value: '\ufeffshort' },
+        ];
+        const result = decodeEntries(encodeEntries({ entries }));
+        expect(result.entries).toEqual(entries);
+        expect(new Map(result.entries.map(({ key, value }) => [key, value])).size).toBe(2);
+    });
+
+    it('resets long strict decoder state after a malformed field', () => {
+        const invalid = Uint8Array.from([0xef, 0xbb, 0xbf, ...Array(124).fill(0x41), 0xff]);
+        const valid = Uint8Array.from([0xef, 0xbb, 0xbf, ...Array(125).fill(0x42)]);
+        expect(invalid.length).toBe(128);
+        expect(valid.length).toBe(128);
+        const first = wire(invalid);
+        const second = wire(valid);
+        // Nested frame lengths exceed 127, so encode each frame length as varint.
+        const wrap = (field: Uint8Array) => [
+            10,
+            (field.length & 127) | 128,
+            field.length >>> 7,
+            ...field,
+        ];
+        const nested = Uint8Array.from([...wrap(first), ...wrap(second)]);
+        expect(decodeNested(nested)).toEqual({
+            texts: [{ value: decoder.decode(invalid) }, { value: decoder.decode(valid) }],
+        });
+        expect(decodeNested(nested).texts[1].value.startsWith('\ufeff')).toBe(true);
     });
 
     it('measures UTF-8 correctly when a code point crosses a scratch-buffer boundary', () => {

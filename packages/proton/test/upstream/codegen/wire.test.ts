@@ -21,7 +21,7 @@ describe('generated wire format', () => {
                 expected.set(payload, prefix.length);
                 expect(codec.encode({ value })).toEqual(expected);
                 expect(codec.decode(expected)).toEqual({
-                    value: new TextDecoder().decode(payload),
+                    value: new TextDecoder('utf-8', { ignoreBOM: true }).decode(payload),
                 });
             }
         }
@@ -102,7 +102,9 @@ describe('generated wire format', () => {
         const payload = new TextEncoder().encode(value);
         const bytes = new Uint8Array([0x0a, payload.length, ...payload]);
         expect(codec.encode({ value })).toEqual(value === '' ? new Uint8Array() : bytes);
-        expect(codec.decode(bytes)).toEqual({ value: new TextDecoder().decode(payload) });
+        expect(codec.decode(bytes)).toEqual({
+            value: new TextDecoder('utf-8', { ignoreBOM: true }).decode(payload),
+        });
     });
 
     it('encodes bytes with a length prefix and copies the decoded data', () => {

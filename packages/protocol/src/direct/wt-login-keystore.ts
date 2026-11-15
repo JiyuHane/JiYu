@@ -113,8 +113,8 @@ function validateMessage(data: Uint8Array, level: number): void {
  * Locally the array is limited to 1024 entries and its encoded count, headers,
  * and values together to 65535 bytes. Tags and lengths are uint16; duplicate
  * 0x543 is rejected rather than applying V2's dictionary last-value behavior.
- * Proton's TextDecoder-compatible behavior strips an initial UTF-8 BOM whereas
- * .NET preserves it. Malformed UTF-8, unsupported/unknown wire types (including
+ * Proton preserves an initial U+FEFF as part of the protobuf string value.
+ * Malformed UTF-8, unsupported/unknown wire types (including
  * groups), and truncated or overflowing framing fail closed locally; this is
  * not a promise of byte-for-byte equivalence with upstream. Unknown ordinary
  * protobuf fields remain accepted. The selected value is copied and its owned

@@ -1,8 +1,8 @@
-export const utf8 = `const __td = new TextDecoder();
+export const utf8 = `const __td = new TextDecoder('utf-8', { ignoreBOM: true });
 const __te = new TextEncoder();
 const __nonAscii = /[^\\x00-\\x7f]/;
 let __utf8Scratch;
-const __tdStrict = new TextDecoder('utf-8', { fatal: true });
+const __tdStrict = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 function __utf8LenLong(value) {
   const buffer = __utf8Scratch ??= new Uint8Array(4096);
   let length = 0;
@@ -140,8 +140,8 @@ function __utf8Read(data, start, end) {
         return __td.decode(data.subarray(start, end));
       }
       const code = ((a & 0x0f) << 12) | ((b & 0x3f) << 6) | (c & 0x3f);
-      // Match TextDecoder's handling of a leading BOM.
-      if (code !== 0xfeff || offset !== start + 3) value += String.fromCharCode(code);
+      // A protobuf string is a value, not a BOM-prefixed text file.
+      value += String.fromCharCode(code);
     } else if (a >= 0xf0 && a < 0xf5 && offset + 2 < end) {
       const b = data[offset++], c = data[offset++], d = data[offset++];
       if ((b & 0xc0) !== 0x80 || (c & 0xc0) !== 0x80 || (d & 0xc0) !== 0x80 ||

@@ -46,6 +46,33 @@ describe('GetUnidirectionalFriendList', () => {
         );
     });
 
+    it('parses a single leading BOM at the JSON boundary, but rejects a second', async () => {
+        const deps = makeDeps();
+        const json = JSON.stringify({
+            ActionStatus: 'OK',
+            ErrorCode: 0,
+            rpt_block_list: [{ id: 1 }],
+        });
+        const response = (value: string) => ({
+            success: true,
+            gotResponse: true,
+            errorCode: 0,
+            errorMessage: '',
+            responseData: Buffer.from(s(4, value)),
+        });
+        deps.sendRawPacket.mockResolvedValue(response('\ufeff' + json));
+        expect(
+            GetUnidirectionalFriendList.decode(Buffer.from(s(4, '\ufeff' + json))).jsonBody,
+        ).toBe('\ufeff' + json);
+        await expect(GetUnidirectionalFriendList.invoke(deps)).resolves.toEqual([{ id: 1 }]);
+        deps.sendRawPacket.mockResolvedValue(response('\ufeff\ufeff' + json));
+        await expect(GetUnidirectionalFriendList.invoke(deps)).rejects.toThrow(SyntaxError);
+        deps.sendRawPacket.mockResolvedValue(response('\ufeff'));
+        await expect(GetUnidirectionalFriendList.invoke(deps)).rejects.toThrow(
+            'get unidirectional friend list empty',
+        );
+    });
+
     it('returns a verified empty list', async () => {
         await expect(GetUnidirectionalFriendList.invoke(makeDeps())).resolves.toEqual([]);
     });

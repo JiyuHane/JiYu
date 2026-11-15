@@ -38,11 +38,16 @@ export namespace GetUnidirectionalFriendList {
             throw new OidbError(body.errorCode, body.errorMessage ?? '', command, subCommand);
         }
 
-        if (!body || !body.jsonBody) {
+        // The protobuf value keeps its BOM; preserve the earlier JSON boundary
+        // behavior by accepting at most one leading BOM before validation.
+        const value = body?.jsonBody;
+        const json = value?.startsWith('\ufeff') ? value.slice(1) : value;
+
+        if (!json) {
             throw new Error('get unidirectional friend list empty');
         }
 
-        const parsed: unknown = JSON.parse(body.jsonBody);
+        const parsed: unknown = JSON.parse(json);
 
         if (!isObject(parsed)) {
             throw new Error('get unidirectional friend list invalid response');

@@ -97,9 +97,9 @@ describe('WT login UID projection', () => {
         expect(() => project(value)).toThrowError('invalid WT login keystore projection');
     });
 
-    it('documents Proton BOM handling, unlike a .NET UTF-8 string', () => {
+    it('preserves the leading BOM as part of the protobuf UID', () => {
         const value = nested(concat(bytes(0xef, 0xbb, 0xbf), text('uid')));
-        expect(project(value)).toEqual({ status: 'present', uid: 'uid' });
+        expect(project(value)).toEqual({ status: 'present', uid: '\ufeffuid' });
         expect(
             new TextDecoder('utf-8', { ignoreBOM: true }).decode(bytes(0xef, 0xbb, 0xbf, 0x61)),
         ).toBe('\ufeffa');

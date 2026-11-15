@@ -998,12 +998,16 @@ function resolveContactArk(
 ): Promise<string> | null {
     const normalized = contactType.trim().toLowerCase();
 
+    // At the contact-service JSON boundary, preserve the old protobuf decoder's
+    // behavior of removing at most one leading BOM before outbound validation.
+    const removeLegacyBom = (ark: string) => (ark.startsWith('\uFEFF') ? ark.slice(1) : ark);
+
     if (normalized === 'qq') {
-        return ref.bridge.apis.contacts.getBuddyRecommendArk(contactId, '');
+        return ref.bridge.apis.contacts.getBuddyRecommendArk(contactId, '').then(removeLegacyBom);
     }
 
     if (normalized === 'group') {
-        return ref.bridge.apis.contacts.getGroupRecommendArk(contactId);
+        return ref.bridge.apis.contacts.getGroupRecommendArk(contactId).then(removeLegacyBom);
     }
 
     return null;
