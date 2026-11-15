@@ -133,17 +133,24 @@ export async function getGroupList(
 }
 
 // group_level lives only in the per-group detail response. Keep its existing
-// short cache, but read mutable group state from the roster refreshed above.
+// short cache per bridge session, but read mutable group state from the roster.
 const GROUP_LEVEL_TTL_MS = 5 * 60 * 1000;
-const groupLevelCache = new Map<number, { level: number; at: number }>();
+const groupLevelCache = new WeakMap<BridgeInterface, Map<number, { level: number; at: number }>>();
 
 async function getGroupLevel(
     bridge: BridgeInterface,
     groupId: number,
     noCache?: boolean,
 ): Promise<number> {
+    let levels = groupLevelCache.get(bridge);
+
+    if (!levels) {
+        levels = new Map();
+        groupLevelCache.set(bridge, levels);
+    }
+
     if (!noCache) {
-        const cached = groupLevelCache.get(groupId);
+        const cached = levels.get(groupId);
 
         if (cached && Date.now() - cached.at < GROUP_LEVEL_TTL_MS) {
             return cached.level;
@@ -153,7 +160,7 @@ async function getGroupLevel(
     try {
         const detail = await bridge.apis.contacts.fetchGroupDetail(groupId);
         const level = detail?.level ?? 0;
-        groupLevelCache.set(groupId, { level, at: Date.now() });
+        levels.set(groupId, { level, at: Date.now() });
         return level;
     } catch (err) {
         if (noCache) {
