@@ -68,6 +68,14 @@ QQ 数字标识须为规范十进制字符串且数值在 1–4294967295 范围�
 
 当前 Jiyu 的好友列表来源于 v11 好友 roster，可能使用缓存并追加设备伪联系人；上游没有独立的 displayname，因此此服务端将 `user_displayname` 固定为空字符串。具体内容与实时性取决于服务端及上游状态。
 
+## OneBot 12 群列表类型
+
+`@harehane/sdk/v12` 导出 `OneBot12GroupInfo` 和 `OneBot12GroupListResponse`，对应 [OneBot 12 `get_group_list`](https://12.onebot.dev/interface/group/actions/#get_group_list)。群信息的 `group_id` 和 `group_name` 均为必填字符串，并允许 JSON 扩展字段；`status: 'ok'` 分支包含群信息数组，`status: 'failed'` 分支保留通用响应的 `data` 类型。
+
+现有客户端可通过 `request('get_group_list', {})` 发出请求，返回通用 `OneBot12ActionResponse`。通用解析器仅检查响应信封和 JSON 值，不校验群字段；调用方使用这些类型前应自行校验数据，类型断言不等于校验。类型导出本身不增加服务端能力，服务端须支持该动作。
+
+当前 Jiyu 服务端返回的是 v11 群列表投影，不是 QQ 群成员列表；由于可能使用缓存或空回退，结果不能证明机器人当前仍在这些群中，也不保证完整或实时。
+
 ## 快速开始
 
 ```ts

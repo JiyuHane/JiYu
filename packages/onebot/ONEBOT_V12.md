@@ -41,7 +41,7 @@ configuration writers and backup restores do not share a revision lock.
 ## Supported behavior and limits
 
 The core currently handles `get_version`, `get_status`, `get_supported_actions`,
-`get_self_info`, `get_friend_list`, `send_message` for private and group text messages and group
+`get_self_info`, `get_friend_list`, `get_group_list`, `send_message` for private and group text messages and group
 mentions, `delete_message`, and `set_group_name`. The latter requires a canonical positive
 safe-integer group ID encoded as a string and a string group name, including an
 empty string; it forwards one request to the existing account-local v11 handler.
@@ -164,6 +164,41 @@ in its own diagnostics, including for v11 callers, and the friend-list provider'
 fallback warning omits exception details. Action observers still receive the
 original response; other services, observers or debug streams may independently
 inspect or disclose it. These protections do not change v11 response contents.
+
+`get_group_list` accepts no parameters, including no `no_cache`, and calls the
+account-local v11 handler exactly once with `{}`. It projects only each positive
+safe-integer numeric `group_id` to a string and its string `group_name`, ignoring
+v11 extras while preserving order, duplicates and empty names. After ordinary
+preflight, nonempty valid JSON parameters return 10004 without a handler call;
+non-JSON input is rejected earlier with 10001. Supplied `self` and `echo` follow
+the existing preflight behavior. The v11 action defaults `no_cache` to false and
+returns `[]` without a provider. Its usual provider skips refresh when
+`identity.groups` is nonempty; when empty it attempts a refresh and on failure
+warns and falls back to the current cache. An empty, successful or cached result
+is not proof of freshness or actual group membership; real QQ behavior is
+unverified. When a decoded group entry lacks `groupUin`, the existing contacts
+provider substitutes numeric zero and can retain that entry in the identity
+cache. If it reaches this action, the positive-ID requirement rejects the entire
+list with 20001 rather than dropping that row. Its real-world frequency is
+unknown. The underlying service may initiate network activity.
+
+The complete result is rejected with fixed 20001 (`invalid group list result`)
+for malformed envelope, array or row, v11 failures 1400/1404, or local limits over
+10,000 entries, 1,024 UTF-16 units per name, or 262,144 units across names.
+Other valid v11 failures and exceptions return fixed 20002 (`group list
+unavailable`), without upstream details or retry. After `await`, the dispatcher
+rejects proxies, sparse arrays, inherited required properties and accessors; it
+reads only required own data descriptors and does not enumerate extras. Await's
+thenable handling may itself execute a `then` getter. These result limits apply
+only at this layer, not to network bytes. The transport defaults to 1 MiB, and
+escaped JSON, field names and echo consume that budget; it may replace an
+oversized core success with error 20001 or close the connection. Existing
+transport failure-message rewriting may also apply. The shared v11 handler's
+terminal action and exception logs are redacted for this action and its provider
+fallback warning omits exception details; v11 response and observer semantics
+remain unchanged. Observers and debug streams can still see raw results and
+independently traverse or disclose them, and other layers retain their own risks.
+See the [group action definition](https://12.onebot.dev/interface/group/actions/#get_group_list).
 
 For group `send_message`, a v12 `mention` with `data.user_id` as a canonical
 positive decimal string in the UIN range 1 through 4294967295 maps to the

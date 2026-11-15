@@ -102,11 +102,7 @@ export async function getGroupList(
             throw err;
         }
 
-        log.warn(
-            'group list refresh failed, using cached roster: uin=%s err=%s',
-            bridge.identity.uin,
-            err instanceof Error ? (err.stack ?? err.message) : String(err),
-        );
+        log.warn('group list refresh failed, using cached roster');
     }
 
     return bridge.identity.groups.map((g) => ({

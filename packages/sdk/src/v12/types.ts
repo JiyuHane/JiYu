@@ -50,6 +50,17 @@ export interface OneBot12ActionResponse extends OneBot12JsonObject {
     echo?: string;
 }
 
+/** Group information returned by OneBot 12 group actions. */
+export interface OneBot12GroupInfo extends OneBot12JsonObject {
+    group_id: string;
+    group_name: string;
+}
+
+/** Describes the response shape; the generic response parser does not validate group fields. */
+export type OneBot12GroupListResponse =
+    | (OneBot12ActionResponse & { status: 'ok'; data: OneBot12GroupInfo[] })
+    | (OneBot12ActionResponse & { status: 'failed' });
+
 /** User information returned by OneBot 12 user actions. */
 export interface OneBot12UserInfo extends OneBot12JsonObject {
     user_id: string;

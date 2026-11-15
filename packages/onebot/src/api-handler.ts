@@ -21,6 +21,10 @@ import {
 } from './streaming';
 const moduleLog = createLogger('Bridge.Action');
 
+function isSensitiveRosterAction(action: string): boolean {
+    return action === 'get_friend_list' || action === 'get_group_list';
+}
+
 function summarizeActionParams(action: string, params: JsonObject): string {
     if (action !== 'fetch_emoji_like') {
         return summarizeParams(params);
@@ -365,8 +369,12 @@ export class ApiHandler {
             // `OidbError.message` already carries the QQ server code, so it needs no
             // special casing. warn (not error) keeps the log file useful without
             // drowning it in expected client-side failures.
-            if (action === 'get_friend_list') {
-                this.log.warn('get_friend_list failed: [redacted]');
+            if (isSensitiveRosterAction(action)) {
+                this.log.warn(
+                    action === 'get_friend_list'
+                        ? 'get_friend_list failed: [redacted]'
+                        : 'get_group_list failed: [redacted]',
+                );
             } else {
                 this.log.warn(
                     '%s failed: %s\n%s',
@@ -418,7 +426,7 @@ export class ApiHandler {
             outcome,
             reason,
             Date.now() - startedAt,
-            action === 'get_friend_list' ? '[redacted]' : renderParamsVerbose(response),
+            isSensitiveRosterAction(action) ? '[redacted]' : renderParamsVerbose(response),
         ]);
     }
 
@@ -436,8 +444,12 @@ export class ApiHandler {
             try {
                 cb({ action, params, response, ms });
             } catch (err) {
-                if (action === 'get_friend_list') {
-                    this.log.warn('get_friend_list action observer error: [redacted]');
+                if (isSensitiveRosterAction(action)) {
+                    this.log.warn(
+                        action === 'get_friend_list'
+                            ? 'get_friend_list action observer error: [redacted]'
+                            : 'get_group_list action observer error: [redacted]',
+                    );
                 } else {
                     this.log.warn(
                         'action observer error: %s',
