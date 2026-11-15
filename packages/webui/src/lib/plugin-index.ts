@@ -210,9 +210,16 @@ export function parseConfigFields(fields: unknown): PluginConfigField[] {
             !isPlainConfigRecord(field) ||
             Object.keys(field).some(
                 (key) =>
-                    !['key', 'label', 'type', 'default', 'description', 'reactive', 'hidden'].includes(
-                        key,
-                    ),
+                    ![
+                        'key',
+                        'label',
+                        'type',
+                        'default',
+                        'description',
+                        'reactive',
+                        'hidden',
+                        'options',
+                    ].includes(key),
             ) ||
             typeof field.key !== 'string' ||
             !field.key.trim() ||
@@ -224,7 +231,10 @@ export function parseConfigFields(fields: unknown): PluginConfigField[] {
             !field.label.trim() ||
             field.label.length > 256 ||
             typeof field.type !== 'string' ||
-            !['string', 'text', 'number', 'boolean'].includes(field.type) ||
+            !['string', 'text', 'number', 'boolean', 'select'].includes(field.type) ||
+            (field.type === 'select'
+                ? !Object.hasOwn(field, 'options') || !isConfigOptions(field.options)
+                : Object.hasOwn(field, 'options')) ||
             (Object.hasOwn(field, 'reactive') && field.reactive !== false) ||
             (Object.hasOwn(field, 'hidden') && field.hidden !== false) ||
             (field.description !== undefined &&
@@ -252,7 +262,60 @@ function isSafeConfigNumber(value: number): boolean {
     );
 }
 
+function isConfigOptionValue(value: unknown): value is string | number {
+    return (
+        (typeof value === 'string' && value.length <= 16384) ||
+        (typeof value === 'number' && isSafeConfigNumber(value))
+    );
+}
+
+/** Network responses are decoded JSON; descriptors also reject ordinary accessors. */
+function isConfigOptions(value: unknown): boolean {
+    if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+        return false;
+    }
+
+    const length = value.length;
+
+    if (length < 1 || length > 256 || Reflect.ownKeys(value).length !== length + 1) {
+        return false;
+    }
+
+    const seen = new Set<string | number>();
+
+    for (let index = 0; index < length; index++) {
+        const item = Object.getOwnPropertyDescriptor(value, String(index));
+
+        if (!item || !item.enumerable || !('value' in item) || !isPlainConfigRecord(item.value)) {
+            return false;
+        }
+
+        const option = item.value;
+
+        if (
+            Object.keys(option).length !== 2 ||
+            !Object.hasOwn(option, 'label') ||
+            !Object.hasOwn(option, 'value') ||
+            typeof option.label !== 'string' ||
+            !option.label.trim() ||
+            option.label.length > 256 ||
+            !isConfigOptionValue(option.value) ||
+            seen.has(option.value)
+        ) {
+            return false;
+        }
+
+        seen.add(option.value);
+    }
+
+    return true;
+}
+
 function isConfigScalar(type: string, value: unknown): value is string | number | boolean {
+    if (type === 'select') {
+        return isConfigOptionValue(value);
+    }
+
     if (type === 'string' || type === 'text') {
         return typeof value === 'string' && value.length <= 16384;
     }
@@ -464,7 +527,13 @@ export function parseConfigValue(fields: PluginConfigField[], value: unknown): P
     const result: PluginConfigValue = Object.create(null);
 
     for (const field of fields) {
-        if (!Object.hasOwn(value, field.key) || !isConfigScalar(field.type, value[field.key])) {
+        if (
+            !Object.hasOwn(value, field.key) ||
+            !isConfigScalar(field.type, value[field.key]) ||
+            (field.type === 'select' &&
+                (!field.options ||
+                    !field.options.some((option) => option.value === value[field.key])))
+        ) {
             return unsupportedConfig();
         }
 

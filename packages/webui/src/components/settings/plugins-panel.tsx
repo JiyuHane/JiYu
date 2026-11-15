@@ -986,6 +986,29 @@ export function ManifestView({
 type ConfigOperation = 'schema' | 'read' | 'write';
 type ConfigDraft = Record<string, string | boolean>;
 
+export function configValueToDraft(fields: PluginConfigField[], value: unknown): ConfigDraft {
+    const values = parseConfigValue(fields, value);
+    const draft: ConfigDraft = Object.create(null);
+
+    for (const field of fields) {
+        const current = values[field.key];
+
+        if (field.type === 'select') {
+            const index = field.options?.findIndex((option) => option.value === current) ?? -1;
+
+            if (index < 0) {
+                throw new Error('配置选项无效');
+            }
+
+            draft[field.key] = `i:${index}`;
+        } else {
+            draft[field.key] = typeof current === 'boolean' ? current : String(current);
+        }
+    }
+
+    return draft;
+}
+
 export function configDraftToValue(
     fields: PluginConfigField[],
     draft: ConfigDraft,
@@ -1003,7 +1026,24 @@ export function configDraftToValue(
 
         const value = draft[field.key];
 
-        if (field.type === 'number') {
+        if (field.type === 'select') {
+            if (typeof value !== 'string' || !/^i:(0|[1-9][0-9]*)$/.test(value)) {
+                throw new Error('配置选项无效');
+            }
+
+            const index = Number(value.slice(2));
+
+            if (
+                !Number.isSafeInteger(index) ||
+                value !== `i:${index}` ||
+                !field.options ||
+                index >= field.options.length
+            ) {
+                throw new Error('配置选项无效');
+            }
+
+            values[field.key] = field.options[index].value;
+        } else if (field.type === 'number') {
             const number = typeof value === 'string' ? parseConfigNumber(value) : null;
 
             if (number === null) {
@@ -1225,15 +1265,7 @@ function PluginConfigDialog({
                 }
 
                 try {
-                    const values = parseConfigValue(fields, result.value);
-                    const next: ConfigDraft = Object.create(null);
-
-                    for (const field of fields) {
-                        const value = values[field.key];
-                        next[field.key] = typeof value === 'boolean' ? value : String(value);
-                    }
-
-                    setDraft(next);
+                    setDraft(configValueToDraft(fields, result.value));
                 } catch {
                     setDraft(null);
                     setError('配置键或值与字段不匹配，暂不支持编辑。');
@@ -1358,52 +1390,76 @@ function PluginConfigDialog({
                 {displayTexts !== null && <PluginPlainTextView texts={displayTexts} />}
                 {draft && fields && displayTexts === null && (
                     <div className="flex flex-col gap-4">
-                        {fields.map((field) => (
-                            <label key={field.key} className="flex flex-col gap-1 text-sm">
-                                <span>{field.label}</span>
-                                {field.description && (
-                                    <span className="text-xs text-muted-foreground">
-                                        {field.description}
-                                    </span>
-                                )}
-                                {field.default !== undefined && (
-                                    <span className="text-xs text-muted-foreground">
-                                        声明的默认值：{String(field.default)}（不会自动填入）
-                                    </span>
-                                )}
-                                {field.type === 'boolean' ? (
-                                    <input
-                                        type="checkbox"
-                                        checked={draft[field.key] === true}
-                                        onChange={(event) =>
-                                            setDraft({
-                                                ...draft,
-                                                [field.key]: event.target.checked,
-                                            })
-                                        }
-                                    />
-                                ) : field.type === 'text' ? (
-                                    <Textarea
-                                        value={String(draft[field.key])}
-                                        maxLength={16384}
-                                        onChange={(event) =>
-                                            setDraft({ ...draft, [field.key]: event.target.value })
-                                        }
-                                    />
-                                ) : (
-                                    <Input
-                                        type="text"
-                                        inputMode={field.type === 'number' ? 'decimal' : undefined}
-                                        autoComplete="off"
-                                        value={String(draft[field.key])}
-                                        maxLength={16384}
-                                        onChange={(event) =>
-                                            setDraft({ ...draft, [field.key]: event.target.value })
-                                        }
-                                    />
-                                )}
-                            </label>
-                        ))}
+                        {fields.map((field) => {
+                            const Wrapper = field.type === 'select' ? 'div' : 'label';
+
+                            return (
+                                <Wrapper key={field.key} className="flex flex-col gap-1 text-sm">
+                                    <span>{field.label}</span>
+                                    {field.description && (
+                                        <span className="text-xs text-muted-foreground">
+                                            {field.description}
+                                        </span>
+                                    )}
+                                    {field.default !== undefined && (
+                                        <span className="text-xs text-muted-foreground">
+                                            声明的默认值：{String(field.default)}（不会自动填入）
+                                        </span>
+                                    )}
+                                    {field.type === 'select' ? (
+                                        <DropdownSelect
+                                            ariaLabel={field.label}
+                                            value={String(draft[field.key])}
+                                            options={(field.options ?? []).map((option, index) => ({
+                                                label: option.label,
+                                                value: `i:${index}`,
+                                            }))}
+                                            onChange={(value) =>
+                                                setDraft({ ...draft, [field.key]: value })
+                                            }
+                                        />
+                                    ) : field.type === 'boolean' ? (
+                                        <input
+                                            type="checkbox"
+                                            checked={draft[field.key] === true}
+                                            onChange={(event) =>
+                                                setDraft({
+                                                    ...draft,
+                                                    [field.key]: event.target.checked,
+                                                })
+                                            }
+                                        />
+                                    ) : field.type === 'text' ? (
+                                        <Textarea
+                                            value={String(draft[field.key])}
+                                            maxLength={16384}
+                                            onChange={(event) =>
+                                                setDraft({
+                                                    ...draft,
+                                                    [field.key]: event.target.value,
+                                                })
+                                            }
+                                        />
+                                    ) : (
+                                        <Input
+                                            type="text"
+                                            inputMode={
+                                                field.type === 'number' ? 'decimal' : undefined
+                                            }
+                                            autoComplete="off"
+                                            value={String(draft[field.key])}
+                                            maxLength={16384}
+                                            onChange={(event) =>
+                                                setDraft({
+                                                    ...draft,
+                                                    [field.key]: event.target.value,
+                                                })
+                                            }
+                                        />
+                                    )}
+                                </Wrapper>
+                            );
+                        })}
                     </div>
                 )}
                 {draft && displayTexts === null && (
