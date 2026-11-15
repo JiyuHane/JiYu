@@ -4,6 +4,7 @@ export type {
     OneBot12Event,
     OneBot12FriendListResponse,
     OneBot12GroupInfo,
+    OneBot12GroupInfoResponse,
     OneBot12GroupListResponse,
     OneBot12JsonObject,
     OneBot12JsonValue,

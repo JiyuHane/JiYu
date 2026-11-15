@@ -159,12 +159,7 @@ async function getGroupLevel(
             throw err;
         }
 
-        log.warn(
-            'group detail refresh failed, using roster metadata: uin=%s group=%d err=%s',
-            bridge.identity.uin,
-            groupId,
-            err instanceof Error ? (err.stack ?? err.message) : String(err),
-        );
+        log.warn('group detail refresh failed, using roster metadata: [redacted]');
         return 0;
     }
 }
@@ -193,12 +188,7 @@ export async function getGroupInfo(
                 throw err;
             }
 
-            log.warn(
-                'group list refresh failed, using cached roster: uin=%s group=%d err=%s',
-                bridge.identity.uin,
-                groupId,
-                err instanceof Error ? (err.stack ?? err.message) : String(err),
-            );
+            log.warn('group list refresh failed, using cached roster: [redacted]');
         }
     }
 
@@ -258,12 +248,7 @@ export async function getGroupInfo(
             throw err;
         }
 
-        log.warn(
-            'non-member group lookup failed: uin=%s group=%d err=%s',
-            bridge.identity.uin,
-            groupId,
-            err instanceof Error ? (err.stack ?? err.message) : String(err),
-        );
+        log.warn('non-member group lookup failed: [redacted]');
     }
 
     return null;

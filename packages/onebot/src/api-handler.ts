@@ -22,7 +22,9 @@ import {
 const moduleLog = createLogger('Bridge.Action');
 
 function isSensitiveRosterAction(action: string): boolean {
-    return action === 'get_friend_list' || action === 'get_group_list';
+    return (
+        action === 'get_friend_list' || action === 'get_group_list' || action === 'get_group_info'
+    );
 }
 
 function summarizeActionParams(action: string, params: JsonObject): string {
@@ -336,7 +338,11 @@ export class ApiHandler {
     ): Promise<import('./types').ApiResponse> {
         // Terse breadcrumb to the log file (debug, which is written to disk under the default
         // file level): lets the operator grep "what did the bot get asked to do" in post-mortems.
-        this.log.debug('%s params=%s', action, summarizeActionParams(action, params));
+        this.log.debug(
+            '%s params=%s',
+            action,
+            action === 'get_group_info' ? '[redacted]' : summarizeActionParams(action, params),
+        );
 
         let response: import('./types').ApiResponse;
         let outcome: 'ok' | 'failed' | 'cancelled';
@@ -373,7 +379,9 @@ export class ApiHandler {
                 this.log.warn(
                     action === 'get_friend_list'
                         ? 'get_friend_list failed: [redacted]'
-                        : 'get_group_list failed: [redacted]',
+                        : action === 'get_group_list'
+                          ? 'get_group_list failed: [redacted]'
+                          : 'get_group_info failed: [redacted]',
                 );
             } else {
                 this.log.warn(
@@ -404,7 +412,7 @@ export class ApiHandler {
         this.log.trace(() => [
             'action_input action=%s params=%s',
             action,
-            renderParamsVerbose(params),
+            action === 'get_group_info' ? '[redacted]' : renderParamsVerbose(params),
         ]);
     }
 
@@ -448,7 +456,9 @@ export class ApiHandler {
                     this.log.warn(
                         action === 'get_friend_list'
                             ? 'get_friend_list action observer error: [redacted]'
-                            : 'get_group_list action observer error: [redacted]',
+                            : action === 'get_group_list'
+                              ? 'get_group_list action observer error: [redacted]'
+                              : 'get_group_info action observer error: [redacted]',
                     );
                 } else {
                     this.log.warn(

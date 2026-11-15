@@ -34,6 +34,7 @@ const ACTIONS = [
     'get_supported_actions',
     'get_self_info',
     'get_friend_list',
+    'get_group_info',
     'get_group_list',
     'set_group_name',
     'send_message',
@@ -344,6 +345,20 @@ export class V12Dispatcher {
             return this.getFriendList(echo);
         }
 
+        if (action === 'get_group_info') {
+            if (extraKeys(params, ['group_id'])) {
+                return response(10004, 'unsupported parameter', null, echo);
+            }
+
+            const groupId = parseAccountId(params.group_id);
+
+            if (groupId === null) {
+                return response(10003, 'invalid group_id', null, echo);
+            }
+
+            return this.getGroupInfo(groupId, echo);
+        }
+
         if (action === 'get_group_list') {
             if (Object.keys(params).length !== 0) {
                 return response(10004, 'unsupported parameter', null, echo);
@@ -570,6 +585,80 @@ export class V12Dispatcher {
             }
 
             return response(0, '', output, echo);
+        } catch {
+            return unavailable();
+        }
+    }
+
+    private async getGroupInfo(groupId: number, echo?: string): Promise<V12Response> {
+        const invalid = () => response(20001, 'invalid group info result', null, echo);
+        const unavailable = () => response(20002, 'group info unavailable', null, echo);
+
+        try {
+            const result: unknown = await this.options.api.handle('get_group_info', {
+                group_id: groupId,
+            });
+
+            // Await may inspect a thenable before these proxy and descriptor checks.
+            if (
+                isProxy(result) ||
+                typeof result !== 'object' ||
+                result === null ||
+                Array.isArray(result)
+            ) {
+                return invalid();
+            }
+
+            const status = Object.getOwnPropertyDescriptor(result, 'status');
+            const retcode = Object.getOwnPropertyDescriptor(result, 'retcode');
+
+            if (!status || !('value' in status) || !retcode || !('value' in retcode)) {
+                return invalid();
+            }
+
+            if (
+                status.value === 'failed' &&
+                Number.isSafeInteger(retcode.value) &&
+                retcode.value > 0
+            ) {
+                return retcode.value === 1400 || retcode.value === 1404 ? invalid() : unavailable();
+            }
+
+            if (status.value !== 'ok' || retcode.value !== 0) {
+                return invalid();
+            }
+
+            const data = Object.getOwnPropertyDescriptor(result, 'data');
+            const value: unknown = data && 'value' in data ? data.value : undefined;
+
+            if (
+                isProxy(value) ||
+                typeof value !== 'object' ||
+                value === null ||
+                Array.isArray(value)
+            ) {
+                return invalid();
+            }
+
+            const id = Object.getOwnPropertyDescriptor(value, 'group_id');
+            const name = Object.getOwnPropertyDescriptor(value, 'group_name');
+
+            if (
+                !id ||
+                !('value' in id) ||
+                typeof id.value !== 'number' ||
+                !Number.isSafeInteger(id.value) ||
+                id.value <= 0 ||
+                id.value !== groupId ||
+                !name ||
+                !('value' in name) ||
+                typeof name.value !== 'string' ||
+                name.value.length > 1024
+            ) {
+                return invalid();
+            }
+
+            return response(0, '', { group_id: String(groupId), group_name: name.value }, echo);
         } catch {
             return unavailable();
         }

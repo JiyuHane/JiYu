@@ -41,7 +41,7 @@ configuration writers and backup restores do not share a revision lock.
 ## Supported behavior and limits
 
 The core currently handles `get_version`, `get_status`, `get_supported_actions`,
-`get_self_info`, `get_friend_list`, `get_group_list`, `send_message` for private and group text messages and group
+`get_self_info`, `get_friend_list`, `get_group_info`, `get_group_list`, `send_message` for private and group text messages and group
 mentions, `delete_message`, and `set_group_name`. The latter requires a canonical positive
 safe-integer group ID encoded as a string and a string group name, including an
 empty string; it forwards one request to the existing account-local v11 handler.
@@ -164,6 +164,45 @@ in its own diagnostics, including for v11 callers, and the friend-list provider'
 fallback warning omits exception details. Action observers still receive the
 original response; other services, observers or debug streams may independently
 inspect or disclose it. These protections do not change v11 response contents.
+
+`get_group_info` accepts only `group_id` and calls the account-local v11 handler
+exactly once with `{group_id: number}`. After common preflight, extra parameters
+(including `no_cache`) take precedence with 10004; a missing or invalid ID returns
+10003 without a handler call. Unlike the [standard's string ID](https://12.onebot.dev/interface/group/actions/#get_group_info),
+this implementation requires a canonical positive decimal string within JavaScript's
+safe-integer range: zero, signs, whitespace, leading zeroes, numeric inputs and
+values above `Number.MAX_SAFE_INTEGER` are rejected. A successful result projects
+only the matching numeric ID and the original string name to
+`{group_id: String(requestId), group_name}`. Empty names are accepted; names over
+1,024 UTF-16 code units are rejected. This local name limit is not a transport byte
+limit: JSON encoding, field names and echo also consume the transport output budget.
+
+The v11 action defaults `no_cache` to false. If the provider is missing or returns
+null, v11 synthesizes success with the requested ID and an empty name. Success
+therefore does not establish that the group exists, that its actual name is empty,
+that the account is a current member, or that the data is live. The provider may
+reuse the identity cache and retains non-member group details in a short TTL cache;
+upstream failures can result in cached or empty fallback data. The underlying
+service may access the network. In the non-member detail path, the upstream
+implementation assigns the requested ID to the returned object without checking
+the response's `groupInfo.uin` or `results.uin`; matching IDs here therefore
+validate only the v11 projection, not that the upstream response belongs to the
+requested group. A missing upstream detail name also becomes an empty string;
+its real-world frequency is unknown. Real QQ behavior has not been verified.
+
+After `await`, the dispatcher rejects Proxy envelopes and data and inspects only
+own data properties for `status`, `retcode`, successful `data`, `group_id` and
+`group_name`; unknown extras are not accessed. Await's thenable handling can itself
+execute a `then` getter before inspection. Malformed results, mismatched IDs and
+v11 failures 1400/1404 return fixed 20001; other valid failures and exceptions
+return fixed 20002, without group IDs or exception details in the fixed messages
+and without automatic retries. Existing transport failure-message rewriting may
+apply. The shared v11 handler's targeted `get_group_info` action diagnostics
+redact inputs, terminal responses and exception text; the three related contact
+warnings omit sensitive details. These contact warnings are shared with the v11
+`get_group_info_ex` and `get_group_detail_info` paths. Observers still receive the
+original v11 response, and existing SSE or other component logs can still expose
+complete data; this change does not alter v11 response or observer semantics.
 
 `get_group_list` accepts no parameters, including no `no_cache`, and calls the
 account-local v11 handler exactly once with `{}`. It projects only each positive

@@ -57,6 +57,11 @@ export interface OneBot12GroupInfo extends OneBot12JsonObject {
 }
 
 /** Describes the response shape; the generic response parser does not validate group fields. */
+export type OneBot12GroupInfoResponse =
+    | (OneBot12ActionResponse & { status: 'ok'; data: OneBot12GroupInfo })
+    | (OneBot12ActionResponse & { status: 'failed'; data: OneBot12JsonValue });
+
+/** Describes the response shape; the generic response parser does not validate group fields. */
 export type OneBot12GroupListResponse =
     | (OneBot12ActionResponse & { status: 'ok'; data: OneBot12GroupInfo[] })
     | (OneBot12ActionResponse & { status: 'failed' });

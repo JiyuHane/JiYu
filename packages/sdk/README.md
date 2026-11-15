@@ -70,11 +70,11 @@ QQ 数字标识须为规范十进制字符串且数值在 1–4294967295 范围�
 
 ## OneBot 12 群列表类型
 
-`@harehane/sdk/v12` 导出 `OneBot12GroupInfo` 和 `OneBot12GroupListResponse`，对应 [OneBot 12 `get_group_list`](https://12.onebot.dev/interface/group/actions/#get_group_list)。群信息的 `group_id` 和 `group_name` 均为必填字符串，并允许 JSON 扩展字段；`status: 'ok'` 分支包含群信息数组，`status: 'failed'` 分支保留通用响应的 `data` 类型。
+`@harehane/sdk/v12` 导出 `OneBot12GroupInfo`、`OneBot12GroupListResponse` 和 `OneBot12GroupInfoResponse`，分别描述 [OneBot 12 `get_group_list`](https://12.onebot.dev/interface/group/actions/#get_group_list) 和 [`get_group_info`](https://12.onebot.dev/interface/group/actions/#get_group_info) 的响应。群信息的 `group_id` 和 `group_name` 均为必填字符串，并允许 JSON 扩展字段；`status: 'ok'` 分支分别包含群信息数组和单个群信息，`status: 'failed'` 分支保留通用响应的 `data` 类型。
 
-现有客户端可通过 `request('get_group_list', {})` 发出请求，返回通用 `OneBot12ActionResponse`。通用解析器仅检查响应信封和 JSON 值，不校验群字段；调用方使用这些类型前应自行校验数据，类型断言不等于校验。类型导出本身不增加服务端能力，服务端须支持该动作。
+现有客户端可通过通用请求 `request('get_group_list', {})` 或 `request('get_group_info', { group_id: '123' })` 发出请求，返回通用 `OneBot12ActionResponse`。通用解析器仅检查响应信封和 JSON 值，不校验群字段；调用方使用这些类型前应自行校验数据，类型断言不等于校验。类型导出本身不增加服务端能力，调用需要支持相应动作的新版 v12 服务端。
 
-当前 Jiyu 服务端返回的是 v11 群列表投影，不是 QQ 群成员列表；由于可能使用缓存或空回退，结果不能证明机器人当前仍在这些群中，也不保证完整或实时。
+当前 Jiyu 的群列表是 v11 群列表投影，不是 QQ 群成员列表；由于可能使用缓存或空回退，结果不证明机器人当前仍在这些群中，也不保证完整或实时。当前 Jiyu 的 v11 群信息在没有 provider 或 provider 返回 `null` 时会合成成功结果，返回请求的群 ID 和空群名；此结果不证明群存在、账号属于该群或信息实时。
 
 ## 快速开始
 
