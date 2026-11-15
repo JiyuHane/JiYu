@@ -58,7 +58,7 @@ export interface PacketPipelineDeps {
 
 export class IncomingPacketPipeline {
     private cmdHandlers_ = new Map<string, CmdParser[]>();
-    private memberRefreshTasks_ = new Map<number, Promise<void>>();
+    private memberRefreshTasks_ = new Set<number>();
     private readonly log: Logger;
     private readonly eventLog: Logger;
     private readonly packetLog: Logger;
@@ -715,11 +715,20 @@ export class IncomingPacketPipeline {
             return;
         }
 
-        if (event.kind === 'group_member_join' && !this.deps.identity.findGroup(groupId)) {
-            refreshGroupList = true;
+        // Reserve before calling dependencies: they can synchronously reenter this
+        // pipeline for the same group, and the refresh can finish synchronously.
+        this.memberRefreshTasks_.add(groupId);
+
+        try {
+            if (event.kind === 'group_member_join' && !this.deps.identity.findGroup(groupId)) {
+                refreshGroupList = true;
+            }
+        } catch (error) {
+            this.memberRefreshTasks_.delete(groupId);
+            throw error;
         }
 
-        const task = (async () => {
+        void (async () => {
             try {
                 if (refreshGroupList) {
                     try {
@@ -747,8 +756,6 @@ export class IncomingPacketPipeline {
                 this.memberRefreshTasks_.delete(groupId);
             }
         })();
-
-        this.memberRefreshTasks_.set(groupId, task);
     }
 
     private rememberEventIdentity(event: QQEventVariant): void {
