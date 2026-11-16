@@ -1,11 +1,17 @@
 import { APP_VERSION } from '@snowluma/common/version';
 import { isProxy } from 'node:util/types';
-import { IOneBotNetworkAdapter, type AdapterStatus, type NetworkAdapterContext } from '../network';
+import {
+    IOneBotNetworkAdapter,
+    type AdapterStatus,
+    type NetworkAdapterContext,
+    type NetworkReloadType,
+} from '../network';
 import { V12Transport } from '../v12-network';
 import { V12Dispatcher } from '../v12/dispatcher';
 import {
     convertV11Event,
     createConnectEvent,
+    createHeartbeatEvent,
     createStatusUpdateEvent,
     V12UnsupportedEventError,
 } from '../v12/events';
@@ -68,6 +74,10 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     private readonly dispatcher: V12Dispatcher;
     private readonly subscribers = new Set<(event: unknown) => void>();
     private readonly subscriberGenerations = new Map<(event: unknown) => void, object>();
+    private readonly heartbeatEnableReloadScopes = new Set<{
+        readonly transport: V12Transport | null;
+        readonly token: object | null;
+    }>();
     readonly #sourceScopes: Array<{
         event: JsonObject;
         payload: DispatchPayload;
@@ -79,6 +89,13 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     private statusEmitting = false;
     private statusPending = false;
     private statusImmediate: ReturnType<typeof setImmediate> | null = null;
+    private heartbeatEmitting = false;
+    private heartbeat: {
+        transport: V12Transport;
+        token: object;
+        epoch: object;
+        timer: ReturnType<typeof setInterval>;
+    } | null = null;
     private transport: V12Transport | null = null;
     private currentStatusTransportToken: object | null = null;
     private openingOwner: object | null = null;
@@ -124,7 +141,41 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     }
 
     protected bindingSignature(config: V12ManagedConfig): string {
-        return JSON.stringify([config.host, config.port, config.accessToken]);
+        return JSON.stringify([
+            config.host,
+            config.port,
+            config.accessToken,
+            config.heartbeat?.enabled === true ? config.heartbeat.interval : null,
+        ]);
+    }
+
+    override reload(next: V12ManagedConfig): Promise<NetworkReloadType> {
+        if (next.heartbeat?.enabled !== true) {
+            return super.reload(next);
+        }
+
+        return this.withHeartbeatEnableReloadScope(() => super.reload(next));
+    }
+
+    override closeForReload(next: V12ManagedConfig): void | Promise<void> {
+        if (next.heartbeat?.enabled !== true) {
+            return super.closeForReload(next);
+        }
+
+        return this.withHeartbeatEnableReloadScope(() => super.closeForReload(next));
+    }
+
+    private async withHeartbeatEnableReloadScope<T>(action: () => T | Promise<T>): Promise<T> {
+        // Close operates on the old config before the desired config is published.
+        // Keep each attempt bound to its original transport, including on failure.
+        const scope = { transport: this.transport, token: this.currentStatusTransportToken };
+        this.heartbeatEnableReloadScopes.add(scope);
+
+        try {
+            return await action();
+        } finally {
+            this.heartbeatEnableReloadScopes.delete(scope);
+        }
     }
 
     async open(): Promise<void> {
@@ -154,6 +205,9 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                 getConnectEvent: () => createConnectEvent(this.version),
                 subscribe: (listener) => this.subscribeStatus(listener),
                 onError: (error) => {
+                    // Retire only this transport's timer before any reentrant cleanup.
+                    this.cancelHeartbeat(token);
+
                     if (this.sourceAttempt === sourceAttempt) {
                         this.revokePoll();
                         this.sourceAttempt = null;
@@ -171,6 +225,8 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                 },
             });
         } catch (error) {
+            this.cancelHeartbeat(token);
+
             if (this.sourceAttempt === sourceAttempt) {
                 this.sourceAttempt = null;
                 this.sourceBinding = null;
@@ -194,6 +250,8 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             this.currentStatusTransportToken !== token ||
             this.transport
         ) {
+            this.cancelHeartbeat(token);
+
             try {
                 await transport.close();
             } catch (error) {
@@ -213,6 +271,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             await transport.open();
 
             if (!this.accepting || !this.options.canAccept()) {
+                this.cancelHeartbeat(token);
                 await transport.close();
 
                 if (ownsOpening()) {
@@ -224,14 +283,35 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                 throw new Error('v12 instance is disposing');
             }
 
+            // An error during bind can revoke sourceAttempt without changing the
+            // opening owner. A heartbeat-enabled binding must not appear active
+            // when its timer generation can no longer be established.
+            if (
+                this.config.heartbeat?.enabled === true &&
+                (!ownsOpening() || !this.accepting || this.sourceAttempt !== sourceAttempt)
+            ) {
+                throw new Error('v12 heartbeat opening superseded');
+            }
+
             if (ownsOpening()) {
                 this.isEnabled = true;
 
                 if (this.sourceAttempt === sourceAttempt) {
                     this.sourceBinding = sourceAttempt;
                 }
+
+                if (
+                    this.isEnabled &&
+                    this.accepting &&
+                    this.sourceAttempt === sourceAttempt &&
+                    this.sourceBinding === sourceAttempt
+                ) {
+                    this.startHeartbeat(transport, token, sourceAttempt);
+                }
             }
         } catch (error) {
+            this.cancelHeartbeat(token);
+
             if (this.sourceAttempt === sourceAttempt) {
                 this.sourceAttempt = null;
                 this.sourceBinding = null;
@@ -261,7 +341,32 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     }
 
     async close(): Promise<void> {
+        const initialTransport = this.transport;
+        const initialToken = this.currentStatusTransportToken;
+        const heartbeatEnabled =
+            this.config.heartbeat?.enabled === true ||
+            [...this.heartbeatEnableReloadScopes].some(
+                (scope) => scope.transport === initialTransport && scope.token === initialToken,
+            );
+
+        if (initialTransport) {
+            this.cancelHeartbeat(initialToken);
+        } else {
+            this.cancelHeartbeat();
+        }
+
         this.revokePoll();
+
+        // Revocation can reenter. An older heartbeat-enabled close must never
+        // take ownership of a replacement transport created during that work.
+        if (
+            heartbeatEnabled &&
+            (this.transport !== initialTransport ||
+                this.currentStatusTransportToken !== initialToken)
+        ) {
+            return;
+        }
+
         const transport = this.transport;
         const token = this.currentStatusTransportToken;
         const previousOpeningOwner = this.openingOwner;
@@ -286,15 +391,23 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
         try {
             transport.quiesce();
         } catch (error) {
-            // Restore status ownership only if no nested close or teardown won.
-            // Source admission remains revoked even when quiesce throws.
-            if (
-                ownsTransport() &&
-                this.closeRevision === closeRevision &&
-                this.openingOwner === null &&
-                this.accepting
-            ) {
-                this.openingOwner = previousOpeningOwner;
+            // Source admission remains revoked even when quiesce throws. With
+            // heartbeat enabled, quiesce may already have taken partial effect;
+            // retain the transport for cleanup without claiming it is active.
+            if (ownsTransport()) {
+                if (heartbeatEnabled && !this.accepting) {
+                    // A nested quiesce/forceClose already revoked acceptance,
+                    // even if it also advanced the close revision.
+                    this.isEnabled = false;
+                    this.cancelStatus();
+                } else if (this.closeRevision === closeRevision && this.openingOwner === null) {
+                    if (heartbeatEnabled) {
+                        this.isEnabled = false;
+                        this.cancelStatus();
+                    } else if (this.accepting) {
+                        this.openingOwner = previousOpeningOwner;
+                    }
+                }
             }
 
             throw error;
@@ -302,6 +415,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
 
         if (ownsTransport()) {
             this.closeRevision = {};
+            this.cancelHeartbeat(token);
             this.isEnabled = false;
             this.cancelStatus();
         }
@@ -321,23 +435,27 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     }
 
     quiesce(): void {
+        this.cancelHeartbeat();
         this.revokePoll();
         this.closeRevision = {};
         this.openingOwner = null;
         this.sourceAttempt = null;
         this.sourceBinding = null;
         this.accepting = false;
+        this.cancelHeartbeat();
         this.cancelStatus();
         this.transport?.quiesce();
     }
 
     override forceClose(): void {
+        this.cancelHeartbeat();
         this.revokePoll();
         this.closeRevision = {};
         this.openingOwner = null;
         this.sourceAttempt = null;
         this.sourceBinding = null;
         this.accepting = false;
+        this.cancelHeartbeat();
         this.cancelStatus();
         this.transport?.forceClose();
     }
@@ -750,6 +868,136 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                 this.flushStatus();
             });
             this.statusImmediate.unref();
+        }
+    }
+
+    private startHeartbeat(transport: V12Transport, token: object, sourceAttempt: object): void {
+        const config = this.config.heartbeat;
+
+        if (config?.enabled !== true) {
+            return;
+        }
+
+        const interval = config.interval;
+
+        if (!Number.isInteger(interval) || interval < 1 || interval > 2_147_483_647) {
+            throw new Error('invalid v12 heartbeat interval');
+        }
+
+        // A unique epoch invalidates even an already-queued callback after cancel.
+        this.cancelHeartbeat();
+        const epoch = {};
+        const timer = setInterval(
+            () => this.emitHeartbeat(transport, token, sourceAttempt, epoch, interval),
+            interval,
+        );
+        this.heartbeat = { transport, token, epoch, timer };
+        timer.unref();
+    }
+
+    private cancelHeartbeat(token?: object | null): void {
+        const heartbeat = this.heartbeat;
+
+        if (!heartbeat || (token !== undefined && heartbeat.token !== token)) {
+            return;
+        }
+
+        this.heartbeat = null;
+        clearInterval(heartbeat.timer);
+    }
+
+    private isHeartbeatCurrent(
+        transport: V12Transport,
+        token: object,
+        sourceAttempt: object,
+        epoch: object,
+    ): boolean {
+        const owns = (): boolean =>
+            this.heartbeat?.transport === transport &&
+            this.heartbeat.token === token &&
+            this.heartbeat.epoch === epoch &&
+            this.transport === transport &&
+            this.currentStatusTransportToken === token &&
+            this.openingOwner === token &&
+            this.sourceAttempt === sourceAttempt &&
+            this.sourceBinding === sourceAttempt &&
+            this.isEnabled &&
+            this.accepting;
+
+        if (!owns()) {
+            return false;
+        }
+
+        try {
+            // canAccept is an injected callback and can itself reenter teardown.
+            return this.options.canAccept() && owns();
+        } catch {
+            this.warnStatus('v12 heartbeat unavailable');
+            return false;
+        }
+    }
+
+    private emitHeartbeat(
+        transport: V12Transport,
+        token: object,
+        sourceAttempt: object,
+        epoch: object,
+        interval: number,
+    ): void {
+        // Initial status is registered before its delivery; do not overtake it
+        // or let a nested timer dispatch recursively interrupt another tick.
+        if (this.statusEmitting || this.heartbeatEmitting) {
+            return;
+        }
+
+        this.heartbeatEmitting = true;
+
+        try {
+            if (
+                !this.isHeartbeatCurrent(transport, token, sourceAttempt, epoch) ||
+                this.subscribers.size === 0
+            ) {
+                return;
+            }
+
+            const event = createHeartbeatEvent(interval);
+            const subscribers = [...this.subscribers].map(
+                (listener) => [listener, this.subscriberGenerations.get(listener)] as const,
+            );
+
+            for (const [listener, generation] of subscribers) {
+                if (
+                    !this.isHeartbeatCurrent(transport, token, sourceAttempt, epoch) ||
+                    this.statusEmitting
+                ) {
+                    return;
+                }
+
+                if (
+                    generation === undefined ||
+                    this.subscriberGenerations.get(listener) !== generation
+                ) {
+                    continue;
+                }
+
+                try {
+                    // All heartbeat fields are primitive; isolate each consumer.
+                    listener({ ...event });
+                } catch {
+                    this.warnStatus('v12 event subscriber failed');
+                }
+
+                if (
+                    !this.isHeartbeatCurrent(transport, token, sourceAttempt, epoch) ||
+                    this.statusEmitting
+                ) {
+                    return;
+                }
+            }
+        } catch {
+            this.warnStatus('v12 heartbeat unavailable');
+        } finally {
+            this.heartbeatEmitting = false;
         }
     }
 

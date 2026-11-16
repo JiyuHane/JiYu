@@ -148,6 +148,11 @@ export interface OneBotV12Config {
     accessToken: string;
     /** Explicitly permit a plaintext listener on a non-loopback address. */
     allowNonLoopback: boolean;
+    /**
+     * Optional v12 heartbeat. Omitted means disabled. The interval is a positive
+     * integer in milliseconds up to 2147483647, even when enabled is false.
+     */
+    heartbeat?: { enabled: boolean; interval: number };
 }
 
 /** Per-UIN OneBot configuration. */

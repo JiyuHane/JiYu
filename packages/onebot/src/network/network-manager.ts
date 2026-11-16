@@ -448,7 +448,11 @@ export class OneBotNetworkManager {
             // Revoke old credentials before attempting unrelated port handoffs.
             // close() first quiesces ingress even if actual release later fails.
             try {
-                await oldV12.adapter.close();
+                if (nextV12) {
+                    await oldV12.adapter.closeForReload(nextV12.config);
+                } else {
+                    await oldV12.adapter.close();
+                }
             } catch (error) {
                 this.markFailure(oldV12.adapter, error);
                 errors.push(this.report(V12_ADAPTER_NAME, oldV12.kind, 'close', error));
@@ -484,7 +488,12 @@ export class OneBotNetworkManager {
             const wasActive = live.adapter.isActive;
 
             try {
-                await live.adapter.close();
+                if (live.kind === 'v12Server' && nextV12) {
+                    await live.adapter.closeForReload(nextV12.config);
+                } else {
+                    await live.adapter.close();
+                }
+
                 released.push([name, live, wasActive]);
             } catch (error) {
                 this.markFailure(live.adapter, error);
@@ -589,7 +598,7 @@ export class OneBotNetworkManager {
             // reopen instead of letting reload() return Normal and clearing the
             // evidence without recovery.
             if (live.adapter.hasApplyFailure) {
-                await live.adapter.close();
+                await live.adapter.closeForReload(next.config);
             }
 
             await live.adapter.reload(next.config);

@@ -38,6 +38,21 @@ The existing WebUI does not expose a v12 editor; its normal v11 settings saves
 preserve the server's existing account-specific v12 settings. Cross-process
 configuration writers and backup restores do not share a revision lock.
 
+Optional v12 heartbeats can be enabled in this account's `v12` object with
+`"heartbeat": { "enabled": true, "interval": 30000 }`. The interval is an
+integer from 1 to 2,147,483,647 **milliseconds**; an explicitly disabled
+heartbeat also requires a valid interval. Omitting `heartbeat` leaves it disabled,
+preserving the existing default. While the listener is running, changing an
+enabled interval or toggling the feature reopens the v12 listener and disconnects
+existing v12 WebSocket clients; it does not change v11 listeners. A locally
+scheduled heartbeat is a nominal transport-level pulse, not evidence that QQ or an account is online, a remote
+client received it, or the timer ran with real-time precision. It is a meta
+event and is not placed in the experimental HTTP polling queue. If releasing a
+heartbeat-enabled listener, or switching a listener to enable heartbeats, fails
+during quiescence, the v12 runtime stops the timer and retains the transport for
+cleanup rather than reporting a successful restoration; retry requires releasing
+the previous transport before reopening.
+
 ## Supported behavior and limits
 
 The core currently handles `get_version`, `get_status`, `get_supported_actions`,

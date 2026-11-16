@@ -290,7 +290,12 @@ export class V12Transport {
                     server.removeListener('error', onError);
                     // Keep post-bind server errors from becoming uncaught exceptions.
                     server.on('error', () => {
-                        this.quiesce();
+                        try {
+                            this.quiesce();
+                        } catch {
+                            // A partial quiesce must still notify the owner so it
+                            // can revoke its timer and record a degraded binding.
+                        }
 
                         try {
                             this.options.onError?.(new Error('v12 listener failure'));

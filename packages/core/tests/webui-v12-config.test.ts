@@ -15,6 +15,18 @@ import { initWebUI } from '../src/webui/server';
 const state = vi.hoisted(() => ({
     fetch: null as null | ((request: Request) => Promise<Response>),
 }));
+// The fixture must not create a real HTTP listener or open a TCP connection.
+vi.mock('node:net', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('node:net')>();
+    const defaultExport = (actual as unknown as { default?: Record<string, unknown> }).default;
+
+    const blocked = () => {
+        throw new Error('unexpected network in WebUI config fixture');
+    };
+
+    const methods = { connect: blocked, createConnection: blocked, createServer: blocked };
+    return { ...actual, ...methods, default: { ...(defaultExport ?? actual), ...methods } };
+});
 vi.mock('@hono/node-server', () => ({
     serve: vi.fn(
         (options: { fetch: typeof state.fetch }, onListen: (info: { port: number }) => void) => {
@@ -32,11 +44,23 @@ const v12 = {
     port: 3012,
     accessToken: 'E5xqVb7_9pLt2QwR4M8kZ1nY',
     allowNonLoopback: false,
+    heartbeat: { enabled: true, interval: 30000 },
 };
 let cwd: string;
 let dir: string;
 
 beforeEach(() => {
+    vi.stubGlobal('fetch', () => {
+        throw new Error('unexpected global fetch in WebUI config fixture');
+    });
+    vi.stubGlobal(
+        'WebSocket',
+        class {
+            constructor() {
+                throw new Error('unexpected WebSocket in WebUI config fixture');
+            }
+        },
+    );
     cwd = process.cwd();
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jiyu-v12-webui-'));
     process.chdir(dir);
@@ -48,6 +72,7 @@ afterEach(() => {
     process.chdir(cwd);
     fs.rmSync(dir, { recursive: true, force: true });
     vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
 });
 
 describe('legacy account config saves', () => {

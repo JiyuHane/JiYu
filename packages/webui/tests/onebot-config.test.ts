@@ -14,6 +14,7 @@ describe('normalizeOneBotConfig history sync', () => {
                 port: 3012,
                 accessToken: 'token',
                 allowNonLoopback: false,
+                heartbeat: { enabled: true, interval: 30000 },
             },
         });
         expect(normalized).not.toHaveProperty('v12');

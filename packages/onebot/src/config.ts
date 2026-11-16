@@ -844,7 +844,7 @@ function validateV12Config(value: unknown): asserts value is OneBotV12Config {
 
     rejectUnknownKeys(
         value,
-        new Set(['enabled', 'host', 'port', 'accessToken', 'allowNonLoopback']),
+        new Set(['enabled', 'host', 'port', 'accessToken', 'allowNonLoopback', 'heartbeat']),
         'v12',
     );
 
@@ -884,6 +884,48 @@ function validateV12Config(value: unknown): asserts value is OneBotV12Config {
 
         if (!assessAccessToken(value.accessToken, ['v12', value.host, value.port]).acceptable) {
             invalid('v12.accessToken must be a strong non-empty token');
+        }
+    }
+
+    const heartbeatProperty = Object.getOwnPropertyDescriptor(value, 'heartbeat');
+
+    if (heartbeatProperty && (!heartbeatProperty.enumerable || !('value' in heartbeatProperty))) {
+        invalid('v12.heartbeat must be an own data property');
+    }
+
+    const heartbeat: unknown = heartbeatProperty?.value;
+
+    if (heartbeat !== undefined) {
+        if (!isObject(heartbeat)) {
+            invalid('v12.heartbeat must be an object');
+        }
+
+        if (Reflect.ownKeys(heartbeat).some((key) => key !== 'enabled' && key !== 'interval')) {
+            invalid('v12.heartbeat contains unsupported fields');
+        }
+
+        const enabled = Object.getOwnPropertyDescriptor(heartbeat, 'enabled');
+        const interval = Object.getOwnPropertyDescriptor(heartbeat, 'interval');
+
+        if (
+            !enabled ||
+            !enabled.enumerable ||
+            !('value' in enabled) ||
+            typeof enabled.value !== 'boolean'
+        ) {
+            invalid('v12.heartbeat.enabled must be a boolean');
+        }
+
+        if (
+            !interval ||
+            !interval.enumerable ||
+            !('value' in interval) ||
+            typeof interval.value !== 'number' ||
+            !Number.isSafeInteger(interval.value) ||
+            interval.value < 1 ||
+            interval.value > NODE_TIMER_MAX_MS
+        ) {
+            invalid(`v12.heartbeat.interval must be an integer between 1 and ${NODE_TIMER_MAX_MS}`);
         }
     }
 }
@@ -1165,6 +1207,20 @@ export function cleanupInvalidPerUinConfigs(): string[] {
     return removed;
 }
 
+function snapshotV12Config(v12: OneBotV12Config) {
+    const property = Object.getOwnPropertyDescriptor(v12, 'heartbeat');
+    const heartbeat: OneBotV12Config['heartbeat'] =
+        property && 'value' in property ? property.value : undefined;
+    const snapshot =
+        heartbeat === undefined
+            ? undefined
+            : { enabled: heartbeat.enabled, interval: heartbeat.interval };
+    return {
+        ...v12,
+        ...(snapshot === undefined ? {} : { heartbeat: snapshot }),
+    };
+}
+
 function toJsonObject(config: OneBotConfig, mode: 'snapshot' | 'overlay'): JsonObject {
     const nets = config.networks;
     return {
@@ -1186,7 +1242,7 @@ function toJsonObject(config: OneBotConfig, mode: 'snapshot' | 'overlay'): JsonO
         },
         historySync: { enabled: config.historySync.enabled },
         notifications: { channelIds: config.notifications?.channelIds ?? [] },
-        ...(config.v12 ? { v12: { ...config.v12 } } : {}),
+        ...(config.v12 ? { v12: snapshotV12Config(config.v12) } : {}),
     };
 }
 
@@ -1322,7 +1378,7 @@ function fromJson(sources: JsonObject[], freshInstall: boolean): OneBotConfig {
 
     if (v12 !== undefined) {
         validateV12Config(v12);
-        config.v12 = { ...v12 };
+        config.v12 = snapshotV12Config(v12);
     }
 
     assertValidOneBotConfig(config);
