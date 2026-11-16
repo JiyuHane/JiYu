@@ -318,15 +318,33 @@ export class Bridge implements BridgeInterface {
             return Promise.reject(new Error('Bridge is disposed'));
         }
 
-        const connection = this.connections.get(pkt.pid);
-        const work = this.identity.initialization.then(() =>
-            pkt.source === 'client-message'
-                ? this.processClientMessage(pkt, connection)
-                : this.pipeline.process(pkt),
-        );
-        this.pendingPackets_.add(work);
-        void work.finally(() => this.pendingPackets_.delete(work)).catch(() => undefined);
-        return work;
+        let finishPacket!: () => void;
+        const reservation = new Promise<void>((resolve) => {
+            finishPacket = resolve;
+        });
+        // Reserve real in-flight work before getters can synchronously reenter disposal.
+        this.pendingPackets_.add(reservation);
+        void reservation.then(() => {
+            this.pendingPackets_.delete(reservation);
+        });
+
+        try {
+            const connection = this.connections.get(pkt.pid);
+            const work = this.identity.initialization.then(() =>
+                pkt.source === 'client-message'
+                    ? this.processClientMessage(pkt, connection)
+                    : this.pipeline.process(pkt),
+            );
+            // Both handlers complete normally, observing rejection without adopting its reason.
+            void work.then(
+                () => finishPacket(),
+                () => finishPacket(),
+            );
+            return work;
+        } catch (error) {
+            finishPacket();
+            throw error;
+        }
     }
 
     private async processClientMessage(

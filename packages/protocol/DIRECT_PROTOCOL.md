@@ -1784,6 +1784,15 @@ remain to be recovered and independently verified.
   hanging dependencies can delay disposal.
   Legacy and Direct pushes use separate dedup instances and may duplicate events;
   their relative ordering and cross-generation identity isolation are not guaranteed.
+  For a manager-owned session's final PID detach, the manager reserves its close
+  before synchronous logging and close observers; a same-UIN reopening from those
+  callbacks therefore receives a `beforeOpen` gate for the reserved close. The gate
+  waits for settlement, including failure, and shutdown still reports close failures.
+  Synthetic tests observe the gate; they do not establish real database behavior.
+  Separate construction and PID-binding reentrancy windows remain outside that
+  guarantee. After manager shutdown begins, late PID-disconnect callbacks are ignored.
+  Bridge packet handling also reserves accepted work before packet and initialization
+  getters can reenter disposal; dependencies that never settle can still block it.
   This port is not automatically claimed by the production session manager, and it
   does not establish peer authentication or live QQ interoperability.
 - `src/direct/raw-multiplex-stream.ts` adapts a caller-supplied, already-established

@@ -52,7 +52,9 @@ export class BridgeManager implements BridgeSessionSource {
 
     private async disposeSessions(): Promise<void> {
         for (const [uin, session] of this.bridges) {
-            this.closeSession(uin, session);
+            // Synchronous dispose failures are recorded in their reservations;
+            // keep closing the remaining sessions before aggregating them.
+            this.closeSession(uin, session, undefined, false);
         }
 
         this.bridges.clear();
@@ -288,31 +290,79 @@ export class BridgeManager implements BridgeSessionSource {
         }
     }
 
-    private closeSession(uin: string, bridge: Bridge): void {
+    private closeSession(
+        uin: string,
+        bridge: Bridge,
+        beforeDispose?: () => void,
+        propagateDisposeError = true,
+    ): void {
         const sessions = this.closingSessions_.get(uin) ?? new Set<Promise<void>>();
-        const closing = bridge.dispose();
+        let resolveClosing!: () => void;
+        let rejectClosing!: (error: unknown) => void;
+        const closing = new Promise<void>((resolve, reject) => {
+            resolveClosing = resolve;
+            rejectClosing = reject;
+        });
         sessions.add(closing);
         this.closingSessions_.set(uin, sessions);
         void closing.then(
             () => {
                 sessions.delete(closing);
 
-                if (sessions.size === 0) {
+                if (sessions.size === 0 && this.closingSessions_.get(uin) === sessions) {
                     this.closingSessions_.delete(uin);
                 }
             },
             (error) => {
-                log.error(
-                    'identity close failed: UIN=%s err=%s',
-                    uin,
-                    error instanceof Error ? (error.stack ?? error.message) : String(error),
-                );
+                try {
+                    log.error(
+                        'identity close failed: UIN=%s err=%s',
+                        uin,
+                        error instanceof Error ? (error.stack ?? error.message) : String(error),
+                    );
+                } catch {
+                    // Diagnostics must not replace the close failure or reject
+                    // the observer promise.
+                }
             },
         );
+
+        const startDispose = () => {
+            try {
+                // Resolve the reservation with void, not the dispose promise:
+                // reentrant opens may already be waiting on this reservation.
+                void Promise.resolve(bridge.dispose()).then(() => resolveClosing(), rejectClosing);
+            } catch (error) {
+                rejectClosing(error);
+
+                if (propagateDisposeError) {
+                    throw error;
+                }
+            }
+        };
+
+        let beforeDisposeCompleted = false;
+
+        try {
+            beforeDispose?.();
+            beforeDisposeCompleted = true;
+        } finally {
+            if (beforeDisposeCompleted) {
+                startDispose();
+            } else {
+                try {
+                    startDispose();
+                } catch {
+                    // Preserve the synchronous observer/logging exception; the
+                    // dispose exception remains in the rejected reservation.
+                }
+            }
+        }
     }
 
-    /** Listener changes take effect on the next event. Close observers run before
-     *  Bridge disposal, so the final process and account identity remain readable. */
+    /** Listener changes take effect on the next event. On final detach, close
+     *  observers run before Bridge disposal and can still read its account identity;
+     *  the final PID has already been detached. */
     subscribeSessions(listener: BridgeSessionListener): () => void {
         const subscription = { listener };
         this.sessionSubscriptions.add(subscription);
@@ -349,6 +399,10 @@ export class BridgeManager implements BridgeSessionSource {
     }
 
     onPidDisconnected(pid: number): void {
+        if (this.disposal_) {
+            return;
+        }
+
         const uin = this.pidToUin_.get(pid);
 
         if (!uin) {
@@ -381,13 +435,18 @@ export class BridgeManager implements BridgeSessionSource {
                         Date.now() - startedAt,
                     );
                 } catch (error) {
-                    runtimeLog.trace(
-                        'bridge_detach_terminal pid=%d uin=%j outcome=failed reason=invariant_violation error=%j elapsedMs=%d',
-                        pid,
-                        uin,
-                        error instanceof Error ? error.message : String(error),
-                        Date.now() - startedAt,
-                    );
+                    try {
+                        runtimeLog.trace(
+                            'bridge_detach_terminal pid=%d uin=%j outcome=failed reason=invariant_violation error=%j elapsedMs=%d',
+                            pid,
+                            uin,
+                            error instanceof Error ? error.message : String(error),
+                            Date.now() - startedAt,
+                        );
+                    } catch {
+                        // Preserve the original synchronous detach failure.
+                    }
+
                     throw error;
                 }
             }),
@@ -484,13 +543,18 @@ export class BridgeManager implements BridgeSessionSource {
                         Date.now() - startedAt,
                     );
                 } catch (error) {
-                    runtimeLog.trace(
-                        'bridge_binding_terminal pid=%d uin=%j source=login outcome=failed reason=binding_failed error=%j elapsedMs=%d',
-                        pid,
-                        uin,
-                        error instanceof Error ? error.message : String(error),
-                        Date.now() - startedAt,
-                    );
+                    try {
+                        runtimeLog.trace(
+                            'bridge_binding_terminal pid=%d uin=%j source=login outcome=failed reason=binding_failed error=%j elapsedMs=%d',
+                            pid,
+                            uin,
+                            error instanceof Error ? error.message : String(error),
+                            Date.now() - startedAt,
+                        );
+                    } catch {
+                        // Preserve the original synchronous binding failure.
+                    }
+
                     throw error;
                 }
             }),
@@ -555,12 +619,17 @@ export class BridgeManager implements BridgeSessionSource {
             handedToPipeline = true;
             completion = session.onPacket(pkt);
         } catch (error) {
-            this.tracePacketFailure(
-                pkt,
-                startedAt,
-                handedToPipeline ? 'pipeline_failed' : 'routing_failed',
-                error,
-            );
+            try {
+                this.tracePacketFailure(
+                    pkt,
+                    startedAt,
+                    handedToPipeline ? 'pipeline_failed' : 'routing_failed',
+                    error,
+                );
+            } catch {
+                // Preserve the original synchronous routing or pipeline failure.
+            }
+
             throw error;
         }
 
@@ -732,11 +801,12 @@ export class BridgeManager implements BridgeSessionSource {
         }
 
         this.pendingHealth.delete(session);
-        this.bridges.delete(uin);
-        log.debug('session closed: UIN=%s', uin);
-        // Fire before dispose() so listeners can still read bridge.identity.
-        this.fireSessionClosed(uin, session, pid);
-        this.closeSession(uin, session);
+        this.closeSession(uin, session, () => {
+            this.bridges.delete(uin);
+            log.debug('session closed: UIN=%s', uin);
+            // Fire before dispose() so listeners can still read bridge.identity.
+            this.fireSessionClosed(uin, session, pid);
+        });
         return true;
     }
 
