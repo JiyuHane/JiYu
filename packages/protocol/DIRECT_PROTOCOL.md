@@ -433,41 +433,54 @@ whose inspected entry byte is `c3` (`ret`); the call alone is not evidence that
 a notification was registered or processed. None of these static observations
 is a live invocation or a successful signature.
 
-Further static windows in `0x68418ac` show an MD5-like candidate computation.
-The caller's `0x68563b4–0x68563e0` path formats a 32-bit value with `%d` and
-passes its stack string at `0x6856439`; if the intermediate objects and their
-pointers remain unchanged, `0x68419ae–0x68419ec` reads the string's pointer and
-low 32 bits of its length and forms a bit count using a left shift by three and
-a right shift by 29. The ELF data at VA/file offset `0xbc6e20` contains
-`0123456789abcdeffedcba9876543210`, corresponding to the conventional MD5
-four-word initialization vector in little-endian order. The inspected
-`0x6841b47–0x6841be8` window assembles bytes into little-endian words. At
-`0x68427d3–0x6843085`, sampled steps of an inline compression copy contain
-constants and rotations matching representative MD5 steps from all four
-rounds, followed by four-word feed-forward. This is a sample, not a proof of
-every step or message-word index.
+Further static windows in `0x68418ac` support a conditional MD5 intermediate
+candidate. The caller's `0x68563b4–0x68563e0` path formats an unidentified
+32-bit value with `%d` and passes a stack string at `0x6856439`. The formatting
+string is the three original bytes `25 64 00`; the value is not established as
+an SSO sequence. Two distinct state checks precede the inspected digest path:
+`0x6843265–0x684327e` tests byte `+1` of the object returned by `0x684bd56`,
+and `0x68433ec–0x684340a` tests dword `+0xa0` of the object returned by
+`0x683f8ae`. The candidate path requires respectively a nonzero byte and a
+value of one; other paths and the actual runtime values remain unknown.
 
-That copy processes full input blocks. A signed 32-bit `%d` representation
-has at most 11 characters, so the ordinary candidate decimal input would not
-itself fill a 64-byte block. A distinct padding-block compression copy at
-`0x6845220–0x68452d1` has the first four MD5 constants and rotations; its
-remaining steps have not been checked for equivalence to the full-block copy.
-Other windows select a `56 − n` or `120 − n` padding length from
-`n = (oldBits >> 3) & 63`, copy an eight-byte bit count, and reference a data
-block at VA `0x9156390` containing `0x80` followed by 63 zero bytes. The data
-block's original file offset is `0x9153390`. Windows at
-`0x68466f6–0x6846796` serialize four state words byte by byte, and
-`0x684694b–0x684695b` pass a 16-byte stack interval to a PLT target whose
+Under those gates and normal control flow, the observed initialization at
+`0x6841993–0x68419ec` clears the bit count, loads the conventional MD5 IV from
+the original bytes at VA/file offset `0xbc6e20`, and reads the third parameter's
+string pointer and low 32 bits of its length. The padding path saves the original
+64-bit bit count, chooses `56 − n` or `120 − n` bytes for
+`n = (oldBits >> 3) & 63`, and copies a block whose first byte is `80` followed
+by 63 zero bytes. Its VA is `0x9156390`, with original file offset `0x9153390`.
+A signed int32 `%d` string is nonempty and has at most 11 ASCII bytes; assuming
+the formatted object, pointers and buffers remain consistent, this case fits
+one final padded block. The `0x6845167–0x684521b` loop assembles its 64 bytes
+into 16 little-endian words.
+
+For the first tail-block copy at `0x6845220–0x6845b1a`, all 64 compression steps were
+compared statically with RFC 1321: constants, rotations, message-word indices,
+round Boolean functions, state dependencies and four-word feed-forward match
+the MD5 compression function. A separate disassembly of the 700 instruction
+records and a comparison with original ELF bytes agreed on their addresses,
+bytes and decoded opcodes. This is a bounded **linear-window** result, not a
+whole-function control-flow proof. The second tail copy beginning at
+`0x6845bb9` and unexamined steps of the full-block copy remain unknown.
+
+The `0x6846699–0x6846796` window serializes four state words into 16 bytes,
+and `0x6846887–0x684695b` copies and passes that interval to a PLT target whose
 `R_X86_64_JUMP_SLOT` names a `basic_string::_M_construct<const char*>`
-specialization. The target's dynamic export metadata independently identifies
-that specialization and the caller's `__to_xstring`-style formatting helper
-(REA Evidence `ev_44f6b2a8375b0ed7b4c9f7af2dc21fef36d6ca6afb989f0e19e875dcd522d82d`);
-actual runtime PLT binding remains unknown. Under the local pointer, aliasing
-and normal-return conditions, this constructs a string from 16 raw bytes rather
-than demonstrating a hex conversion. These are static code and byte
-observations; they do not prove the remaining padding-block steps, the complete
-data flow to the returned slot, the selected runtime branch, or the final QQ
-signing algorithm. No native code was executed to establish them.
+specialization. Dynamic export metadata also identifies the caller's
+`__to_xstring`-style formatting helper (REA Evidence
+`ev_44f6b2a8375b0ed7b4c9f7af2dc21fef36d6ca6afb989f0e19e875dcd522d82d`);
+actual runtime PLT binding remains unknown. Pointer identity, absence of
+intervening replacement or destructive aliasing, normal completion and the
+result's downstream use are all still conditions, not observed runtime facts.
+
+The offline [signed-decimal MD5 candidate](src/direct/target-signed-decimal-md5-candidate.ts)
+accepts an unsigned 32-bit bit pattern, formats it as a signed decimal integer
+and returns the 16 raw MD5 bytes. Its fixed-vector tests exercise only this pure
+calculation, not the target. It is not wired into a signer and does not establish
+that the target returns these bytes, that they reach a particular result slot,
+that the supplied ZIP implements this path, or that real QQ accepts them. No
+native code was executed to establish these observations.
 
 A complete inventory of this ELF's 885 defined default/protected dynamic exports contains no symbol whose
 value equals `0x6613200` or `0x66137b0` (REA evidence
