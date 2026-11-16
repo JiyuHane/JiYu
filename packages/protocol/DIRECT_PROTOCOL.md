@@ -2140,7 +2140,8 @@ remain to be recovered and independently verified.
   commit and an owner-liveness check succeed. A later failure must clear that
   queue and revoke the key. The caller must verify that the supplied transport
   really belongs to its claimed lease: the internal entry does not establish this
-  relationship. Production owner, push queue and Bridge wiring remain unfinished.
+  relationship. The standalone candidate queue described below is not yet wired
+  to this entry, a production owner or Bridge.
 - `src/direct/linux-easy-account-owner.ts` is an opt-in, one-shot local owner for
   an injected raw client. It creates one private broker lease and sequentially
   performs the reference key exchange, EasyLogin and registration on it, without
@@ -2173,8 +2174,13 @@ remain to be recovered and independently verified.
   operation cancellation or client close; a failed revocation does not prove
   erasure. An external `whenClosed` event is still observed asynchronously. A
   tentative classification is not authentication and is not delivered as a
-  business event. Push queues and production integration are not implemented by
-  either variant.
+  business event. The deep-internal `extractLinuxEasyOwnerPushBody` is available
+  only after local registration and active-key checks. It checks the expected
+  MsgPush metadata, re-parses the complete inner SSO and returns a separate,
+  caller-owned business body; the caller must wipe it. This extraction does not
+  authenticate the sender. A trusted composition must independently verify the
+  same stable raw frame before extraction, and bind its stop path to the ingress.
+  Neither owner variant is connected to an ingress or production push handling.
   The lifetime deadline and phase deadlines depend on event-loop progress. Close
   revokes local state and requests poison, but cannot stop work already inside an
   uncooperative callback or transport, nor erase their retained copies. A broker
@@ -2183,6 +2189,13 @@ remain to be recovered and independently verified.
   synchronous transport fence; the original client or other wrappers can bypass
   this module's local lease discipline. This owner neither creates a connection nor
   attaches to the production Bridge, and does not establish QQ interoperability.
+- `src/direct/linux-easy-push-queue.ts` provides a standalone, synchronous bounded
+  FIFO for copied candidate frames and metadata. Its byte and count limits include
+  the one in-flight item. The local drain switch does not establish registration,
+  an active key or source authentication. Release and close wipe queue-owned
+  frames best effort, but not copies or transferred storage held elsewhere. This
+  queue is not connected to the owner or ingress; in particular, it does not solve
+  unknown D2 frames arriving before the EasyLogin response stages a key.
 - `src/direct/sso12-packet-client.ts` is a single-flight protocol-12 client for
   an already-connected socket, with caller-supplied account policy, classifier,
   signing metadata, device parameters and zero-key or D2-key encryption. It

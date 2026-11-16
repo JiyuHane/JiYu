@@ -1,5 +1,7 @@
 import { addAbortListener } from 'node:events';
 import { isPromise, isProxy, isSharedArrayBuffer, isUint8Array } from 'node:util/types';
+import { MSG_PUSH_CMD } from '../msg-push';
+import { decodeSsoResponse } from './sso';
 import {
     runLinuxEasyLoginSession,
     runLinuxEasyLoginSessionWithKeyCapability,
@@ -74,9 +76,47 @@ const classifiers = new WeakMap<
     LinuxEasyAccountOwner,
     (frame: Uint8Array) => D2Candidate | undefined
 >();
+type OwnerPushBody = { meta: D2Candidate; body: Uint8Array };
+const pushBodyExtractors = new WeakMap<
+    LinuxEasyAccountOwner,
+    (frame: Uint8Array, expected: D2Candidate) => OwnerPushBody | undefined
+>();
 const weakMapGet = WeakMap.prototype.get;
 const weakMapSet = WeakMap.prototype.set;
 const weakMapDelete = WeakMap.prototype.delete;
+
+/**
+ * Deep internal extraction only; expected is a trusted routing snapshot, not
+ * authentication. Before calling, a trusted verifier must independently return
+ * strictly true for the same stable complete encrypted frame, and the caller
+ * must check whether verification modified its copy. Ingress then synchronously
+ * snapshots the returned body. No key, lease or token is exposed to callbacks;
+ * deep imports are not same-process isolation. The caller owns and must wipe the
+ * returned sensitive body. Never log it or its metadata. This is not delivery or
+ * production wiring; pre-login unknown frames remain unhandled.
+ */
+export function extractLinuxEasyOwnerPushBody(
+    owner: LinuxEasyAccountOwner,
+    frame: Uint8Array,
+    expected: Readonly<{ uin: string; sequence: number; command: string; retCode: number }>,
+):
+    | {
+          meta: Readonly<{ uin: string; sequence: number; command: string; retCode: number }>;
+          body: Uint8Array;
+      }
+    | undefined {
+    try {
+        if (typeof owner !== 'object' || owner === null || isProxy(owner)) {
+            return undefined;
+        }
+
+        const extract = Reflect.apply(weakMapGet, pushBodyExtractors, [owner]) as
+            ((value: Uint8Array, route: D2Candidate) => OwnerPushBody | undefined) | undefined;
+        return extract?.(frame, expected);
+    } catch {
+        return undefined;
+    }
+}
 
 /** Trusted internal callers only: metadata is sensitive; do not log it. Parsing is not
  * peer authentication, payload validation, message delivery, or an online assertion. */
@@ -111,6 +151,51 @@ const getAborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'abort
 const values = Uint8Array.prototype.values;
 const set = Uint8Array.prototype.set;
 const fill = Uint8Array.prototype.fill;
+const getPrototypeOf = Object.getPrototypeOf;
+const getDescriptor = Object.getOwnPropertyDescriptor;
+const ownKeys = Reflect.ownKeys;
+const hasOwn = Object.hasOwn;
+const isInteger = Number.isInteger;
+
+// Exact own data fields only. Neither input getters nor inherited setters run.
+function snapshotPushRoute(value: unknown, uin: string): D2Candidate {
+    if (typeof value !== 'object' || value === null || isProxy(value)) {
+        throw new TypeError('invalid route');
+    }
+
+    const proto = getPrototypeOf(value);
+
+    if ((proto !== Object.prototype && proto !== null) || ownKeys(value).length !== 4) {
+        throw new TypeError('invalid route');
+    }
+
+    const account = getDescriptor(value, 'uin');
+    const sequence = getDescriptor(value, 'sequence');
+    const command = getDescriptor(value, 'command');
+    const retCode = getDescriptor(value, 'retCode');
+
+    if (
+        !account ||
+        !hasOwn(account, 'value') ||
+        account.value !== uin ||
+        !sequence ||
+        !hasOwn(sequence, 'value') ||
+        typeof sequence.value !== 'number' ||
+        !isInteger(sequence.value) ||
+        sequence.value < 0 ||
+        sequence.value > 0xffffffff ||
+        !command ||
+        !hasOwn(command, 'value') ||
+        command.value !== MSG_PUSH_CMD ||
+        !retCode ||
+        !hasOwn(retCode, 'value') ||
+        retCode.value !== 0
+    ) {
+        throw new TypeError('invalid route');
+    }
+
+    return freeze({ uin, sequence: sequence.value, command: command.value, retCode: 0 });
+}
 
 function record(value: unknown, allowed: readonly string[]): Record<string, unknown> {
     if (typeof value !== 'object' || value === null || isProxy(value)) {
@@ -300,6 +385,7 @@ function createOwner(withKeyCapability: boolean): LinuxEasyAccountOwner {
         }
 
         Reflect.apply(weakMapDelete, classifiers, [owner]);
+        Reflect.apply(weakMapDelete, pushBodyExtractors, [owner]);
 
         if (timer !== undefined) {
             clearTimeout(timer);
@@ -1064,6 +1150,98 @@ function createOwner(withKeyCapability: boolean): LinuxEasyAccountOwner {
                                 }
                             },
                         ]);
+                        Reflect.apply(weakMapSet, pushBodyExtractors, [
+                            owner,
+                            (
+                                frame: Uint8Array,
+                                expected: D2Candidate,
+                            ): OwnerPushBody | undefined => {
+                                let frameCopy: Uint8Array | undefined;
+                                let decoded:
+                                    ReturnType<typeof decodeLinuxEasyServiceResponse> | undefined;
+                                let sso: ReturnType<typeof decodeSsoResponse> | undefined;
+                                let output: Uint8Array | undefined;
+                                let transferred = false;
+
+                                // No clock here: in particular, inspect no caller input when
+                                // the exact owner generation, lease or capability is inactive.
+                                const localFence = (): void => {
+                                    if (
+                                        currentState() !== 'registered' ||
+                                        epoch !== generation ||
+                                        controller.signal.aborted ||
+                                        lease !== acquired ||
+                                        capability !== created ||
+                                        !session ||
+                                        session.uin !== uin ||
+                                        linuxEasyKeyState(created) !== 'active'
+                                    ) {
+                                        throw new Error('stopped');
+                                    }
+
+                                    // Phase lookup itself must not weaken the final state fence.
+                                    if (
+                                        currentState() !== 'registered' ||
+                                        epoch !== generation ||
+                                        controller.signal.aborted ||
+                                        lease !== acquired ||
+                                        capability !== created ||
+                                        !session ||
+                                        session.uin !== uin
+                                    ) {
+                                        throw new Error('stopped');
+                                    }
+                                };
+
+                                try {
+                                    localFence();
+                                    frameCopy = copyBytes(frame, 65536);
+                                    const route = snapshotPushRoute(expected, uin);
+                                    nowChecked(generation);
+                                    localFence();
+                                    decoded = decodeLinuxEasyServiceResponse({
+                                        token: created,
+                                        lease: acquired,
+                                        uin,
+                                        frame: frameCopy,
+                                        maxSsoBodyBytes: 65536,
+                                    });
+                                    sso = decodeSsoResponse(decoded.body, 65536);
+
+                                    if (
+                                        decoded.uin !== route.uin ||
+                                        decoded.sequence !== route.sequence ||
+                                        decoded.command !== route.command ||
+                                        decoded.retCode !== route.retCode ||
+                                        sso.sequence >>> 0 !== route.sequence ||
+                                        sso.command !== route.command ||
+                                        sso.retCode !== route.retCode
+                                    ) {
+                                        return undefined;
+                                    }
+
+                                    output = copyBytes(sso.body, 65536);
+                                    const result: OwnerPushBody = { meta: route, body: output };
+                                    nowChecked(generation);
+                                    localFence();
+                                    transferred = true;
+                                    return result;
+                                } catch {
+                                    return undefined;
+                                } finally {
+                                    if (!transferred) {
+                                        wipe(output);
+                                    }
+
+                                    wipe(sso?.body);
+                                    wipe(sso?.cookie);
+                                    wipe(sso?.reserved);
+                                    wipe(sso?.headerExtension);
+                                    wipe(decoded?.body);
+                                    wipe(frameCopy);
+                                }
+                            },
+                        ]);
                         check(generation);
                     } catch (error) {
                         // Only the token created by this owner is ours to revoke, including
@@ -1080,8 +1258,9 @@ function createOwner(withKeyCapability: boolean): LinuxEasyAccountOwner {
 
                         try {
                             Reflect.apply(weakMapDelete, classifiers, [owner]);
+                            Reflect.apply(weakMapDelete, pushBodyExtractors, [owner]);
                         } catch {
-                            /* Continue teardown if classifier removal fails. */
+                            /* Continue teardown if internal extractor removal fails. */
                         }
 
                         try {
