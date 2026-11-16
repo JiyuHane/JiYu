@@ -1857,9 +1857,22 @@ remain to be recovered and independently verified.
   excluded. If key-exchange construction fails after deriving a shared secret, that
   internal value is also outside this flow's cleanup guarantee. If the protobuf
   decoder throws before returning, its internal field copies are not reachable for
-  cleanup. Cancellation discards
-  the retained handle, but JavaScript and the crypto provider do not guarantee
-  secure memory erasure.
+  cleanup. Cancellation discards the retained handle, but JavaScript and the crypto
+  provider do not guarantee secure memory erasure.
+- `src/direct/sso-reference-key-exchange-flow.ts` composes one prepared exchange
+  over an injected borrowed raw transport. It binds the expected UIN and raw uint32
+  sequence, passes a copied protobuf body to caller-supplied reserved metadata and
+  requires a caller-supplied raw-frame policy before consuming the same candidate.
+  A changed signer input is rejected, although that comparison cannot establish what
+  the signer actually signed. The outer response dummy byte must be zero as a local
+  restriction; the reference flow separately checks framing, account, sequence,
+  command and return code. Response-key verification is also caller policy, not
+  established server identity. Abort or deadline ends the local wait and clears
+  owned views best-effort; an uncooperative transport, callback or guard may remain
+  active and retain its own copies or side effects. A transport invoked before a
+  failure is reported with unknown write state. Do not reuse it without an owner
+  establishing quiescence, and do not interpret this reference transaction as an
+  online session, retry guarantee, runtime integration or live QQ interoperability.
 - `src/direct/nt-linux-login-reference.ts` independently constructs an offline
   Linux PC NT-login request body from the fixed LagrangeV2 `7011cdf` reference's
   [common request](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Services/Login/NTLoginCommon.cs#L13-L29)
