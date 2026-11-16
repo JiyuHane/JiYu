@@ -61,7 +61,8 @@ The core currently handles `get_version`, `get_status`, `get_supported_actions`,
 `send_message` for private and group text, group mentions, and a single standalone
 location segment in either conversation type, `delete_message`, `set_group_name`,
 `leave_group`, and the restricted URL mode of `get_file`. The account runtime also
-installs the local `upload_file` and `get_file` data capability described below.
+installs local `upload_file`, `get_file` data, and `get_file_fragmented` read
+capabilities described below.
 Setting a group name
 requires a canonical positive uint32 group ID encoded as a string and a string
 group name, including an empty string; it forwards one request to the existing account-local v11 handler. The
@@ -133,12 +134,41 @@ types return 10004; the separate `upload_file_fragmented` action remains
 unimplemented and returns 10002. Other group/normal file and video operations,
 local-path modes and outbound media remain unsupported.
 
+The restricted `get_file_fragmented` capability reads only these local upload
+handles; image, voice and v11 file IDs do not fall back to another source. It is
+advertised only while the local data capability, both fragment callbacks and the
+listener lease are available. `prepare` returns `{name, total_size, sha256}`;
+`transfer` returns `{data}` as padded Base64 of exactly the requested byte range.
+Both `offset` and `size` must be nonnegative JavaScript safe integers. This
+implementation accepts a zero-sized range, including at the end of a file, but
+rejects a range extending beyond the current file or a requested size above
+256 KiB with 10004 instead of truncating it. This is a local policy, not a claim
+that the standard specifies EOF behavior. `prepare` creates no session and is not
+an authorization token: each transfer independently checks the current store and
+lease, and a valid handle can be read without an earlier prepare. Each stage's
+success response is bounded separately; transfer checks its full success envelope
+before reading a chunk. A direct dispatcher promise may settle after its lease is
+revoked if the response was already constructed. Transport quiescence handles
+its own pending responses, but delivery, a smaller configured limit, and bytes
+already handed to a peer remain outside the local size check. Metadata
+SHA-256 comes from the local store's upload-time bytes; a custom direct-core
+provider is trusted for its contents and the dispatcher validates only its shape.
+For this new action, a direct-core options object must be non-Proxy and have a
+plain or null prototype; its upload, read, metadata, chunk and optional readiness
+callbacks must be own data properties rather than inherited methods or accessors.
+The fragment path compares their identities after reentrant checks and rejects
+nested fragment dispatch while a fragment operation or its capability check is
+running. The legacy upload/data paths retain their existing callback behavior.
+These checks do not verify the truthfulness of callback contents or closure state.
+
 Each listener retains at most 32 entries and 4 MiB (4,194,304) raw bytes in total;
 exhaustion returns a fixed failure without evicting an unexpired entry. Expiry is
 10 minutes from the upload's initial valid local clock sample, including subsequent
 processing time; in an extreme delay an entry can already be expired when success
-is returned. Reads do not extend the deadline. Cleanup is lazy, so idle expired
-content may remain in memory until the next store access or close. Since only the
+is returned. Reads do not extend the deadline. Each read samples expiry on entry;
+if a synchronous trusted guard crosses the deadline, that read may complete and
+the next access expires the entry. Cleanup is lazy, so idle expired content may
+remain in memory until the next store access or close. Since only the
 active map is checked for random-ID collisions, a historical ID could in principle
 coincide with a new random ID; there is no permanent tombstone guarantee.
 
@@ -149,6 +179,10 @@ synchronous callbacks and before commit to block a late request from an old
 generation. A post-bind transport error attempts to quiesce the transport first;
 the runtime also checks its read-only transport state at the guarded points, so
 a quiesced transport rejects data access, including after reentrant callbacks.
+These checks assume the owner's synchronous readiness and lease callbacks report
+truthful state. A callback that returns stale `true`, or a test replacement that
+mutates one readiness source while another is being checked, is not an atomic
+state snapshot or an authentication guarantee.
 
 If close or quiesce throws while an open is pending, or construction reports an
 error and the existing lifecycle later restores that listener as active, the

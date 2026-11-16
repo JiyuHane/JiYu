@@ -12,6 +12,13 @@ export type V12ReadUploadResult =
     | { kind: 'ok'; name: string; data: string; sha256: string }
     | { kind: 'not_found' | 'unavailable' };
 
+export type V12FragmentMetadataResult =
+    | { kind: 'ok'; name: string; totalSize: number; sha256: string }
+    | { kind: 'not_found' | 'unavailable' };
+
+export type V12FragmentChunkResult =
+    { kind: 'ok'; data: string } | { kind: 'not_found' | 'unavailable' | 'invalid_range' };
+
 const MAX_NAME_LENGTH = 4096;
 const MAX_FILE_BYTES = 256 * 1024;
 const MAX_BASE64_LENGTH = 4 * Math.ceil(MAX_FILE_BYTES / 3);
@@ -55,6 +62,7 @@ const typedArrayByteLength = Object.getOwnPropertyDescriptor(
     'byteLength',
 )!.get!;
 const finiteNumber = Number.isFinite;
+const safeInteger = Number.isSafeInteger;
 const typedArraySet = Uint8Array.prototype.set;
 const typedArrayFill = Uint8Array.prototype.fill;
 const charCodeAt = Function.prototype.call.bind(String.prototype.charCodeAt) as (
@@ -480,6 +488,135 @@ export class V12UploadedDataStore {
             }
 
             return { kind: 'ok', name: entry.name, data, sha256: entry.sha256 };
+        } catch {
+            return { kind: 'unavailable' };
+        } finally {
+            this.#busy = false;
+        }
+    }
+
+    /**
+     * Read metadata from this generation's local memory only, not from QQ,
+     * network storage, or a persistent upload. Each read performs lazy expiry
+     * and its own optional disclosure guard.
+     */
+    getMetadata(fileId: string, canRead?: () => boolean): V12FragmentMetadataResult {
+        return this.#readFragment(fileId, canRead, (entry): V12FragmentMetadataResult => ({
+            kind: 'ok',
+            name: entry.name,
+            totalSize: entry.length,
+            sha256: entry.sha256,
+        }));
+    }
+
+    /**
+     * Encode exactly the requested local byte range as padded Base64. A range
+     * ending at the file length may be empty; returned strings are managed by
+     * JavaScript and their erasure by garbage collection is not guaranteed.
+     */
+    getChunk(
+        fileId: string,
+        offset: number,
+        size: number,
+        canRead?: () => boolean,
+    ): V12FragmentChunkResult {
+        return this.#readFragment(fileId, canRead, (entry): V12FragmentChunkResult => {
+            if (
+                typeof offset !== 'number' ||
+                !safeInteger(offset) ||
+                offset < 0 ||
+                typeof size !== 'number' ||
+                !safeInteger(size) ||
+                size < 0 ||
+                offset > entry.length ||
+                size > entry.length - offset
+            ) {
+                return { kind: 'invalid_range' };
+            }
+
+            const data: unknown = apply(bufferToString, entry.bytes, [
+                'base64',
+                offset,
+                offset + size,
+            ]);
+
+            if (typeof data !== 'string') {
+                return { kind: 'unavailable' };
+            }
+
+            return { kind: 'ok', data };
+        });
+    }
+
+    #readFragment<T extends V12FragmentMetadataResult | V12FragmentChunkResult>(
+        fileId: string,
+        canRead: (() => boolean) | undefined,
+        read: (entry: Entry) => T,
+    ): T | { kind: 'not_found' | 'unavailable' } {
+        if (this.#closed || this.#busy || !this.#validOptions) {
+            return { kind: 'unavailable' };
+        }
+
+        this.#busy = true;
+        const revision = this.#revision;
+
+        try {
+            if (this.#accessTime(revision) === null) {
+                return { kind: 'unavailable' };
+            }
+
+            const entries = this.#entries;
+
+            if (!entries || !this.#current(revision)) {
+                return { kind: 'unavailable' };
+            }
+
+            let entry: Entry | undefined;
+
+            if (
+                typeof fileId === 'string' &&
+                fileId.length === V12_UPLOAD_TOKEN_PREFIX.length + TOKEN_TEXT_LENGTH &&
+                isV12UploadToken(fileId)
+            ) {
+                entry = apply(mapGet, entries, [fileId]) as Entry | undefined;
+            }
+
+            if (!this.#current(revision)) {
+                return { kind: 'unavailable' };
+            }
+
+            if (!entry) {
+                // All misses obey the guard without inspecting or coercing an
+                // invalid fileId. Recheck after its synchronous callback.
+                if (canRead !== undefined && apply(canRead, undefined, []) !== true) {
+                    return { kind: 'unavailable' };
+                }
+
+                return this.#current(revision) && this.#entries === entries
+                    ? { kind: 'not_found' }
+                    : { kind: 'unavailable' };
+            }
+
+            const result = read(entry);
+
+            if (!this.#current(revision)) {
+                return { kind: 'unavailable' };
+            }
+
+            // A range failure can reveal the file boundary, so guard it too.
+            if (canRead !== undefined) {
+                const allowed: unknown = apply(canRead, undefined, []);
+
+                if (allowed !== true) {
+                    return { kind: 'unavailable' };
+                }
+            }
+
+            if (!this.#current(revision) || this.#entries !== entries) {
+                return { kind: 'unavailable' };
+            }
+
+            return result;
         } catch {
             return { kind: 'unavailable' };
         } finally {

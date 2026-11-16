@@ -1,5 +1,10 @@
 import type { ApiResponse, JsonObject, JsonValue } from '../types';
-import type { V12ReadUploadResult, V12UploadResult } from './uploaded-data-store';
+import type {
+    V12FragmentChunkResult,
+    V12FragmentMetadataResult,
+    V12ReadUploadResult,
+    V12UploadResult,
+} from './uploaded-data-store';
 
 /** Internal listener-lifetime check, not an authentication boundary. */
 export type V12FileLease = () => boolean;
@@ -44,6 +49,15 @@ export interface V12CoreOptions {
     ): V12UploadResult;
     /** Synchronous local read; the lease is a lifetime fence, not authentication. */
     getUploadedDataFile?(fileId: string, lease?: V12FileLease): V12ReadUploadResult;
+    /** Read metadata for a local upload, scoped to the owner's current generation. */
+    getUploadedDataFileMetadata?(fileId: string, lease?: V12FileLease): V12FragmentMetadataResult;
+    /** Read an exact local byte range as canonical padded Base64. */
+    getUploadedDataFileChunk?(
+        fileId: string,
+        offset: number,
+        size: number,
+        lease?: V12FileLease,
+    ): V12FragmentChunkResult;
     /** Optional listener readiness; absence preserves direct core callback behavior. */
     isUploadDataSupported?(lease?: V12FileLease): boolean;
 }

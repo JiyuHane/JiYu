@@ -26,6 +26,14 @@ type PreparedOrdinary = {
     fileLease: V12FileLease | undefined;
 };
 
+type FragmentProviders = {
+    upload: NonNullable<V12CoreOptions['uploadDataFile']>;
+    get: NonNullable<V12CoreOptions['getUploadedDataFile']>;
+    metadata: NonNullable<V12CoreOptions['getUploadedDataFileMetadata']>;
+    chunk: NonNullable<V12CoreOptions['getUploadedDataFileChunk']>;
+    readiness: V12CoreOptions['isUploadDataSupported'];
+};
+
 type Preflight =
     { kind: 'error'; response: V12Response } | { kind: 'ready'; request: PreparedRequest };
 
@@ -103,6 +111,12 @@ function fileLeaseCurrent(lease?: V12FileLease): boolean {
 function ownData(value: object, key: string): unknown {
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     return descriptor && 'value' in descriptor ? descriptor.value : undefined;
+}
+
+/** Fragment provider fields must also survive ordinary JSON enumeration. */
+function ownEnumerableData(value: object, key: string): unknown {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor?.enumerable && 'value' in descriptor ? descriptor.value : undefined;
 }
 
 function isProviderRecord(value: unknown): value is object {
@@ -216,6 +230,8 @@ export class V12Dispatcher {
     private readonly self: V12CoreOptions['self'];
     private readonly version: V12CoreOptions['version'];
     readonly #preparedOrdinary = new WeakMap<object, PreparedOrdinary>();
+    // A provider/readiness callback may synchronously reenter this dispatcher.
+    #fragmentBusy = false;
 
     constructor(private readonly options: V12CoreOptions) {
         let self: unknown;
@@ -430,6 +446,92 @@ export class V12Dispatcher {
         }
     }
 
+    /** Read only own data descriptors: no provider getter or Proxy trap runs. */
+    private fragmentProviders(): FragmentProviders | null {
+        if (isProxy(this.options)) {
+            return null;
+        }
+
+        const prototype = Object.getPrototypeOf(this.options);
+
+        if (prototype !== Object.prototype && prototype !== null) {
+            return null;
+        }
+
+        const upload = ownData(this.options, 'uploadDataFile');
+        const get = ownData(this.options, 'getUploadedDataFile');
+        const metadata = ownData(this.options, 'getUploadedDataFileMetadata');
+        const chunk = ownData(this.options, 'getUploadedDataFileChunk');
+        const readinessDescriptor = Object.getOwnPropertyDescriptor(
+            this.options,
+            'isUploadDataSupported',
+        );
+
+        if (readinessDescriptor && !('value' in readinessDescriptor)) {
+            return null;
+        }
+
+        const readiness: unknown = readinessDescriptor?.value;
+
+        if (
+            typeof upload !== 'function' ||
+            typeof get !== 'function' ||
+            typeof metadata !== 'function' ||
+            typeof chunk !== 'function' ||
+            (readiness !== undefined && typeof readiness !== 'function')
+        ) {
+            return null;
+        }
+
+        return { upload, get, metadata, chunk, readiness } as FragmentProviders;
+    }
+
+    /** Compare after potentially reentrant callbacks, without invoking getters. */
+    private sameFragmentProviders(expected: FragmentProviders): boolean {
+        const current = this.fragmentProviders();
+        return (
+            current !== null &&
+            current.upload === expected.upload &&
+            current.get === expected.get &&
+            current.metadata === expected.metadata &&
+            current.chunk === expected.chunk &&
+            current.readiness === expected.readiness
+        );
+    }
+
+    private fragmentProvidersCurrent(
+        providers: FragmentProviders,
+        fileLease?: V12FileLease,
+    ): boolean {
+        try {
+            if (!this.sameFragmentProviders(providers)) {
+                return false;
+            }
+
+            if (
+                providers.readiness !== undefined &&
+                apply(providers.readiness, this.options, [fileLease]) !== true
+            ) {
+                return false;
+            }
+
+            return fileLeaseCurrent(fileLease) && this.sameFragmentProviders(providers);
+        } catch {
+            return false;
+        }
+    }
+
+    private validatedFragmentProviders(fileLease?: V12FileLease): FragmentProviders | null {
+        try {
+            const providers = this.fragmentProviders();
+            return providers && this.fragmentProvidersCurrent(providers, fileLease)
+                ? providers
+                : null;
+        } catch {
+            return null;
+        }
+    }
+
     private async handleSnapshot(
         input: Record<string, unknown>,
         fileLease?: V12FileLease,
@@ -437,6 +539,23 @@ export class V12Dispatcher {
         const echo = typeof input.echo === 'string' ? input.echo : undefined;
         const action = input.action as string;
         const params = input.params as Record<string, unknown>;
+
+        if (action === 'get_file_fragmented') {
+            if (this.#fragmentBusy) {
+                return response(20002, 'file unavailable', null, echo);
+            }
+
+            this.#fragmentBusy = true;
+
+            try {
+                const providers = this.validatedFragmentProviders(fileLease);
+                return providers
+                    ? this.getFileFragmented(params, echo, fileLease, providers)
+                    : response(10002, 'unsupported action', null, echo);
+            } finally {
+                this.#fragmentBusy = false;
+            }
+        }
 
         if (action === 'upload_file') {
             if (!this.supportsUploadData(fileLease)) {
@@ -462,8 +581,27 @@ export class V12Dispatcher {
             if (action === 'get_supported_actions') {
                 const actions: string[] = [...ACTIONS];
 
-                if (this.supportsUploadData(fileLease)) {
-                    actions.push('upload_file');
+                const wasFragmentBusy = this.#fragmentBusy;
+                this.#fragmentBusy = true;
+
+                try {
+                    const uploadSupported = this.supportsUploadData(fileLease);
+                    const providers =
+                        uploadSupported && !wasFragmentBusy
+                            ? this.validatedFragmentProviders(fileLease)
+                            : null;
+
+                    // The final lease callback may reenter or alter providers;
+                    // compare their identities once more without callbacks.
+                    if (uploadSupported && fileLeaseCurrent(fileLease)) {
+                        actions.push('upload_file');
+
+                        if (providers && this.sameFragmentProviders(providers)) {
+                            actions.push('get_file_fragmented');
+                        }
+                    }
+                } finally {
+                    this.#fragmentBusy = wasFragmentBusy;
                 }
 
                 return response(0, '', actions, echo);
@@ -790,6 +928,208 @@ export class V12Dispatcher {
             const fileId = ownData(result, 'fileId');
             return isCanonicalUploadId(fileId)
                 ? response(0, '', { file_id: fileId }, echo)
+                : unavailable();
+        } catch {
+            return unavailable();
+        }
+    }
+
+    private getFileFragmented(
+        params: Record<string, unknown>,
+        echo: string | undefined,
+        fileLease: V12FileLease | undefined,
+        providers: FragmentProviders,
+    ): V12Response {
+        const invalid = () => response(10003, 'invalid file parameters', null, echo);
+        const notFound = () => response(20001, 'invalid file result', null, echo);
+        const unavailable = () => response(20002, 'file unavailable', null, echo);
+
+        if (typeof params.stage !== 'string') {
+            return invalid();
+        }
+
+        if (params.stage !== 'prepare' && params.stage !== 'transfer') {
+            return response(10004, 'unsupported file stage', null, echo);
+        }
+
+        if (
+            extraKeys(
+                params,
+                params.stage === 'prepare'
+                    ? ['stage', 'file_id']
+                    : ['stage', 'file_id', 'offset', 'size'],
+            )
+        ) {
+            return response(10004, 'unsupported parameter', null, echo);
+        }
+
+        const fileId = params.file_id;
+
+        if (typeof fileId !== 'string' || fileId.length === 0 || fileId.length > 4096) {
+            return invalid();
+        }
+
+        let offset: number | undefined;
+        let size: number | undefined;
+
+        if (params.stage === 'transfer') {
+            if (
+                typeof params.offset !== 'number' ||
+                !Number.isSafeInteger(params.offset) ||
+                params.offset < 0 ||
+                typeof params.size !== 'number' ||
+                !Number.isSafeInteger(params.size) ||
+                params.size < 0
+            ) {
+                return invalid();
+            }
+
+            offset = params.offset;
+            size = params.size;
+
+            // All supported local files fit this byte bound. Reject impossible
+            // ranges before invoking a custom provider, without adding integers
+            // that could overflow the JavaScript safe-integer range.
+            if (offset > MAX_UPLOAD_DATA_BYTES || size > MAX_UPLOAD_DATA_BYTES - offset) {
+                return response(10004, 'unsupported file range', null, echo);
+            }
+        }
+
+        // Do not redeem image/voice handles or fall back to the v11 file lookup.
+        if (!isV12UploadToken(fileId)) {
+            return response(10004, 'unsupported file source', null, echo);
+        }
+
+        if (!isCanonicalUploadId(fileId)) {
+            return notFound();
+        }
+
+        try {
+            if (params.stage === 'prepare') {
+                if (!this.fragmentProvidersCurrent(providers, fileLease)) {
+                    return unavailable();
+                }
+
+                const args: unknown[] = [fileId];
+
+                if (fileLease !== undefined) {
+                    args.push(fileLease);
+                }
+
+                const result: unknown = apply(providers.metadata, this.options, args);
+
+                if (
+                    !this.fragmentProvidersCurrent(providers, fileLease) ||
+                    !isProviderRecord(result)
+                ) {
+                    return unavailable();
+                }
+
+                const kind = ownEnumerableData(result, 'kind');
+
+                if (kind === 'not_found') {
+                    return notFound();
+                }
+
+                if (kind !== 'ok') {
+                    return unavailable();
+                }
+
+                const name = ownEnumerableData(result, 'name');
+                const totalSize = ownEnumerableData(result, 'totalSize');
+                const sha256 = ownEnumerableData(result, 'sha256');
+
+                // The account-local store computes the digest on upload. This
+                // validates a custom callback's shape, not its content identity.
+                if (
+                    typeof name !== 'string' ||
+                    name.length > 4096 ||
+                    typeof totalSize !== 'number' ||
+                    !Number.isSafeInteger(totalSize) ||
+                    totalSize < 0 ||
+                    totalSize > MAX_UPLOAD_DATA_BYTES ||
+                    typeof sha256 !== 'string' ||
+                    sha256.length !== 64 ||
+                    !/^[0-9a-f]{64}$/.test(sha256)
+                ) {
+                    return unavailable();
+                }
+
+                const payload = { name, total_size: totalSize, sha256 };
+
+                if (!fileSuccessFits(payload, echo)) {
+                    return response(10003, 'file response too large', null, echo);
+                }
+
+                return this.fragmentProvidersCurrent(providers, fileLease)
+                    ? response(0, '', payload, echo)
+                    : unavailable();
+            }
+
+            // Both values were checked above before reaching the transfer branch.
+            if (offset === undefined || size === undefined) {
+                return invalid();
+            }
+
+            // All Base64 characters, including padding, occupy one JSON byte.
+            // Bound the complete envelope before asking the provider for bytes.
+            const encodedLength = 4 * Math.ceil(size / 3);
+
+            if (!fileSuccessFits({ data: 'A'.repeat(encodedLength) }, echo)) {
+                return response(10003, 'file response too large', null, echo);
+            }
+
+            if (!this.fragmentProvidersCurrent(providers, fileLease)) {
+                return unavailable();
+            }
+
+            const args: unknown[] = [fileId, offset, size];
+
+            if (fileLease !== undefined) {
+                args.push(fileLease);
+            }
+
+            const result: unknown = apply(providers.chunk, this.options, args);
+
+            if (!this.fragmentProvidersCurrent(providers, fileLease) || !isProviderRecord(result)) {
+                return unavailable();
+            }
+
+            const kind = ownEnumerableData(result, 'kind');
+
+            if (kind === 'not_found') {
+                return notFound();
+            }
+
+            if (kind === 'invalid_range') {
+                return response(10004, 'unsupported file range', null, echo);
+            }
+
+            if (kind !== 'ok') {
+                return unavailable();
+            }
+
+            const data = ownEnumerableData(result, 'data');
+
+            if (!isCanonicalUploadData(data)) {
+                return unavailable();
+            }
+
+            const padding = data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0;
+            const decodedLength = (data.length / 4) * 3 - padding;
+
+            if (decodedLength !== size) {
+                return unavailable();
+            }
+
+            const payload = { data };
+
+            if (!fileSuccessFits(payload, echo)) {
+                return response(10003, 'file response too large', null, echo);
+            }
+
+            return this.fragmentProvidersCurrent(providers, fileLease)
+                ? response(0, '', payload, echo)
                 : unavailable();
         } catch {
             return unavailable();

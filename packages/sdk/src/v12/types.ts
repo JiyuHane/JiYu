@@ -130,6 +130,46 @@ export type OneBot12GetFileUrlResponse =
     | (OneBot12ActionResponse & { status: 'ok'; data: OneBot12GetFileUrlData })
     | (OneBot12ActionResponse & { status: 'failed'; data: OneBot12JsonValue });
 
+/** Prepare a fragmented read; the file ID is interpreted by the implementation. */
+export interface OneBot12GetFileFragmentedPrepareParams extends OneBot12JsonObject {
+    stage: 'prepare';
+    file_id: string;
+}
+
+/** Read a byte range; JSON int64 values are represented by safe integers in JavaScript. */
+export interface OneBot12GetFileFragmentedTransferParams extends OneBot12JsonObject {
+    stage: 'transfer';
+    file_id: string;
+    /** Byte offset. This type does not validate the integer or its range. */
+    offset: number;
+    /** Requested size in bytes. This type does not validate the integer or its range. */
+    size: number;
+}
+
+/** Prepare metadata reported by a supporting implementation. */
+export interface OneBot12GetFileFragmentedPrepareResult extends OneBot12JsonObject {
+    name: string;
+    /** JSON int64 represented as a safe integer; this type does not validate it. */
+    total_size: number;
+    /** Server-reported SHA-256; this field alone does not establish integrity or trust. */
+    sha256: string;
+}
+
+/** JSON bytes are Base64 strings rather than byte arrays. */
+export interface OneBot12GetFileFragmentedTransferResult extends OneBot12JsonObject {
+    data: string;
+}
+
+/** Describes the response shape; the generic parser does not validate prepare fields. */
+export type OneBot12GetFileFragmentedPrepareResponse =
+    | (OneBot12ActionResponse & { status: 'ok'; data: OneBot12GetFileFragmentedPrepareResult })
+    | (OneBot12ActionResponse & { status: 'failed'; data: OneBot12JsonValue });
+
+/** Describes the response shape; the generic parser does not validate transfer fields. */
+export type OneBot12GetFileFragmentedTransferResponse =
+    | (OneBot12ActionResponse & { status: 'ok'; data: OneBot12GetFileFragmentedTransferResult })
+    | (OneBot12ActionResponse & { status: 'failed'; data: OneBot12JsonValue });
+
 /** Group information returned by OneBot 12 group actions. */
 export interface OneBot12GroupInfo extends OneBot12JsonObject {
     group_id: string;

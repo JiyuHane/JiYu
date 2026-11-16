@@ -294,6 +294,74 @@ files or make outbound network requests. The client transport is separate, and
 this v12 data subset does not upload to QQ or send image, voice or file messages.
 See the [server details](../onebot/ONEBOT_V12.md#local-data-uploads).
 
+## `get_file_fragmented` read-only types
+
+`@harehane/sdk/v12` exports the following optional TypeScript shapes for
+[OneBot 12 `get_file_fragmented`](https://12.onebot.dev/interface/file/actions/#get_file_fragmented):
+
+- `OneBot12GetFileFragmentedPrepareParams`: `{ stage: 'prepare', file_id: string }`.
+- `OneBot12GetFileFragmentedPrepareResult`: `{ name: string, total_size: number, sha256: string }`.
+- `OneBot12GetFileFragmentedTransferParams`: `{ stage: 'transfer', file_id: string, offset: number, size: number }`.
+- `OneBot12GetFileFragmentedTransferResult`: `{ data: string }`, where JSON bytes are Base64 text.
+- `OneBot12GetFileFragmentedPrepareResponse` and `OneBot12GetFileFragmentedTransferResponse`: envelopes with their respective result on `status: 'ok'` and arbitrary JSON `data` on `status: 'failed'`.
+
+`total_size`, `offset` and `size` represent the JavaScript safe-integer subset of
+JSON `int64`; `offset` and `size` are byte counts. TypeScript's `number` type does
+not enforce integer or range restrictions. The shapes permit JSON extension
+fields, although a particular server may reject them. The generic codec retains
+its existing JSON and safe-number policies, but performs no action-specific field,
+range, Base64 or digest validation; these new types add no runtime interception.
+
+For a `client` and a `fileId` supplied by a supporting implementation, the
+existing generic calls can describe the two stages:
+
+```ts
+import type {
+    OneBot12GetFileFragmentedPrepareParams,
+    OneBot12GetFileFragmentedTransferParams,
+} from '@harehane/sdk/v12';
+
+const prepare: OneBot12GetFileFragmentedPrepareParams = {
+    stage: 'prepare',
+    file_id: fileId,
+};
+const metadata = await client.call('get_file_fragmented', prepare);
+```
+
+After the application validates the returned fields and selects a range allowed by
+the server, a transfer request can be expressed as:
+
+```ts
+const transfer: OneBot12GetFileFragmentedTransferParams = {
+    stage: 'transfer',
+    file_id: fileId,
+    offset: 0,
+    size: 1,
+};
+const fragment = await client.call('get_file_fragmented', transfer);
+```
+
+The sample's one-byte range is illustrative; the caller must choose a range
+appropriate to the validated result and server limits. Both `call()` and
+`request()` still return the generic `OneBot12ActionResponse`, not an automatically
+narrowed response. The response types describe the intended shapes; an assertion is
+not validation. The returned SHA-256 is a server-reported descriptor, not proof of
+source authenticity or content integrity. Callers that require integrity need to
+verify the assembled bytes and assess the trust of any expected digest separately.
+The SDK does not automatically decode, assemble, verify, retry or stream these calls.
+
+An implementation must support the action; exporting types does not establish
+server support. Even a listed action does not promise every file ID or range is
+accepted. Jiyu's account runtime provides this action only while its local data
+capability and listener lease are available. It covers only an `upload_file`
+`type: 'data'` token held in memory for the same account and current listener
+generation, subject to its lifetime and capacity limits. Jiyu permits zero-byte
+ranges, rejects ranges extending beyond the file rather than truncating them, and
+samples expiry on each read; these are implementation policies, not universal
+server guarantees. URL/path uploads, legacy v11 IDs and incoming QQ media handles
+are outside that scope. This is not a claim about QQ media retrieval, other
+OneBot servers or network availability.
+
 ## `get_file` URL subset
 
 `@harehane/sdk/v12` exports `OneBot12GetFileUrlParams`,

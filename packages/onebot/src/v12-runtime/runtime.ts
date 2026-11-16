@@ -235,6 +235,46 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                     return { kind: 'unavailable' };
                 }
             },
+            getUploadedDataFileMetadata: (fileId, lease) => {
+                const slot = this.acquireUploadSlot(lease);
+
+                if (!slot) {
+                    return { kind: 'unavailable' };
+                }
+
+                const current = () => this.isUploadSlotCurrent(slot, lease);
+
+                try {
+                    if (!current()) {
+                        return { kind: 'unavailable' };
+                    }
+
+                    const result = slot.store.getMetadata(fileId, current);
+                    return current() ? result : { kind: 'unavailable' };
+                } catch {
+                    return { kind: 'unavailable' };
+                }
+            },
+            getUploadedDataFileChunk: (fileId, offset, size, lease) => {
+                const slot = this.acquireUploadSlot(lease);
+
+                if (!slot) {
+                    return { kind: 'unavailable' };
+                }
+
+                const current = () => this.isUploadSlotCurrent(slot, lease);
+
+                try {
+                    if (!current()) {
+                        return { kind: 'unavailable' };
+                    }
+
+                    const result = slot.store.getChunk(fileId, offset, size, current);
+                    return current() ? result : { kind: 'unavailable' };
+                } catch {
+                    return { kind: 'unavailable' };
+                }
+            },
         });
         registerOrderedRuntime(this, (source) => recordPreparedScopeLoss(this, source));
     }
@@ -312,7 +352,9 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
 
             try {
                 // This callback may synchronously close or replace the listener.
-                return this.options.canAccept() && this.uploadTransportReady(transport, owns);
+                return (
+                    this.options.canAccept() === true && this.uploadTransportReady(transport, owns)
+                );
             } catch {
                 return false;
             }
@@ -1393,9 +1435,9 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
         try {
             // The readiness check, canAccept and lease may all reenter lifecycle code.
             return (
-                this.options.canAccept() &&
+                this.options.canAccept() === true &&
                 this.uploadTransportReady(transport, owns) &&
-                lease() &&
+                lease() === true &&
                 this.uploadTransportReady(transport, owns)
             );
         } catch {
