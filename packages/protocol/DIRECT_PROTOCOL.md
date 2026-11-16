@@ -1868,7 +1868,8 @@ remain to be recovered and independently verified.
   restriction; the reference flow separately checks framing, account, sequence,
   command and return code. Response-key verification is also caller policy, not
   established server identity. Abort or deadline ends the local wait and clears
-  owned views best-effort; an uncooperative transport, callback or guard may remain
+  owned views best-effort, including locally staged session key and ticket copies
+  until final handoff. An uncooperative transport, callback or guard may remain
   active and retain its own copies or side effects. A transport invoked before a
   failure is reported with unknown write state. Do not reuse it without an owner
   establishing quiescence, and do not interpret this reference transaction as an
@@ -1948,8 +1949,12 @@ remain to be recovered and independently verified.
   views best-effort but does not establish transport quiescence or revoke callback
   side effects. Guard-owned buffers may remain until an uncooperative transport
   settles; after any uncertain write, the owner must resolve that transport before
-  reuse. This experimental reference flow is not wired into production Direct,
-  does not mark an account online, and has not established live interoperability.
+  reuse. A synthetic in-memory test manually runs key exchange and EasyLogin on
+  the same broker lease, with caller-managed credential cleanup and poisoning on
+  failure. That fixture assumes successful transport quiescence; it is not a
+  production session owner or proof of peer identity. This experimental reference
+  flow is not wired into production Direct, does not mark an account online, and
+  has not established live interoperability.
 - `src/direct/sso12-packet-client.ts` is a single-flight protocol-12 client for
   an already-connected socket, with caller-supplied account policy, classifier,
   signing metadata, device parameters and zero-key or D2-key encryption. It

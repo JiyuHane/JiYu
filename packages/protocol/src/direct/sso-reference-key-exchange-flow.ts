@@ -500,8 +500,10 @@ export async function referenceKeyExchangeOnTransport(
 
                 try {
                     assertActive();
-                    key = snapshot(temporary.sessionKey, MAX_SERVICE_FRAME_BYTES);
-                    ticket = snapshot(temporary.sessionTicket, MAX_SERVICE_FRAME_BYTES);
+                    // The guard may hold this result while the lease or transport
+                    // remains unsettled. Track both copies until final handoff.
+                    key = track(snapshot(temporary.sessionKey, MAX_SERVICE_FRAME_BYTES));
+                    ticket = track(snapshot(temporary.sessionTicket, MAX_SERVICE_FRAME_BYTES));
                     assertActive();
                     const result = {
                         sessionKey: key,
@@ -514,8 +516,8 @@ export async function referenceKeyExchangeOnTransport(
                     disposeResult(temporary);
 
                     if (!committed) {
-                        wipe(key);
-                        wipe(ticket);
+                        release(key);
+                        release(ticket);
                     }
                 }
             },
@@ -552,6 +554,8 @@ export async function referenceKeyExchangeOnTransport(
             }
 
             observedResponse = undefined;
+            owned.delete(result.value.sessionKey);
+            owned.delete(result.value.sessionTicket);
             return result;
         }
 
