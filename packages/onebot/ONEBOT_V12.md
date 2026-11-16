@@ -469,8 +469,11 @@ successful delivery remain unverified.
 
 `send_message` reports the timestamp already stored by Jiyu. That record may
 come from the QQ response or a local-clock fallback and is not necessarily a
-QQ-confirmed time. If a send has happened but its result or timestamp is
-unavailable, the outcome can be uncertain: do not automatically retry. A
+QQ-confirmed time. Jiyu returns it only when it is finite, positive and at most
+`Number.MAX_SAFE_INTEGER`; positive fractions remain accepted. This is a local
+JSON/SDK interoperability constraint, not an upper bound prescribed by OneBot.
+If a send has happened but its result or timestamp is unavailable or outside
+this range, the outcome can be uncertain: do not automatically retry. A
 transport timeout also does not imply that the underlying action stopped.
 
 Input, output and concurrency are bounded. If an action response cannot fit

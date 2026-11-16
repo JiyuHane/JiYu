@@ -1374,7 +1374,12 @@ export class V12Dispatcher {
                 );
             }
 
-            if (typeof timestamp !== 'number' || !Number.isFinite(timestamp) || timestamp <= 0) {
+            if (
+                typeof timestamp !== 'number' ||
+                !Number.isFinite(timestamp) ||
+                timestamp <= 0 ||
+                timestamp > Number.MAX_SAFE_INTEGER
+            ) {
                 return response(
                     20001,
                     'message sent but result metadata is unavailable; do not retry automatically',
