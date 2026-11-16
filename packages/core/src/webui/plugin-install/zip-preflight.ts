@@ -225,6 +225,7 @@ interface RecordMetadata {
     version: number;
     time: number;
     date: number;
+    mtime: number | null;
     crc: number;
     compressed: number;
     size: number;
@@ -235,10 +236,11 @@ interface RecordMetadata {
 
 /**
  * Synchronous preflight of a strict ZIP32 stored/raw-DEFLATE subset, suited to
- * synthetic fixtures. An archive with no file entries is malformed. Common
- * archives using extra fields or data descriptors remain unsupported. The
- * result establishes neither plugin compatibility, provenance, permission nor
- * filesystem safety; this function performs no extraction or installation.
+ * synthetic fixtures. An archive with no file entries is malformed. Only a
+ * symmetric mtime-only UT extra field is supported; other extra fields and data
+ * descriptors remain unsupported. The result establishes neither plugin
+ * compatibility, provenance, permission nor filesystem safety; this function
+ * performs no extraction or installation.
  * Work is bounded by one input snapshot, entry count and declared output limits;
  * no wall-clock or process RSS bound is promised.
  */
@@ -298,6 +300,50 @@ function parseZip(
         const u16 = (offset: number): number => view.getUint16(offset, true);
         const u32 = (offset: number): number => view.getUint32(offset, true);
 
+        // The caller bounds the complete extra region before inspecting its fields.
+        const extraMtime = (offset: number, length: number): number | null => {
+            if (length === 0) {
+                return null;
+            }
+
+            let position = 0;
+
+            while (position < length) {
+                const remaining = length - position;
+
+                if (remaining < 4) {
+                    // Preserve the existing unsupported classification for a one-byte extra.
+                    fail(position === 0 && length === 1 ? 'unsupported' : 'malformed');
+                }
+
+                const field = offset + position;
+                const fieldSize = u16(field + 2);
+
+                if (fieldSize > remaining - 4) {
+                    fail('malformed');
+                }
+
+                if (u16(field) === 0x5455) {
+                    if (fieldSize === 0 || (bytes[field + 4] === 1 && fieldSize < 5)) {
+                        fail('malformed');
+                    }
+                }
+
+                position += 4 + fieldSize;
+            }
+
+            if (
+                length !== 9 ||
+                u16(offset) !== 0x5455 ||
+                u16(offset + 2) !== 5 ||
+                bytes[offset + 4] !== 1
+            ) {
+                fail('unsupported');
+            }
+
+            return u32(offset + 5);
+        };
+
         if (bytes.length < 22) {
             fail('malformed');
         }
@@ -338,6 +384,7 @@ function parseZip(
         }
 
         const records: RecordMetadata[] = [];
+        const centralExtras: Array<{ offset: number; length: number }> = [];
         const root: Tree = { spelling: '', explicit: true, file: false, children: new Map() };
         let cursor = centralStart;
         let total = 0;
@@ -365,13 +412,16 @@ function parseZip(
             const internal = u16(cursor + 36);
             const external = u32(cursor + 38);
             const offset = u32(cursor + 42);
+            const extraStart = cursor + 46 + nameLength;
+
+            bound(cursor + 46, nameLength, end);
+            bound(extraStart, extra, end);
 
             if (
                 compressed === 0xffffffff ||
                 size === 0xffffffff ||
                 offset === 0xffffffff ||
                 startDisk !== 0 ||
-                extra !== 0 ||
                 comment !== 0 ||
                 internal !== 0 ||
                 (flags & ~0x800) !== 0 ||
@@ -391,7 +441,6 @@ function parseZip(
                 fail('unsafe_path');
             }
 
-            bound(cursor + 46, nameLength, end);
             let name = '';
 
             for (let j = 0; j < nameLength; j++) {
@@ -437,6 +486,7 @@ function parseZip(
                 version,
                 time,
                 date,
+                mtime: null,
                 crc,
                 compressed,
                 size,
@@ -444,17 +494,25 @@ function parseZip(
                 dataStart: 0,
                 directory,
             });
-            cursor += 46 + nameLength;
+            centralExtras.push({ offset: extraStart, length: extra });
+            cursor += 46 + nameLength + extra;
         }
 
         if (cursor !== end) {
             fail('malformed');
         }
 
+        for (let i = 0; i < records.length; i++) {
+            records[i].mtime = extraMtime(centralExtras[i].offset, centralExtras[i].length);
+        }
+
         const sorted = [...records].sort((a, b) => a.offset - b.offset);
         let localCursor = 0;
 
-        for (const record of sorted) {
+        for (let i = 0; i < sorted.length; i++) {
+            const record = sorted[i];
+            const nextOffset = i + 1 < sorted.length ? sorted[i + 1].offset : centralStart;
+
             if (record.offset !== localCursor) {
                 fail('malformed');
             }
@@ -466,9 +524,16 @@ function parseZip(
             }
 
             const nameLength = u16(localCursor + 26);
+            const extraLength = u16(localCursor + 28);
+            const extraStart = localCursor + 30 + nameLength;
 
-            if (u16(localCursor + 28) !== 0) {
-                fail('unsupported');
+            bound(localCursor + 30, nameLength, centralStart);
+            bound(extraStart, extraLength, centralStart);
+            const dataStart = extraStart + extraLength;
+            bound(dataStart, record.compressed, centralStart);
+
+            if (dataStart + record.compressed !== nextOffset) {
+                fail('malformed');
             }
 
             if (
@@ -485,16 +550,15 @@ function parseZip(
                 fail('malformed');
             }
 
-            bound(localCursor + 30, nameLength, centralStart);
-
             for (let j = 0; j < nameLength; j++) {
                 if (bytes[localCursor + 30 + j] !== record.name.charCodeAt(j)) {
                     fail('malformed');
                 }
             }
 
-            const dataStart = localCursor + 30 + nameLength;
-            bound(dataStart, record.compressed, centralStart);
+            if (extraMtime(extraStart, extraLength) !== record.mtime) {
+                fail('malformed');
+            }
 
             record.dataStart = dataStart;
             localCursor = dataStart + record.compressed;

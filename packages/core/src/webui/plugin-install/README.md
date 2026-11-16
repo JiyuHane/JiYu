@@ -10,11 +10,15 @@ permissions and crash recovery require separate platform-specific handling.
 
 The limited ZIP32 profile accepts stored (method 0) and raw DEFLATE (method 8)
 regular files, portable ASCII paths and recognized DOS or Unix declarations.
-Directories must be stored and empty; method 8 requires version-needed 20. It
-rejects empty archives and directory-only archives, data descriptors, ZIP64,
-encryption, extra fields, comments, unsupported creator metadata, path and case
-collisions, and non-contiguous record layouts. This is not general compatibility
-with common community ZIPs; many legitimate releases are rejected.
+Directories must be stored and empty; method 8 requires version-needed 20. Each
+entry may have either no extra field, or exactly one mtime-only extended timestamp
+field (`0x5455`, data length 5, flags 1) whose four raw timestamp bytes match in
+its local and central headers. These bytes are checked for consistency, not
+interpreted as trusted dates. Other or duplicate extra fields, asymmetric fields,
+data descriptors, ZIP64, encryption, comments, unsupported creator metadata,
+path and case collisions, non-contiguous record layouts, empty archives and
+directory-only archives remain rejected. This is not general compatibility with
+common community ZIPs; many legitimate releases are rejected.
 
 The primitive validates a private snapshot and all local and central records
 before processing any archive content, then decompresses in memory for inspection
@@ -60,6 +64,19 @@ Synchronous inflate and CRC can block the event loop. Do not connect this
 primitive to an online route: production integration requires a separate
 isolation, cancellation and resource-control design. It establishes no filesystem
 safety, authorization or signature. Tests use only synthetic in-memory fixtures.
+
+The user-supplied NapCat source snapshot with SHA-256
+`3f8378928116587295c508fe61f82591c9fb64b5b5e7185e0b8b3e9e32b013f7`
+has 1,296 ZIP entries; static header inspection found the accepted nine-byte
+mtime-only field in both headers of each entry, with matching bytes. The archive
+inventory is identified by REA evidence
+`ev_b242fd24f2a814d54113f3226fdcc81dd6b1c9ed5f391a80f6b033ff3accb5cc`;
+the per-header field checks are separate static reads. This is one source
+archive, not a plugin release or evidence about other archives. It also
+exceeds the archive, entry-count, individual-output and aggregate-output limits;
+it has a 40-byte archive comment and other unsupported header and path details.
+The narrow timestamp addition therefore does not make that source archive pass
+this preflight, establish plugin compatibility, or justify increasing the limits.
 
 ## Worker lifecycle prototype
 
