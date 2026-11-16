@@ -109,6 +109,14 @@ export interface OneBot12HttpClientOptions extends OneBot12ClientOptions {
     fetch?: typeof fetch;
     /** Explicit Authorization takes precedence over accessToken. */
     headers?: HeadersInit;
+    /**
+     * OneBot 12 recommends echoing a non-empty request echo (SHOULD). HTTP pairs
+     * each response with its request, but that association does not authenticate
+     * the peer. With a non-empty request echo, 'allow' accepts an omitted response
+     * echo; a present echo must still match. Defaults to 'reject'. Empty or absent
+     * request echoes retain their existing behavior.
+     */
+    missingEchoPolicy?: 'reject' | 'allow';
 }
 
 /** OneBot 12 application-side HTTP transport. No failed action is retried. */
@@ -118,9 +126,21 @@ export class OneBot12HttpClient {
     private readonly headers: Headers;
     private readonly timeoutMs: number;
     private readonly maxResponseBytes: number;
+    private readonly missingEchoPolicy: 'reject' | 'allow';
 
     constructor(options: OneBot12HttpClientOptions) {
         this.baseUrl = validateEndpoint(options.baseUrl, 'http');
+        const missingEchoPolicy = options.missingEchoPolicy;
+
+        if (
+            missingEchoPolicy !== undefined &&
+            missingEchoPolicy !== 'reject' &&
+            missingEchoPolicy !== 'allow'
+        ) {
+            throw new OneBot12ClientError('invalid_options', 'Invalid missingEchoPolicy');
+        }
+
+        this.missingEchoPolicy = missingEchoPolicy ?? 'reject';
         this.timeoutMs = checkedLimit(options.requestTimeoutMs ?? 30_000, 'requestTimeoutMs', 0);
         this.maxResponseBytes = checkedLimit(
             options.maxResponseBytes ?? 4 * 1024 * 1024,
@@ -291,7 +311,11 @@ export class OneBot12HttpClient {
                 );
             }
 
-            if (echo && result.echo !== echo) {
+            if (
+                echo &&
+                (this.missingEchoPolicy === 'reject' || Object.hasOwn(result, 'echo')) &&
+                result.echo !== echo
+            ) {
                 throw new OneBot12ClientError(
                     'invalid_response',
                     'OneBot 12 response echo mismatch',

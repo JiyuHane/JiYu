@@ -34,6 +34,15 @@ being delivered as either kind. The SDK still accepts `status: "failed"` with
 client never automatically retries an action. A timeout or disconnected transport
 does not prove that an action's side effects did not occur.
 
+For a nonempty requested `echo`, the HTTP client defaults to requiring the same
+response `echo`. The [candidate response specification](https://12.onebot.dev/connect/data-protocol/action-response/)
+recommends returning it; to interoperate with an implementation that omits this
+recommended field, set `missingEchoPolicy: 'allow'` on the HTTP client. This
+accepts only an absent response `echo`: an echo that is present but different,
+non-string or duplicated still fails. The option does not synthesize an echo,
+change empty-request-echo handling, or apply to WebSocket clients. HTTP's
+request/response association does not itself establish the peer's identity.
+
 `maxResponseBytes` limits the UTF-8 body bytes delivered by Fetch, after any
 content decoding Fetch performs. With a non-identity `Content-Encoding`, the
 client ignores `Content-Length` for the preliminary size check and enforces the
