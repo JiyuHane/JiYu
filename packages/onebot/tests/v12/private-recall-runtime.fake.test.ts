@@ -780,7 +780,7 @@ describe('private recall: real pipeline, manager and V12Runtime with fake transp
         }
     });
 
-    it('isolates same-account contexts and rejects expired tickets without changing ordinary events', async () => {
+    it('isolates same-account contexts and rejects expired tickets for recall and ordinary events', async () => {
         const a = await fixture();
         const b = await fixture();
 
@@ -812,12 +812,7 @@ describe('private recall: real pipeline, manager and V12Runtime with fake transp
                 },
                 old,
             );
-            expect(a.published).toHaveLength(2);
-            expect(a.published[1]).toMatchObject({
-                type: 'notice',
-                detail_type: 'friend_increase',
-                user_id: String(PEER),
-            });
+            expect(a.published).toHaveLength(1);
         } finally {
             await a.close();
             await b.close();

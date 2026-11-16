@@ -714,7 +714,33 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                         // The optional poll path must never suppress existing fanout.
                     }
 
-                    this.publish(converted);
+                    if (scope && source !== undefined) {
+                        // Tickets identify an internal admission epoch; they do not
+                        // authenticate the upstream event or same-process callers.
+                        const sourceScopeCurrent = (): boolean => {
+                            const ownsScope = (): boolean =>
+                                this.#sourceScopes.at(-1) === scope &&
+                                scope.event === event &&
+                                scope.payload === payload &&
+                                scope.source === source &&
+                                this.isEnabled &&
+                                this.accepting;
+
+                            if (!ownsScope()) {
+                                return false;
+                            }
+
+                            const current = this.isSourceCurrent(source);
+                            // Verification can synchronously reenter the runtime.
+                            return current && ownsScope();
+                        };
+
+                        if (sourceScopeCurrent()) {
+                            this.publish(converted, sourceScopeCurrent);
+                        }
+                    } else {
+                        this.publish(converted);
+                    }
                 }
             } else if (admission) {
                 skipOrderedAdmission(admission);

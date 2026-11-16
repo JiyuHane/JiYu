@@ -534,7 +534,7 @@ describe('internal source generation (no transports)', () => {
         await f.runtime.close();
     });
 
-    it('carries stale metadata through async fanout while preserving existing subscribers', async () => {
+    it('carries stale metadata through async fanout without publishing to subscribers', async () => {
         const f = makeRuntime();
         await f.runtime.open();
         f.generation.setOnline(true);
@@ -550,8 +550,7 @@ describe('internal source generation (no transports)', () => {
         await pending;
         expect(recv).toHaveBeenCalledOnce();
         expect(f.runtime[verifySource](ticket)).toBe(false);
-        expect(received).toHaveLength(1);
-        expect(received[0]).toMatchObject({ type: 'message', message_id: '1' });
+        expect(received).toHaveLength(0);
         await f.runtime.close();
     });
 

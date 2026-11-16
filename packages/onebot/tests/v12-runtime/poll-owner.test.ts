@@ -239,14 +239,12 @@ describe('explicit internal poll owner (pure memory)', () => {
                 valid === 'outer' ? current : foreign,
             );
             expect(spy.mock.calls.map((args) => args.length)).toEqual([2, 2]);
-            expect(seen).toHaveBeenCalledTimes(2);
+            expect(seen).toHaveBeenCalledOnce();
             const sink = new Sink();
             await poll.start(request(), sink).result;
             const item = JSON.parse(sink.body).data[0];
             expect(item.message_id).toBe(valid === 'outer' ? '41' : '42');
-            expect(item.id).toBe(
-                (seen.mock.calls[valid === 'inner' ? 0 : 1]![0] as { id: string }).id,
-            );
+            expect(item.id).toBe((seen.mock.calls[0]![0] as { id: string }).id);
             const empty = new Sink();
             await poll.start(request(), empty).result;
             expect(JSON.parse(empty.body).data).toEqual([]);
@@ -492,7 +490,7 @@ describe('explicit internal poll owner (pure memory)', () => {
         await flush();
     });
 
-    it('does not admit missing, stale, wrong account or other owner tickets but preserves WS', async () => {
+    it('does not admit missing, stale, wrong account or other owner tickets and preserves unqualified WS', async () => {
         const f = setup();
         const other = setup();
         await f.runtime.open();
@@ -511,7 +509,8 @@ describe('explicit internal poll owner (pure memory)', () => {
         f.generation.setOnline(false);
         f.generation.setOnline(true);
         await f.manager.emitEvent(event(4), old);
-        expect(seen).toHaveBeenCalledTimes(3);
+        expect(seen).toHaveBeenCalledOnce();
+        expect((seen.mock.calls[0]![0] as { message_id: string }).message_id).toBe('1');
         expect(pollOwnerStats(f.runtime)).toMatchObject({ accepted: 0 });
         expect((await p.start(request(), new Sink()).result).kind).toBe('epoch_invalid');
         await f.runtime.close();
