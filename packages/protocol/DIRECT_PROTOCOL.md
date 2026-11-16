@@ -30,7 +30,12 @@ not evidence that a server accepts them for an independent client.
 
 The extracted ELF `wrapper.node` has SHA-256
 `dc5209e20002735e31a20c9cded0a807d1db4779277dec66c9221ea28a870328`.
-Its bytes contain `wtlogin64.trans_emp` at file offset `0x883394`,
+REA's independent ELF-note inspection of that digest reports GNU build ID
+`29595d4c6b8f42ee` (Evidence
+`ev_e1f49c53fd22c261bb9436b99e56049d3f257674c2b9951c91fc7340adff066a`).
+Its `PT_NOTE` and `SHT_NOTE` refer to the same underlying note at file offset
+`0x2a8`; they are not independent copies or runtime evidence. Its bytes contain
+`wtlogin64.trans_emp` at file offset `0x883394`,
 `wtlogin64.login` at `0x8833a8`,
 `trpc.login.ecdh.EcdhService.SsoNTLoginRapidLogin` at `0x8580c5`,
 `trpc.login.ecdh.EcdhService.SsoKeyExchange` at `0x88dc33`, and
@@ -353,11 +358,17 @@ ELF's 885 defined default/protected dynamic exports contains no symbol whose
 value equals `0x6613200` or `0x66137b0` (REA evidence
 `ev_6829f3d51f172faae17c5de300ab034d8496bae4e5913bea953c39d2f68b7722`).
 This does not rule out local/hidden symbols, indirect calls, bindings or code in
-other modules. In separate bounded instruction windows, the exported
-`notifyRefreshSign` and `clearSign` both obtain a receiver from global
-`0x9178fa8` and call its virtual slot `+0x28`; neither inspected window directly
-calls `0x6613200` or `0x66137b0`. Their relationship to the object returned by
-`0x6613810` is still unknown, as are the dispatch targets and signing algorithm.
+other modules. REA's exact export-table projection for this digest reports
+`MSF::MSFSDK::notifyRefreshSign` at `0x670e760` with declared size 808 and
+`MSF::MSFSDK::clearSign` at `0x670eba0` with declared size 299 (Evidence
+`ev_7c15e1adeefdfaebda06707a851ea1e3745061fe60525dfa0d30340a98e48691`).
+Declared symbol sizes do not establish complete code boundaries or execution.
+In separate bounded instruction windows, those exports both obtain a receiver
+from global `0x9178fa8` and call its virtual slot `+0x28`; neither inspected
+window directly calls `0x6613200` or `0x66137b0`. The export-table inspection
+did not revalidate those instruction windows. Their relationship to the object
+returned by `0x6613810` is still unknown, as are the dispatch targets and signing
+algorithm.
 The two constructed objects have separate virtual-table address points at
 `0x902c6c8` and `0x902c7c8`; ELF relative relocations put `0x6713850` and
 `0x6713c00` in their respective `+0x30` slots. Local instruction windows make
