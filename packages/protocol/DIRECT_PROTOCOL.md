@@ -2112,6 +2112,21 @@ remain to be recovered and independently verified.
   encoded frame and 256 fields per inspected message; selected fields reject
   duplicates and wrong wire types, and all varints must be minimally encoded.
   These stricter rules are not a complete description of V2 or QQ behavior.
+- `src/direct/nt-linux-easy-unusual-device-reference.ts` separately projects the
+  reference EasyLogin response body's field 3 (`SecProtect`) and its nested field 2
+  (`UnusualDeviceCheckSig`) as opaque bytes. It reports the presence of the outer
+  message separately from a missing, empty or nonempty nested value and returns an
+  independent caller-owned copy. It leaves the existing ticket projection and owner
+  unchanged. The fixed V2 reference [returns this field for error 140022011](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Services/Login/EasyLoginService.cs#L22-L33)
+  and [passes a present value into a later WT path](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Logic/WtExchangeLogic.cs#L128-L145).
+  This helper does not inspect the status or start that path: caller policy must
+  bind the decoded status and body, authenticate the source, manage freshness and
+  clear returned bytes. Its synthetic GCM/Proton and explicit QR-body fixtures do
+  not prove QQ interoperability or SSO signature semantics. The local parser caps
+  input at 1 MiB and each inspected message at 256 fields, rejecting duplicate
+  selected fields, wrong wire types, non-minimal varints and protobuf groups;
+  unknown fields are skipped. These rules are local rather than V2 equivalence or
+  a CPU-time bound, and the separate QR TLV encoder has a 65535-byte value limit.
 - `src/direct/sso-reference-linux-easy-login-flow.ts` composes those PC helpers
   into one transaction on a caller-supplied borrowed raw transport. Its signer
   receives the complete serialized NT forward request, including the session

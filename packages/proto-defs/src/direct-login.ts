@@ -125,6 +125,17 @@ export interface LinuxNTEasyLoginReferenceResponseBody {
     tickets?: pb_optional<1, LinuxNTEasyLoginReferenceTickets>;
 }
 
+// Separate EasyLogin security projection; it does not alter the ticket-only schema.
+// https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/Login/NTLogin.cs#L368-L378
+// https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/Login/NTLogin.cs#L461-L469
+export interface LinuxNTEasyLoginReferenceSecProtect {
+    unusualDeviceCheckSig?: pb_optional<2, bytes>;
+}
+
+export interface LinuxNTEasyLoginReferenceSecurityBody {
+    secProtect?: pb_optional<3, LinuxNTEasyLoginReferenceSecProtect>;
+}
+
 // Field declarations independently derived from LagrangeV2; original authors retain ownership.
 // https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/System/ThirdPartyLoginResponse.cs
 export interface DirectThirdPartyLoginResponse {
