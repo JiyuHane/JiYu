@@ -1831,10 +1831,25 @@ remain to be recovered and independently verified.
   server: the flow requires a caller-supplied response verifier, whose trust
   policy is not implemented here. The optional caller-supplied inner SSO A2
   defaults to empty; it is distinct from the empty outer D2 used with zero-key
-  transport. The caller must ensure it belongs to the intended account. Reserved
-  metadata must already be supplied before the flow generates its key-exchange
-  body, so this API does not support an asynchronous body-dependent signer.
-  Synthetic tests use a permissive verifier only for their in-process peer.
+  transport. The caller must ensure it belongs to the intended account. The
+  legacy `createKeyExchangeFlow` accepts reserved metadata before generating its
+  body. The additive `prepareKeyExchangeFlow` instead generates one protobuf body
+  and exposes a borrowed copy before `finish(reserved)` frames that same private
+  body, allowing a caller to await a body-dependent signer. The reference
+  [signing call](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Context/PacketContext.cs#L49-L57)
+  passes the protobuf packet data before SSO framing. This is an in-process
+  ownership contract, not an isolation boundary against code altering built-ins.
+  The comparison at finish detects current changes to the borrowed bytes, but does
+  not prove what an external signer actually signed. Finish or cancel ends the
+  borrow and clears the exposed view best-effort: a callback still awaiting can
+  observe it cleared, and
+  the owner of any separate copy must clear that copy. Finish is one-shot even on
+  failure; cancellation during finishing revokes the result. The resulting flow
+  rejects recursive completion without affecting the outer completion, and a
+  verifier that synchronously cancels it prevents ticket delivery. Its sequence is
+  signed 32-bit; an adapter carrying uint32 must preserve its bit pattern explicitly.
+  A signer deadline and transport lease remain caller responsibilities. Synthetic
+  tests use a permissive verifier only for their in-process peer.
   The serialized `KeyExchangeRequestBuf` plaintext, successfully returned
   decryption buffers and reachable response-decoder outputs on later failures are
   wiped best-effort; SSO framing and other intermediate copies, crypto/codec copies
