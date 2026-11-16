@@ -480,7 +480,29 @@ and returns the 16 raw MD5 bytes. Its fixed-vector tests exercise only this pure
 calculation, not the target. It is not wired into a signer and does not establish
 that the target returns these bytes, that they reach a particular result slot,
 that the supplied ZIP implements this path, or that real QQ accepts them. No
-native code was executed to establish these observations.
+target native code was executed to establish these observations.
+
+In `0x683fa74`, separate bounded decoding windows recover three command
+constants: `trpc.o3.ecdh_access.EcdhAccess.SsoEstablishShareKey`,
+`trpc.o3.ecdh_access.EcdhAccess.SsoSecureA2Establish`, and
+`trpc.o3.ecdh_access.EcdhAccess.SsoSecureA2Access`. The inspected comparisons
+call a PLT entry whose `R_X86_64_JUMP_SLOT` names `strcmp`; those C-string
+comparisons constrain only the prefix before the first NUL, not necessarily the
+complete original string object. Under the indicated equal-branch and normal
+pointer/lifetime conditions, their flattened state paths converge on a call at
+`0x684011a` to `0x6be3c6c` with a global object, a body copy and a command copy.
+An entry window in that helper compares the command against a length and pointer
+stored in zero-filled global memory through a `memcmp`-named PLT entry. The
+runtime values, dynamic PLT binding, remaining helper behavior and any
+cryptographic operation are unknown.
+
+Other bounded windows conditionally move the helper result into a local string,
+append its bytes to a return string and copy that result to the caller's output
+region at `+0x100`. This is a candidate data dependency on the region previously
+associated with the `extra` diagnostic, not proof of the executed path, a
+complete extra algorithm, the contents of the user's supplied ZIP, or a working
+QQ signature. Normal returns, unchanged intermediate pointers and contents, no
+destructive aliasing and the expected dynamic bindings remain assumptions.
 
 A complete inventory of this ELF's 885 defined default/protected dynamic exports contains no symbol whose
 value equals `0x6613200` or `0x66137b0` (REA evidence
