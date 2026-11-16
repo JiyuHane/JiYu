@@ -127,6 +127,17 @@ function validOrderedEvent(event: unknown, self: OrderedSelf): boolean {
             }
 
             fields.push('group_id');
+        } else if (Object.hasOwn(event, 'qq.target_id')) {
+            if (
+                Object.hasOwn(event, 'qq.auto_reply') ||
+                parseAccountId(event['qq.target_id']) === null ||
+                event.user_id !== self.user_id ||
+                event.time > Number.MAX_SAFE_INTEGER
+            ) {
+                return false;
+            }
+
+            fields.push('qq.target_id');
         } else if (Object.hasOwn(event, 'qq.auto_reply')) {
             if (event['qq.auto_reply'] !== true) {
                 return false;

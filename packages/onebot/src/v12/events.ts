@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { isProxy } from 'node:util/types';
 import type { V12ConvertedEvent, V12MessageEvent, V12Self } from './types';
 import { fromV11AccountId, fromV11MessageId, isObject, isSelf } from './validation';
 
@@ -7,7 +8,7 @@ export class V12UnsupportedEventError extends Error {
     readonly reason = 'self_sent_message';
 
     constructor() {
-        super('V12 self-sent message mapping is not implemented');
+        super('V12 self-sent message shape is not supported');
         this.name = 'V12UnsupportedEventError';
     }
 }
@@ -223,11 +224,6 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
 
     const detail = input.message_type;
 
-    if (isSent && detail !== 'group') {
-        // Private self events carry target_id, with no equivalent v12 recipient field.
-        throw new V12UnsupportedEventError();
-    }
-
     if (
         (detail !== 'private' && detail !== 'group') ||
         (detail === 'private' && input.sub_type !== 'friend') ||
@@ -240,7 +236,7 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
         throw new Error('unsupported V11 message type');
     }
 
-    // Jiyu opts in to observed group self echoes, not send or delivery confirmation.
+    // These are observed self echoes, not send or delivery confirmation.
     const sentUserId = isSent ? fromV11AccountId(input.user_id) : null;
 
     if (isSent && sentUserId === null) {
@@ -248,6 +244,40 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
     }
 
     if (isSent && sentUserId !== self.user_id) {
+        throw new V12UnsupportedEventError();
+    }
+
+    // If the optional sender projection has a safely observable, canonical ID,
+    // reject an explicit contradiction rather than treating it as this account.
+    // Missing or uninspectable sender metadata remains unknown; never call getters.
+    if (isSent && detail === 'private') {
+        const sender = Object.getOwnPropertyDescriptor(input, 'sender');
+
+        if (
+            sender?.enumerable &&
+            'value' in sender &&
+            !isProxy(sender.value) &&
+            isObject(sender.value)
+        ) {
+            const id = Object.getOwnPropertyDescriptor(sender.value, 'user_id');
+            const projected = id?.enumerable && 'value' in id ? fromV11AccountId(id.value) : null;
+
+            if (projected !== null && projected !== self.user_id) {
+                throw new V12UnsupportedEventError();
+            }
+        }
+    }
+
+    // Only a visible own data property is evidence of the private peer. Do not
+    // invoke an accessor or accept an inherited or hidden target.
+    const target =
+        isSent && detail === 'private'
+            ? Object.getOwnPropertyDescriptor(input, 'target_id')
+            : undefined;
+    const targetId =
+        target?.enumerable && 'value' in target ? fromV11AccountId(target.value) : null;
+
+    if (isSent && detail === 'private' && targetId === null) {
         throw new V12UnsupportedEventError();
     }
 
@@ -271,7 +301,9 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
 
     // V11 message extras were previously ignored; do not invoke an auto_reply getter.
     const autoReply =
-        detail === 'private' ? Object.getOwnPropertyDescriptor(input, 'auto_reply') : undefined;
+        !isSent && detail === 'private'
+            ? Object.getOwnPropertyDescriptor(input, 'auto_reply')
+            : undefined;
     const message: V12MessageEvent['message'] = [];
     const alt: string[] = [];
 
@@ -331,6 +363,7 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
         alt_message: alt.join(''),
         user_id: userId,
         ...(groupId === null ? {} : { group_id: groupId }),
+        ...(targetId === null ? {} : { 'qq.target_id': targetId }),
         ...(autoReply?.enumerable && 'value' in autoReply && autoReply.value === true
             ? { 'qq.auto_reply': true as const }
             : {}),

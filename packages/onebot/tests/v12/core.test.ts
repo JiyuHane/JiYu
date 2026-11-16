@@ -7,7 +7,6 @@ import {
     createConnectEvent,
     createHeartbeatEvent,
     createStatusUpdateEvent,
-    V12UnsupportedEventError,
 } from '../../src/v12/events';
 import type { V12CoreOptions } from '../../src/v12/types';
 
@@ -546,7 +545,13 @@ describe('V12 message and lifecycle event conversion', () => {
         });
         const sent = await convertEvent(ctx, { ...inbound, senderUin: 10001, peerUin: 42 });
         expect(sent).toMatchObject({ post_type: 'message_sent', user_id: 10001, target_id: 42 });
-        expect(() => convertV11Event(sent, self)).toThrow(V12UnsupportedEventError);
+        expect(convertV11Event(sent, self)).toMatchObject({
+            detail_type: 'private',
+            user_id: '10001',
+            'qq.target_id': '42',
+            message_id: '-123',
+            message: text('hi'),
+        });
         const missingId = { ...converted };
         delete missingId.message_id;
         expect(() => convertV11Event(missingId, self)).toThrow('invalid V11 message event');

@@ -105,13 +105,18 @@ account and its nonnegative finite timestamp does not exceed JavaScript's safe
 integer maximum. This local bound keeps this new projection within the SDK and
 internal poll JSON number limits; it does not alter ordinary incoming messages.
 This reports the existing self echo; it does not independently confirm send,
-receipt or delivery. Private self-sent events remain unsupported because
-v11's `target_id` has no equivalent standard v12 recipient field. A group
-self echo with an unsupported segment fails conversion rather than producing a
-partial event; if the internal ordered poll owner is active, this failure marks
-an ordering gap instead of silently skipping the event. The poll owner is not
-wired to a production HTTP polling action. Other notices and requests are not
-yet translated to v12. Unsupported actions, parameters and message segments return explicit errors. File APIs, HTTP event
+receipt or delivery. A private friend self echo with the same account identity and
+a visible valid v11 `target_id` maps to a private message with the target retained
+in the nonstandard string extension `qq.target_id`. A target equal to the account
+is preserved without inferring whether that conversation exists. The existing
+v11 converter may omit a target equal to self, so this path only preserves the
+field when v11 actually supplies it; unknown or invalid targets are skipped
+rather than guessed. Private temporary-chat echoes
+remain unsupported. A self echo with an unsupported segment fails conversion
+rather than producing a partial event; if the internal ordered poll owner is
+active, this failure marks an ordering gap instead of silently skipping the
+event. The poll owner is not wired to a production HTTP polling action. Other
+notices and requests are not yet translated to v12. Unsupported actions, parameters and message segments return explicit errors. File APIs, HTTP event
 polling and HTTP Webhook are not implemented by this listener. Capability and
 error details remain authoritative at runtime.
 

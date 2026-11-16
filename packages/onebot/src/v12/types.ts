@@ -49,6 +49,8 @@ export interface V12MessageEvent {
     group_id?: string;
     /** Jiyu QQ-specific private message marker, not a send confirmation. */
     'qq.auto_reply'?: true;
+    /** Observed V11 private self-echo target, not a delivery confirmation. */
+    'qq.target_id'?: string;
 }
 
 export interface V12FriendIncreaseEvent {

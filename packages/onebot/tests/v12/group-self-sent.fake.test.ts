@@ -227,10 +227,10 @@ describe('synthetic V11 group self-sent to V12', () => {
         }
     });
 
-    it('keeps private self-sent explicitly unsupported instead of dropping target_id', () => {
+    it('keeps private self-sent with an unknown target unsupported', () => {
         expect(() =>
             convertV11Event(
-                { ...sent, message_type: 'private', sub_type: 'friend', target_id: 42 },
+                { ...sent, message_type: 'private', sub_type: 'friend', target_id: 0 },
                 self,
             ),
         ).toThrow(V12UnsupportedEventError);
