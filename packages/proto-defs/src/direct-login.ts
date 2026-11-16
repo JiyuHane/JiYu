@@ -106,6 +106,25 @@ export interface LinuxNTLoginReferenceResponseCommon {
     body?: pb_optional<2, bytes>;
 }
 
+// Independent EasyLogin field declarations; overall upstream license undetermined.
+// https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Services/Login/EasyLoginService.cs#L13-L25
+// https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/Login/NTLogin.cs#L306-L315
+// https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/Login/NTLogin.cs#L455-L464
+export interface LinuxNTEasyLoginReferenceRequestBody {
+    a1: pb_optional<1, bytes>;
+}
+
+export interface LinuxNTEasyLoginReferenceTickets {
+    a1?: pb_optional<3, bytes>;
+    a2?: pb_optional<4, bytes>;
+    d2?: pb_optional<5, bytes>;
+    d2Key?: pb_optional<6, bytes>;
+}
+
+export interface LinuxNTEasyLoginReferenceResponseBody {
+    tickets?: pb_optional<1, LinuxNTEasyLoginReferenceTickets>;
+}
+
 // Field declarations independently derived from LagrangeV2; original authors retain ownership.
 // https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/System/ThirdPartyLoginResponse.cs
 export interface DirectThirdPartyLoginResponse {

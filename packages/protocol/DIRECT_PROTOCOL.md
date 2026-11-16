@@ -1876,6 +1876,22 @@ remain to be recovered and independently verified.
   Owned reachable byte temporaries are wiped best-effort, excluding caller buffers,
   returned body and runtime/crypto-internal copies. No session orchestration or
   production Bridge integration is provided by either reference helper.
+- `src/direct/nt-linux-easy-login-reference.ts` independently encodes the PC
+  EasyLogin opaque request body and projects four ticket fields from its response,
+  based on the reference's [service](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Services/Login/EasyLoginService.cs#L9-L33)
+  and [packet declarations](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/Login/NTLogin.cs#L306-L315).
+  The caller explicitly supplies a nonempty A1 to the request encoder and may pass
+  its returned bytes as the NT request helper's body. The response projector
+  accepts an explicit body, reports whether its tickets message was present, and
+  returns independent A1/A2/D2/D2Key byte arrays or `null` for absent fields;
+  present-empty arrays are preserved. It does not validate ticket contents, bind
+  them to an account or peer, decide login success, persist credentials, or handle
+  the separate unusual-device response. The caller owns and must clear input and
+  returned byte arrays. Reachable internal copies are wiped best-effort, excluding
+  runtime/codec copies that become inaccessible. Local limits are 1 MiB per
+  encoded frame and 256 fields per inspected message; selected fields reject
+  duplicates and wrong wire types, and all varints must be minimally encoded.
+  These stricter rules are not a complete description of V2 or QQ behavior.
 - `src/direct/sso12-packet-client.ts` is a single-flight protocol-12 client for
   an already-connected socket, with caller-supplied account policy, classifier,
   signing metadata, device parameters and zero-key or D2-key encryption. It
