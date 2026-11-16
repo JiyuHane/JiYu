@@ -36,6 +36,12 @@ export interface OneBot12ImageSegment extends OneBot12MessageSegment {
     data: OneBot12JsonObject & { file_id: string };
 }
 
+/** Describes a voice segment; the generic segment parser does not validate file_id. */
+export interface OneBot12VoiceSegment extends OneBot12MessageSegment {
+    type: 'voice';
+    data: OneBot12JsonObject & { file_id: string };
+}
+
 /** Incoming messages are segment arrays; outgoing message parameters may also be a string or single segment. */
 export type OneBot12Message = OneBot12MessageSegment[];
 export type OneBot12OutgoingMessage = OneBot12Message | OneBot12MessageSegment | string;

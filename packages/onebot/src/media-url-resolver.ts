@@ -35,13 +35,12 @@ export class MediaUrlResolver {
         if (!element.url) {
             try {
                 await this.populateUrl(element, isGroup, sessionId);
-            } catch (err) {
-                // Preserve the media segment when its download URL is unavailable.
+            } catch {
+                // Preserve the segment without logging exception details that may contain signed URLs.
                 log.warn(
-                    'media URL resolution failed type=%s is_group=%s: %s',
+                    'media URL resolution failed type=%s is_group=%s: [redacted]',
                     element.type,
                     isGroup,
-                    err instanceof Error ? err.message : String(err),
                 );
             }
         }

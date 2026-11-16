@@ -2,8 +2,9 @@ import { createCipheriv, createDecipheriv, randomBytes, type DecipherGCM } from 
 import { TextDecoder } from 'node:util';
 import { classifyFileUrl } from './file-url';
 
-/** Local OneBot 12 image handles, unrelated to QQ signatures or QQ encryption. */
+/** Local OneBot 12 media handles, unrelated to QQ signatures or QQ encryption. */
 export const V12_IMAGE_TOKEN_PREFIX = 'jiyu-image:v1:';
+export const V12_VOICE_TOKEN_PREFIX = 'jiyu-voice:v1:';
 
 const KEY_BYTES = 32;
 const NONCE_PREFIX_BYTES = 4;
@@ -14,11 +15,52 @@ const MAX_TOKEN_LENGTH = 4096;
 const MAX_ISSUES = 1n << 24n;
 const MAX_ACCOUNT_CHARS = 128;
 const MAX_ACCOUNT_BYTES = 256;
-const TOKEN_ERROR = 'image file token unavailable';
+
+// These module-private frozen configurations are the only possible purposes.
+// Each engine retains its selected configuration for its entire lifetime.
+const IMAGE_PURPOSE = Object.freeze({
+    prefix: V12_IMAGE_TOKEN_PREFIX,
+    aad: 'jiyu-onebot12-image-v1',
+    error: 'image file token unavailable',
+    accountError: 'invalid image file token account',
+    providerFailure: 'image token provider failure',
+});
+const VOICE_PURPOSE = Object.freeze({
+    prefix: V12_VOICE_TOKEN_PREFIX,
+    aad: 'jiyu-onebot12-voice-v1',
+    error: 'voice file token unavailable',
+    accountError: 'invalid voice file token account',
+    providerFailure: 'voice token provider failure',
+});
+type TokenPurpose = typeof IMAGE_PURPOSE | typeof VOICE_PURPOSE;
 
 /** Identifies the reserved namespace, including malformed or expired handles. */
 export function isV12ImageToken(id: string): boolean {
     return typeof id === 'string' && id.startsWith(V12_IMAGE_TOKEN_PREFIX);
+}
+
+/** Identifies the reserved namespace, including malformed or expired handles. */
+export function isV12VoiceToken(id: string): boolean {
+    return typeof id === 'string' && id.startsWith(V12_VOICE_TOKEN_PREFIX);
+}
+
+/** Validates a sealable URL snapshot without issuing a handle or performing I/O. */
+export function isV12SealableFileUrl(value: unknown): value is string {
+    try {
+        if (
+            typeof value !== 'string' ||
+            value.length === 0 ||
+            value.length > MAX_URL_BYTES ||
+            Buffer.byteLength(value, 'utf8') > MAX_URL_BYTES
+        ) {
+            return false;
+        }
+
+        const checked = classifyFileUrl(value);
+        return checked.kind === 'valid' && checked.url === value;
+    } catch {
+        return false;
+    }
 }
 
 function validAccountId(accountId: unknown): accountId is string {
@@ -59,21 +101,21 @@ function validAccountId(accountId: unknown): accountId is string {
  * redeemable until this issuer is revoked, but its URL can expire independently.
  * It is a sensitive bearer reference, not proof of availability or file identity.
  */
-export class V12ImageFileTokens {
+class V12FileTokenEngine {
+    readonly #purpose: TokenPurpose;
     #key: Buffer | null = null;
     #noncePrefix: Buffer | null = null;
     #aad: Buffer | null = null;
     #issued = 0n;
 
-    constructor(accountId: string) {
+    constructor(accountId: string, purpose: TokenPurpose) {
+        this.#purpose = purpose;
+
         if (!validAccountId(accountId)) {
-            throw new Error('invalid image file token account');
+            throw new Error(purpose.accountError);
         }
 
-        const aad = Buffer.from(
-            JSON.stringify(['jiyu-onebot12-image-v1', 'qq', accountId]),
-            'utf8',
-        );
+        const aad = Buffer.from(JSON.stringify([purpose.aad, 'qq', accountId]), 'utf8');
         let key: Buffer | undefined;
         let noncePrefix: Buffer | undefined;
 
@@ -87,7 +129,7 @@ export class V12ImageFileTokens {
                 !Buffer.isBuffer(noncePrefix) ||
                 noncePrefix.length !== NONCE_PREFIX_BYTES
             ) {
-                throw new Error(TOKEN_ERROR);
+                throw new Error(this.#purpose.error);
             }
 
             this.#key = key;
@@ -98,7 +140,7 @@ export class V12ImageFileTokens {
             key?.fill(0);
             noncePrefix?.fill(0);
             aad.fill(0);
-            throw new Error(TOKEN_ERROR);
+            throw new Error(this.#purpose.error);
         }
     }
 
@@ -106,19 +148,8 @@ export class V12ImageFileTokens {
         let plaintext: Buffer | undefined;
 
         try {
-            if (
-                typeof url !== 'string' ||
-                url.length === 0 ||
-                url.length > MAX_URL_BYTES ||
-                Buffer.byteLength(url, 'utf8') > MAX_URL_BYTES
-            ) {
-                throw new Error(TOKEN_ERROR);
-            }
-
-            const checked = classifyFileUrl(url);
-
-            if (checked.kind !== 'valid' || checked.url !== url) {
-                throw new Error(TOKEN_ERROR);
+            if (!isV12SealableFileUrl(url)) {
+                throw new Error(this.#purpose.error);
             }
 
             const key = this.#key;
@@ -126,7 +157,7 @@ export class V12ImageFileTokens {
             const aad = this.#aad;
 
             if (!key || !prefix || !aad || this.#issued >= MAX_ISSUES) {
-                throw new Error(TOKEN_ERROR);
+                throw new Error(this.#purpose.error);
             }
 
             // Reserve the nonce before encryption and never reuse it on failure.
@@ -141,16 +172,16 @@ export class V12ImageFileTokens {
             const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
             const tag = cipher.getAuthTag();
             const id =
-                V12_IMAGE_TOKEN_PREFIX +
+                this.#purpose.prefix +
                 Buffer.concat([nonce, ciphertext, tag]).toString('base64url');
 
             if (this.#key !== key || id.length > MAX_TOKEN_LENGTH) {
-                throw new Error(TOKEN_ERROR);
+                throw new Error(this.#purpose.error);
             }
 
             return id;
         } catch {
-            throw new Error(TOKEN_ERROR);
+            throw new Error(this.#purpose.error);
         } finally {
             plaintext?.fill(0);
         }
@@ -158,7 +189,7 @@ export class V12ImageFileTokens {
 
     redeem(id: string): string | null {
         const plaintextParts: Buffer[] = [];
-        const providerFailure = Symbol('image token provider failure');
+        const providerFailure = Symbol(this.#purpose.providerFailure);
 
         try {
             const key = this.#key;
@@ -168,11 +199,11 @@ export class V12ImageFileTokens {
                 return null;
             }
 
-            if (!isV12ImageToken(id)) {
+            if (!id.startsWith(this.#purpose.prefix)) {
                 return null;
             }
 
-            const encoded = id.slice(V12_IMAGE_TOKEN_PREFIX.length);
+            const encoded = id.slice(this.#purpose.prefix.length);
 
             if (!encoded || !/^[A-Za-z0-9_-]+$/.test(encoded) || encoded.length % 4 === 1) {
                 return null;
@@ -232,7 +263,7 @@ export class V12ImageFileTokens {
             return url;
         } catch (error) {
             if (error === providerFailure) {
-                throw new Error(TOKEN_ERROR);
+                throw new Error(this.#purpose.error);
             }
 
             return null;
@@ -253,5 +284,71 @@ export class V12ImageFileTokens {
         key?.fill(0);
         prefix?.fill(0);
         aad?.fill(0);
+    }
+}
+
+/** Account-instance-local image URL snapshot handles. */
+export class V12ImageFileTokens {
+    readonly #engine: V12FileTokenEngine;
+
+    constructor(accountId: string) {
+        this.#engine = new V12FileTokenEngine(accountId, IMAGE_PURPOSE);
+    }
+
+    issue(url: string): string {
+        try {
+            return this.#engine.issue(url);
+        } catch {
+            throw new Error(IMAGE_PURPOSE.error);
+        }
+    }
+
+    redeem(id: string): string | null {
+        let engine: V12FileTokenEngine;
+
+        try {
+            engine = this.#engine;
+        } catch {
+            return null;
+        }
+
+        return engine.redeem(id);
+    }
+
+    revoke(): void {
+        this.#engine.revoke();
+    }
+}
+
+/** Account-instance-local voice URL snapshot handles. */
+export class V12VoiceFileTokens {
+    readonly #engine: V12FileTokenEngine;
+
+    constructor(accountId: string) {
+        this.#engine = new V12FileTokenEngine(accountId, VOICE_PURPOSE);
+    }
+
+    issue(url: string): string {
+        try {
+            return this.#engine.issue(url);
+        } catch {
+            throw new Error(VOICE_PURPOSE.error);
+        }
+    }
+
+    redeem(id: string): string | null {
+        let engine: V12FileTokenEngine;
+
+        try {
+            engine = this.#engine;
+        } catch {
+            return null;
+        }
+
+        return engine.redeem(id);
+    }
+
+    revoke(): void {
+        this.#engine.revoke();
     }
 }

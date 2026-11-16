@@ -116,11 +116,38 @@ function ordinaryImageUrl(segment: object): string | null {
     return data.url;
 }
 
+// This projects only the observable V11 shape; it does not establish the
+// identity or playability of the original QQ media.
+function ordinaryVoiceUrl(segment: object): string | null {
+    const outer = visibleOwnData(segment, ['type', 'data']);
+
+    if (!outer || outer.type !== 'record') {
+        return null;
+    }
+
+    const data = visibleOwnData(outer.data, ['file', 'url']);
+
+    if (
+        !data ||
+        typeof data.file !== 'string' ||
+        typeof data.url !== 'string' ||
+        data.url.length === 0
+    ) {
+        return null;
+    }
+
+    return data.url;
+}
+
 /** A known but unsupported V11 event returns null; malformed input throws. */
 export function convertV11Event(
     input: unknown,
     self: V12Self,
-    options?: { issueImageFileId: (url: string) => string },
+    options?: {
+        issueImageFileId: (url: string) => string;
+        issueVoiceFileId?: (url: string) => string;
+        validateMediaFileUrl?: (url: string) => boolean;
+    },
 ): V12ConvertedEvent | null {
     if (isProxy(self) || !isObject(self)) {
         throw new Error('invalid V11 event or V12 account identity');
@@ -434,7 +461,7 @@ export function convertV11Event(
 
     const message: V12MessageEvent['message'] = [];
     const alt: string[] = [];
-    const images: { index: number; url: string }[] = [];
+    const media: { type: 'image' | 'voice'; index: number; url: string }[] = [];
 
     for (let index = 0; index < sourceSegments.length; index += 1) {
         const segment = sourceSegments[index];
@@ -445,21 +472,29 @@ export function convertV11Event(
 
         const type = segmentProperty(segment, 'type');
 
-        if (type === 'image') {
+        if (type === 'image' || type === 'record') {
             if (isSent || !options) {
                 throw new Error('unsupported or invalid V11 message segment');
             }
 
-            const url = ordinaryImageUrl(segment);
+            const url = type === 'image' ? ordinaryImageUrl(segment) : ordinaryVoiceUrl(segment);
 
             if (url === null) {
                 throw new Error('unsupported or invalid V11 message segment');
             }
 
-            images.push({ index: message.length, url });
-            // This placeholder stays local until every segment and issued ID is valid.
-            message.push({ type: 'image', data: { file_id: '' } });
-            alt.push('[图片]');
+            const mediaType = type === 'image' ? 'image' : 'voice';
+            media.push({ type: mediaType, index: message.length, url });
+
+            // These placeholders remain private until all issuance succeeds.
+            if (mediaType === 'image') {
+                message.push({ type: 'image', data: { file_id: '' } });
+                alt.push('[图片]');
+            } else {
+                message.push({ type: 'voice', data: { file_id: '' } });
+                alt.push('[语音]');
+            }
+
             continue;
         }
 
@@ -515,6 +550,56 @@ export function convertV11Event(
         }
     }
 
+    // Capture and validate all required issuers before allocating an event ID or
+    // calling any issuer. An earlier callback cannot replace a later callback.
+    const issueImage = media.some((item) => item.type === 'image')
+        ? options?.issueImageFileId
+        : undefined;
+    const issueVoice = media.some((item) => item.type === 'voice')
+        ? options?.issueVoiceFileId
+        : undefined;
+    const issuance = media.map((item) => {
+        const issue = item.type === 'image' ? issueImage : issueVoice;
+
+        if (typeof issue !== 'function') {
+            throw new Error('unsupported or invalid V11 message segment');
+        }
+
+        return { ...item, issue };
+    });
+
+    // The optional preflight is read once and runs over captured URLs before
+    // any issuer or event ID allocation. Never expose a URL through its errors.
+    if (issuance.length > 0) {
+        let validate: ((url: string) => boolean) | undefined;
+
+        try {
+            validate = options?.validateMediaFileUrl;
+        } catch {
+            throw new Error('invalid V12 media file URL');
+        }
+
+        if (validate !== undefined) {
+            if (typeof validate !== 'function') {
+                throw new Error('invalid V12 media file URL');
+            }
+
+            for (const item of issuance) {
+                let valid: boolean;
+
+                try {
+                    valid = validate(item.url);
+                } catch {
+                    throw new Error('invalid V12 media file URL');
+                }
+
+                if (valid !== true) {
+                    throw new Error('invalid V12 media file URL');
+                }
+            }
+        }
+    }
+
     // Capture the validated event before calling the issuer, which may mutate its
     // caller's input. No partially populated event is exposed if issuance fails.
     const converted: V12MessageEvent = {
@@ -537,23 +622,20 @@ export function convertV11Event(
             : {}),
     };
 
-    if (images.length > 0) {
-        const issue = options?.issueImageFileId;
+    // All segments and issuers are validated. Issue synchronously in source
+    // order; a later failure does not undo earlier issuer side effects.
+    for (const item of issuance) {
+        const issue = item.issue;
+        const fileId = issue(item.url);
 
-        if (typeof issue !== 'function') {
-            throw new Error('unsupported or invalid V11 message segment');
+        if (typeof fileId !== 'string' || fileId.length === 0 || fileId.length > 4096) {
+            throw new Error(`invalid V12 ${item.type} file id`);
         }
 
-        // Validate the complete message before the first synchronous issuance.
-        for (const image of images) {
-            const fileId = issue(image.url);
-
-            if (typeof fileId !== 'string' || fileId.length === 0 || fileId.length > 4096) {
-                throw new Error('invalid V12 image file id');
-            }
-
-            message[image.index] = { type: 'image', data: { file_id: fileId } };
-        }
+        message[item.index] =
+            item.type === 'image'
+                ? { type: 'image', data: { file_id: fileId } }
+                : { type: 'voice', data: { file_id: fileId } };
     }
 
     return converted;

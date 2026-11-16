@@ -8,7 +8,11 @@ import {
 } from '../network';
 import { V12Transport } from '../v12-network';
 import { V12Dispatcher } from '../v12/dispatcher';
-import { V12ImageFileTokens } from '../v12/image-file-token';
+import {
+    isV12SealableFileUrl,
+    V12ImageFileTokens,
+    V12VoiceFileTokens,
+} from '../v12/image-file-token';
 import {
     convertV11Event,
     createConnectEvent,
@@ -47,6 +51,10 @@ import {
     type PollGate,
 } from './poll-owner';
 
+// Local per-event admission limits, not QQ or OneBot protocol limits.
+const MAX_INBOUND_MEDIA_SEGMENTS = 128;
+const MAX_INBOUND_MEDIA_URL_BYTES = 256 * 1024;
+
 function hasFriendRecallType(event: JsonObject): boolean {
     try {
         if (isProxy(event)) {
@@ -74,6 +82,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     private readonly version = { impl: 'jiyu', version: APP_VERSION };
     private readonly dispatcher: V12Dispatcher;
     private imageFileTokens: V12ImageFileTokens | null = null;
+    #voiceFileTokens: V12VoiceFileTokens | null = null;
     private readonly subscribers = new Set<(event: unknown) => void>();
     private readonly subscriberGenerations = new Map<(event: unknown) => void, object>();
     private readonly heartbeatEnableReloadScopes = new Set<{
@@ -147,6 +156,18 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
 
                 const url = tokens.redeem(fileId);
                 return this.imageFileTokens === tokens && this.isEnabled && this.accepting
+                    ? url
+                    : null;
+            },
+            resolveVoiceFileUrl: (fileId) => {
+                const tokens = this.#voiceFileTokens;
+
+                if (!tokens || !this.isEnabled || !this.accepting) {
+                    return null;
+                }
+
+                const url = tokens.redeem(fileId);
+                return this.#voiceFileTokens === tokens && this.isEnabled && this.accepting
                     ? url
                     : null;
             },
@@ -456,8 +477,8 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
         this.sourceAttempt = null;
         this.sourceBinding = null;
         this.accepting = false;
-        this.imageFileTokens?.revoke();
-        this.imageFileTokens = null;
+
+        this.revokeMediaTokens();
         this.cancelHeartbeat();
         this.cancelStatus();
         this.transport?.quiesce();
@@ -471,8 +492,8 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
         this.sourceAttempt = null;
         this.sourceBinding = null;
         this.accepting = false;
-        this.imageFileTokens?.revoke();
-        this.imageFileTokens = null;
+
+        this.revokeMediaTokens();
         this.cancelHeartbeat();
         this.cancelStatus();
         this.transport?.forceClose();
@@ -684,6 +705,11 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             };
 
             let converted: ReturnType<typeof convertV11Event>;
+            let issuedImageIssuer: V12ImageFileTokens | null = null;
+            let issuedVoiceIssuer: V12VoiceFileTokens | null = null;
+            const mediaIssuersCurrent = (): boolean =>
+                (issuedImageIssuer === null || this.imageFileTokens === issuedImageIssuer) &&
+                (issuedVoiceIssuer === null || this.#voiceFileTokens === issuedVoiceIssuer);
 
             if (privateRecall) {
                 converted =
@@ -700,19 +726,39 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                     converted = null;
                 }
             } else {
-                let issuedImage = false;
+                // Each synchronous conversion owns its own mixed-media budget.
+                let mediaSegments = 0;
+                let mediaUrlBytes = 0;
                 converted = convertV11Event(event, this.self, {
+                    validateMediaFileUrl: (url) => {
+                        if (!isV12SealableFileUrl(url)) {
+                            return false;
+                        }
+
+                        const bytes = Buffer.byteLength(url, 'utf8');
+
+                        if (
+                            mediaSegments >= MAX_INBOUND_MEDIA_SEGMENTS ||
+                            bytes > MAX_INBOUND_MEDIA_URL_BYTES - mediaUrlBytes
+                        ) {
+                            return false;
+                        }
+
+                        mediaSegments += 1;
+                        mediaUrlBytes += bytes;
+                        return true;
+                    },
                     issueImageFileId: (url) => {
                         // Unlike legacy text input, an image capability is issued
                         // only while the supplied internal source epoch is current.
-                        if (!sourceScopeCurrent()) {
+                        if (!sourceScopeCurrent() || !mediaIssuersCurrent()) {
                             throw new Error('v12 image source unavailable');
                         }
 
                         if (!this.imageFileTokens) {
                             const candidate = new V12ImageFileTokens(this.self.user_id);
 
-                            if (!sourceScopeCurrent()) {
+                            if (!sourceScopeCurrent() || !mediaIssuersCurrent()) {
                                 candidate.revoke();
                                 throw new Error('v12 image source unavailable');
                             }
@@ -727,26 +773,86 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
 
                         const issuer = this.imageFileTokens;
 
-                        if (!issuer || !sourceScopeCurrent()) {
+                        if (
+                            !issuer ||
+                            !sourceScopeCurrent() ||
+                            this.imageFileTokens !== issuer ||
+                            !mediaIssuersCurrent()
+                        ) {
                             throw new Error('v12 image source unavailable');
                         }
 
                         const fileId = issuer.issue(url);
                         const current = sourceScopeCurrent();
 
-                        if (!current || this.imageFileTokens !== issuer) {
+                        if (!current || this.imageFileTokens !== issuer || !mediaIssuersCurrent()) {
                             throw new Error('v12 image source unavailable');
                         }
 
-                        issuedImage = true;
+                        issuedImageIssuer ??= issuer;
+                        return fileId;
+                    },
+                    issueVoiceFileId: (url) => {
+                        // Voice uses its own account-instance issuer, but the same
+                        // internal source epoch and synchronous scope as images.
+                        if (!sourceScopeCurrent() || !mediaIssuersCurrent()) {
+                            throw new Error('v12 voice source unavailable');
+                        }
+
+                        if (!this.#voiceFileTokens) {
+                            const candidate = new V12VoiceFileTokens(this.self.user_id);
+
+                            if (!sourceScopeCurrent() || !mediaIssuersCurrent()) {
+                                candidate.revoke();
+                                throw new Error('v12 voice source unavailable');
+                            }
+
+                            // Verification may reenter and install a different issuer.
+                            if (this.#voiceFileTokens) {
+                                candidate.revoke();
+                            } else {
+                                this.#voiceFileTokens = candidate;
+                            }
+                        }
+
+                        const issuer = this.#voiceFileTokens;
+
+                        if (
+                            !issuer ||
+                            !sourceScopeCurrent() ||
+                            this.#voiceFileTokens !== issuer ||
+                            !mediaIssuersCurrent()
+                        ) {
+                            throw new Error('v12 voice source unavailable');
+                        }
+
+                        const fileId = issuer.issue(url);
+                        const current = sourceScopeCurrent();
+
+                        if (
+                            !current ||
+                            this.#voiceFileTokens !== issuer ||
+                            !mediaIssuersCurrent()
+                        ) {
+                            throw new Error('v12 voice source unavailable');
+                        }
+
+                        issuedVoiceIssuer ??= issuer;
                         return fileId;
                     },
                 });
 
                 // This must precede poll resolution: an already committed item
                 // cannot be recalled by the later WebSocket fanout guard.
-                if (issuedImage && !sourceScopeCurrent()) {
-                    throw new Error('v12 image source unavailable');
+                if (
+                    (issuedImageIssuer !== null || issuedVoiceIssuer !== null) &&
+                    (!sourceScopeCurrent() || !mediaIssuersCurrent())
+                ) {
+                    throw new Error(
+                        issuedImageIssuer !== null
+                            ? 'v12 image source unavailable'
+                            : 'v12 voice source unavailable',
+                    );
                 }
             }
 
@@ -801,8 +907,11 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                     if (scope && source !== undefined) {
                         // Tickets identify an internal admission epoch; they do not
                         // authenticate the upstream event or same-process callers.
-                        if (sourceScopeCurrent()) {
-                            this.publish(converted, sourceScopeCurrent);
+                        const mediaSourceCurrent = (): boolean =>
+                            sourceScopeCurrent() && mediaIssuersCurrent();
+
+                        if (mediaSourceCurrent()) {
+                            this.publish(converted, mediaSourceCurrent);
                         }
                     } else {
                         this.publish(converted);
@@ -1113,6 +1222,43 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                 // Both diagnostic channels failed; retain delivery semantics.
             }
         }
+    }
+
+    private revokeMediaTokens(): void {
+        const imageTokens = this.imageFileTokens;
+        const voiceTokens = this.#voiceFileTokens;
+        // Remove both references before any reentrant revocation or diagnostic.
+        this.imageFileTokens = null;
+        this.#voiceFileTokens = null;
+
+        const revoke = (
+            tokens: V12ImageFileTokens | V12VoiceFileTokens | null,
+            kind: 'image' | 'voice',
+        ): void => {
+            if (!tokens) {
+                return;
+            }
+
+            try {
+                tokens.revoke();
+            } catch {
+                // Revocation is best-effort; never report the exception or URL.
+                const message = `v12 ${kind} token revocation failed`;
+
+                try {
+                    this.log.warn(message);
+                } catch {
+                    try {
+                        process.emitWarning(message);
+                    } catch {
+                        // Diagnostic failures must not block the remaining cleanup.
+                    }
+                }
+            }
+        };
+
+        revoke(imageTokens, 'image');
+        revoke(voiceTokens, 'voice');
     }
 
     private revokePoll(): void {

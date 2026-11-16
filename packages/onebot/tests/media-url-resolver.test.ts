@@ -1,7 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { subscribeLogs, type LogEntry } from '@snowluma/common/logger';
 import { MediaUrlResolver } from '../src/media-url-resolver';
-import { RKeyCache } from '../src/instance-rkey';
 import type { MessageElement } from '@snowluma/protocol/events';
 
 function makeBridge(overrides: Record<string, ReturnType<typeof vi.fn>> = {}) {
@@ -29,6 +28,14 @@ function makeRkey(overrides: { resolveMediaUrl?: ReturnType<typeof vi.fn> } = {}
 }
 
 const MEDIA_NODE = { fileUuid: 'uuid-1' };
+const FAILURE_CASES = [
+    ['file', true, 'getUrl'],
+    ['file', false, 'getPrivateUrl'],
+    ['record', true, 'getPttUrl'],
+    ['record', false, 'getPrivatePttUrl'],
+    ['video', true, 'getVideoUrl'],
+    ['video', false, 'getPrivateVideoUrl'],
+] as const;
 
 describe('MediaUrlResolver — file element', () => {
     let bridge: ReturnType<typeof makeBridge>;
@@ -125,20 +132,14 @@ describe('MediaUrlResolver — short-circuits and resilience', () => {
         expect(rkey.resolveMediaUrl).toHaveBeenCalledOnce();
     });
 
-    it.each([
-        ['file', true, 'getUrl'],
-        ['file', false, 'getPrivateUrl'],
-        ['record', true, 'getPttUrl'],
-        ['record', false, 'getPrivatePttUrl'],
-        ['video', true, 'getVideoUrl'],
-        ['video', false, 'getPrivateVideoUrl'],
-    ] as const)(
+    it.each(FAILURE_CASES)(
         '%s group=%s: reports URL failure and preserves the media',
         async (type, isGroup, method) => {
             const bridge = makeBridge({
                 [method]: vi.fn().mockRejectedValue(new Error('network down')),
             });
-            const resolver = new MediaUrlResolver(bridge as any, new RKeyCache());
+            const rkey = makeRkey();
+            const resolver = new MediaUrlResolver(bridge as any, rkey as any);
             const element: MessageElement = {
                 type,
                 fileId: 'fid',
@@ -152,15 +153,154 @@ describe('MediaUrlResolver — short-circuits and resilience', () => {
             try {
                 await expect(resolver.resolve(element, isGroup, 12345)).resolves.toBe('');
                 expect(element).toEqual(original);
+                expect(rkey.resolveMediaUrl).toHaveBeenCalledOnce();
+                expect(rkey.resolveMediaUrl).toHaveBeenCalledWith(bridge, element, isGroup);
+                expect(rkey.resolveMediaUrl.mock.calls[0]?.[0]).toBe(bridge);
+                expect(rkey.resolveMediaUrl.mock.calls[0]?.[1]).toBe(element);
                 expect(entries).toContainEqual(
                     expect.objectContaining({
                         level: 'warn',
-                        message: expect.stringMatching(/media URL resolution failed.*network down/),
+                        scope: 'OneBot',
+                        message: `media URL resolution failed type=${type} is_group=${isGroup}: [redacted]`,
                     }),
                 );
+                expect(JSON.stringify(entries)).not.toContain('network down');
             } finally {
                 unsubscribe();
             }
+        },
+    );
+
+    for (const [type, isGroup, method] of FAILURE_CASES) {
+        it.each(['Error', 'Error getters', 'getter object', 'string'] as const)(
+            `${type} group=${isGroup}: redacts %s failures without inspecting them`,
+            async (kind) => {
+                const marker = 'synthetic_media_url_token_marker_01';
+                const syntheticUrl = `https://media.invalid/download?token=${marker}&sig=fake_signature`;
+                const messageGetter = vi.fn(() => {
+                    if (kind === 'getter object') {
+                        throw new Error('unexpected message getter access');
+                    }
+
+                    return `download failed: ${syntheticUrl}`;
+                });
+                const stackGetter = vi.fn(() => {
+                    throw new Error('unexpected stack getter access');
+                });
+                const toStringGetter = vi.fn(() => {
+                    throw new Error('unexpected toString getter access');
+                });
+                const toPrimitiveGetter = vi.fn(() => {
+                    throw new Error('unexpected Symbol.toPrimitive getter access');
+                });
+                const accessors = {
+                    stack: { configurable: true, enumerable: true, get: stackGetter },
+                    toString: { configurable: true, enumerable: true, get: toStringGetter },
+                    [Symbol.toPrimitive]: { configurable: true, get: toPrimitiveGetter },
+                    message: { configurable: true, enumerable: true, get: messageGetter },
+                };
+                let thrown: unknown;
+
+                if (kind === 'Error') {
+                    thrown = new Error(`download failed: ${syntheticUrl}`);
+                } else if (kind === 'Error getters') {
+                    thrown = Object.defineProperties(
+                        new Error(`download failed: ${syntheticUrl}`),
+                        accessors,
+                    );
+                } else if (kind === 'getter object') {
+                    thrown = Object.defineProperties({ payload: syntheticUrl }, accessors);
+                } else {
+                    thrown = `download failed: ${syntheticUrl}`;
+                }
+
+                const failingApi =
+                    kind === 'getter object'
+                        ? vi.fn(() => {
+                              throw thrown;
+                          })
+                        : vi.fn().mockRejectedValue(thrown);
+                const bridge = makeBridge({ [method]: failingApi });
+                const rkeyResult = 'resolved-by-fake-rkey';
+                const rkey = makeRkey({ resolveMediaUrl: vi.fn(async () => rkeyResult) });
+                const resolver = new MediaUrlResolver(bridge as any, rkey as any);
+                const element: MessageElement = {
+                    type,
+                    fileId: 'fid',
+                    fileHash: 'hash',
+                    mediaNode: MEDIA_NODE,
+                    url: '',
+                };
+                const original = structuredClone(element);
+                const entries: LogEntry[] = [];
+                const unsubscribe = subscribeLogs((entry) => entries.push(entry));
+
+                try {
+                    await expect(resolver.resolve(element, isGroup, 12345)).resolves.toBe(
+                        rkeyResult,
+                    );
+                    expect(element).toEqual(original);
+                    const api = bridge.apis.groupFile[method];
+                    expect(api).toHaveBeenCalledOnce();
+
+                    if (type === 'file') {
+                        if (isGroup) {
+                            expect(api).toHaveBeenCalledWith(12345, 'fid');
+                        } else {
+                            expect(api).toHaveBeenCalledWith(12345, 'fid', 'hash');
+                        }
+                    } else if (isGroup) {
+                        expect(api).toHaveBeenCalledWith(12345, MEDIA_NODE);
+                    } else {
+                        expect(api).toHaveBeenCalledWith(MEDIA_NODE);
+                    }
+
+                    expect(rkey.resolveMediaUrl).toHaveBeenCalledOnce();
+                    expect(rkey.resolveMediaUrl).toHaveBeenCalledWith(bridge, element, isGroup);
+                    expect(rkey.resolveMediaUrl.mock.calls[0]?.[0]).toBe(bridge);
+                    expect(rkey.resolveMediaUrl.mock.calls[0]?.[1]).toBe(element);
+                    expect(api.mock.invocationCallOrder[0]!).toBeLessThan(
+                        rkey.resolveMediaUrl.mock.invocationCallOrder[0]!,
+                    );
+                    expect(entries).toContainEqual(
+                        expect.objectContaining({
+                            level: 'warn',
+                            scope: 'OneBot',
+                            message: `media URL resolution failed type=${type} is_group=${isGroup}: [redacted]`,
+                        }),
+                    );
+                    expect(JSON.stringify(entries)).not.toContain(marker);
+                    expect(JSON.stringify(entries)).not.toContain(syntheticUrl);
+                    expect(messageGetter).not.toHaveBeenCalled();
+                    expect(stackGetter).not.toHaveBeenCalled();
+                    expect(toStringGetter).not.toHaveBeenCalled();
+                    expect(toPrimitiveGetter).not.toHaveBeenCalled();
+                } finally {
+                    unsubscribe();
+                }
+            },
+        );
+    }
+
+    it.each([
+        [true, 'getPttUrl'],
+        [false, 'getPrivatePttUrl'],
+    ] as const)(
+        'record group=%s: preserves a subsequent RKey rejection',
+        async (isGroup, method) => {
+            const bridge = makeBridge({
+                [method]: vi.fn().mockRejectedValue(new Error('fake media failure')),
+            });
+            const rkeyFailure = new Error('fake rkey failure');
+            const rkey = makeRkey({ resolveMediaUrl: vi.fn().mockRejectedValue(rkeyFailure) });
+            const resolver = new MediaUrlResolver(bridge as any, rkey as any);
+            const element: MessageElement = { type: 'record', mediaNode: MEDIA_NODE };
+            const original = structuredClone(element);
+
+            await expect(resolver.resolve(element, isGroup, 12345)).rejects.toBe(rkeyFailure);
+            expect(element).toEqual(original);
+            expect(rkey.resolveMediaUrl).toHaveBeenCalledOnce();
+            expect(rkey.resolveMediaUrl).toHaveBeenCalledWith(bridge, element, isGroup);
         },
     );
 

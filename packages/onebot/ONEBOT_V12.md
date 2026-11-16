@@ -73,74 +73,104 @@ response is not proof that a requested deletion did or did not happen. Its
 response inspection rejects a final Proxy value after JavaScript's `await` has
 performed thenable handling, which may itself execute a `then` getter.
 
-`get_file` currently supports only `type: "url"`. Ordinary opaque `file_id`
+`get_file` currently supports only `type: "url"`. Non-reserved opaque `file_id`
 values are passed once to the existing account-local v11 media lookup; supported
 hits come from that account's cached image or voice metadata. The ID must be a
 nonempty string of at most 4,096 UTF-16 code units. Supported v12 incoming image
-events can also supply a separate transient image handle as described below;
-v12 uploads do not yet supply IDs. Success returns only `name` and the original
-HTTP(S) `url`; URL syntax is checked, but availability, validity period, required
-credentials, or access from the application are not verified. Cached names can
-be identifiers or other stored labels rather than original filenames. A label
+and voice segments can instead supply separate transient handles as described
+below; v12 uploads do not yet supply IDs. Success returns only `name` and the
+original HTTP(S) `url`. The [OneBot URL mode](https://12.onebot.dev/interface/file/actions/#get_file)
+requires the application to be able to download the file; Jiyu's best-effort URL
+syntax check does not establish that requirement, URL availability, validity
+period, required credentials, or application access. Cached names can be
+identifiers or other stored labels rather than original filenames. A label
 containing `/` or NUL, or equal to `.` or `..`, is projected as an empty unknown
 name because it is not a Linux filename; other labels are retained without proof
 they were the original filename. Consumers must validate names for their own
-platform before using them as filesystem paths. Missing
-URL or other retrieval types return 10004; a cache miss is not proof that the
-underlying file does not exist. Group/normal files, videos, uploads, local paths,
-inline data and fragmented transfer remain unsupported here. The v11
-`get_file` request, result and action-error logs are redacted, and the image
-URL-refresh warning no longer records its exception; observers and other
-lower-level logging or configured URL-refresh services can still see data.
+platform before using them as filesystem paths. Missing URL or other retrieval
+types return 10004; a cache miss is not proof that the underlying file does not
+exist. Group/normal files, videos, uploads, local paths, inline data and
+fragmented transfer remain unsupported here. The v11 `get_file` request, result
+and action-error logs are redacted, and the image URL-refresh warning no longer
+records its exception; observers and other lower-level logging or configured
+URL-refresh services can still see data.
 
 Incoming friend/private and normal/group messages with text and v11 `at`
 segments are converted to v12 `text`, `mention` and `mention_all` segments.
-Ordinary incoming images are additionally projected as `image` segments when
-an internal source ticket remains current and the observed v11 fields match the
-supported ordinary image shape. This checks the public JSON-visible keys and
-reads required image fields as own data properties; non-enumerable internal
-metadata is not projected or treated as evidence of QQ origin. The local
-`alt_message` renders each such image as `[图片]`. Flash images, marketplace
-faces, nonzero subtypes, custom summaries, sent-message echoes and other
-unsupported segments visible at this boundary are rejected for the whole v12
-event; v11 behavior is unchanged.
-An upstream decoder or v11 conversion may already have omitted a segment, so
-this is not an end-to-end guarantee against losing message semantics. The
-conversion preserves the v11 field, not an independently verified QQ mention:
-the upstream decoder can normalize an unresolved mention UIN to zero, which
-the v11 converter represents as `all`. The v12 `alt_message` renders mentions
-as `@<user_id>` or `@全体成员`, without reconstructing platform display names.
-For supported incoming private messages, an enumerable own v11 data property
-`auto_reply: true` is preserved as the optional own JSON field
+A current internal source ticket also permits ordinary incoming images and
+voice records with the supported v11 public shapes. In particular, voice must be
+exactly `{type: 'record', data: {file: <string>, url: <nonempty HTTP(S) string>}}`
+at the public JSON-visible boundary; `file` may be empty. Required fields are own
+enumerable data properties, and visible extras, accessors and proxies are
+rejected. Non-enumerable internal metadata is not projected or treated as
+evidence of QQ origin. An accepted record is projected lossily as exactly
+`{type: 'voice', data: {file_id}}`, with `[语音]` in `alt_message`; an accepted
+image renders as `[图片]`. Before issuing any media handle, the account-local
+runtime checks the required event data, every supported segment shape and every
+media URL against its syntax and size limits. Text, mentions, images and voice
+retain their source order. Media issuers recheck their URLs and issue in that
+order; a later issuance failure exposes no partial event but does not roll back
+earlier issuer side effects. Flash images, marketplace faces, nonzero image
+subtypes, custom summaries, audio/video segments, media-bearing sent-message
+echoes and other unsupported segments visible at this boundary reject the whole
+v12 event; sending voice remains unsupported and v11 message and action
+semantics are unchanged.
+
+Before issuing any handle for an incoming v12 event containing images or voice,
+the runtime also enforces a combined maximum of 128 image/voice segments and
+256 KiB (262,144 bytes) across their UTF-8 URLs. Exceeding either limit fails
+the whole conversion without truncation; an already-prepared internal ordered
+poll admission records an ordering gap under its existing rules. Text-only
+events and v11 behavior are unaffected by these media limits.
+These are local workload policies, not QQ or OneBot protocol limits, and they
+do not bound total CPU use or process RSS. If a subsequent issuer or provider
+fails after reserving a nonce, that nonce is not rolled back.
+
+This projection is not lossless or an end-to-end no-network guarantee. A real
+`OneBotInstance` normally passes through the existing v11 RKey and, for voice,
+PTT URL resolution before constructing the event. That resolver may access the
+network or change the source element; an upstream decoder or v11 conversion
+may already have omitted a segment or semantics such as format and duration.
+Existing v11 file-ID logic remains unchanged. If the v11 media URL population
+step throws, that particular resolver catch logs a fixed redacted warning
+instead of the original exception; it is not a guarantee about other logs.
+The conversion preserves the v11 mention field, not an independently verified QQ
+mention: the upstream decoder can normalize an unresolved mention UIN to zero,
+which the v11 converter represents as `all`. The v12 `alt_message` renders
+mentions as `@<user_id>` or `@全体成员`, without reconstructing platform display
+names. For supported incoming private messages, an enumerable own v11 data
+property `auto_reply: true` is preserved as the optional own JSON field
 `qq.auto_reply: true`. Accessor and non-enumerable properties are ignored
-without invoking an `auto_reply` getter. This is a Jiyu
-QQ-specific extension, not a OneBot 12 standard field or confirmation of a
-successful send. Other values are ignored, and the field is omitted when absent;
-group messages never acquire it. This is partial event conversion support, not a
-claim that HTTP event polling or live QQ behavior has been verified.
+without invoking an `auto_reply` getter. This is a Jiyu QQ-specific extension,
+not a OneBot 12 standard field or confirmation of a successful send. Other values
+are ignored, and the field is omitted when absent; group messages never acquire
+it. This is partial event conversion support: production HTTP event polling is
+not implemented, and local fixtures do not prove QQ interoperability.
 
-Each supported image event carries a `jiyu-image:v1:` file ID that seals the
-HTTP(S) URL observed in its v11 segment. A later `get_file` on the same active
-v12 runtime returns that exact URL and an empty unknown name, without querying
-the v11 media alias, refreshing the URL, or downloading the file. This new branch
-does not invoke v11 action observers or v11 `get_file` action logs. URLs above
-3,000 UTF-8 bytes or rejected by the existing URL syntax checks are unsupported.
-The ID protects an observed URL string, not the original image bytes, QQ source
-identity, future URL content or access. Local AES-GCM is used only for this
-handle and is unrelated to QQ signing or its encryption algorithms.
+Each supported image or voice segment carries a transient `jiyu-image:v1:` or
+`jiyu-voice:v1:` file ID that seals the exact HTTP(S) URL observed in its v11
+segment. A later `get_file` on the same active v12 runtime returns that exact URL
+and `name: ''`, without calling the v11 media lookup, refreshing the URL,
+downloading or validating the file, or invoking v11 `get_file` action observers
+or logs. URLs above 3,000 UTF-8 bytes, IDs above 4,096 UTF-16 code units, and
+URLs rejected by the existing syntax checks are unsupported. The ID protects an
+observed URL string, not the original bytes, QQ source identity, actual file
+identity, future URL content or access. Local AES-GCM is unrelated to QQ signing
+or its encryption algorithms; voice uses a separate purpose, random key, AAD and
+nonce state from images.
 
-The ID is a transferable bearer reference: anyone who can call `get_file` on
+Each ID is a transferable bearer reference: anyone who can call `get_file` on
 the issuing runtime can recover the URL, and its length is visible. The same
-runtime retains its key across a listener close/reopen and online-status changes;
-permanent runtime quiesce/force-close revokes it, while replacement or restart
-uses a new key. Each key issues at most 2²⁴ handles; exhaustion rejects new
-image projections without revoking previously issued handles. Key-buffer clearing
-is best effort and does not erase copies held
-by JavaScript, native crypto or consumers. The `jiyu-image:v1:` prefix is now
-reserved: an invalid, tampered, revoked or foreign handle fails rather than
-falling back to v11, so a pre-existing v11 alias with that prefix is no longer
-accepted through v12 `get_file`. Existing v11 actions themselves are unchanged.
-The original v11 event and debug/observer channels may still contain the URL.
+runtime retains its keys across listener close/reopen and online-status changes;
+permanent runtime quiesce/force-close revokes them, while replacement or restart
+uses new keys. Each key issues at most 2²⁴ handles; exhaustion rejects new
+projections for that purpose without revoking previously issued handles.
+Key-buffer clearing is best effort and does not erase copies held by JavaScript,
+native crypto or consumers. Both prefixes are reserved: an invalid, tampered,
+revoked or foreign handle fails rather than falling back to v11. In particular,
+a pre-existing v11 alias beginning `jiyu-voice:v1:` is no longer accepted via
+v12 `get_file`; v11 actions themselves remain unchanged. The original v11 event
+and debug/observer channels may still contain the URL.
 
 For an ordinary event delivered with an internal source ticket, v12 WebSocket
 fanout now rechecks its original listener binding and online epoch before
@@ -148,12 +178,15 @@ publishing and before each subscriber. An expired, foreign or unverifiable
 provided ticket is not published to v12 subscribers; v11 dispatch is unchanged.
 Events with no ticket retain the legacy unguarded fanout. A synchronous reentry
 with the exact same event and payload can inherit the surrounding ticket scope.
-For image projections the source is also rechecked before poll admission;
-other existing admission and settlement behavior is unchanged, and a poll result
-already committed before a later WebSocket check is not rolled back. This fence depends
-on the instance's synchronous source verifier; it does not establish upstream
-QQ identity, suppress same-epoch delivery to a later-joining client, or cancel
-an asynchronous subscriber that already began work.
+For image and voice projections the source and current issuer references are also
+rechecked before poll resolution and WebSocket delivery; other admission and
+settlement behavior is unchanged. A poll result already committed before a later
+WebSocket check is not rolled back, and the internal poll seam is not a
+same-process authentication boundary. These checks depend on the instance's
+synchronous source verifier and observed issuer identity; they do not establish
+upstream QQ identity, prevent arbitrary same-process mutation, suppress same-epoch
+delivery to a later-joining client, or cancel an asynchronous subscriber that
+already began work.
 
 A private `friend_recall` may produce `notice.private_message_delete` only
 through the account-local runtime path. The originating upstream
@@ -261,9 +294,10 @@ remain unsupported. A self echo with an unsupported segment fails conversion
 rather than producing a partial event; if the internal ordered poll owner is
 active, this failure marks an ordering gap instead of silently skipping the
 event. The poll owner is not wired to a production HTTP polling action. Other
-notices and requests are not yet translated to v12. Unsupported actions, parameters and message segments return explicit errors. File APIs, HTTP event
-polling and HTTP Webhook are not implemented by this listener. Capability and
-error details remain authoritative at runtime.
+notices and requests are not yet translated to v12. Unsupported actions,
+parameters and message segments return explicit errors. File operations beyond
+the `get_file` URL subset, HTTP event polling and HTTP Webhook are not implemented
+by this listener. Capability and error details remain authoritative at runtime.
 
 A WebSocket connection receives `meta.connect` first and then the current
 account status; network connection alone does not assert that the account is

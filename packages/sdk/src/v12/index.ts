@@ -27,6 +27,7 @@ export type {
     OneBot12TextSegment,
     OneBot12UserInfo,
     OneBot12UserInfoResponse,
+    OneBot12VoiceSegment,
 } from './types.js';
 export {
     ONEBOT12_JSON_MAX_BYTES,

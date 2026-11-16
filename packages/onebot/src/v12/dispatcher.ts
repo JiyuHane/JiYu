@@ -2,7 +2,7 @@ import { isProxy } from 'node:util/types';
 import type { ApiResponse, JsonObject, JsonValue } from '../types';
 import type { V12CoreOptions, V12Response } from './types';
 import { classifyFileUrl } from './file-url';
-import { isV12ImageToken } from './image-file-token';
+import { isV12ImageToken, isV12VoiceToken } from './image-file-token';
 import {
     MAX_REQUEST_STRING_LENGTH,
     fromV11MessageId,
@@ -572,6 +572,20 @@ export class V12Dispatcher {
             // so could turn a damaged or foreign handle into a different file.
             try {
                 const url = this.options.resolveImageFileUrl?.(fileId);
+                const checked = classifyFileUrl(url);
+                return checked.kind === 'valid'
+                    ? response(0, '', { name: '', url: checked.url }, echo)
+                    : invalid();
+            } catch {
+                return unavailable();
+            }
+        }
+
+        if (isV12VoiceToken(fileId)) {
+            // Reserved voice handles have an independent issuer and must not
+            // fall back to a v11 alias, even when malformed or unredeemable.
+            try {
+                const url = this.options.resolveVoiceFileUrl?.(fileId);
                 const checked = classifyFileUrl(url);
                 return checked.kind === 'valid'
                     ? response(0, '', { name: '', url: checked.url }, echo)

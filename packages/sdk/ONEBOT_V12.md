@@ -160,26 +160,61 @@ they use; a type assertion is not validation.
 Jiyu's current v12 server supports only this URL subset, not the complete
 `get_file` action: bytes and path modes, and other file operations, are not
 implemented. Supply an already-known legacy ID from the same account's v11
-media cache, or the transient ID from a supported incoming v12 image. A cache
-miss or another kind of ID may fail. An incoming image ID is a transferable
-same-runtime handle for the URL observed during conversion; it does not identify
-verified file bytes and expires when that runtime is permanently quiesced,
-force-closed or replaced.
-Jiyu checks that a returned link has an acceptable HTTP(S) URL syntax, but does
-not verify its reachability, expiration, or the caller's permission to access it.
-A cached
-label containing `/` or NUL, or equal to `.` or `..`, becomes an empty unknown
-`name`; other labels may still be cache IDs rather than original filenames.
-Validate `name` for your own platform before using it as a filesystem path.
+media cache, or the transient ID from a supported incoming v12 image or voice
+segment. A cache miss or another kind of ID may fail. The
+[OneBot URL-mode definition](https://12.onebot.dev/interface/file/actions/#get_file)
+requires the application to be able to download the file. Jiyu checks URL syntax
+on a best-effort basis, but does not establish that requirement, reachability,
+expiration or the caller's permission to access the URL. A cached label
+containing `/` or NUL, or equal to `.` or `..`, becomes an empty unknown `name`;
+other labels may still be cache IDs rather than original filenames. Validate
+`name` for your own platform before using it as a filesystem path.
 
-`OneBot12ImageSegment` is available as an optional static type. The generic SDK
-parser does not validate its `file_id`. Jiyu currently emits this segment only
-for a limited set of source-qualified ordinary incoming images. Its
-`jiyu-image:v1:` IDs are bearer references to an observed URL, not proof of file
-identity or QQ origin; a handle only works with its issuing active runtime and
-is invalid after that runtime is quiesced, force-closed or replaced. This reserved prefix is
-not forwarded to v11, including when decoding fails. Outbound image segments,
-voice/video, flash and marketplace-face conversions remain unsupported.
+`OneBot12ImageSegment` and `OneBot12VoiceSegment` are optional static types. The
+voice type describes `type: 'voice'` with a string `data.file_id`; the generic
+SDK parser does not validate that field or other segment-specific fields. A type
+assertion is not validation. Jiyu emits voice only for a current source-qualified
+friend/private or normal/group incoming v11 `record` whose public data is
+exactly `{file: string, url: nonempty HTTP(S) string}`. It outputs only
+`{type: 'voice', data: {file_id}}`, with `[语音]` in `alt_message`. Supported
+text, mentions, images and voices retain their order; unsupported or invalid
+visible segments reject the whole event. Outbound image/voice, self-sent media
+echoes, v11 `audio`, video, flash and marketplace-face conversions remain
+unsupported.
+
+Before issuing any handle for an incoming v12 event containing images or voice,
+the Jiyu runtime limits the combined number of image/voice segments to 128 and
+their combined UTF-8 URL lengths to 256 KiB (262,144 bytes). Exceeding either
+limit fails the whole conversion without truncation; an already-prepared
+internal ordered poll admission records a gap under its existing rules. Text-only
+events and v11 behavior are unaffected by these media limits.
+These are local workload policies, not QQ or OneBot protocol limits, and they do
+not bound total CPU use or process RSS. A nonce already reserved by an issuer is
+not rolled back if that issuer or its provider subsequently fails.
+
+Jiyu's `jiyu-image:v1:` and `jiyu-voice:v1:` IDs are transferable bearer
+references to the URL observed in the respective v11 segment, not proof of QQ
+origin, actual file identity or bytes. For a supported handle, `get_file`
+returns `name: ''` and the original observed URL without a v11 lookup, refresh,
+download or file validation. The voice handle uses a separate purpose, random
+key, AAD and nonce state from the image handle; a URL is limited to 3,000 UTF-8
+bytes, an ID to 4,096 UTF-16 code units and each key to 2²⁴ issuances. The same
+runtime keeps its keys across listener close/reopen; permanent quiesce,
+force-close, replacement or restart invalidates its handles. Key clearing is
+best effort. Either reserved prefix bypasses v11 even when decoding fails, so a
+pre-existing v11 alias beginning `jiyu-voice:v1:` no longer works through v12
+`get_file`; v11 alias lookup itself is unchanged. A caller with access to the issuing
+runtime can redeem a transferred handle, its length leaks URL length, and v11
+events or debug/observer paths may still expose the URL.
+
+This snapshot is not an end-to-end no-network or lossless media path. A real
+`OneBotInstance` normally performs v11 RKey and voice PTT resolution before
+constructing the event; the resolver may access the network or change the source
+element, and upstream conversion may lose format, duration or other semantics.
+Existing v11 file-ID logic is unchanged. A redacted warning replaces exception
+details only in the media URL population catch; other logs have separate
+behavior. Production HTTP event polling remains unavailable, and local fixtures
+do not establish live QQ interoperability. See the [server details](../onebot/ONEBOT_V12.md).
 
 ## Data and compatibility limits
 
