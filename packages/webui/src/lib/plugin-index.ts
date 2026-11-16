@@ -6,6 +6,7 @@ import {
     type LocalPluginsResult,
     type LocalPluginMutationResult,
     type PluginConfigField,
+    type PluginConfigOptionValue,
     type PluginConfigValue,
     type PluginDisplaySidecar,
 } from '@/lib/api/types';
@@ -196,16 +197,59 @@ function unsupportedConfig(): never {
     throw new ApiError(502, '插件配置格式或字段暂不支持', 'CONFIG_UI_UNSUPPORTED');
 }
 
+/** Snapshot a bounded dense JSON array without reading element accessors or iterators. */
+function snapshotConfigFields(fields: unknown): readonly unknown[] | null {
+    try {
+        if (!Array.isArray(fields) || Object.getPrototypeOf(fields) !== Array.prototype) {
+            return null;
+        }
+
+        const lengthProperty = Object.getOwnPropertyDescriptor(fields, 'length');
+        const length = lengthProperty && 'value' in lengthProperty ? lengthProperty.value : null;
+
+        if (
+            typeof length !== 'number' ||
+            !Number.isSafeInteger(length) ||
+            length < 0 ||
+            length > 64 ||
+            Reflect.ownKeys(fields).length !== length + 1
+        ) {
+            return null;
+        }
+
+        const snapshot: unknown[] = [];
+
+        for (let index = 0; index < length; index++) {
+            const item = Object.getOwnPropertyDescriptor(fields, String(index));
+
+            if (!item || !item.enumerable || !('value' in item)) {
+                return null;
+            }
+
+            snapshot.push(item.value);
+        }
+
+        return Object.freeze(snapshot);
+    } catch {
+        // Non-JSON values may cause reflection to throw.
+        return null;
+    }
+}
+
 /** Reject unsupported schema semantics instead of silently dropping fields. */
 export function parseConfigFields(fields: unknown): PluginConfigField[] {
-    if (!Array.isArray(fields) || fields.length > 64) {
+    const fieldSnapshot = snapshotConfigFields(fields);
+
+    if (fieldSnapshot === null) {
         return unsupportedConfig();
     }
 
     const seen = new Set<string>();
     const accepted: PluginConfigField[] = [];
 
-    for (const field of fields) {
+    for (let index = 0; index < fieldSnapshot.length; index++) {
+        const field = fieldSnapshot[index];
+
         if (
             !isPlainConfigRecord(field) ||
             Object.keys(field).some(
@@ -231,8 +275,10 @@ export function parseConfigFields(fields: unknown): PluginConfigField[] {
             !field.label.trim() ||
             field.label.length > 256 ||
             typeof field.type !== 'string' ||
-            !['string', 'text', 'number', 'boolean', 'select'].includes(field.type) ||
-            (field.type === 'select'
+            !['string', 'text', 'number', 'boolean', 'select', 'multi-select'].includes(
+                field.type,
+            ) ||
+            (field.type === 'select' || field.type === 'multi-select'
                 ? !Object.hasOwn(field, 'options') || !isConfigOptions(field.options)
                 : Object.hasOwn(field, 'options')) ||
             (Object.hasOwn(field, 'reactive') && field.reactive !== false) ||
@@ -243,12 +289,28 @@ export function parseConfigFields(fields: unknown): PluginConfigField[] {
             return unsupportedConfig();
         }
 
-        if (Object.hasOwn(field, 'default') && !isConfigScalar(field.type, field.default)) {
+        if (
+            Object.hasOwn(field, 'default') &&
+            (field.type === 'multi-select'
+                ? copyConfigOptionValues(field.default) === null
+                : !isConfigScalar(field.type, field.default))
+        ) {
             return unsupportedConfig();
         }
 
-        seen.add(field.key);
-        accepted.push(field as unknown as PluginConfigField);
+        if (field.type === 'multi-select') {
+            const snapshot = snapshotMultiSelectField(field);
+
+            if (seen.has(snapshot.key)) {
+                return unsupportedConfig();
+            }
+
+            seen.add(snapshot.key);
+            accepted.push(snapshot);
+        } else {
+            seen.add(field.key);
+            accepted.push(field as unknown as PluginConfigField);
+        }
     }
 
     return accepted;
@@ -262,11 +324,55 @@ function isSafeConfigNumber(value: number): boolean {
     );
 }
 
-function isConfigOptionValue(value: unknown): value is string | number {
+function isConfigOptionValue(value: unknown): value is PluginConfigOptionValue {
     return (
         (typeof value === 'string' && value.length <= 16384) ||
         (typeof value === 'number' && isSafeConfigNumber(value))
     );
+}
+
+/** Copy a bounded, dense JSON array without invoking ordinary element accessors. */
+function copyConfigOptionValues(value: unknown, maxLength = 256): PluginConfigOptionValue[] | null {
+    try {
+        if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+            return null;
+        }
+
+        const lengthProperty = Object.getOwnPropertyDescriptor(value, 'length');
+        const length = lengthProperty && 'value' in lengthProperty ? lengthProperty.value : null;
+
+        if (
+            typeof length !== 'number' ||
+            !Number.isSafeInteger(length) ||
+            length < 0 ||
+            length > maxLength ||
+            Reflect.ownKeys(value).length !== length + 1
+        ) {
+            return null;
+        }
+
+        const copy: PluginConfigOptionValue[] = [];
+
+        for (let index = 0; index < length; index++) {
+            const item = Object.getOwnPropertyDescriptor(value, String(index));
+
+            if (
+                !item ||
+                !item.enumerable ||
+                !('value' in item) ||
+                !isConfigOptionValue(item.value)
+            ) {
+                return null;
+            }
+
+            copy.push(item.value);
+        }
+
+        return copy;
+    } catch {
+        // Reflection on non-JSON values may itself throw; reject the value.
+        return null;
+    }
 }
 
 /** Network responses are decoded JSON; descriptors also reject ordinary accessors. */
@@ -309,6 +415,138 @@ function isConfigOptions(value: unknown): boolean {
     }
 
     return true;
+}
+
+/** Freeze an independent multi-select snapshot using only validated own data properties. */
+function snapshotMultiSelectField(field: Record<string, unknown>): PluginConfigField {
+    try {
+        const descriptors = Object.getOwnPropertyDescriptors(field);
+        const names = Reflect.ownKeys(descriptors);
+        const allowed = [
+            'key',
+            'label',
+            'type',
+            'default',
+            'description',
+            'reactive',
+            'hidden',
+            'options',
+        ];
+        const snapshot: Record<string, unknown> = {};
+
+        for (const name of names) {
+            if (typeof name !== 'string' || !allowed.includes(name)) {
+                return unsupportedConfig();
+            }
+
+            const descriptor = descriptors[name];
+
+            if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) {
+                return unsupportedConfig();
+            }
+
+            if (name === 'options') {
+                const source: unknown = descriptor.value;
+
+                if (!Array.isArray(source) || !isConfigOptions(source)) {
+                    return unsupportedConfig();
+                }
+
+                const lengthProperty = Object.getOwnPropertyDescriptor(source, 'length');
+                const length =
+                    lengthProperty && 'value' in lengthProperty ? lengthProperty.value : null;
+
+                if (
+                    typeof length !== 'number' ||
+                    !Number.isSafeInteger(length) ||
+                    length < 1 ||
+                    length > 256 ||
+                    Reflect.ownKeys(source).length !== length + 1
+                ) {
+                    return unsupportedConfig();
+                }
+
+                const options: NonNullable<PluginConfigField['options']> = [];
+                const seen = new Set<PluginConfigOptionValue>();
+
+                for (let index = 0; index < length; index++) {
+                    const item = Object.getOwnPropertyDescriptor(source, String(index));
+
+                    if (
+                        !item ||
+                        !item.enumerable ||
+                        !('value' in item) ||
+                        !isPlainConfigRecord(item.value) ||
+                        Reflect.ownKeys(item.value).length !== 2
+                    ) {
+                        return unsupportedConfig();
+                    }
+
+                    const label = Object.getOwnPropertyDescriptor(item.value, 'label');
+                    const value = Object.getOwnPropertyDescriptor(item.value, 'value');
+
+                    if (
+                        !label ||
+                        !label.enumerable ||
+                        !('value' in label) ||
+                        typeof label.value !== 'string' ||
+                        !label.value.trim() ||
+                        label.value.length > 256 ||
+                        !value ||
+                        !value.enumerable ||
+                        !('value' in value) ||
+                        !isConfigOptionValue(value.value) ||
+                        seen.has(value.value)
+                    ) {
+                        return unsupportedConfig();
+                    }
+
+                    seen.add(value.value);
+                    options.push(Object.freeze({ label: label.value, value: value.value }));
+                }
+
+                Object.freeze(options);
+                snapshot.options = options;
+            } else if (name === 'default') {
+                const defaults = copyConfigOptionValues(descriptor.value);
+
+                if (defaults === null) {
+                    return unsupportedConfig();
+                }
+
+                Object.freeze(defaults);
+                snapshot.default = defaults;
+            } else {
+                snapshot[name] = descriptor.value;
+            }
+        }
+
+        if (
+            typeof snapshot.key !== 'string' ||
+            !snapshot.key.trim() ||
+            snapshot.key.length > 128 ||
+            [...snapshot.key].some(
+                (char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127,
+            ) ||
+            DANGEROUS_CONFIG_KEYS.has(snapshot.key) ||
+            typeof snapshot.label !== 'string' ||
+            !snapshot.label.trim() ||
+            snapshot.label.length > 256 ||
+            snapshot.type !== 'multi-select' ||
+            !Object.hasOwn(snapshot, 'options') ||
+            (Object.hasOwn(snapshot, 'reactive') && snapshot.reactive !== false) ||
+            (Object.hasOwn(snapshot, 'hidden') && snapshot.hidden !== false) ||
+            (snapshot.description !== undefined &&
+                (typeof snapshot.description !== 'string' || snapshot.description.length > 1024))
+        ) {
+            return unsupportedConfig();
+        }
+
+        return Object.freeze(snapshot) as unknown as PluginConfigField;
+    } catch {
+        // Non-JSON inputs can make reflection fail; keep the public error fixed.
+        return unsupportedConfig();
+    }
 }
 
 function isConfigScalar(type: string, value: unknown): value is string | number | boolean {
@@ -527,8 +765,39 @@ export function parseConfigValue(fields: PluginConfigField[], value: unknown): P
     const result: PluginConfigValue = Object.create(null);
 
     for (const field of fields) {
+        if (!Object.hasOwn(value, field.key)) {
+            return unsupportedConfig();
+        }
+
+        if (field.type === 'multi-select') {
+            const options = field.options;
+
+            if (!options || !isConfigOptions(options)) {
+                return unsupportedConfig();
+            }
+
+            const selected = copyConfigOptionValues(value[field.key], options.length);
+
+            if (selected === null) {
+                return unsupportedConfig();
+            }
+
+            const available = new Set(options.map((option) => option.value));
+            const seen = new Set<PluginConfigOptionValue>();
+
+            for (const item of selected) {
+                if (seen.has(item) || !available.has(item)) {
+                    return unsupportedConfig();
+                }
+
+                seen.add(item);
+            }
+
+            result[field.key] = selected;
+            continue;
+        }
+
         if (
-            !Object.hasOwn(value, field.key) ||
             !isConfigScalar(field.type, value[field.key]) ||
             (field.type === 'select' &&
                 (!field.options ||

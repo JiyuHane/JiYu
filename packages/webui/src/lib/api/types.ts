@@ -206,17 +206,18 @@ export interface LocalPluginMutationResult {
 }
 
 export type PluginConfigScalar = string | number | boolean;
-export type PluginConfigValue = Record<string, PluginConfigScalar>;
+export type PluginConfigOptionValue = string | number;
+export type PluginConfigValue = Record<string, PluginConfigScalar | PluginConfigOptionValue[]>;
 export interface PluginConfigOption {
     label: string;
-    value: string | number;
+    value: PluginConfigOptionValue;
 }
 export interface PluginConfigField {
     key: string;
     label: string;
-    type: 'string' | 'text' | 'number' | 'boolean' | 'select';
+    type: 'string' | 'text' | 'number' | 'boolean' | 'select' | 'multi-select';
     description?: string;
-    default?: PluginConfigScalar;
+    default?: PluginConfigScalar | PluginConfigOptionValue[];
     options?: PluginConfigOption[];
     reactive?: false;
     hidden?: false;

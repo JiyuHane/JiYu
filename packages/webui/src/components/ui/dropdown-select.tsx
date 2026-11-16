@@ -10,6 +10,7 @@ interface DropdownSelectProps<T extends string> {
     options: ReadonlyArray<DropdownOption<T>>;
     onChange: (v: T) => void;
     ariaLabel: string;
+    disabled?: boolean;
     className?: string;
 }
 
@@ -26,6 +27,7 @@ export function DropdownSelect<T extends string>({
     options,
     onChange,
     ariaLabel,
+    disabled,
     className,
 }: DropdownSelectProps<T>) {
     return (
@@ -34,6 +36,7 @@ export function DropdownSelect<T extends string>({
             items={options.map((option) => ({ ...option }))}
             onChange={(next) => onChange(next as T)}
             label={ariaLabel}
+            disabled={disabled}
             className={className}
         />
     );

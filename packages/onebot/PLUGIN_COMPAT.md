@@ -83,12 +83,17 @@ The configuration panel calls static schema and optional get/set hooks only
 on explicit user actions. Its editor accepts at most 64 fields, only `key`,
 `label`, `type`, `default`, `description`, and optional `reactive: false` and
 `hidden: false` properties, nonempty safe keys and nonempty labels, and the
-`string`, `text`, `number`, `boolean`, and restricted static `select` types.
-A `select` also has `options`: 1–256 entries with nonblank labels and unique
-string or safe-number values; numeric `1` and string `"1"` remain distinct.
-The current value must match an option exactly. A declared default need not
-match an option, is shown as a declaration, and is never automatically saved.
-These are narrower UI rules than the builder's schema rules. When present, the
+`string`, `text`, `number`, `boolean`, and restricted static `select` and
+`multi-select` types. Both selection types require `options`: 1–256 entries with
+nonblank labels and unique string or safe-number values; numeric `1` and string
+`"1"` remain distinct. A single current value must match one option exactly. A
+multi-select current value must be a dense array of distinct declared options;
+an empty array is valid, and the editor preserves selection order. Declared
+defaults need not match the options, are displayed as declarations, and are
+never automatically saved; a multi-select default can also contain duplicates.
+The editor disables its controls while a configuration operation is busy or the
+account cannot execute; read and write confirmation and generation guards still
+apply. These are narrower UI rules than the builder's schema rules. When present, the
 metadata properties must be own enumerable data properties with the value
 `false`; `hidden: false` leaves the field visible. Other `hidden` and `reactive`
 values remain unsupported; neither metadata property enters configuration values

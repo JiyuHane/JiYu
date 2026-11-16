@@ -25,6 +25,7 @@ import {
     type LocalPluginsResult,
     type LocalPluginManifest,
     type PluginConfigField,
+    type PluginConfigOptionValue,
     type PluginConfigValue,
 } from '@/lib/api/types';
 import {
@@ -984,7 +985,114 @@ export function ManifestView({
 }
 
 type ConfigOperation = 'schema' | 'read' | 'write';
-type ConfigDraft = Record<string, string | boolean>;
+
+export function configConfirmationText(operation: ConfigOperation): string {
+    if (operation === 'schema') {
+        return '读取字段将清空当前未提交的配置；此操作可能执行插件代码，插件拥有当前进程完整权限。';
+    }
+
+    if (operation === 'read') {
+        return '读取将替换当前未提交的配置；此操作可能执行插件代码，插件拥有当前进程完整权限。';
+    }
+
+    return '将整体提交当前配置，可能覆盖插件或后台的并发修改；持久化由插件决定。';
+}
+
+export type ConfigDraft = Record<string, string | boolean | string[]>;
+
+export function applyConfigDraftField(
+    previous: ConfigDraft | null,
+    key: string,
+    value: string | boolean,
+): ConfigDraft | null {
+    return previous === null ? null : { ...previous, [key]: value };
+}
+
+function multiSelectTokenIndex(field: PluginConfigField, token: unknown): number {
+    if (
+        field.type !== 'multi-select' ||
+        !field.options ||
+        typeof token !== 'string' ||
+        !/^i:(0|[1-9][0-9]*)$/.test(token)
+    ) {
+        throw new Error('配置选项无效');
+    }
+
+    const index = Number(token.slice(2));
+
+    if (!Number.isSafeInteger(index) || token !== `i:${index}` || index >= field.options.length) {
+        throw new Error('配置选项无效');
+    }
+
+    return index;
+}
+
+/** Copy only dense, data-property token arrays from the validated JSON-backed editor. */
+function copyMultiSelectTokens(field: PluginConfigField, value: unknown): string[] {
+    if (
+        field.type !== 'multi-select' ||
+        !field.options ||
+        !Array.isArray(value) ||
+        Object.getPrototypeOf(value) !== Array.prototype ||
+        value.length > field.options.length ||
+        Reflect.ownKeys(value).length !== value.length + 1
+    ) {
+        throw new Error('配置选项无效');
+    }
+
+    const tokens: string[] = [];
+    const seen = new Set<string>();
+
+    for (let index = 0; index < value.length; index++) {
+        const entry = Object.getOwnPropertyDescriptor(value, String(index));
+
+        if (!entry || !entry.enumerable || !('value' in entry) || typeof entry.value !== 'string') {
+            throw new Error('配置选项无效');
+        }
+
+        multiSelectTokenIndex(field, entry.value);
+
+        if (seen.has(entry.value)) {
+            throw new Error('配置选项无效');
+        }
+
+        seen.add(entry.value);
+        tokens.push(entry.value);
+    }
+
+    return tokens;
+}
+
+function multiSelectDraftEntry(draft: ConfigDraft, key: string): unknown {
+    const entry = Object.getOwnPropertyDescriptor(draft, key);
+
+    if (!entry || !entry.enumerable || !('value' in entry)) {
+        throw new Error('配置字段格式无效');
+    }
+
+    return entry.value;
+}
+
+/** Validate both the current selection and the requested change before copying it. */
+export function updateMultiSelectTokens(
+    field: PluginConfigField,
+    value: unknown,
+    token: string,
+    checked: boolean,
+): string[] {
+    const tokens = copyMultiSelectTokens(field, value);
+    multiSelectTokenIndex(field, token);
+
+    if (typeof checked !== 'boolean') {
+        throw new Error('配置选项无效');
+    }
+
+    if (checked) {
+        return tokens.includes(token) ? tokens : [...tokens, token];
+    }
+
+    return tokens.filter((current) => current !== token);
+}
 
 export function configValueToDraft(fields: PluginConfigField[], value: unknown): ConfigDraft {
     const values = parseConfigValue(fields, value);
@@ -1001,6 +1109,33 @@ export function configValueToDraft(fields: PluginConfigField[], value: unknown):
             }
 
             draft[field.key] = `i:${index}`;
+        } else if (field.type === 'multi-select') {
+            const options = field.options;
+
+            if (!options || !Array.isArray(current)) {
+                throw new Error('配置选项无效');
+            }
+
+            const indexes = new Map<PluginConfigOptionValue, number>();
+
+            for (const [index, option] of options.entries()) {
+                if (indexes.has(option.value)) {
+                    throw new Error('配置选项无效');
+                }
+
+                indexes.set(option.value, index);
+            }
+
+            const tokens = current.map((selected) => {
+                const index = indexes.get(selected);
+
+                if (index === undefined) {
+                    throw new Error('配置选项无效');
+                }
+
+                return `i:${index}`;
+            });
+            draft[field.key] = copyMultiSelectTokens(field, tokens);
         } else {
             draft[field.key] = typeof current === 'boolean' ? current : String(current);
         }
@@ -1009,24 +1144,75 @@ export function configValueToDraft(fields: PluginConfigField[], value: unknown):
     return draft;
 }
 
+function copyConfigDraft(fields: PluginConfigField[], draft: ConfigDraft): Record<string, unknown> {
+    try {
+        if (!draft || typeof draft !== 'object' || Array.isArray(draft) || fields.length === 0) {
+            throw new Error();
+        }
+
+        const prototype = Object.getPrototypeOf(draft);
+        const expected = new Set(fields.map((field) => field.key));
+        const keys = Reflect.ownKeys(draft);
+
+        if (
+            (prototype !== Object.prototype && prototype !== null) ||
+            expected.size !== fields.length ||
+            keys.length !== fields.length ||
+            [...expected].some(
+                (key) =>
+                    typeof key !== 'string' ||
+                    key === '__proto__' ||
+                    key === 'prototype' ||
+                    key === 'constructor',
+            )
+        ) {
+            throw new Error();
+        }
+
+        const values: Record<string, unknown> = Object.create(null);
+
+        for (const key of keys) {
+            if (typeof key !== 'string' || !expected.has(key)) {
+                throw new Error();
+            }
+
+            const entry = Object.getOwnPropertyDescriptor(draft, key);
+
+            if (!entry || !entry.enumerable || !('value' in entry)) {
+                throw new Error();
+            }
+
+            values[key] = entry.value;
+        }
+
+        return values;
+    } catch {
+        throw new Error('配置字段格式无效');
+    }
+}
+
 export function configDraftToValue(
     fields: PluginConfigField[],
     draft: ConfigDraft,
 ): PluginConfigValue {
-    if (fields.length === 0 || Object.keys(draft).length !== fields.length) {
-        throw new Error('配置字段格式无效');
-    }
-
+    const snapshot = copyConfigDraft(fields, draft);
     const values: PluginConfigValue = Object.create(null);
 
     for (const field of fields) {
-        if (!Object.hasOwn(draft, field.key)) {
-            throw new Error('配置字段格式无效');
-        }
+        const value = snapshot[field.key];
 
-        const value = draft[field.key];
+        if (field.type === 'multi-select') {
+            const options = field.options;
+            const tokens = copyMultiSelectTokens(field, value);
 
-        if (field.type === 'select') {
+            if (!options) {
+                throw new Error('配置选项无效');
+            }
+
+            values[field.key] = tokens.map(
+                (token) => options[multiSelectTokenIndex(field, token)].value,
+            );
+        } else if (field.type === 'select') {
             if (typeof value !== 'string' || !/^i:(0|[1-9][0-9]*)$/.test(value)) {
                 throw new Error('配置选项无效');
             }
@@ -1082,6 +1268,83 @@ export function configErrorText(caught: unknown): string {
         CONFIG_GENERATION_CHANGED: '插件实例已更替，请重新读取字段和配置。',
     };
     return code && Object.hasOwn(fixed, code) ? fixed[code] : '配置操作未确认，结果可能未知。';
+}
+
+export function formatConfigDefault(value: NonNullable<PluginConfigField['default']>): string {
+    return Array.isArray(value) ? JSON.stringify(value) : String(value);
+}
+
+export function PluginMultiSelectControl({
+    field,
+    tokens,
+    disabled,
+    onChange,
+}: {
+    field: PluginConfigField;
+    tokens: readonly string[];
+    disabled: boolean;
+    onChange: (token: string, checked: boolean) => void;
+}) {
+    const [invalid, setInvalid] = useState(false);
+    let selected: Set<string>;
+
+    try {
+        selected = new Set(copyMultiSelectTokens(field, tokens));
+    } catch {
+        return (
+            <p role="alert" className="text-xs text-destructive">
+                多选字段格式无效，请重新读取配置。
+            </p>
+        );
+    }
+
+    return (
+        <>
+            <fieldset
+                disabled={disabled}
+                className="flex min-w-0 flex-col gap-2 rounded-lg border border-border px-3 py-2"
+            >
+                <legend className="sr-only">{field.label}</legend>
+                {field.options?.map((option, index) => {
+                    const token = `i:${index}`;
+                    return (
+                        <label key={token} className="flex min-w-0 items-center gap-2">
+                            <input
+                                type="checkbox"
+                                className="size-4 shrink-0 accent-primary"
+                                checked={selected.has(token)}
+                                disabled={disabled}
+                                onChange={(event) => {
+                                    if (disabled) {
+                                        return;
+                                    }
+
+                                    const checked = event.currentTarget.checked;
+
+                                    try {
+                                        copyMultiSelectTokens(field, tokens);
+                                        multiSelectTokenIndex(field, token);
+                                    } catch {
+                                        setInvalid(true);
+                                        return;
+                                    }
+
+                                    setInvalid(false);
+                                    onChange(token, checked);
+                                }}
+                            />
+                            <span className="min-w-0 break-words">{option.label}</span>
+                        </label>
+                    );
+                })}
+            </fieldset>
+            {invalid && (
+                <p role="alert" className="text-xs text-destructive">
+                    多选字段格式无效，请重新读取配置。
+                </p>
+            )}
+        </>
+    );
 }
 
 export function PluginPlainTextView({ texts }: { texts: readonly string[] }) {
@@ -1391,7 +1654,18 @@ function PluginConfigDialog({
                 {draft && fields && displayTexts === null && (
                     <div className="flex flex-col gap-4">
                         {fields.map((field) => {
-                            const Wrapper = field.type === 'select' ? 'div' : 'label';
+                            const Wrapper =
+                                field.type === 'select' || field.type === 'multi-select'
+                                    ? 'div'
+                                    : 'label';
+                            const multiEntry =
+                                field.type === 'multi-select'
+                                    ? Object.getOwnPropertyDescriptor(draft, field.key)
+                                    : undefined;
+                            const multiDraft: unknown =
+                                multiEntry && multiEntry.enumerable && 'value' in multiEntry
+                                    ? multiEntry.value
+                                    : undefined;
 
                             return (
                                 <Wrapper key={field.key} className="flex flex-col gap-1 text-sm">
@@ -1402,43 +1676,110 @@ function PluginConfigDialog({
                                         </span>
                                     )}
                                     {field.default !== undefined && (
-                                        <span className="text-xs text-muted-foreground">
-                                            声明的默认值：{String(field.default)}（不会自动填入）
+                                        <span
+                                            className={
+                                                field.type === 'multi-select'
+                                                    ? 'min-w-0 break-all text-xs text-muted-foreground'
+                                                    : 'text-xs text-muted-foreground'
+                                            }
+                                        >
+                                            声明的默认值：
+                                            {formatConfigDefault(field.default)}
+                                            （不会自动填入）
                                         </span>
                                     )}
-                                    {field.type === 'select' ? (
+                                    {field.type === 'multi-select' ? (
+                                        Array.isArray(multiDraft) ? (
+                                            <PluginMultiSelectControl
+                                                field={field}
+                                                tokens={multiDraft}
+                                                disabled={busy || !canExecute}
+                                                onChange={(token, checked) => {
+                                                    setDraft((previous) => {
+                                                        if (!previous) {
+                                                            return previous;
+                                                        }
+
+                                                        try {
+                                                            const next = updateMultiSelectTokens(
+                                                                field,
+                                                                multiSelectDraftEntry(
+                                                                    previous,
+                                                                    field.key,
+                                                                ),
+                                                                token,
+                                                                checked,
+                                                            );
+                                                            return {
+                                                                ...previous,
+                                                                [field.key]: next,
+                                                            };
+                                                        } catch {
+                                                            return previous;
+                                                        }
+                                                    });
+                                                }}
+                                            />
+                                        ) : (
+                                            <p role="alert" className="text-xs text-destructive">
+                                                多选字段格式无效，请重新读取配置。
+                                            </p>
+                                        )
+                                    ) : field.type === 'select' ? (
                                         <DropdownSelect
+                                            key={busy || !canExecute ? 'disabled' : 'enabled'}
                                             ariaLabel={field.label}
+                                            disabled={busy || !canExecute}
                                             value={String(draft[field.key])}
                                             options={(field.options ?? []).map((option, index) => ({
                                                 label: option.label,
                                                 value: `i:${index}`,
                                             }))}
-                                            onChange={(value) =>
-                                                setDraft({ ...draft, [field.key]: value })
-                                            }
+                                            onChange={(value) => {
+                                                if (busy || !canExecute) {
+                                                    return;
+                                                }
+
+                                                setDraft((previous) =>
+                                                    applyConfigDraftField(
+                                                        previous,
+                                                        field.key,
+                                                        value,
+                                                    ),
+                                                );
+                                            }}
                                         />
                                     ) : field.type === 'boolean' ? (
                                         <input
                                             type="checkbox"
                                             checked={draft[field.key] === true}
-                                            onChange={(event) =>
-                                                setDraft({
-                                                    ...draft,
-                                                    [field.key]: event.target.checked,
-                                                })
-                                            }
+                                            disabled={busy || !canExecute}
+                                            onChange={(event) => {
+                                                const checked = event.currentTarget.checked;
+                                                setDraft((previous) =>
+                                                    applyConfigDraftField(
+                                                        previous,
+                                                        field.key,
+                                                        checked,
+                                                    ),
+                                                );
+                                            }}
                                         />
                                     ) : field.type === 'text' ? (
                                         <Textarea
                                             value={String(draft[field.key])}
                                             maxLength={16384}
-                                            onChange={(event) =>
-                                                setDraft({
-                                                    ...draft,
-                                                    [field.key]: event.target.value,
-                                                })
-                                            }
+                                            disabled={busy || !canExecute}
+                                            onChange={(event) => {
+                                                const value = event.currentTarget.value;
+                                                setDraft((previous) =>
+                                                    applyConfigDraftField(
+                                                        previous,
+                                                        field.key,
+                                                        value,
+                                                    ),
+                                                );
+                                            }}
                                         />
                                     ) : (
                                         <Input
@@ -1449,12 +1790,17 @@ function PluginConfigDialog({
                                             autoComplete="off"
                                             value={String(draft[field.key])}
                                             maxLength={16384}
-                                            onChange={(event) =>
-                                                setDraft({
-                                                    ...draft,
-                                                    [field.key]: event.target.value,
-                                                })
-                                            }
+                                            disabled={busy || !canExecute}
+                                            onChange={(event) => {
+                                                const value = event.currentTarget.value;
+                                                setDraft((previous) =>
+                                                    applyConfigDraftField(
+                                                        previous,
+                                                        field.key,
+                                                        value,
+                                                    ),
+                                                );
+                                            }}
                                         />
                                     )}
                                 </Wrapper>
@@ -1505,9 +1851,7 @@ function PluginConfigDialog({
                     description={`账号 ${uin} · 插件 ${id}`}
                     content={
                         <p className="text-sm">
-                            {confirm?.operation === 'write'
-                                ? '将整体提交当前配置，可能覆盖插件或后台的并发修改；持久化由插件决定。'
-                                : '此操作可能执行插件代码；插件拥有当前进程完整权限。'}{' '}
+                            {confirm ? configConfirmationText(confirm.operation) : ''}{' '}
                             不会自动重试。
                         </p>
                     }
