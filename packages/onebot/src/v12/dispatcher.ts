@@ -21,6 +21,11 @@ type PreparedRequest = {
     fallbackEcho: string | undefined;
 };
 
+type PreparedOrdinary = {
+    request: PreparedRequest;
+    fileLease: V12FileLease | undefined;
+};
+
 type Preflight =
     { kind: 'error'; response: V12Response } | { kind: 'ready'; request: PreparedRequest };
 
@@ -210,7 +215,7 @@ function v11Failure(result: ApiResponse, echo?: string): V12Response | null {
 export class V12Dispatcher {
     private readonly self: V12CoreOptions['self'];
     private readonly version: V12CoreOptions['version'];
-    readonly #preparedOrdinary = new WeakMap<object, PreparedRequest>();
+    readonly #preparedOrdinary = new WeakMap<object, PreparedOrdinary>();
 
     constructor(private readonly options: V12CoreOptions) {
         let self: unknown;
@@ -238,25 +243,33 @@ export class V12Dispatcher {
             : this.runPrepared(checked.request, fileLease);
     }
 
-    /** Internal future HTTP integration seam. It does not register or run a poll. */
-    createInternalHttpPreflight(): Readonly<{ classify(input: unknown): HttpPreflight }> {
-        return Object.freeze({ classify: (input: unknown) => this.classifyHttpRequest(input) });
+    /** Internal future HTTP integration seam. It does not register or run a poll.
+     * A trusted caller binds its listener's lease here, not when consuming a token.
+     * The lease is a lifetime check, not authentication of the caller or source. */
+    createInternalHttpPreflight(
+        fileLease?: V12FileLease,
+    ): Readonly<{ classify(input: unknown): HttpPreflight }> {
+        return Object.freeze({
+            classify: (input: unknown) => this.classifyHttpRequest(input, fileLease),
+        });
     }
 
     /** Consume only a token issued by this dispatcher's HTTP preflight, at most once. */
     async handlePreparedOrdinary(token: object): Promise<V12Response> {
-        const request = this.#preparedOrdinary.get(token);
+        const prepared = this.#preparedOrdinary.get(token);
 
-        if (!request) {
+        if (!prepared) {
             return response(10001, 'invalid action request');
         }
 
         this.#preparedOrdinary.delete(token);
-        // This future HTTP seam has no listener lease; file effects fail closed.
-        return this.runPrepared(request, () => false);
+        return this.runPrepared(prepared.request, prepared.fileLease ?? (() => false));
     }
 
-    private classifyHttpRequest(input: unknown): HttpPreflight {
+    private classifyHttpRequest(
+        input: unknown,
+        fileLease: V12FileLease | undefined,
+    ): HttpPreflight {
         const checked = this.preflight(input);
 
         if (checked.kind === 'error') {
@@ -268,7 +281,7 @@ export class V12Dispatcher {
 
         if (action !== 'get_latest_events') {
             const token = Object.freeze(Object.create(null) as object);
-            this.#preparedOrdinary.set(token, request);
+            this.#preparedOrdinary.set(token, { request, fileLease });
             return Object.freeze({ kind: 'ordinary', token });
         }
 
