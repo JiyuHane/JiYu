@@ -1,3 +1,4 @@
+import { addAbortListener } from 'node:events';
 import type { Socket } from 'node:net';
 import { isProxy } from 'node:util/types';
 import {
@@ -169,8 +170,9 @@ export async function referenceRegister(
 }
 
 /**
- * Borrows a raw transport without closing or awaiting it. Its implementation owns
- * single-flight, deadline/cancellation enforcement, actual writes and writeState.
+ * Borrows a raw transport without closing or draining it. Its implementation owns
+ * single-flight, actual writes and their effects. The local deadline and cancellation
+ * settle this call, but do not establish that the underlying operation has stopped.
  * An untrusted transport can stall indefinitely, close itself on abort, or
  * misrepresent identity, candidate choice, writes and their effects. The observed
  * transport UIN need not match the login UIN; it is pinned across callbacks.
@@ -181,7 +183,9 @@ export async function referenceRegister(
  * trust successful settlement means callbacks have ceased, and to enforce
  * exclusivity and sequence/write semantics. Late external effects remain the
  * transport's responsibility. Borrowed transport failure codes are normalized;
- * writeState is reported by that transport. Callback and byte binding is checked
+ * ordinary transport failures retain their validated writeState. Local cancellation
+ * or timeout after invocation conservatively reports unknown, not transport silence.
+ * Callback and byte binding is checked
  * locally, not server authentication or a claim about any real server or runtime.
  * Reading the transport method can run a getter; awaiting its result can access
  * a thenable's `then`. These and their external effects belong to the transport
@@ -230,11 +234,49 @@ async function registerFlow(
     let active = true;
     let requestFrame: Uint8Array | undefined;
     let signal: AbortSignal | undefined;
+    let abortListener: ReturnType<typeof addAbortListener> | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let invoked = false;
+    let stopCode: 'raw-cancelled' | 'raw-timeout' | undefined;
     const controller = new AbortController();
     const abort = (): void => controller.abort();
+    let resolveStopped!: (result: SsoReferenceRegisterResult) => void;
+    const stopped = new Promise<SsoReferenceRegisterResult>((resolve) => {
+        resolveStopped = resolve;
+    });
+
+    const stop = (code: 'raw-cancelled' | 'raw-timeout'): void => {
+        if (!active || stopCode) {
+            return;
+        }
+
+        active = false;
+        stopCode = code;
+        // Resolve before abort dispatch: a transport may synchronously reenter here.
+        resolveStopped({
+            kind: 'failure',
+            code: invoked ? 'borrowed-transaction-failed' : code,
+            writeState: invoked ? 'unknown' : 'not-written',
+        });
+        controller.abort();
+    };
 
     const assertActive = (): void => {
-        if (!active || controller.signal.aborted || performance.now() >= started + timeout) {
+        if (borrowed !== undefined && active) {
+            if (signal && abortedGetter.call(signal)) {
+                stop('raw-cancelled');
+            } else if (performance.now() >= started + timeout) {
+                stop('raw-timeout');
+            }
+        }
+
+        if (
+            !active ||
+            (borrowed !== undefined
+                ? abortedGetter.call(controller.signal)
+                : controller.signal.aborted) ||
+            performance.now() >= started + timeout
+        ) {
             throw new Error('transaction stopped');
         }
     };
@@ -357,25 +399,51 @@ async function registerFlow(
         }
 
         if (signal) {
-            EventTarget.prototype.addEventListener.call(signal, 'abort', abort, { once: true });
+            if (borrowed !== undefined) {
+                abortListener = addAbortListener(signal, () => stop('raw-cancelled'));
 
-            if (abortedGetter.call(signal)) {
-                abort();
+                if (abortedGetter.call(signal)) {
+                    stop('raw-cancelled');
+                }
+            } else {
+                EventTarget.prototype.addEventListener.call(signal, 'abort', abort, { once: true });
+
+                if (abortedGetter.call(signal)) {
+                    abort();
+                }
             }
         }
 
         const remaining = Math.max(1, Math.ceil(started + timeout - performance.now()));
 
         if (performance.now() >= started + timeout) {
-            controller.abort();
+            if (borrowed !== undefined) {
+                stop('raw-timeout');
+            } else {
+                controller.abort();
+            }
         }
 
-        if (borrowed !== undefined && controller.signal.aborted) {
-            return {
-                kind: 'failure',
-                code: signal && abortedGetter.call(signal) ? 'raw-cancelled' : 'raw-timeout',
-                writeState: 'not-written',
+        if (borrowed !== undefined && !active) {
+            return await stopped;
+        }
+
+        if (borrowed !== undefined) {
+            const onDeadline = (): void => {
+                if (!active) {
+                    return;
+                }
+
+                const delay = started + timeout - performance.now();
+
+                if (delay <= 0) {
+                    stop('raw-timeout');
+                } else {
+                    timer = setTimeout(onDeadline, Math.max(1, Math.ceil(delay)));
+                }
             };
+
+            timer = setTimeout(onDeadline, remaining);
         }
 
         const transport: Sso12RawTransport =
@@ -385,10 +453,19 @@ async function registerFlow(
                       transactRaw<C, T>(
                           rawOptions: Sso12RawOptions<C, T>,
                       ): Promise<Sso12RawResult<T>> {
-                          return guardBorrowedTransport<C, T>(borrowed)(rawOptions);
+                          const tracked: Sso12RawTransport = {
+                              transactRaw<A, B>(
+                                  raw: Sso12RawOptions<A, B>,
+                              ): Promise<Sso12RawResult<B>> {
+                                  assertActive();
+                                  invoked = true;
+                                  return borrowed.transactRaw(raw);
+                              },
+                          };
+                          return guardBorrowedTransport<C, T>(tracked)(rawOptions);
                       },
                   };
-        const result = await runRegistration(transport, {
+        const operation = runRegistration(transport, {
             timeoutMs: remaining,
             signal: controller.signal,
             buildRequest: async (identity) => {
@@ -418,6 +495,11 @@ async function registerFlow(
                     owned.push(body);
                     signerInput = Uint8Array.from(body);
                     owned.push(signerInput);
+
+                    if (borrowed !== undefined) {
+                        assertActive();
+                    }
+
                     const signed = await signer({
                         uin,
                         uid,
@@ -461,10 +543,19 @@ async function registerFlow(
                 let responseCopy: Uint8Array | undefined;
 
                 try {
+                    if (borrowed !== undefined) {
+                        assertActive();
+                    }
+
                     requestCopy = Uint8Array.from(requestFrame!);
                     owned.push(requestCopy);
                     responseCopy = Uint8Array.from(candidate);
                     owned.push(responseCopy);
+
+                    if (borrowed !== undefined) {
+                        assertActive();
+                    }
+
                     const accepted = await verifier({
                         uin,
                         sequence: identity.sequence,
@@ -513,19 +604,50 @@ async function registerFlow(
             },
         });
 
-        if (
-            borrowed !== undefined &&
-            result.kind === 'response' &&
-            (controller.signal.aborted || performance.now() >= started + timeout)
-        ) {
-            return { kind: 'failure', code: 'borrowed-transaction-failed', writeState: 'unknown' };
+        // Install both observers even if synchronous reentry already stopped the call.
+        // A late guarded response is ignored; its callback/transport copies remain
+        // their respective owners' responsibility until their work settles.
+        const observed =
+            borrowed === undefined
+                ? operation
+                : operation.then(
+                      (value) => value,
+                      () =>
+                          ({
+                              kind: 'failure',
+                              code: 'borrowed-transaction-failed',
+                              writeState: 'unknown',
+                          }) as const,
+                  );
+        const result =
+            borrowed === undefined ? await observed : await Promise.race([observed, stopped]);
+
+        if (borrowed !== undefined) {
+            if (active && signal && abortedGetter.call(signal)) {
+                stop('raw-cancelled');
+            }
+
+            if (active && performance.now() >= started + timeout) {
+                stop('raw-timeout');
+            }
+
+            if (stopCode) {
+                return await stopped;
+            }
         }
 
         return result;
     } finally {
         active = false;
 
-        if (signal) {
+        if (timer !== undefined) {
+            clearTimeout(timer);
+        }
+
+        if (borrowed !== undefined) {
+            abortListener?.[Symbol.dispose]();
+            controller.abort();
+        } else if (signal) {
             try {
                 EventTarget.prototype.removeEventListener.call(signal, 'abort', abort);
             } catch {

@@ -430,7 +430,9 @@ describe('borrowed reference registration (pure memory)', () => {
         expect(await pending).toMatchObject({
             kind: 'failure',
             code: 'borrowed-transaction-failed',
-            writeState: 'not-written',
+            // The outer deadline/abort can win before the borrowed transport's
+            // claim of not-written is observed.
+            writeState: 'unknown',
         });
         expect(body.every((v) => v === 0)).toBe(true);
         release(body);

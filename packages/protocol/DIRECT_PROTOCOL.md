@@ -1481,15 +1481,22 @@ remain to be recovered and independently verified.
   bytes, and the returned result token. The confirmed login UIN, which may differ
   from the transport's local UIN, is used for signing and envelope checks. This
   is still one registration transaction, not a combined login session: the
-  transport owner must provide exclusivity, sequence allocation, timeout and
-  cancellation enforcement, accurate write status, and quiescence before reuse.
-  A transport may stall indefinitely, close itself on cancellation, misreport its
-  effects or invoke late callbacks; the guard cannot prove actual writes, server
-  identity, signature authenticity or a physical session. Once invoked, transport
-  failures use fixed result codes; locally detected pre-cancellation or expiry have
-  separate codes, while invalid configuration rejects instead of returning a
-  result. A valid failure's write status remains the transport's claim; exceptions,
-  invalid results and guard violations instead report `unknown`. A method getter
+  transport owner must provide exclusivity, sequence allocation, accurate write
+  status and quiescence before reuse. A local abort or deadline ends the borrowed
+  call even when the transport does not settle; after invocation its write state is
+  `unknown`. This local settlement does not stop transport effects or prove it is
+  safe to reuse. A transport may stall indefinitely, close itself when the
+  transaction signal is aborted, misreport effects or invoke late callbacks. The
+  signal is transaction-scoped and may also be aborted during successful cleanup;
+  it must not be treated as a connection-lifetime signal. Guard-owned copies can
+  remain held by an uncooperative pending operation; local cleanup covers only
+  reachable buffers owned by the registration flow. The guard cannot prove actual
+  writes, server identity, signature authenticity or a physical session. Once
+  invoked, transport failures use fixed result codes; locally detected pre-cancellation
+  or expiry have separate codes, while invalid configuration rejects instead of
+  returning a result. Absent a locally winning stop, a valid failure's write status
+  remains the transport's claim; exceptions, invalid results and guard violations
+  instead report `unknown`. A method getter
   can run even before options validation, and Promise/thenable assimilation can
   have effects; both belong to the caller's transport trust boundary.
   Bounded candidate copies and synchronous validation do not bound total memory,
@@ -1974,6 +1981,28 @@ remain to be recovered and independently verified.
   constructors/species, arbitrary thenables and other same-process changes remain
   outside that contract. Actual QQ interoperability and production Bridge wiring
   remain unverified.
+- `src/direct/linux-easy-reference-register.ts` provides a separate borrowed-lease
+  handoff from an EasyLogin response to reference registration. It uses the existing
+  four-ticket projection and registration transaction; UID and its association with
+  UIN, peer trust, ticket validity and reuse of the same exclusive lease remain
+  explicit caller responsibilities. The registration transport's identity UIN must
+  match the supplied account for this handoff, without changing the general borrowed
+  registration contract. The local gate requires a present wire code equal to zero;
+  unlike the [pinned V2 decode](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Services/Login/NTLoginCommon.cs#L55-L76),
+  it rejects an omitted code that protobuf defaults to zero. A separate caller
+  policy must also accept the account/UID; neither rule proves authentication.
+  A non-success registration classification requests lease poisoning; the returned
+  `poison` describes the local request, not completed closure. Success is only the
+  existing registration-response classification, not proof that QQ is online. The
+  two calls have separate deadlines; an owner requiring a single end-to-end deadline
+  must enforce it across both. The owner must not reuse an uncertain lease, and must
+  establish successful quiescence. Lease termination is observed asynchronously,
+  not as a synchronous revocation fence. Outstanding callbacks, guard or transport
+  effects and their private copies can outlive local settlement. A synthetic test
+  composes key exchange, EasyLogin and registration using the same in-memory broker
+  lease and an explicit caller policy; it does not authenticate its fake peer. The
+  adapter does not persist tickets or connect the production Bridge; live
+  interoperability is unverified.
 - `src/direct/sso12-packet-client.ts` is a single-flight protocol-12 client for
   an already-connected socket, with caller-supplied account policy, classifier,
   signing metadata, device parameters and zero-key or D2-key encryption. It
