@@ -98,7 +98,7 @@ function waitUntil(predicate: () => boolean): Promise<void> {
     });
 }
 
-function fixture() {
+function fixture(allowIncompleteFollowingFrame = false) {
     const allocations: Uint8Array[] = [];
 
     const own = <T extends Uint8Array>(bytes: T): T => {
@@ -131,11 +131,14 @@ function fixture() {
     const dispatched = deferred<void>();
     const frames: Uint8Array[] = [];
     const classified: string[] = [];
+    const pushOrigins: { id: number; sequence: number | undefined }[] = [];
     const held: number[] = [];
     const muxVerified: number[] = [];
     const fullVerified: number[] = [];
     const expectedFrames = new Map<number, Uint8Array>();
+    const expectedBodies = new Map<number, Uint8Array>();
     let registeredSettled = false;
+    let registeredSucceeded = false;
     let owner!: ReturnType<typeof createLinuxEasyAccountOwnerWithKeyCapability>;
     let processor!: ReturnType<typeof createLinuxEasyPushProcessor>;
 
@@ -227,9 +230,12 @@ function fixture() {
     }
 
     const meta = (sequence: number) => ({ uin: UIN, sequence, command: MSG_PUSH_CMD, retCode: 0 });
-    const onPush = vi.fn((frame: Uint8Array, route: RawMultiplexPushRoute) =>
-        processor.onPush(frame, route),
-    );
+    const onPush = vi.fn((frame: Uint8Array, route: RawMultiplexPushRoute) => {
+        const expected = expectedFrames.get(route.id);
+        expect(expected).toBeDefined();
+        expect(Array.from(frame)).toEqual(Array.from(expected!));
+        return processor.onPush(frame, route);
+    });
     const mux = createRawMultiplexClient({
         uin: UIN,
         initialSequence: KE,
@@ -239,6 +245,7 @@ function fixture() {
         maxFrames: 8,
         maxPushFrames: 8,
         maxPushBytes: 262144,
+        ...(allowIncompleteFollowingFrame ? { allowIncompleteFollowingFrame: true } : {}),
         write: (bytes) => {
             const index = frames.length;
             frames.push(own(Uint8Array.from(bytes)));
@@ -272,10 +279,29 @@ function fixture() {
             }
 
             expect(candidate).toEqual(meta(candidate!.sequence));
-            expect(registeredSettled).toBe(false);
-            expect(isLinuxEasyOwnerPushActive(owner)).toBe(false);
-            expect(extractLinuxEasyOwnerPushBody(owner, frame, candidate!)).toBeUndefined();
+
+            if (registeredSucceeded) {
+                expect(registeredSettled).toBe(true);
+                expect(isLinuxEasyOwnerPushActive(owner)).toBe(true);
+                const expected = expectedBodies.get(candidate!.sequence);
+                expect(expected).toBeDefined();
+                const extracted = extractLinuxEasyOwnerPushBody(owner, frame, candidate!);
+
+                try {
+                    expect(extracted).toBeDefined();
+                    expect(extracted!.meta).toEqual(meta(candidate!.sequence));
+                    expect(Array.from(extracted!.body)).toEqual(Array.from(expected!));
+                } finally {
+                    extracted?.body.fill(0);
+                }
+            } else {
+                expect(registeredSettled).toBe(false);
+                expect(isLinuxEasyOwnerPushActive(owner)).toBe(false);
+                expect(extractLinuxEasyOwnerPushBody(owner, frame, candidate!)).toBeUndefined();
+            }
+
             classified.push(`push:${candidate!.sequence}`);
+            pushOrigins.push({ id: candidate!.sequence, sequence: identity.sequence });
             firstClassified.resolve();
             return { kind: 'push', name: candidate!.command, id: candidate!.sequence };
         },
@@ -435,10 +461,11 @@ function fixture() {
         );
         const frame = response(sequence, MSG_PUSH_CMD, body, true);
         expectedFrames.set(sequence, own(Uint8Array.from(frame)));
+        expectedBodies.set(sequence, body);
         return { body, frame };
     }
 
-    function feedEasyAndPush() {
+    function feedEasyAndPush(incomplete = false) {
         const request = unpack(frames[1]!, false);
         expect(request.sequence).toBe(EASY);
         expect(request.command).toBe(LINUX_EASY_LOGIN_COMMAND);
@@ -498,8 +525,7 @@ function fixture() {
             own(
                 Buffer.concat([
                     response(EASY, request.command, body, false),
-                    first.frame,
-                    second.frame,
+                    ...(incomplete ? [first.frame.subarray(0, 1)] : [first.frame, second.frame]),
                 ]),
             ),
         );
@@ -525,7 +551,8 @@ function fixture() {
     function start() {
         const pending = owner.start(options);
         void pending.then(
-            () => {
+            (result) => {
+                registeredSucceeded = result.kind === 'registered';
                 registeredSettled = true;
             },
             () => {
@@ -583,6 +610,7 @@ function fixture() {
         }
 
         expectedFrames.clear();
+        expectedBodies.clear();
 
         if (errors.length) {
             throw new AggregateError(errors, 'synthetic fixture cleanup failed');
@@ -601,6 +629,7 @@ function fixture() {
         firstClassified,
         dispatched,
         classified,
+        pushOrigins,
         held,
         muxVerified,
         fullVerified,
@@ -737,24 +766,48 @@ describe('synthetic raw multiplex + Linux Easy owner + push processor', () => {
                             { serviceCmd: MSG_PUSH_CMD, seqId: PUSH + 1 },
                         ]);
                         // Check the relevant decoded event projection, not every field.
-                        expect(f.dispatch.mock.calls.map(([, events]) => events)).toMatchObject([
-                            [
-                                {
-                                    kind: 'friend_message',
-                                    selfUin: Number(UIN),
-                                    senderUin: 10001,
-                                    elements: [{ type: 'text', text: `synthetic ${PUSH}` }],
-                                },
-                            ],
-                            [
-                                {
-                                    kind: 'friend_message',
-                                    selfUin: Number(UIN),
-                                    senderUin: 10001,
-                                    elements: [{ type: 'text', text: `synthetic ${PUSH + 1}` }],
-                                },
-                            ],
+                        const third = f.push(PUSH + 2);
+                        f.mux.feed(third.frame);
+                        await bounded(waitUntil(() => f.dispatch.mock.calls.length >= 3));
+                        await bounded(turn());
+                        expect(f.classified).toEqual([
+                            'ke',
+                            'easy',
+                            `push:${PUSH}`,
+                            `push:${PUSH + 1}`,
+                            'register',
+                            `push:${PUSH + 2}`,
                         ]);
+                        expect(f.muxVerified).toEqual([PUSH, PUSH + 1, PUSH + 2]);
+                        expect(f.onPush.mock.calls.map(([, route]) => route.id)).toEqual([
+                            PUSH,
+                            PUSH + 1,
+                            PUSH + 2,
+                        ]);
+                        expect(f.onPush.mock.results.map((result) => result.value)).toEqual([
+                            undefined,
+                            undefined,
+                            undefined,
+                        ]);
+                        expect(f.fullVerified).toEqual([PUSH, PUSH + 1, PUSH + 2]);
+                        expect(f.dispatch).toHaveBeenCalledTimes(3);
+                        expect(f.dispatch.mock.calls.map(([meta]) => meta)).toEqual([
+                            { serviceCmd: MSG_PUSH_CMD, seqId: PUSH },
+                            { serviceCmd: MSG_PUSH_CMD, seqId: PUSH + 1 },
+                            { serviceCmd: MSG_PUSH_CMD, seqId: PUSH + 2 },
+                        ]);
+                        expect(f.dispatch.mock.calls.map(([, events]) => events)).toMatchObject(
+                            [PUSH, PUSH + 1, PUSH + 2].map((sequence) => [
+                                {
+                                    kind: 'friend_message',
+                                    selfUin: Number(UIN),
+                                    senderUin: 10001,
+                                    elements: [{ type: 'text', text: `synthetic ${sequence}` }],
+                                },
+                            ]),
+                        );
+                        expect(f.processor.status()).toBe('active');
+                        expect(f.mux.closed).toBe(false);
                     }
                 }
 
@@ -787,4 +840,108 @@ describe('synthetic raw multiplex + Linux Easy owner + push processor', () => {
         },
         20000,
     );
+
+    it('retains the Easy origin of a synthetic split push across registration', async () => {
+        const f = fixture(true);
+        const pending = f.start();
+        const errors: unknown[] = [];
+
+        try {
+            await bounded(f.written[0]!.promise);
+            f.feedKey();
+            await bounded(f.written[1]!.promise);
+            const { first } = f.feedEasyAndPush(true);
+            await bounded(f.easyVerifyEntered.promise);
+            expect(f.classified).toEqual(['ke', 'easy']);
+            expect(f.frames).toHaveLength(2);
+            expect(f.onPush).not.toHaveBeenCalled();
+            f.easyVerifyGate.resolve(true);
+
+            // No more input arrives until the next transaction has actually written.
+            await bounded(f.written[2]!.promise);
+            expect(f.frames).toHaveLength(3);
+            expect(f.settled()).toBe(false);
+            expect(f.mux.closed).toBe(false);
+            expect(f.classified).toEqual(['ke', 'easy']);
+            expect(f.dispatch).not.toHaveBeenCalled();
+            f.mux.feed(first.frame.subarray(1));
+            await bounded(waitUntil(() => f.onPush.mock.calls.length === 1));
+            expect(f.pushOrigins).toEqual([{ id: PUSH, sequence: EASY }]);
+            expect(f.classified).toEqual(['ke', 'easy', `push:${PUSH}`]);
+            expect(f.muxVerified).toEqual([PUSH]);
+            expect(f.onPush.mock.calls[0]![1]).toEqual({
+                kind: 'push',
+                name: MSG_PUSH_CMD,
+                id: PUSH,
+            });
+            expect(f.onPush.mock.results[0]).toMatchObject({ type: 'return', value: undefined });
+            expect(f.processor.status()).toBe('buffering');
+            expect(f.settled()).toBe(false);
+            expect(isLinuxEasyOwnerPushActive(f.owner)).toBe(false);
+            expect(classifyLinuxEasyOwnerD2Candidate(f.owner, first.frame)).toEqual(f.meta(PUSH));
+            expect(
+                extractLinuxEasyOwnerPushBody(f.owner, first.frame, f.meta(PUSH)),
+            ).toBeUndefined();
+            expect(f.fullVerified).toEqual([]);
+            expect(f.dispatch).not.toHaveBeenCalled();
+
+            f.feedRegister(true);
+            expect(await bounded(pending)).toEqual({
+                kind: 'registered',
+                registerSequence: REGISTER,
+            });
+            expect(f.classified).toEqual(['ke', 'easy', `push:${PUSH}`, 'register']);
+            expect(f.options.register.verifyRaw).toHaveBeenCalledOnce();
+            expect(f.settled()).toBe(true);
+            expect(isLinuxEasyOwnerPushActive(f.owner)).toBe(true);
+            expect(classifyLinuxEasyOwnerD2Candidate(f.owner, first.frame)).toEqual(f.meta(PUSH));
+            const extracted = extractLinuxEasyOwnerPushBody(f.owner, first.frame, f.meta(PUSH));
+
+            try {
+                expect(extracted).toBeDefined();
+                expect(extracted!.meta).toEqual(f.meta(PUSH));
+                expect(Array.from(extracted!.body)).toEqual(Array.from(first.body));
+            } finally {
+                extracted?.body.fill(0);
+            }
+
+            expect(f.processor.activate()).toBe(true);
+            await bounded(waitUntil(() => f.dispatch.mock.calls.length === 1));
+            await bounded(turn());
+            expect(f.fullVerified).toEqual([PUSH]);
+            expect(f.dispatch).toHaveBeenCalledTimes(1);
+            expect(f.dispatch.mock.calls[0]![0]).toEqual({
+                serviceCmd: MSG_PUSH_CMD,
+                seqId: PUSH,
+            });
+            expect(f.dispatch.mock.calls[0]![1]).toMatchObject([
+                {
+                    kind: 'friend_message',
+                    selfUin: Number(UIN),
+                    senderUin: 10001,
+                    elements: [{ type: 'text', text: `synthetic ${PUSH}` }],
+                },
+            ]);
+            expect(f.processor.status()).toBe('active');
+            expect(f.mux.closed).toBe(false);
+        } catch (error) {
+            errors.push(error);
+        } finally {
+            try {
+                await f.close();
+            } catch (error) {
+                errors.push(error);
+            }
+
+            try {
+                await bounded(pending.catch(() => undefined));
+            } catch (error) {
+                errors.push(error);
+            }
+        }
+
+        if (errors.length) {
+            throw new AggregateError(errors, 'synthetic split-frame test or cleanup failed');
+        }
+    }, 20000);
 });

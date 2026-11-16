@@ -79,6 +79,7 @@ export function createRawMultiplexStream(
         'maxFrames',
         'maxPushFrames',
         'maxPushBytes',
+        'allowIncompleteFollowingFrame',
         'classify',
         'holdFollowingFrames',
         'verifyPush',

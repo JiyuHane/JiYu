@@ -24,6 +24,14 @@ export interface RawMultiplexClientOptions {
     maxFrames: number;
     maxPushFrames: number;
     maxPushBytes: number;
+    /**
+     * Allow a transaction to settle while a following frame is incomplete. This is
+     * trusted caller policy, not peer authentication. The retained frame keeps its
+     * original transaction identity and may later fail and close the client; observe
+     * whenClosed. A retained partial frame has no independent assembly deadline;
+     * the caller must arrange any required timeout or close. The default is false.
+     */
+    allowIncompleteFollowingFrame?: boolean;
     write(frame: Uint8Array): void | Promise<void>;
     classify(
         frame: Uint8Array,
@@ -62,6 +70,8 @@ const arrayBufferLengthGetter = Object.getOwnPropertyDescriptor(
 const nativeValues = Uint8Array.prototype.values;
 const nativeFill = Uint8Array.prototype.fill;
 const nativeThen = Promise.prototype.then;
+
+const settledResolve = (): void => {};
 
 function wipe(bytes: Uint8Array | undefined): void {
     if (bytes) {
@@ -164,7 +174,7 @@ type Pending = {
     context: unknown;
     verify?: Sso12RawOptions<unknown, unknown>['verifyCandidate'];
     consume?: Sso12RawOptions<unknown, unknown>['consumeCandidate'];
-    timer: ReturnType<typeof setTimeout>;
+    timer?: ReturnType<typeof setTimeout>;
     abort?: ReturnType<typeof addAbortListener>;
     resolve: (result: Sso12RawResult<unknown>) => void;
 };
@@ -198,6 +208,7 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
         'maxFrames',
         'maxPushFrames',
         'maxPushBytes',
+        'allowIncompleteFollowingFrame',
         'write',
         'classify',
         'holdFollowingFrames',
@@ -218,6 +229,8 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
         !uint(maxFrames, 1, 65536) ||
         !uint(maxPushFrames, 1, 65536) ||
         !uint(maxPushBytes, 14, MAX_FRAME * 64) ||
+        (config.allowIncompleteFollowingFrame !== undefined &&
+            typeof config.allowIncompleteFollowingFrame !== 'boolean') ||
         typeof config.write !== 'function' ||
         typeof config.classify !== 'function' ||
         (config.holdFollowingFrames !== undefined &&
@@ -274,6 +287,7 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
 
     const finishPending = (p: Pending): void => {
         clearTimeout(p.timer);
+        p.timer = undefined;
 
         try {
             p.abort?.[Symbol.dispose]();
@@ -281,6 +295,7 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
             /* best effort */
         }
 
+        p.abort = undefined;
         p.context = undefined;
         p.verify = undefined;
         p.consume = undefined;
@@ -294,6 +309,10 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
         closed = true;
         wipe(prefix);
         wipe(partial);
+        origin = undefined;
+        originWritten = false;
+        used = 0;
+        prefixUsed = 0;
         wipe(activeIncoming?.bytes);
         activeIncoming = undefined;
         partial = undefined;
@@ -323,7 +342,9 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
             p.candidate = undefined;
             finishPending(p);
             p.value = undefined;
-            p.resolve({ kind: 'failure', code, writeState: p.written ? 'unknown' : 'not-written' });
+            const resolve = p.resolve;
+            p.resolve = settledResolve;
+            resolve({ kind: 'failure', code, writeState: p.written ? 'unknown' : 'not-written' });
         }
 
         resolveClosed(Object.freeze({ kind, code }));
@@ -356,8 +377,7 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
             p.candidate ||
             processing ||
             incoming.length ||
-            partial ||
-            prefixUsed ||
+            (!config.allowIncompleteFollowingFrame && (partial || prefixUsed)) ||
             !live(p)
         ) {
             return;
@@ -367,7 +387,9 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
         finishPending(p);
         const value = p.value;
         p.value = undefined;
-        p.resolve({
+        const resolve = p.resolve;
+        p.resolve = settledResolve;
+        resolve({
             kind: 'response',
             sequence: p.identity.sequence,
             value,

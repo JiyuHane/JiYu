@@ -1588,7 +1588,16 @@ remain to be recovered and independently verified.
   finishes. The caller must stage required state during consumption, keep business
   delivery separately gated, and ensure its writer does not depend on a held frame.
   A held partial frame or sustained input can delay settlement until timeout. The
-  barrier itself supplies neither a key nor authentication. Already queued or
+  opt-in `allowIncompleteFollowingFrame` permits settlement after a matched response
+  is verified and consumed while a subsequent frame remains incomplete. The frame
+  retains the identity captured when its prefix began; a stale response cannot become
+  a later transaction's response. A later bad frame can still close the client after
+  success. This option gives the incomplete frame no independent assembly deadline;
+  callers needing one must arrange a timeout or close. A synthetic Linux EasyLogin
+  fixture exercises a push prefix before the register request and its remainder
+  afterward; this is not evidence that a QQ server sends that ordering. Full-frame
+  backlog and callback completion still gate settlement. The barrier itself supplies
+  neither a key nor authentication. Already queued or
   running push callbacks are not paused by the barrier. Successful transaction
   settlement means that transaction's callbacks and write have ended, not that
   independent push handling is globally quiescent. A later push failure can close
