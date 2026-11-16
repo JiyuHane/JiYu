@@ -2186,7 +2186,9 @@ remain to be recovered and independently verified.
   caller-owned business body; the caller must wipe it. This extraction does not
   authenticate the sender. A trusted composition must independently verify the
   same stable raw frame before extraction, and bind its stop path to the ingress.
-  Neither owner variant is connected to an ingress or production push handling.
+  The optional local processor described below performs this composition when given
+  a caller-supplied verifier; neither owner variant is automatically attached to
+  production push handling.
   The lifetime deadline and phase deadlines depend on event-loop progress. Close
   revokes local state and requests poison, but cannot stop work already inside an
   uncooperative callback or transport, nor erase their retained copies. A broker
@@ -2200,8 +2202,29 @@ remain to be recovered and independently verified.
   the one in-flight item. The local drain switch does not establish registration,
   an active key or source authentication. Release and close wipe queue-owned
   frames best effort, but not copies or transferred storage held elsewhere. This
-  queue is not connected to the owner or ingress; in particular, it does not solve
-  unknown D2 frames arriving before the EasyLogin response stages a key.
+  queue is not connected to the owner or ingress by default; in particular, it
+  does not solve unknown D2 frames arriving before the EasyLogin response stages
+  a key. `takeDetailed` atomically distinguishes an item from an empty, disabled,
+  busy, closed or failed take; a failed take retains the FIFO and its quota.
+- `src/direct/linux-easy-push-processor.ts` is a separate experimental in-memory
+  composition of an exclusive owner, candidate queue, caller verifier and guarded
+  ingress. The caller must await successful local registration before activation
+  and assert the identity and source policy. The synchronous verifier sees a copy
+  of the complete encrypted frame and must return exactly `true`; mutation still
+  present at return is detected, but retained copies and mutation followed by
+  restoration are not. The processor then reclassifies the queued frame, compares
+  its route, extracts the active-key business body and submits it to the guarded
+  ingress. Its `status()` distinguishes a local processing failure from an
+  explicitly stopped processor without exposing frames or error details; active
+  is only the last local observation, not a remote connection check. Its stop
+  path wipes reachable owned buffers best effort; it cannot undo an already-entered
+  parser or pipeline, or erase data retained by a callback.
+  A dependency must not wait for this processor's own drain or subsequent FIFO
+  work: doing so can deadlock. Drain can remain pending on an uncooperative pipeline
+  or initialization. The microtask-only pump has no fairness bound, and an idle
+  owner termination is observed at the next check or explicit stop. Source
+  authentication, real transport wiring, delivery and QQ interoperability remain
+  unverified. No unknown pre-response D2 classification is added by this module.
 - `src/direct/sso12-packet-client.ts` is a single-flight protocol-12 client for
   an already-connected socket, with caller-supplied account policy, classifier,
   signing metadata, device parameters and zero-key or D2-key encryption. It

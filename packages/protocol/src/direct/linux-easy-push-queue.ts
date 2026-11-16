@@ -28,12 +28,21 @@ export type LinuxEasyPushQueueLease = Readonly<{
     release(): void;
 }>;
 
+export type LinuxEasyPushQueueTakeResult =
+    | Readonly<{ kind: 'item'; lease: LinuxEasyPushQueueLease }>
+    | Readonly<{ kind: 'empty' | 'busy' | 'disabled' | 'closed' | 'failed' }>;
+
 export type LinuxEasyPushQueue = Readonly<{
     enqueue(frame: unknown, meta: unknown): LinuxEasyPushQueueResult;
     enableDrain(): boolean;
     take(): LinuxEasyPushQueueLease | undefined;
     close(): void;
 }>;
+
+export type LinuxEasyPushQueueDetailed = LinuxEasyPushQueue &
+    Readonly<{
+        takeDetailed(): LinuxEasyPushQueueTakeResult;
+    }>;
 
 // Local resource ceilings, not protocol limits. Command length is measured in
 // UTF-16 code units; byte frames are preserved without parsing or interpretation.
@@ -65,6 +74,12 @@ const closed = freeze({ kind: 'rejected', reason: 'closed' } as const);
 const invalid = freeze({ kind: 'rejected', reason: 'invalid' } as const);
 const capacity = freeze({ kind: 'rejected', reason: 'capacity' } as const);
 const reentrant = freeze({ kind: 'rejected', reason: 'reentrant' } as const);
+
+const takeEmpty = freeze({ kind: 'empty' } as const);
+const takeBusy = freeze({ kind: 'busy' } as const);
+const takeDisabled = freeze({ kind: 'disabled' } as const);
+const takeClosed = freeze({ kind: 'closed' } as const);
+const takeFailed = freeze({ kind: 'failed' } as const);
 
 type Slot = {
     frame: Uint8Array;
@@ -172,7 +187,7 @@ function wipe(frame: Uint8Array): void {
 
 export function createLinuxEasyPushQueue(
     options: Readonly<LinuxEasyPushQueueOptions>,
-): LinuxEasyPushQueue {
+): LinuxEasyPushQueueDetailed {
     let maxFrameBytes: number;
     let maxQueuedFrames: number;
     let maxQueuedBytes: number;
@@ -227,6 +242,10 @@ export function createLinuxEasyPushQueue(
             const length = frameLength(frame);
             const copiedMeta = snapshotMeta(meta);
 
+            if (stopped) {
+                return closed;
+            }
+
             if (length === undefined || length > maxFrameBytes || !copiedMeta) {
                 return invalid;
             }
@@ -244,6 +263,11 @@ export function createLinuxEasyPushQueue(
                 next: undefined,
             };
 
+            if (stopped) {
+                wipe(privateFrame);
+                return closed;
+            }
+
             if (tail) {
                 tail.next = slot;
             } else {
@@ -260,7 +284,7 @@ export function createLinuxEasyPushQueue(
                 wipe(privateFrame);
             }
 
-            return invalid;
+            return stopped ? closed : invalid;
         } finally {
             busy = false;
         }
@@ -284,12 +308,17 @@ export function createLinuxEasyPushQueue(
 
         try {
             const slot = head;
+            let published = false;
             // Construct the handle before mutating the queue, so an exceptional
             // allocation leaves the original FIFO and quota untouched.
             const lease = freeze({
                 frame: slot.frame,
                 meta: slot.meta,
                 release(): void {
+                    if (!published) {
+                        return;
+                    }
+
                     if (inflight !== slot) {
                         // Re-wipe only this lease, without touching a later lease
                         // or charging quota twice. Detached transfers stay external.
@@ -303,6 +332,12 @@ export function createLinuxEasyPushQueue(
                     wipe(slot.frame);
                 },
             });
+
+            // A replaced intrinsic can reenter close() before the commit.
+            if (stopped) {
+                return undefined;
+            }
+
             head = slot.next;
             slot.next = undefined;
 
@@ -311,9 +346,80 @@ export function createLinuxEasyPushQueue(
             }
 
             inflight = slot;
+            published = true;
             return lease;
         } catch {
             return undefined;
+        } finally {
+            busy = false;
+        }
+    }
+
+    function takeDetailed(): LinuxEasyPushQueueTakeResult {
+        if (stopped) {
+            return takeClosed;
+        }
+
+        if (busy) {
+            return takeBusy;
+        }
+
+        if (!draining) {
+            return takeDisabled;
+        }
+
+        if (inflight) {
+            return takeBusy;
+        }
+
+        if (!head) {
+            return takeEmpty;
+        }
+
+        busy = true;
+
+        try {
+            const slot = head;
+            let published = false;
+            // Finish both allocations before moving the FIFO or charging a lease.
+            const lease = freeze({
+                frame: slot.frame,
+                meta: slot.meta,
+                release(): void {
+                    if (!published) {
+                        return;
+                    }
+
+                    if (inflight !== slot) {
+                        wipe(slot.frame);
+                        return;
+                    }
+
+                    inflight = undefined;
+                    chargedFrames -= 1;
+                    chargedBytes -= slot.size;
+                    wipe(slot.frame);
+                },
+            });
+            const result = freeze({ kind: 'item' as const, lease });
+
+            // close() may have erased the slot during an intercepted intrinsic.
+            if (stopped) {
+                return takeClosed;
+            }
+
+            head = slot.next;
+            slot.next = undefined;
+
+            if (!head) {
+                tail = undefined;
+            }
+
+            inflight = slot;
+            published = true;
+            return result;
+        } catch {
+            return stopped ? takeClosed : takeFailed;
         } finally {
             busy = false;
         }
@@ -346,5 +452,5 @@ export function createLinuxEasyPushQueue(
         }
     }
 
-    return freeze({ enqueue, enableDrain, take, close });
+    return freeze({ enqueue, enableDrain, take, takeDetailed, close });
 }
