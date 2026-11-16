@@ -37,6 +37,31 @@ export interface TargetSso12ReserveInput {
     field32?: Uint8Array;
 }
 
+/**
+ * Caller-supplied opaque contents associated with native string-like objects at
+ * these result offsets. The values are not the 0x18-byte object headers, and no
+ * character encoding or string decoding is assumed. Static log length labels are
+ * candidate names, not proof of dynamic origin or signing semantics; this type
+ * does not equate these slots with the sign/token/extra API fields.
+ */
+export interface NativeSignResultPayloads {
+    readonly at00: Uint8Array;
+    readonly at18: Uint8Array;
+    readonly at30: Uint8Array;
+}
+
+const reserveFieldNames = [
+    'field12',
+    'field13',
+    'field15',
+    'field16',
+    'field21Enabled',
+    'field23',
+    'field24',
+    'field26',
+    'field32',
+] as const;
+
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
 const typedArrayLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get!;
 const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
@@ -165,18 +190,46 @@ export function encodeTargetSso12Reserve(input: TargetSso12ReserveInput): Uint8A
     }
 }
 
+/**
+ * Compose caller-supplied slot contents with the target-static reserve subset.
+ * The offset permutation is conditional on the observed result retaining its
+ * layout when transferred into the request. This function does not extract
+ * native memory, decode strings, generate signatures, or perform I/O. Slot and
+ * base records must remain stable until the synchronous encoder snapshots them.
+ * The returned encoded bytes belong to the caller; cleanup follows the existing
+ * encoder's best-effort snapshot policy.
+ */
+export function encodeTargetSso12ReserveFromNativeSlots(
+    base: Omit<TargetSso12ReserveInput, 'field24'>,
+    slots: NativeSignResultPayloads,
+): Uint8Array {
+    try {
+        const fields = record(base, reserveFieldNames);
+        const values = record(slots, ['at00', 'at18', 'at30']);
+
+        if (
+            Object.hasOwn(fields, 'field24') ||
+            !Object.hasOwn(values, 'at00') ||
+            !Object.hasOwn(values, 'at18') ||
+            !Object.hasOwn(values, 'at30')
+        ) {
+            throw new TypeError('invalid native slots');
+        }
+
+        fields.field24 = {
+            field1: values.at30,
+            field2: values.at00,
+            field3: values.at18,
+        };
+        // The encoder validates the assembled byte fields before copying them.
+        return encodeTargetSso12Reserve(fields as TargetSso12ReserveInput);
+    } catch {
+        throw new Error('target SSO12 reserve construction failed');
+    }
+}
+
 function encode(input: TargetSso12ReserveInput, owned: Uint8Array[]): Uint8Array {
-    const fields = record(input, [
-        'field12',
-        'field13',
-        'field15',
-        'field16',
-        'field21Enabled',
-        'field23',
-        'field24',
-        'field26',
-        'field32',
-    ]);
+    const fields = record(input, reserveFieldNames);
 
     function optionalBytes(name: string): ByteView | undefined {
         return Object.hasOwn(fields, name) ? inspectBytes(fields[name]) : undefined;

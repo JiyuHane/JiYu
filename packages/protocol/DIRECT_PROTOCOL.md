@@ -330,22 +330,53 @@ from the head context: its string offsets `+0x30`, `+0x00`, and `+0x18` feed
 child fields 1, 2, and 3 respectively, when nonempty. This permutation is a
 memory-layout observation, not evidence of signature or other business meaning.
 The same `req + 0x98` container is also read by the bounded path beginning at
-`0x666a830`; its constructor, population source and any relationship to signing
-remain unknown. A caller at `0x66678b0` invokes a virtual slot compatible with the
-observed V12 head encoder, but static inspection did not establish its runtime
-receiver type or complete calling chain. A separately bounded wrapper path
-at `0x6664434` passes a stack request to `0x66672f0`; immediately before that,
-`0x6664411` calls `0x6665a90` with a destination at request `+0x98` and a
-stack-sourced input. That helper transfers a pointer and clears the source slot;
-if the destination held an old object, it releases that object's resources. On a
-conditional earlier path, `0x6673480` invokes a virtual method and moves three
-0x18-byte string-like objects from its output into a newly allocated object;
-failure returns a null pointer. Nearby static diagnostic strings include
-`security_sign_manager.cc`, `GetSignInfo` and `sign success`, which link this
-bounded path to a signing-manager context. They do not establish the virtual
-method implementation, field meanings, runtime reachability, signing algorithm
-or usable signing service. The observed getter `0x6613810` copies a global
-object/control-pointer pair and increments a reference count; `0x66137b0` sets
+`0x666a830`. A more complete static trace now connects a conditional signing-manager
+path to that request slot. In the function at `0x6663ca0`, let `S` denote the
+stack pointer after its prologue. `0x6663d8a` initializes `[S+0x10]` to zero.
+When the local sign condition holds, `0x6663dc8` calls `0x6673480` with output
+slot `S+0x2c8`; at `0x6663ddd`, `0x6665a90` transfers that pointer into
+`[S+0x10]`. At `0x6664404–0x6664411` the same helper transfers it to
+`[S+0xf8]`, and `0x666442c–0x6664434` passes `S+0x60` as the request to
+`0x66672f0`, so the destination is request `+0x98`. The helper at
+`0x6665a97–0x6665aa4` reads and clears the source slot and writes the destination;
+it also releases an existing destination object when present. The inspected
+normal branches and loops between those transfers do not directly write or
+pass `[S+0x10]`. This is conditional on normal returns, valid objects and no
+indirect alias or concurrent write; exception cleanup and other execution paths
+are not proven equivalent.
+
+Inside `0x6673480`, the virtual call at `0x66734e1` receives a 72-byte temporary
+output region. On a nonzero return, `0x6673572–0x66735d6` moves three 24-byte
+string-like representations into a new object at offsets `+0x00`, `+0x18` and
+`+0x30`. The `GetSignInfo` success diagnostic calls `0x6674000`, whose
+`0x6674008–0x6674078` reads their lengths in that order and formats them using
+`token:%lld extra:%lld sign:%lld`. Thus **the diagnostic labels** support the
+candidates `+0x00` = token, `+0x18` = extra and `+0x30` = sign; they do not
+independently prove the byte values' cryptographic semantics. The subsequent
+`0x666a660` checks and writes the nonempty `+0x30`, `+0x00` and `+0x18`
+contents to field-24 children 1, 2 and 3 respectively; all empty yields no
+child. For its call at `0x6663dc8`, the caller passes a pointer `D` from the
+current request controller, a pointer `V` loaded from `[D+0x20]`, and a 32-bit
+value `K` from controller `+0x58`. The virtual call receives `D`, `V`, the
+temporary output and `K`. Later, `0x666431c–0x6664367` reads the controller and
+its nested pointer again to populate the request's sequence-like field and
+payload pointer/length. Those observations are consistent with the callback
+seeing the source used for the request body and sequence, **if** the objects
+and values did not change between reads; they do not establish command or
+account provenance, identity across intervening calls, or an actual invocation.
+This agrees in field numbering with the independently inspected
+[LagrangeV2 secure-info declaration](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Common/BotSignProvider.cs#L620-L628),
+but agreement is not proof of binary compatibility or shared implementation.
+
+The path from `0x66672f0` reaches `0x66678b0`, whose call at `0x6667929` uses an
+unresolved receiver's virtual slot `+0x20`. Only **if** that receiver selects the
+observed V12 head encoder at `0x6669490` does its call at `0x6669727` pass the
+request to the field-24 builder at `0x666a1d0`. The virtual receiver, concrete
+signing callback, complete input provenance, runtime reachability, signature
+algorithm and usable signing service remain unestablished.
+
+The observed getter `0x6613810` copies a global object/control-pointer pair and
+increments a reference count; `0x66137b0` sets
 that pair from an input supplied elsewhere. A bounded inspection identifies
 `0x6613200` as one caller: it copies its caller-supplied pair into a temporary
 and passes that pair to `0x66137b0`. The getter and setter access the two global
@@ -1006,9 +1037,13 @@ remain to be recovered and independently verified.
   and rejects sparse arrays, accessors and shared buffers.
   Fields 13, 15 and 16 retain explicitly present empty bytes, field 26 retains
   an explicitly present zero, and field 24 is emitted only if a child is nonempty.
-  Enabling field 21 writes the observed constant 32. Field numbers are
-  intentionally not assigned business or signing semantics; the encoder is not
-  a complete model of the target reserve.
+  Enabling field 21 writes the observed constant 32. The additive
+  `encodeTargetSso12ReserveFromNativeSlots` helper accepts caller-supplied raw
+  bytes for the observed `+0x00`, `+0x18` and `+0x30` string-like result slots
+  and maps them to field-24 children 2, 3 and 1 respectively. It does not read a
+  native object, implement a signer, choose a command or establish runtime field
+  semantics. The `GetSignInfo` length labels discussed above are candidates;
+  neither encoder is a complete model of the target reserve.
 - `src/direct/target-sso12-head.ts` encodes the statically observed V12 request
   header. The sequence, context numbers, opaque byte strings and already-encoded
   reserve are explicit inputs; it does not infer their semantics or create a
