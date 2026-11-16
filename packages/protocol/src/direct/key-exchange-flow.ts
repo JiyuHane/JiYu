@@ -12,11 +12,21 @@ import { decodeSsoResponse, encodeSso12Request } from './sso';
 // https://github.com/LagrangeDev/Lagrange.Core/blob/fe789c4a23796fbc82fa09e70a9c44c8a5cf2948/Lagrange.Core/Internal/Services/Login/KeyExchangeService.cs
 export const KEY_EXCHANGE_COMMAND = 'trpc.login.ecdh.EcdhService.SsoKeyExchange';
 
+function wipeKeyExchangeBytes(bytes: Uint8Array | undefined): void {
+    try {
+        bytes?.fill(0);
+    } catch {
+        // Best-effort only; Proton and the runtime may retain other copies.
+    }
+}
+
 export interface KeyExchangeFlowInput {
     uin: string;
     guid: Uint8Array;
     version: string;
     subAppId: number;
+    /** Optional inner SSO A2; absent defaults to empty, independent of outer D2. */
+    a2?: Uint8Array;
     reserved: Uint8Array;
     sequence: number;
     serverPublicKey: Uint8Array;
@@ -61,6 +71,12 @@ export function createKeyExchangeFlow(input: KeyExchangeFlowInput): {
         throw new TypeError('guid must be nonempty bytes');
     }
 
+    const a2 = input.a2;
+
+    if (a2 !== undefined && !(a2 instanceof Uint8Array)) {
+        throw new TypeError('a2 must be bytes');
+    }
+
     if (!(input.reserved instanceof Uint8Array)) {
         throw new TypeError('reserved must be bytes');
     }
@@ -89,12 +105,19 @@ export function createKeyExchangeFlow(input: KeyExchangeFlowInput): {
     const sequence = input.sequence;
     const verifyServerResponse = input.verifyServerResponse;
     const secret = encodeKeyExchangeRequestBuf({ uin, guid: input.guid });
-    const exchange = buildKeyExchange(
-        secret,
-        input.serverPublicKey,
-        input.verifyKey,
-        input.timestamp,
-    );
+    let exchange: ReturnType<typeof buildKeyExchange>;
+
+    try {
+        exchange = buildKeyExchange(
+            secret,
+            input.serverPublicKey,
+            input.verifyKey,
+            input.timestamp,
+        );
+    } finally {
+        wipeKeyExchangeBytes(secret);
+    }
+
     // The request-side ECDH result is no longer needed after constructing the fields.
     exchange.sharedSecret.fill(0);
     const body = encodeKeyExchangeRequest({
@@ -107,7 +130,7 @@ export function createKeyExchangeFlow(input: KeyExchangeFlowInput): {
     const sso = encodeSso12Request({
         sequence,
         subAppId: input.subAppId,
-        a2: new Uint8Array(),
+        a2: a2 ?? new Uint8Array(),
         command: KEY_EXCHANGE_COMMAND,
         guid: input.guid,
         version: input.version,
@@ -187,22 +210,41 @@ export function createKeyExchangeFlow(input: KeyExchangeFlowInput): {
 
             const responseKey = deriveOnce(payload.publicKey);
 
-            try {
-                const decoded = decodeKeyExchangeResponseSecret(
-                    decryptKeyExchangeBytes(payload.secret, responseKey),
-                );
+            let plaintext: Uint8Array | undefined;
+            let sessionKey: Uint8Array | undefined;
+            let sessionTicket: Uint8Array | undefined;
+            let committed = false;
 
-                if (!decoded.sessionKey?.length || !decoded.sessionTicket?.length) {
-                    throw new Error('missing key exchange session key or ticket');
+            try {
+                let result: KeyExchangeFlowResult;
+
+                try {
+                    plaintext = decryptKeyExchangeBytes(payload.secret, responseKey);
+                    const decoded = decodeKeyExchangeResponseSecret(plaintext);
+                    sessionKey = decoded.sessionKey;
+                    sessionTicket = decoded.sessionTicket;
+
+                    if (!sessionKey?.length || !sessionTicket?.length) {
+                        throw new Error('missing key exchange session key or ticket');
+                    }
+
+                    result = {
+                        sessionKey,
+                        sessionTicket,
+                        expiration: decoded.expiration,
+                    };
+                } finally {
+                    wipeKeyExchangeBytes(plaintext);
+                    responseKey.fill(0);
                 }
 
-                return {
-                    sessionKey: decoded.sessionKey,
-                    sessionTicket: decoded.sessionTicket,
-                    expiration: decoded.expiration,
-                };
+                committed = true;
+                return result;
             } finally {
-                responseKey.fill(0);
+                if (!committed) {
+                    wipeKeyExchangeBytes(sessionKey);
+                    wipeKeyExchangeBytes(sessionTicket);
+                }
             }
         },
     };

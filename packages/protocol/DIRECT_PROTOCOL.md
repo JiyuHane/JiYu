@@ -1829,9 +1829,22 @@ remain to be recovered and independently verified.
   exchange frame and a one-shot response decoder. These do not establish a full
   login. GCM using an unverified response public key does not authenticate the
   server: the flow requires a caller-supplied response verifier, whose trust
-  policy is not implemented here. Synthetic tests use a permissive verifier
-  only for their in-process peer. Cancellation discards the retained handle, but
-  JavaScript and the crypto provider do not guarantee secure memory erasure.
+  policy is not implemented here. The optional caller-supplied inner SSO A2
+  defaults to empty; it is distinct from the empty outer D2 used with zero-key
+  transport. The caller must ensure it belongs to the intended account. Reserved
+  metadata must already be supplied before the flow generates its key-exchange
+  body, so this API does not support an asynchronous body-dependent signer.
+  Synthetic tests use a permissive verifier only for their in-process peer.
+  The serialized `KeyExchangeRequestBuf` plaintext, successfully returned
+  decryption buffers and reachable response-decoder outputs on later failures are
+  wiped best-effort; SSO framing and other intermediate copies, crypto/codec copies
+  that never become accessible, and caller-owned or transferred session bytes are
+  excluded. If key-exchange construction fails after deriving a shared secret, that
+  internal value is also outside this flow's cleanup guarantee. If the protobuf
+  decoder throws before returning, its internal field copies are not reachable for
+  cleanup. Cancellation discards
+  the retained handle, but JavaScript and the crypto provider do not guarantee
+  secure memory erasure.
 - `src/direct/nt-linux-login-reference.ts` independently constructs an offline
   Linux PC NT-login request body from the fixed LagrangeV2 `7011cdf` reference's
   [common request](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Services/Login/NTLoginCommon.cs#L13-L29)

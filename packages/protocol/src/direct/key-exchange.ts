@@ -12,6 +12,14 @@ const PUBLIC_SIZE = 65;
 const NONCE_SIZE = 12;
 const TAG_SIZE = 16;
 
+function wipeKeyExchangeBytes(bytes: Uint8Array | undefined): void {
+    try {
+        bytes?.fill(0);
+    } catch {
+        // The runtime and crypto provider may retain other copies.
+    }
+}
+
 /** Independent byte primitives; serialization and account/session handling belong to the caller.
  * Wire facts: https://github.com/LagrangeDev/Lagrange.Core/blob/fe789c4a23796fbc82fa09e70a9c44c8a5cf2948/Lagrange.Core/Internal/Services/Login/KeyExchangeService.cs
  */
@@ -93,12 +101,28 @@ export function decryptKeyExchangeBytes(encoded: Uint8Array, key: Uint8Array): U
         authTagLength: TAG_SIZE,
     });
     decipher.setAuthTag(encoded.subarray(encoded.length - TAG_SIZE));
-    return Uint8Array.from(
-        Buffer.concat([
-            decipher.update(encoded.subarray(NONCE_SIZE, encoded.length - TAG_SIZE)),
-            decipher.final(),
-        ]),
-    );
+    let updated: Buffer | undefined;
+    let final: Buffer | undefined;
+    let output: Uint8Array | undefined;
+    let committed = false;
+
+    try {
+        updated = decipher.update(encoded.subarray(NONCE_SIZE, encoded.length - TAG_SIZE));
+        final = decipher.final();
+        output = new Uint8Array(updated.length + final.length);
+        output.set(updated);
+        output.set(final, updated.length);
+        committed = true;
+        return output;
+    } finally {
+        // Wiping is best-effort and must not replace a crypto or allocation error.
+        wipeKeyExchangeBytes(updated);
+        wipeKeyExchangeBytes(final);
+
+        if (!committed) {
+            wipeKeyExchangeBytes(output);
+        }
+    }
 }
 
 /** SHA-256 over the public point, fixed fields, encrypted secret and timestamp. */
