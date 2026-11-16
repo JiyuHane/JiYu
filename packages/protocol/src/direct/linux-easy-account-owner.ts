@@ -81,9 +81,31 @@ const pushBodyExtractors = new WeakMap<
     LinuxEasyAccountOwner,
     (frame: Uint8Array, expected: D2Candidate) => OwnerPushBody | undefined
 >();
+const pushActiveChecks = new WeakMap<LinuxEasyAccountOwner, () => boolean>();
 const weakMapGet = WeakMap.prototype.get;
 const weakMapSet = WeakMap.prototype.set;
 const weakMapDelete = WeakMap.prototype.delete;
+
+/**
+ * Deep trusted composition only: this is a synchronous local state gate, not
+ * peer authentication, login, online status, or physical disconnect detection.
+ * It exposes no capability, lease, account data, or callback to the caller.
+ * A concurrent send does not make this local gate inactive; the composing driver
+ * owns ingress start/stop ordering and any send/ingress mutual exclusion.
+ */
+export function isLinuxEasyOwnerPushActive(owner: LinuxEasyAccountOwner): boolean {
+    try {
+        if (typeof owner !== 'object' || owner === null || isProxy(owner)) {
+            return false;
+        }
+
+        const checkActive = Reflect.apply(weakMapGet, pushActiveChecks, [owner]) as
+            (() => boolean) | undefined;
+        return checkActive?.() === true;
+    } catch {
+        return false;
+    }
+}
 
 /**
  * Deep internal extraction only; expected is a trusted routing snapshot, not
@@ -386,6 +408,7 @@ function createOwner(withKeyCapability: boolean): LinuxEasyAccountOwner {
 
         Reflect.apply(weakMapDelete, classifiers, [owner]);
         Reflect.apply(weakMapDelete, pushBodyExtractors, [owner]);
+        Reflect.apply(weakMapDelete, pushActiveChecks, [owner]);
 
         if (timer !== undefined) {
             clearTimeout(timer);
@@ -1077,6 +1100,22 @@ function createOwner(withKeyCapability: boolean): LinuxEasyAccountOwner {
                         }
 
                         loginCapability = created;
+
+                        // A registration can reenter stop before its WeakMap set returns.
+                        // Check after each assignment so the catch removes every mapping,
+                        // including one inserted after an earlier stop already ran.
+                        const checkBinding = (): void => {
+                            if (
+                                currentState() !== 'starting' ||
+                                epoch !== generation ||
+                                controller.signal.aborted ||
+                                lease !== acquired ||
+                                capability !== created
+                            ) {
+                                throw new Error('stopped');
+                            }
+                        };
+
                         Reflect.apply(weakMapSet, classifiers, [
                             owner,
                             (frame: Uint8Array): D2Candidate | undefined => {
@@ -1150,6 +1189,7 @@ function createOwner(withKeyCapability: boolean): LinuxEasyAccountOwner {
                                 }
                             },
                         ]);
+                        checkBinding();
                         Reflect.apply(weakMapSet, pushBodyExtractors, [
                             owner,
                             (
@@ -1242,6 +1282,47 @@ function createOwner(withKeyCapability: boolean): LinuxEasyAccountOwner {
                                 }
                             },
                         ]);
+                        checkBinding();
+                        const pushSignal = controller.signal;
+                        checkBinding();
+                        Reflect.apply(weakMapSet, pushActiveChecks, [
+                            owner,
+                            (): boolean => {
+                                // The exact lease/token/account and owner epoch come from
+                                // this creation closure, not from the capability's passive
+                                // generation object, which does not validate freshness.
+                                const localStateMatches = (): boolean =>
+                                    currentState() === 'registered' &&
+                                    epoch === generation &&
+                                    !apply(getAborted, pushSignal, []) &&
+                                    lease === acquired &&
+                                    capability === created &&
+                                    session !== undefined &&
+                                    session.uin === uin;
+
+                                try {
+                                    if (!localStateMatches()) {
+                                        return false;
+                                    }
+
+                                    // Clock access may synchronously reenter close.
+                                    nowChecked(generation);
+
+                                    if (
+                                        !localStateMatches() ||
+                                        linuxEasyKeyState(created) !== 'active'
+                                    ) {
+                                        return false;
+                                    }
+
+                                    // No clock or outside callback after the phase lookup.
+                                    return localStateMatches();
+                                } catch {
+                                    return false;
+                                }
+                            },
+                        ]);
+                        checkBinding();
                         check(generation);
                     } catch (error) {
                         // Only the token created by this owner is ours to revoke, including
@@ -1259,8 +1340,9 @@ function createOwner(withKeyCapability: boolean): LinuxEasyAccountOwner {
                         try {
                             Reflect.apply(weakMapDelete, classifiers, [owner]);
                             Reflect.apply(weakMapDelete, pushBodyExtractors, [owner]);
+                            Reflect.apply(weakMapDelete, pushActiveChecks, [owner]);
                         } catch {
-                            /* Continue teardown if internal extractor removal fails. */
+                            /* Continue teardown if internal mapping removal fails. */
                         }
 
                         try {

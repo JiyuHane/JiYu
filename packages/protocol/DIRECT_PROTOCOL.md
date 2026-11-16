@@ -1812,8 +1812,14 @@ remain to be recovered and independently verified.
   valid borrowed body through the synchronous snapshot; this ingress cannot detect
   a buffer already wiped upstream. A separate synthetic OneBot test composes this
   ingress with the real event pipeline and v12 conversion using fake account contexts;
-  it tracks ingress and OneBot drains separately. Identity, pipeline and ordinary
-  Promise internals are trusted in-process dependencies. Core `Bridge` now exposes
+  it tracks ingress and OneBot drains separately. A separate deep-internal guarded
+  factory accepts a trusted synchronous local-liveness check: a non-true result
+  stops admission and fences the next processing stage. The check is not source
+  authentication, and must not mutate the identity. Already-entered parser or
+  pipeline effects are not rolled back; a guard after pipeline settlement can
+  report stopped even though effects have occurred. Identity, pipeline, ordinary
+  Array and Promise intrinsics, and the absence of synchronous reentry from runtime
+  hooks remain trusted in-process assumptions. Core `Bridge` now exposes
   an internal, opt-in, single-claim composition port bound to that Bridge's identity
   and packet pipeline. Its owner must supply authentication and limits; activation
   does not attach a transport, sender, PID or online status. Bridge disposal stops

@@ -186,8 +186,61 @@ type Item = {
  * species, are caller trust assumptions; they are not an adversarial isolation boundary.
  */
 export function createDirectPushIngress(options: DirectPushIngressOptions): DirectPushIngress {
+    return createIngress(options);
+}
+
+/**
+ * Deep internal lifecycle fence, supplied and trusted by the caller. It is not
+ * peer authentication, registration, online-state, or delivery verification.
+ * Inactive resources are noticed only at the next fence or explicit stop; an
+ * external close event is known only after its callback has actually run. Effects
+ * already entered in the parser, callbacks or pipeline cannot be rolled back.
+ * A fence after pipeline settlement can report stopped, but does not undo those
+ * effects or synchronously detect an external close event not yet observed.
+ *
+ * The trusted guard must only report the owner's local lifecycle and must not
+ * modify identity or its reported value. Identity, pipeline, unmodified runtime
+ * intrinsics (including Array and Promise), and the absence of asynchronous hooks
+ * that synchronously reenter this code are trust assumptions, not an adversarial
+ * isolation boundary. An identity getter can synchronously stop the ingress; each
+ * following fence checks state. These checks do not establish that identity stays
+ * unchanged across arbitrary callbacks or prove a remote identity or connection.
+ */
+export function createGuardedDirectPushIngress(
+    options: DirectPushIngressOptions,
+    guard: () => boolean,
+): DirectPushIngress {
+    if (typeof guard !== 'function') {
+        throw new TypeError('invalid direct ingress guard');
+    }
+
+    return createIngress(options, guard);
+}
+
+function createIngress(
+    options: DirectPushIngressOptions,
+    guard?: () => boolean,
+): DirectPushIngress {
     const { uin, identity, pipeline, maxBodyBytes, maxPendingBytes, maxPending, maxEventsPerPush } =
         options;
+
+    function initialIdentityMatches(): boolean {
+        try {
+            const value: unknown = identity.uin;
+
+            if (guard) {
+                observePromise(value);
+            }
+
+            return value === uin;
+        } catch (error) {
+            if (guard) {
+                observePromise(error);
+            }
+
+            throw error;
+        }
+    }
 
     if (
         typeof uin !== 'string' ||
@@ -201,13 +254,17 @@ export function createDirectPushIngress(options: DirectPushIngressOptions): Dire
         !positiveInteger(maxEventsPerPush) ||
         !identity ||
         !pipeline ||
-        identity.uin !== uin
+        !initialIdentityMatches()
     ) {
         throw new TypeError('invalid direct ingress options');
     }
 
     const processEvents = pipeline.processDecodedDirectEvents;
     const initialization = identity.initialization;
+
+    if (guard) {
+        observePromise(processEvents);
+    }
 
     if (typeof processEvents !== 'function' || !isPromise(initialization)) {
         throw new TypeError('invalid direct ingress options');
@@ -223,6 +280,8 @@ export function createDirectPushIngress(options: DirectPushIngressOptions): Dire
     let pending = 0;
     let pendingBytes = 0;
     let admitting = false;
+    let admittingBody: Uint8Array | undefined;
+    let checkingGuard = false;
     let running = false;
     let current: Item | undefined;
     const queue: Item[] = [];
@@ -240,10 +299,85 @@ export function createDirectPushIngress(options: DirectPushIngressOptions): Dire
         }
     }
 
+    function stop(): void {
+        if (state === 'stopped') {
+            return;
+        }
+
+        state = 'stopped';
+
+        if (admittingBody) {
+            wipe(admittingBody);
+        }
+
+        if (current && current.phase !== 'pipeline') {
+            wipe(current.body);
+        }
+
+        for (const item of queue.splice(0)) {
+            wipe(item.body);
+            item.resolve({ kind: 'rejected', reason: 'stopped' });
+            release(item.bytes);
+        }
+    }
+
+    // Do not access `.then` on arbitrary thenables or assimilate them.
+    function observePromise(value: unknown): void {
+        if (isPromise(value)) {
+            apply(promiseThen, value, [undefined, () => undefined]);
+        }
+    }
+
+    function fence(expected: 'disabled' | 'active'): boolean {
+        if (state !== expected) {
+            return false;
+        }
+
+        if (!guard) {
+            return true;
+        }
+
+        // Reentry through a guard must not recursively invoke it or admit work.
+        if (checkingGuard) {
+            stop();
+            return false;
+        }
+
+        checkingGuard = true;
+        let accepted = false;
+
+        try {
+            const result: unknown = apply(guard, undefined, []);
+            observePromise(result);
+            accepted = result === true;
+        } catch (error) {
+            observePromise(error);
+        } finally {
+            checkingGuard = false;
+        }
+
+        if (!accepted) {
+            stop();
+            return false;
+        }
+
+        return state === expected;
+    }
+
     function sameIdentity(): boolean {
         try {
-            return identity.uin === uin;
-        } catch {
+            const value: unknown = identity.uin;
+
+            if (guard) {
+                observePromise(value);
+            }
+
+            return value === uin;
+        } catch (error) {
+            if (guard) {
+                observePromise(error);
+            }
+
             return false;
         }
     }
@@ -258,7 +392,7 @@ export function createDirectPushIngress(options: DirectPushIngressOptions): Dire
             ok = false;
         }
 
-        if (state !== 'active') {
+        if (!fence('active')) {
             return { kind: 'rejected', reason: 'stopped' };
         }
 
@@ -266,25 +400,39 @@ export function createDirectPushIngress(options: DirectPushIngressOptions): Dire
             return { kind: 'failed', reason: 'initialization' };
         }
 
-        if (!sameIdentity()) {
+        const matchesBeforeParse = sameIdentity();
+
+        if (!guard && !matchesBeforeParse) {
             return { kind: 'rejected', reason: 'identity-changed' };
         }
 
-        if (state !== 'active') {
+        if (!fence('active')) {
             return { kind: 'rejected', reason: 'stopped' };
+        }
+
+        if (!matchesBeforeParse) {
+            return { kind: 'rejected', reason: 'identity-changed' };
         }
 
         let events: QQEventVariant[];
 
         try {
             events = parseDirectMsgPushOrThrow({ ...item.meta, body: item.body }, identity, dedup);
-        } catch {
-            return state === 'active'
+        } catch (error) {
+            if (guard) {
+                observePromise(error);
+            }
+
+            return fence('active')
                 ? { kind: 'failed', reason: 'parse' }
                 : { kind: 'rejected', reason: 'stopped' };
         }
 
-        if (state !== 'active') {
+        if (guard) {
+            observePromise(events);
+        }
+
+        if (!fence('active')) {
             return { kind: 'rejected', reason: 'stopped' };
         }
 
@@ -301,24 +449,38 @@ export function createDirectPushIngress(options: DirectPushIngressOptions): Dire
 
         try {
             detached = clone(events);
-        } catch {
-            return state === 'active'
+        } catch (error) {
+            if (guard) {
+                observePromise(error);
+            }
+
+            return fence('active')
                 ? { kind: 'failed', reason: 'clone' }
                 : { kind: 'rejected', reason: 'stopped' };
         }
 
-        if (state !== 'active') {
+        if (guard) {
+            observePromise(detached);
+        }
+
+        if (!fence('active')) {
             return { kind: 'rejected', reason: 'stopped' };
         }
 
         wipe(item.body);
 
-        if (!sameIdentity()) {
+        const matchesBeforePipeline = sameIdentity();
+
+        if (!guard && !matchesBeforePipeline) {
             return { kind: 'rejected', reason: 'identity-changed' };
         }
 
-        if (state !== 'active') {
+        if (!fence('active')) {
             return { kind: 'rejected', reason: 'stopped' };
+        }
+
+        if (!matchesBeforePipeline) {
+            return { kind: 'rejected', reason: 'identity-changed' };
         }
 
         item.phase = 'pipeline';
@@ -328,8 +490,21 @@ export function createDirectPushIngress(options: DirectPushIngressOptions): Dire
                 { serviceCmd: item.meta.command, seqId: item.meta.sequence },
                 detached,
             ]);
+
+            if (guard && !fence('active')) {
+                return { kind: 'rejected', reason: 'stopped' };
+            }
+
             return { kind: 'settled', events: count };
-        } catch {
+        } catch (error) {
+            if (guard) {
+                observePromise(error);
+
+                if (!fence('active')) {
+                    return { kind: 'rejected', reason: 'stopped' };
+                }
+            }
+
             return { kind: 'failed', reason: 'pipeline' };
         }
     }
@@ -372,8 +547,12 @@ export function createDirectPushIngress(options: DirectPushIngressOptions): Dire
                 return false;
             }
 
+            if (!fence('disabled')) {
+                return false;
+            }
+
             state = 'active';
-            return true;
+            return fence('active');
         },
         submit(body, meta): Promise<DirectIngressResult> {
             if (state !== 'active') {
@@ -381,6 +560,10 @@ export function createDirectPushIngress(options: DirectPushIngressOptions): Dire
                     kind: 'rejected',
                     reason: state === 'stopped' ? 'stopped' : 'not-active',
                 });
+            }
+
+            if (!fence('active')) {
+                return Promise.resolve({ kind: 'rejected', reason: 'stopped' });
             }
 
             if (admitting) {
@@ -420,46 +603,49 @@ export function createDirectPushIngress(options: DirectPushIngressOptions): Dire
             }
 
             admitting = true;
-            let matches: boolean;
+            admittingBody = copy;
+            let transferred = false;
 
             try {
-                matches = sameIdentity();
+                const matches = sameIdentity();
+                const active = fence('active');
+
+                if (!active || !matches) {
+                    return Promise.resolve(
+                        !active
+                            ? { kind: 'rejected', reason: 'stopped' }
+                            : { kind: 'rejected', reason: 'identity-changed' },
+                    );
+                }
+
+                return new Promise((resolve) => {
+                    // Promise construction may synchronously reenter through runtime hooks.
+                    if (!fence('active')) {
+                        resolve({ kind: 'rejected', reason: 'stopped' });
+                        return;
+                    }
+
+                    queue.push({
+                        body: copy,
+                        bytes: size,
+                        meta: snapshot!,
+                        resolve,
+                        phase: 'queued',
+                    });
+                    transferred = true;
+                    start();
+                });
             } finally {
+                admittingBody = undefined;
                 admitting = false;
-            }
 
-            if (state !== 'active' || !matches) {
-                wipe(copy);
-                release(size);
-                return Promise.resolve(
-                    state !== 'active'
-                        ? { kind: 'rejected', reason: 'stopped' }
-                        : { kind: 'rejected', reason: 'identity-changed' },
-                );
-            }
-
-            return new Promise((resolve) => {
-                queue.push({ body: copy, bytes: size, meta: snapshot!, resolve, phase: 'queued' });
-                start();
-            });
-        },
-        stop(): void {
-            if (state === 'stopped') {
-                return;
-            }
-
-            state = 'stopped';
-
-            if (current && current.phase !== 'pipeline') {
-                wipe(current.body);
-            }
-
-            for (const item of queue.splice(0)) {
-                wipe(item.body);
-                item.resolve({ kind: 'rejected', reason: 'stopped' });
-                release(item.bytes);
+                if (!transferred) {
+                    wipe(copy);
+                    release(size);
+                }
             }
         },
+        stop,
         drain(): Promise<void> {
             if (state !== 'stopped') {
                 return Promise.reject(new Error('stop ingress before drain'));
