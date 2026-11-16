@@ -2160,8 +2160,16 @@ remain to be recovered and independently verified.
   operation; an uncertain attempted send
   closes the owner and requests poison without retry. Its response is a local
   protocol projection, not proof of message delivery. Owner-held byte copies are
-  wiped best effort on close or failure. Push and production integration are not
-  implemented by this owner.
+  wiped best effort on close or failure. The separate deep-import-only
+  `createLinuxEasyAccountOwnerWithKeyCapability` variant binds a tentative key to
+  its own lease and commits it only after the local registration success result,
+  using the EasyLogin sequence and a separate comparison copy. Its internal
+  `classifyLinuxEasyOwnerD2Candidate` returns only account, sequence, command and
+  return-code metadata, never the body, key or ticket. The input frame and decoded
+  SSO body are each limited to 64 KiB by local policy, not by an established QQ
+  protocol limit. Metadata is sensitive and must not be logged. A tentative
+  classification is not authentication and is not delivered as a business event.
+  Push queues and production integration are not implemented by either variant.
   The lifetime deadline and phase deadlines depend on event-loop progress. Close
   revokes local state and requests poison, but cannot stop work already inside an
   uncooperative callback or transport, nor erase their retained copies. A broker

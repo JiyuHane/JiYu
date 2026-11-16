@@ -2,9 +2,19 @@ import { addAbortListener } from 'node:events';
 import { isPromise, isProxy, isSharedArrayBuffer, isUint8Array } from 'node:util/types';
 import {
     runLinuxEasyLoginSession,
+    runLinuxEasyLoginSessionWithKeyCapability,
     type LinuxEasyLoginSessionOptions,
     type LinuxEasyLoginSessionResult,
 } from './linux-easy-login-session';
+import {
+    assertLinuxEasyKeyTentative,
+    commitLinuxEasyKey,
+    createLinuxEasyKeyCapability,
+    decodeLinuxEasyServiceResponse,
+    linuxEasyKeyState,
+    revokeLinuxEasyKey,
+    type LinuxEasyKeyToken,
+} from './linux-easy-key-capability';
 import {
     registerLinuxEasyReference,
     type LinuxEasyReferenceRegisterOptions,
@@ -55,8 +65,39 @@ export interface LinuxEasyAccountOwner {
     close(): void;
 }
 
+type D2Candidate = Readonly<{ uin: string; sequence: number; command: string; retCode: number }>;
+const classifiers = new WeakMap<
+    LinuxEasyAccountOwner,
+    (frame: Uint8Array) => D2Candidate | undefined
+>();
+const weakMapGet = WeakMap.prototype.get;
+const weakMapSet = WeakMap.prototype.set;
+const weakMapDelete = WeakMap.prototype.delete;
+
+/** Trusted internal callers only: metadata is sensitive; do not log it. Parsing is not
+ * peer authentication, payload validation, message delivery, or an online assertion. */
+export function classifyLinuxEasyOwnerD2Candidate(
+    owner: LinuxEasyAccountOwner,
+    frame: Uint8Array,
+): D2Candidate | undefined {
+    try {
+        if (typeof owner !== 'object' || owner === null || isProxy(owner)) {
+            return undefined;
+        }
+
+        const classify = Reflect.apply(weakMapGet, classifiers, [owner]) as
+            ((value: Uint8Array) => D2Candidate | undefined) | undefined;
+        return classify?.(frame);
+    } catch {
+        return undefined;
+    }
+}
+
 const MAX_TIMER = 0x7fffffff;
 const LIMIT = 1024 * 1024;
+const Bytes = Uint8Array;
+const apply = Reflect.apply;
+const freeze = Object.freeze;
 const typed = Object.getPrototypeOf(Uint8Array.prototype) as object;
 const getBuffer = Object.getOwnPropertyDescriptor(typed, 'buffer')!.get!;
 const getOffset = Object.getOwnPropertyDescriptor(typed, 'byteOffset')!.get!;
@@ -87,7 +128,7 @@ function record(value: unknown, allowed: readonly string[]): Record<string, unkn
             typeof key !== 'string' ||
             !allowed.includes(key) ||
             !descriptor ||
-            !('value' in descriptor)
+            !Object.hasOwn(descriptor, 'value')
         ) {
             throw new TypeError('invalid options');
         }
@@ -103,21 +144,21 @@ function copyBytes(value: unknown, max: number): Uint8Array {
         throw new TypeError('invalid bytes');
     }
 
-    values.call(value);
-    const storage = getBuffer.call(value) as ArrayBufferLike;
-    const offset = getOffset.call(value) as number;
-    const length = getLength.call(value) as number;
+    apply(values, value, []);
+    const storage = apply(getBuffer, value, []) as ArrayBufferLike;
+    const offset = apply(getOffset, value, []) as number;
+    const length = apply(getLength, value, []) as number;
 
     if (
         length > max ||
         isSharedArrayBuffer(storage) ||
-        (getResizable && getResizable.call(storage))
+        (getResizable && apply(getResizable, storage, []))
     ) {
         throw new TypeError('invalid bytes');
     }
 
-    const output = new Uint8Array(length);
-    set.call(output, new Uint8Array(storage, offset, length));
+    const output = new Bytes(length);
+    apply(set, output, [new Bytes(storage, offset, length)]);
     return output;
 }
 
@@ -170,7 +211,9 @@ function validSignal(value: unknown): value is AbortSignal {
  * attributed in nt-linux-easy-login-reference.ts to LagrangeV2 revision
  * 7011cdf87368cc0fb77273c1508e779a52328165 (overall upstream license undetermined).
  *
- * whenClosed is asynchronous observation, not a synchronous transport fence. Timers
+ * Registration signer and transport callbacks can also observe the D2 wire header.
+ * whenClosed is asynchronous observation, not a synchronous transport fence: broker
+ * terminal transitions can precede the owner's capability revocation. Timers
  * depend on event-loop progress. Close marks state first, then aborts and poisons; it
  * cannot stop uncooperative transport/callbacks or erase copies held elsewhere. Late
  * login results are observed and their reachable body wiped best effort. Callers must
@@ -178,12 +221,22 @@ function validSignal(value: unknown): value is AbortSignal {
  * any late values the broker discards before they reach this owner.
  */
 export function createLinuxEasyAccountOwner(): LinuxEasyAccountOwner {
+    return createOwner(false);
+}
+
+/** Internal reference composition; not wired into production or a public callback. */
+export function createLinuxEasyAccountOwnerWithKeyCapability(): LinuxEasyAccountOwner {
+    return createOwner(true);
+}
+
+function createOwner(withKeyCapability: boolean): LinuxEasyAccountOwner {
     const controller = new AbortController();
     const owned = new Set<Uint8Array>();
     let state: 'new' | 'starting' | 'registered' | 'closed' = 'new';
     let epoch = 0;
     let busy = false;
     let lease: RawSessionLease | undefined;
+    let capability: LinuxEasyKeyToken | undefined;
     let session:
         | {
               uin: string;
@@ -221,6 +274,18 @@ export function createLinuxEasyAccountOwner(): LinuxEasyAccountOwner {
         state = 'closed';
         epoch++;
         stopReason = reason;
+        // Remove the exact-owner entry and revoke before abort, poison or other cleanup.
+        Reflect.apply(weakMapDelete, classifiers, [owner]);
+        const currentCapability = capability;
+        capability = undefined;
+
+        if (currentCapability) {
+            try {
+                revokeLinuxEasyKey(currentCapability);
+            } catch {
+                /* continue teardown */
+            }
+        }
 
         if (timer !== undefined) {
             clearTimeout(timer);
@@ -309,7 +374,7 @@ export function createLinuxEasyAccountOwner(): LinuxEasyAccountOwner {
         }
     };
 
-    return {
+    const owner: LinuxEasyAccountOwner = {
         close(): void {
             stop('closed');
         },
@@ -663,6 +728,7 @@ export function createLinuxEasyAccountOwner(): LinuxEasyAccountOwner {
             let stage: 'owner' | 'login' | 'register' = 'owner';
             let succeeded = false;
             let body: Uint8Array | null | undefined;
+            let loginCapability: LinuxEasyKeyToken | undefined;
 
             const own = (bytes: Uint8Array): Uint8Array => {
                 owned.add(bytes);
@@ -863,11 +929,118 @@ export function createLinuxEasyAccountOwner(): LinuxEasyAccountOwner {
                     () => stop('lease-closed'),
                 );
                 check(generation);
+
+                if (withKeyCapability) {
+                    // Creation can reenter close through runtime hooks. A capability created
+                    // after stop must still be explicitly revoked even though stop is idempotent.
+                    const created = createLinuxEasyKeyCapability({
+                        lease: acquired,
+                        uin,
+                        generation: {},
+                    });
+                    loginCapability = created;
+                    capability = created;
+
+                    try {
+                        check(generation);
+                        Reflect.apply(weakMapSet, classifiers, [
+                            owner,
+                            (frame: Uint8Array): D2Candidate | undefined => {
+                                let frameCopy: Uint8Array | undefined;
+                                let decoded:
+                                    ReturnType<typeof decodeLinuxEasyServiceResponse> | undefined;
+
+                                const fence = (): void => {
+                                    check(generation);
+
+                                    if (
+                                        (currentState() !== 'starting' &&
+                                            currentState() !== 'registered') ||
+                                        lease !== acquired ||
+                                        capability !== created
+                                    ) {
+                                        throw new Error('stopped');
+                                    }
+
+                                    const phase = linuxEasyKeyState(created);
+
+                                    if (phase !== 'tentative' && phase !== 'active') {
+                                        throw new Error('unavailable');
+                                    }
+
+                                    check(generation);
+
+                                    if (lease !== acquired || capability !== created) {
+                                        throw new Error('stopped');
+                                    }
+                                };
+
+                                try {
+                                    // Snapshot before the clock/phase fence, which may
+                                    // reenter and mutate the caller's frame. Already-closed
+                                    // or mismatched owners do not inspect the input at all.
+                                    if (
+                                        (currentState() !== 'starting' &&
+                                            currentState() !== 'registered') ||
+                                        epoch !== generation ||
+                                        controller.signal.aborted ||
+                                        lease !== acquired ||
+                                        capability !== created
+                                    ) {
+                                        return undefined;
+                                    }
+
+                                    frameCopy = copyBytes(frame, 65536);
+                                    fence();
+                                    decoded = decodeLinuxEasyServiceResponse({
+                                        token: created,
+                                        lease: acquired,
+                                        uin,
+                                        frame: frameCopy,
+                                        // Local resource limit, not a protocol maximum.
+                                        maxSsoBodyBytes: 65536,
+                                    });
+                                    const candidate = freeze({
+                                        uin: decoded.uin,
+                                        sequence: decoded.sequence,
+                                        command: decoded.command,
+                                        retCode: decoded.retCode,
+                                    });
+                                    fence();
+                                    return candidate;
+                                } catch {
+                                    return undefined;
+                                } finally {
+                                    wipe(decoded?.body);
+                                    wipe(frameCopy);
+                                }
+                            },
+                        ]);
+                        check(generation);
+                    } catch (error) {
+                        Reflect.apply(weakMapDelete, classifiers, [owner]);
+
+                        if (capability === created) {
+                            capability = undefined;
+                        }
+
+                        revokeLinuxEasyKey(created);
+                        throw error;
+                    }
+                }
+
                 stage = 'login';
-                const pendingLogin = runLinuxEasyLoginSession(acquired, {
+                const loginOptions: LinuxEasyLoginSessionOptions = {
                     ...(login as unknown as Omit<LinuxEasyLoginSessionOptions, 'signal'>),
                     signal: controller.signal,
-                });
+                };
+                const pendingLogin = loginCapability
+                    ? runLinuxEasyLoginSessionWithKeyCapability(
+                          acquired,
+                          loginOptions,
+                          loginCapability,
+                      )
+                    : runLinuxEasyLoginSession(acquired, loginOptions);
                 const observedLogin = pendingLogin.then(
                     (result) => {
                         if (
@@ -944,6 +1117,21 @@ export function createLinuxEasyAccountOwner(): LinuxEasyAccountOwner {
                 }
 
                 check(generation);
+
+                if (loginCapability) {
+                    if (lease !== acquired || capability !== loginCapability) {
+                        throw new Error('stopped');
+                    }
+
+                    assertLinuxEasyKeyTentative({
+                        token: loginCapability,
+                        lease: acquired,
+                        uin,
+                        sequence: loginResult.easyLoginSequence,
+                    });
+                    check(generation);
+                }
+
                 stage = 'register';
                 const pendingRegister = registerLinuxEasyReference(acquired, {
                     ...(registration as unknown as Omit<
@@ -981,6 +1169,41 @@ export function createLinuxEasyAccountOwner(): LinuxEasyAccountOwner {
                 }
 
                 check(generation);
+
+                if (loginCapability) {
+                    if (lease !== acquired || capability !== loginCapability) {
+                        throw new Error('stopped');
+                    }
+
+                    // Keep the owner's decoded key for send; commit uses a separate,
+                    // plain comparison copy that is wiped on every outcome.
+                    let comparisonKey: Uint8Array | undefined;
+
+                    try {
+                        comparisonKey = Uint8Array.from(decoded.d2Key);
+                        check(generation);
+                        commitLinuxEasyKey({
+                            token: loginCapability,
+                            lease: acquired,
+                            uin,
+                            sequence: loginResult.easyLoginSequence,
+                            comparisonKey,
+                        });
+                    } finally {
+                        wipe(comparisonKey);
+                    }
+
+                    check(generation);
+
+                    if (
+                        lease !== acquired ||
+                        capability !== loginCapability ||
+                        linuxEasyKeyState(loginCapability) !== 'active'
+                    ) {
+                        throw new Error('stopped');
+                    }
+                }
+
                 // Keep only the registration profile and tickets used by the send flow.
                 // Its a1 input is copied then wiped without use, so retain no original a1.
                 const guid = profile.guid as Uint8Array;
@@ -1012,12 +1235,31 @@ export function createLinuxEasyAccountOwner(): LinuxEasyAccountOwner {
                         registration.buildReserved as SsoReferenceSendTextOptions['buildReserved'],
                     verifyRaw: registration.verifyRaw as SsoReferenceSendTextOptions['verifyRaw'],
                 };
+
+                if (loginCapability) {
+                    // Last clock/reentry fence follows cleanup and session construction.
+                    check(generation);
+
+                    if (
+                        currentState() !== 'starting' ||
+                        lease !== acquired ||
+                        capability !== loginCapability ||
+                        linuxEasyKeyState(loginCapability) !== 'active'
+                    ) {
+                        throw new Error('stopped');
+                    }
+                }
+
                 state = 'registered';
                 succeeded = true;
                 return { kind: 'registered', registerSequence: result.sequence };
             } catch {
                 return fail(currentState() === 'closed' ? stopReason : 'invalid-or-failed');
             } finally {
+                if (!succeeded && withKeyCapability) {
+                    stop('failed');
+                }
+
                 wipe(body);
 
                 if (!succeeded) {
@@ -1030,4 +1272,5 @@ export function createLinuxEasyAccountOwner(): LinuxEasyAccountOwner {
             }
         },
     };
+    return owner;
 }

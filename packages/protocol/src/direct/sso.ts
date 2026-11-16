@@ -5,7 +5,7 @@ import { inflateSync } from 'node:zlib';
 // https://github.com/LagrangeDev/Lagrange.Core/blob/fe789c4a23796fbc82fa09e70a9c44c8a5cf2948/Lagrange.Core/Internal/Packets/Struct/SsoPacker.cs
 // Reserved metadata, signing, login, and compatibility with any QQ build are
 // outside this module. The limits below are local resource limits, not wire facts.
-const MAX_SSO_BYTES = 16 * 1024 * 1024;
+export const MAX_SSO_BYTES = 16 * 1024 * 1024;
 const FIXED_12 = Uint8Array.of(2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 const utf8 = new TextDecoder('utf-8', { fatal: true });
 const fillBytes = Uint8Array.prototype.fill;
@@ -175,10 +175,20 @@ class Reader {
 
 /**
  * Parse a complete inner SSO response. Compressed bodies are zlib streams.
- * Limits are enforced before and during decompression. Nonzero return codes
- * remain visible when parsing succeeds; invalid data still raises an error.
+ * Limits are enforced before and during decompression. An optional body limit is
+ * a local resource bound, not a protocol limit. Nonzero return codes remain
+ * visible when parsing succeeds; invalid data still raises an error.
  */
-export function decodeSsoResponse(bytes: Uint8Array): SsoResponse {
+export function decodeSsoResponse(bytes: Uint8Array, maxBodyBytes?: number): SsoResponse {
+    if (
+        maxBodyBytes !== undefined &&
+        (!Number.isInteger(maxBodyBytes) || maxBodyBytes < 1 || maxBodyBytes > MAX_SSO_BYTES)
+    ) {
+        throw new RangeError('invalid SSO body size limit');
+    }
+
+    const bodyLimit = maxBodyBytes ?? MAX_SSO_BYTES;
+
     if (bytes.byteLength > MAX_SSO_BYTES) {
         throw new RangeError('SSO message exceeds size limit');
     }
@@ -213,9 +223,13 @@ export function decodeSsoResponse(bytes: Uint8Array): SsoResponse {
         headerExtension = header.rest();
 
         if (dataFlag === 0 || dataFlag === 4) {
+            if (encodedBody.length > bodyLimit) {
+                throw new RangeError('SSO body exceeds size limit');
+            }
+
             body = encodedBody;
         } else if (dataFlag === 1) {
-            body = inflateSync(encodedBody, { maxOutputLength: MAX_SSO_BYTES });
+            body = inflateSync(encodedBody, { maxOutputLength: bodyLimit });
         } else {
             throw new Error(`unsupported SSO data flag: ${dataFlag}`);
         }

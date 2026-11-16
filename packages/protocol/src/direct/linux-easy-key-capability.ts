@@ -1,7 +1,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import { isProxy, isUint8Array } from 'node:util/types';
 import { decodeServiceResponse, MAX_SERVICE_FRAME_BYTES } from './service-frame';
-import { decodeSsoResponse } from './sso';
+import { decodeSsoResponse, MAX_SSO_BYTES } from './sso';
 
 // Internal reference only. A deep import is not a same-process security boundary;
 // QQ-TEA and successful parsing do not authenticate a peer or validate a payload.
@@ -49,6 +49,8 @@ export interface LinuxEasyKeyDecodeInput {
     lease: object;
     uin: string;
     frame: Uint8Array;
+    /** Optional local limit for the decoded SSO body, not a protocol limit. */
+    maxSsoBodyBytes?: number;
 }
 export interface LinuxEasyServiceResponse {
     uin: string;
@@ -536,6 +538,24 @@ export function decodeLinuxEasyServiceResponse(
 
     try {
         const [token, lease, uin, frame] = fields(input, ['token', 'lease', 'uin', 'frame']);
+        const limitDescriptor = getDescriptor(input, 'maxSsoBodyBytes');
+
+        if (limitDescriptor && !hasOwn(limitDescriptor, 'value')) {
+            return fail();
+        }
+
+        const maxSsoBodyBytes: unknown = limitDescriptor?.value;
+
+        if (
+            maxSsoBodyBytes !== undefined &&
+            (typeof maxSsoBodyBytes !== 'number' ||
+                !integer(maxSsoBodyBytes) ||
+                maxSsoBodyBytes < 1 ||
+                maxSsoBodyBytes > MAX_SSO_BYTES)
+        ) {
+            return fail();
+        }
+
         const value = lookup(token);
         const expected = value.key;
 
@@ -561,7 +581,7 @@ export function decodeLinuxEasyServiceResponse(
             return fail();
         }
 
-        sso = decodeSsoResponse(body);
+        sso = decodeSsoResponse(body, maxSsoBodyBytes);
 
         if (
             (value.phase !== 'tentative' && value.phase !== 'active') ||
