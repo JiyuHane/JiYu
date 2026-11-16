@@ -78,6 +78,12 @@ QQ 数字标识须为规范十进制字符串且数值在 1–4294967295 范围�
 
 当前 Jiyu 的群列表是 v11 群列表投影，不是 QQ 群成员列表；由于可能使用缓存或空回退，结果不证明机器人当前仍在这些群中，也不保证完整或实时。当前 Jiyu 的 v11 群信息在没有 provider 或 provider 返回 `null` 时会合成成功结果，返回请求的群 ID 和空群名；此结果不证明群存在、账号属于该群或信息实时。
 
+## OneBot 12 群成员类型
+
+`@harehane/sdk/v12` 导出 `OneBot12GroupMemberInfo`、`OneBot12GroupMemberInfoResponse` 和 `OneBot12GroupMemberListResponse`，描述 [OneBot 12 `get_group_member_info`](https://12.onebot.dev/interface/group/actions/#get_group_member_info) 和 [`get_group_member_list`](https://12.onebot.dev/interface/group/actions/#get_group_member_list) 的响应。成员的 `user_id`、`user_name`、`user_displayname` 为必填字符串，允许 JSON 扩展字段；成功响应分别包含单个成员或成员数组，失败响应保留通用 JSON `data`。
+
+使用通用 `call('get_group_member_info', { group_id: '123', user_id: '456' })` 或 `call('get_group_member_list', { group_id: '123' })` 发送请求；返回类型仍是 `OneBot12ActionResponse`。通用解析器只校验响应信封和 JSON 值，不校验成员字段；调用方使用具体类型前应自行校验，类型断言不等于校验。类型导出本身不增加服务端能力。
+
 ## 快速开始
 
 ```ts

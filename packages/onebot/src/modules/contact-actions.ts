@@ -42,12 +42,7 @@ async function fetchSingleGroupMembers(
     try {
         return await bridge.apis.contacts.fetchGroupMemberList(groupId, { force });
     } catch (err) {
-        log.warn(
-            'group member refresh failed: uin=%s group=%d err=%s',
-            bridge.identity.uin,
-            groupId,
-            err instanceof Error ? (err.stack ?? err.message) : String(err),
-        );
+        log.warn('group member refresh failed: [redacted]');
         throw err;
     }
 }
@@ -272,12 +267,7 @@ export async function getGroupMemberList(
             formatGroupMember(groupId, m, cachedQidianProfile(bridge, m.uin)),
         );
     } catch (err) {
-        log.warn(
-            'group member fetch failed, using classified cache: uin=%s group=%d err=%s',
-            bridge.identity.uin,
-            groupId,
-            err instanceof Error ? (err.stack ?? err.message) : String(err),
-        );
+        log.warn('group member fetch failed, using classified cache: [redacted]');
         const cached = getCachedGroupMembers(bridge, groupId);
 
         if (cached.length === 0) {
@@ -313,13 +303,8 @@ export async function getGroupMemberInfo(
     if (noCache || !profile) {
         try {
             profile = await bridge.apis.contacts.fetchUserProfile(userId);
-        } catch (error) {
-            log.warn(
-                'group member profile unavailable: group=%d member=%d error=%s',
-                groupId,
-                userId,
-                error instanceof Error ? error.message : String(error),
-            );
+        } catch {
+            log.warn('group member profile unavailable: [redacted]');
         }
     }
 

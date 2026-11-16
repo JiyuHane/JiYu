@@ -21,19 +21,26 @@ import {
 } from './streaming';
 const moduleLog = createLogger('Bridge.Action');
 
-// List actions retain their existing input logging, while individual lookups
-// redact inputs as well as terminal responses and exception diagnostics.
+// Member queries redact their inputs as well as their results; the group ID
+// itself is private even for the list form.
+function isGroupMemberQuery(action: string): boolean {
+    return action === 'get_group_member_list' || action === 'get_group_member_info';
+}
+
 function hasSensitiveActionDiagnostics(action: string): boolean {
     return (
         action === 'get_friend_list' ||
         action === 'get_group_list' ||
         action === 'get_group_info' ||
-        action === 'get_stranger_info'
+        action === 'get_stranger_info' ||
+        isGroupMemberQuery(action)
     );
 }
 
 function hasSensitiveActionInput(action: string): boolean {
-    return action === 'get_group_info' || action === 'get_stranger_info';
+    return (
+        action === 'get_group_info' || action === 'get_stranger_info' || isGroupMemberQuery(action)
+    );
 }
 
 function summarizeActionParams(action: string, params: JsonObject): string {
@@ -199,6 +206,12 @@ export class ApiHandler {
      *  on-demand (ref-counted) by the WebUI debug stream. */
     private readonly observers = new Set<ActionObserver>();
 
+    // A child logger also renders its account UIN and routes to a per-account
+    // file. Keep member-query diagnostics on the same scope without that data.
+    private actionLogger(action: string): Logger {
+        return isGroupMemberQuery(action) ? moduleLog : this.log;
+    }
+
     /** Observe handled actions (debug). Returns an unsubscribe. */
     setObserver(cb: ActionObserver): () => void {
         this.observers.add(cb);
@@ -320,7 +333,7 @@ export class ApiHandler {
                 RETCODE.ACTION_FAILED,
                 'OneBot instance is shutting down',
             );
-            this.log.warn('rejected Action %s after instance quiesce', action);
+            this.actionLogger(action).warn('rejected Action %s after instance quiesce', action);
             this.traceActionTerminal(action, response, startedAt, 'failed', 'quiesced');
             this.notifyObservers(action, params, response, 0);
             return response;
@@ -330,7 +343,7 @@ export class ApiHandler {
 
         if (!registered) {
             const response = failedResponse(RETCODE.UNKNOWN_ACTION, 'unknown action');
-            this.log.debug('unknown action %s', action);
+            this.actionLogger(action).debug('unknown action %s', action);
             this.traceActionTerminal(action, response, startedAt, 'failed', 'unknown_action');
             return response;
         }
@@ -347,7 +360,7 @@ export class ApiHandler {
     ): Promise<import('./types').ApiResponse> {
         // Terse breadcrumb to the log file (debug, which is written to disk under the default
         // file level): lets the operator grep "what did the bot get asked to do" in post-mortems.
-        this.log.debug(
+        this.actionLogger(action).debug(
             '%s params=%s',
             action,
             hasSensitiveActionInput(action) ? '[redacted]' : summarizeActionParams(action, params),
@@ -363,10 +376,12 @@ export class ApiHandler {
                 sink
                     ? {
                           send: async (frame) => {
-                              this.log.trace(() => [
+                              this.actionLogger(action).trace(() => [
                                   'action_stream_frame action=%s frame=%s',
                                   action,
-                                  renderParamsVerbose(frame),
+                                  isGroupMemberQuery(action)
+                                      ? '[redacted]'
+                                      : renderParamsVerbose(frame),
                               ]);
                               await sink.send(frame);
                           },
@@ -385,7 +400,7 @@ export class ApiHandler {
             // special casing. warn (not error) keeps the log file useful without
             // drowning it in expected client-side failures.
             if (hasSensitiveActionDiagnostics(action)) {
-                this.log.warn(`${action} failed: [redacted]`);
+                this.actionLogger(action).warn(`${action} failed: [redacted]`);
             } else {
                 this.log.warn(
                     '%s failed: %s\n%s',
@@ -412,7 +427,7 @@ export class ApiHandler {
     }
 
     private traceActionInput(action: string, params: JsonObject): void {
-        this.log.trace(() => [
+        this.actionLogger(action).trace(() => [
             'action_input action=%s params=%s',
             action,
             hasSensitiveActionInput(action) ? '[redacted]' : renderParamsVerbose(params),
@@ -431,7 +446,7 @@ export class ApiHandler {
             | 'unknown_action'
             | 'quiesced',
     ): void {
-        this.log.trace(() => [
+        this.actionLogger(action).trace(() => [
             'action_terminal action=%s outcome=%s reason=%s ms=%d response=%s',
             action,
             outcome,
@@ -456,7 +471,7 @@ export class ApiHandler {
                 cb({ action, params, response, ms });
             } catch (err) {
                 if (hasSensitiveActionDiagnostics(action)) {
-                    this.log.warn(`${action} action observer error: [redacted]`);
+                    this.actionLogger(action).warn(`${action} action observer error: [redacted]`);
                 } else {
                     this.log.warn(
                         'action observer error: %s',

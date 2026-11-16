@@ -41,8 +41,10 @@ configuration writers and backup restores do not share a revision lock.
 ## Supported behavior and limits
 
 The core currently handles `get_version`, `get_status`, `get_supported_actions`,
-`get_self_info`, `get_user_info`, `get_friend_list`, `get_group_info`, `get_group_list`, `send_message` for private and group text messages and group
-mentions, `delete_message`, and `set_group_name`. The latter requires a canonical positive
+`get_self_info`, `get_user_info`, `get_friend_list`, `get_group_info`,
+`get_group_list`, `get_group_member_list`, `get_group_member_info`,
+`send_message` for private and group text messages and group mentions,
+`delete_message`, and `set_group_name`. The latter requires a canonical positive
 uint32 group ID encoded as a string and a string group name, including an empty
 string; it forwards one request to the existing account-local v11 handler. The
 uint32 limit prevents truncation in the downstream group-name encoding.
@@ -102,12 +104,29 @@ and QQ-side behavior have not been verified.
 
 After final source and event revalidation, the runtime may publish this notice
 through v12 subscriber and WebSocket fanout; publication does not establish
-client delivery. This event is intentionally excluded from the runtime's
-internal poll paths: an ordered admission, when present, is skipped rather than
-resolved with the event, and the legacy poll buffer does not enqueue it. The
-poll owner's structural validator remains available for direct trusted fixtures;
+client delivery. The runtime does not enqueue private recall into either poll
+path: it lacks a final poll-commit guard on the original v11 object. For an
+already-ready, ordered-eligible admission that has converted successfully, still
+has its valid original source and exact ticket, and is not a replay of the same
+object with the same ticket, the child is failed rather than silently skipped.
+Source-current checks depend on a trusted synchronous verifier; a callback that
+changes the online generation and returns a stale `true` is not fenced merely by
+calling it again. The production closure uses internal synchronous state checks;
+a side-effectful fake callback does not establish remote behavior.
+If no other terminal condition wins first, the internal owner records a sticky
+`child_failed` ordering gap for that source epoch and retires its queue;
+previously queued, unconsumed data may also be discarded. A prior sticky gap
+keeps its first reason; an earlier deadline, clock or other ordering failure can
+therefore take precedence over `child_failed`. An absent or stale source, invalid
+ticket, same-object/same-ticket replay or pre-ready input does not by itself
+create this recall-specific gap; other ordering failures still follow their own
+policies. The legacy buffer
+does not enqueue private recall and has separate unresolved empty-result and
+bounded-overflow concerns.
+`pollOwnerStats` exposes the gap internally, not as a public gap API. The poll
+owner's structural validator remains available to direct trusted fixtures;
 that does not establish runtime poll admission. Production HTTP event polling
-remains unimplemented.
+and an end-to-end completeness guarantee remain unimplemented.
 
 A valid v11 `group_recall` maps to `notice.group_message_delete` after account,
 time, field and identifier validation. It uses `recall` when sender and operator match;
@@ -341,6 +360,59 @@ fallback warning omits exception details; v11 response and observer semantics
 remain unchanged. Observers and debug streams can still see raw results and
 independently traverse or disclose them, and other layers retain their own risks.
 See the [group action definition](https://12.onebot.dev/interface/group/actions/#get_group_list).
+
+`get_group_member_list` accepts only `group_id`; `get_group_member_info` accepts
+only `group_id` and `user_id`. Each is a canonical positive decimal string from
+`1` through `4294967295`; numeric IDs, zero, leading zeroes, signs, whitespace
+and larger values are invalid. After ordinary request, `self` and `echo`
+preflight, unsupported parameters, including `no_cache`, return 10004 before ID
+validation; missing or invalid IDs return 10003. A valid request for either
+v12 action calls the account-local v11 `get_group_member_list` exactly once with
+`{group_id: number}`, without automatic retry. It does not call the v11 member
+info action, whose fallback can synthesize a member. These uint32 restrictions
+are local to these v12 actions, not a global QQ or OneBot ID limit.
+
+Each successful v11 row must have own data properties `group_id` equal to the
+requested numeric group ID, positive uint32 numeric `user_id`, and primitive
+string `nickname` and `card`. Although the v11 member schema permits `card` to
+be omitted, v12 requires an own data-property string: a missing or accessor
+`card` rejects the entire result with 20001 rather than inventing an empty value.
+The production formatter normally supplies `card`, but this is not a guarantee
+about every provider result; a missing field cannot be equated with an unset
+card. The output contains exactly the standard string fields
+`{user_id: String(user_id), user_name: nickname, user_displayname: card}`;
+it does not add `group_id`. List results preserve row order, duplicates and empty
+names. Info validates the entire list, including rows after a match, and succeeds
+only for exactly one matching user ID. Zero or multiple matches return explicit
+failure 35000 (`group member match unavailable or ambiguous`), not a claim that
+that member does not exist. Malformed envelopes, rows or lists and v11 failures
+1400/1404 return fixed 20001; other well-formed v11 failures or exceptions return
+fixed 20002, without upstream details. Existing transport failure-message rewriting
+may apply.
+
+The complete list is rejected when it exceeds 10,000 rows, either name exceeds
+1,024 UTF-16 code units, or the two name fields total more than 262,144 UTF-16
+code units across all rows. After `await`, the dispatcher rejects proxies, sparse
+arrays, accessors and inherited required properties and reads only required own
+data descriptors; unknown extras are not enumerated. Await's thenable handling
+can itself execute a `then` getter before these checks. These are local result
+limits, not a bound on network bytes or process memory. The transport's separate
+default 1 MiB output limit includes JSON escaping, field names and echo, and may
+replace an oversized success with an error or close the connection.
+
+The v11 list returns `[]` without a provider. Its usual provider may fall back to
+nonempty classified cached members after a fetch failure; absent such cached data,
+the failure propagates. The upstream member decoder can substitute empty names
+for missing nickname or card data. The row's v11 `group_id` is supplied from the
+request rather than independently checked against a server group assertion.
+Consequently even a validated unique match, and likewise an empty or cached list,
+does not prove server-side group attribution, completeness, freshness, group
+existence or actual current membership. The v11 provider may perform network or
+cache work; real QQ behavior is unverified. Targeted action diagnostics redact
+member-query inputs and terminal results, but observers and other components may
+still receive or expose the original v11 data. SDK member response types describe
+shapes only: the generic SDK parser checks the envelope and JSON, not the member
+fields. See the [candidate group actions](https://12.onebot.dev/interface/group/actions/).
 
 For private `send_message`, the target `user_id` must be a canonical positive
 uint32 decimal string; larger values return `10003` before the v11 handler is

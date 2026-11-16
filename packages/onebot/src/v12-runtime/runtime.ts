@@ -550,12 +550,6 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
 
             if (converted) {
                 if (privateRecall) {
-                    // Poll delivery lacks a final guard on the original v11 object.
-                    // Treat this supported WS-only projection as an intentional skip.
-                    if (admission) {
-                        skipOrderedAdmission(admission);
-                    }
-
                     if (
                         recallSource &&
                         source !== undefined &&
@@ -564,15 +558,26 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                         this.#privateRecallPublished.get(event) !== source
                     ) {
                         const verifiedSource = recallSource;
-                        // Mark this local event/ticket attempt before any subscriber or
-                        // guard callback can reenter. This is not QQ-level deduplication.
+                        // Mark this local event/ticket attempt before any admission,
+                        // subscriber or guard callback can reenter.
                         this.#privateRecallPublished.set(event, source);
+
+                        // Poll delivery has no final guard on the original v11 object.
+                        // A genuinely admitted projection must not disappear silently.
+                        if (admission?.kind === 'eligible' && admission.target === this) {
+                            failOrderedAdmission(admission);
+                        } else if (admission) {
+                            skipOrderedAdmission(admission);
+                        }
+
                         this.publish(
                             converted,
                             () =>
                                 recallScopeCurrent() &&
                                 matchesPrivateRecallEvent(event, verifiedSource),
                         );
+                    } else if (admission) {
+                        skipOrderedAdmission(admission);
                     }
                 } else {
                     try {

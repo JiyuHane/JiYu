@@ -4,6 +4,7 @@
 
 - Rename the Jiyu SDK package from `@snowluma/sdk` to `@harehane/sdk`. This changes dependency and import paths; existing `SnowLuma` API identifiers and OneBot v11 behavior remain unchanged. The old package name is not an automatic alias; see [VERSIONING.md](VERSIONING.md#package-name-migration).
 - Add independent OneBot 12 HTTP and forward WebSocket clients, a Node-only reverse WebSocket listener, and bounded JSON codecs under `@harehane/sdk/v12` and `@harehane/sdk/v12/node`. Supported implementation capabilities vary; see [ONEBOT_V12.md](ONEBOT_V12.md).
+- Add OneBot 12 group-member response types. The generic response parser validates the envelope and JSON, not the action-specific member fields.
 
 - Fix ordinary WebSocket request deadlines to include connection waits, prevent expired requests from being sent after a late open, and preserve shared connections when an individual request times out or is cancelled. Refs #666.
 

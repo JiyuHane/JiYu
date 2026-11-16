@@ -37,6 +37,8 @@ const ACTIONS = [
     'get_friend_list',
     'get_group_info',
     'get_group_list',
+    'get_group_member_list',
+    'get_group_member_info',
     'set_group_name',
     'send_message',
     'delete_message',
@@ -381,6 +383,28 @@ export class V12Dispatcher {
             }
 
             return this.getGroupList(echo);
+        }
+
+        if (action === 'get_group_member_list' || action === 'get_group_member_info') {
+            const isInfo = action === 'get_group_member_info';
+
+            if (extraKeys(params, isInfo ? ['group_id', 'user_id'] : ['group_id'])) {
+                return response(10004, 'unsupported parameter', null, echo);
+            }
+
+            const groupId = parseAccountId(params.group_id);
+            const userId = isInfo ? parseAccountId(params.user_id) : null;
+
+            // Both downstream group and member identifiers are encoded as uint32.
+            if (
+                groupId === null ||
+                groupId > 0xffffffff ||
+                (isInfo && (userId === null || userId > 0xffffffff))
+            ) {
+                return response(10003, 'invalid group_id or user_id', null, echo);
+            }
+
+            return this.getGroupMembers(groupId, userId, echo);
         }
 
         if (action === 'set_group_name') {
@@ -870,6 +894,157 @@ export class V12Dispatcher {
             }
 
             return response(0, '', output, echo);
+        } catch {
+            return unavailable();
+        }
+    }
+
+    /**
+     * Both v12 member reads use the v11 list: its info action can synthesize a
+     * member. The list may itself be cached or an empty placeholder, so neither
+     * a match nor an empty list proves current membership or freshness.
+     */
+    private async getGroupMembers(
+        groupId: number,
+        userId: number | null,
+        echo?: string,
+    ): Promise<V12Response> {
+        const kind = userId === null ? 'group member list' : 'group member info';
+        const invalid = () => response(20001, `invalid ${kind} result`, null, echo);
+        const unavailable = () => response(20002, `${kind} unavailable`, null, echo);
+
+        try {
+            const result: unknown = await this.options.api.handle('get_group_member_list', {
+                group_id: groupId,
+            });
+
+            // Await can inspect a thenable before these proxy and descriptor checks.
+            if (
+                isProxy(result) ||
+                typeof result !== 'object' ||
+                result === null ||
+                Array.isArray(result)
+            ) {
+                return invalid();
+            }
+
+            const status = Object.getOwnPropertyDescriptor(result, 'status');
+            const retcode = Object.getOwnPropertyDescriptor(result, 'retcode');
+
+            if (!status || !('value' in status) || !retcode || !('value' in retcode)) {
+                return invalid();
+            }
+
+            if (
+                status.value === 'failed' &&
+                Number.isSafeInteger(retcode.value) &&
+                retcode.value > 0
+            ) {
+                return retcode.value === 1400 || retcode.value === 1404 ? invalid() : unavailable();
+            }
+
+            if (status.value !== 'ok' || retcode.value !== 0) {
+                return invalid();
+            }
+
+            const data = Object.getOwnPropertyDescriptor(result, 'data');
+            const rows: unknown = data && 'value' in data ? data.value : undefined;
+
+            if (isProxy(rows) || !Array.isArray(rows)) {
+                return invalid();
+            }
+
+            const length = Object.getOwnPropertyDescriptor(rows, 'length');
+
+            if (
+                !length ||
+                !('value' in length) ||
+                typeof length.value !== 'number' ||
+                !Number.isSafeInteger(length.value) ||
+                length.value < 0 ||
+                length.value > 10000
+            ) {
+                return invalid();
+            }
+
+            const output: JsonObject[] = [];
+            let stringUnits = 0;
+            let matchCount = 0;
+            let match: JsonObject | null = null;
+
+            for (let i = 0; i < length.value; i += 1) {
+                const item = Object.getOwnPropertyDescriptor(rows, String(i));
+                const row: unknown = item && 'value' in item ? item.value : undefined;
+
+                if (isProxy(row) || typeof row !== 'object' || row === null || Array.isArray(row)) {
+                    return invalid();
+                }
+
+                // Inspect only required own data properties; unknown v11 fields stay unread.
+                const rowGroupId = Object.getOwnPropertyDescriptor(row, 'group_id');
+                const id = Object.getOwnPropertyDescriptor(row, 'user_id');
+                const nickname = Object.getOwnPropertyDescriptor(row, 'nickname');
+                const card = Object.getOwnPropertyDescriptor(row, 'card');
+
+                if (
+                    !rowGroupId ||
+                    !('value' in rowGroupId) ||
+                    typeof rowGroupId.value !== 'number' ||
+                    rowGroupId.value !== groupId ||
+                    !id ||
+                    !('value' in id) ||
+                    typeof id.value !== 'number' ||
+                    !Number.isSafeInteger(id.value) ||
+                    id.value <= 0 ||
+                    id.value > 0xffffffff ||
+                    !nickname ||
+                    !('value' in nickname) ||
+                    typeof nickname.value !== 'string' ||
+                    nickname.value.length > 1024 ||
+                    !card ||
+                    !('value' in card) ||
+                    typeof card.value !== 'string' ||
+                    card.value.length > 1024
+                ) {
+                    return invalid();
+                }
+
+                stringUnits += nickname.value.length + card.value.length;
+
+                if (stringUnits > 262144) {
+                    return invalid();
+                }
+
+                const member: JsonObject = {
+                    user_id: String(id.value),
+                    user_name: nickname.value,
+                    user_displayname: card.value,
+                };
+
+                // Define an own element directly; do not invoke inherited array setters.
+                Object.defineProperty(output, String(i), {
+                    value: member,
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                });
+
+                if (userId !== null && id.value === userId) {
+                    matchCount += 1;
+                    match = member;
+                }
+            }
+
+            if (userId === null) {
+                return response(0, '', output, echo);
+            }
+
+            // Decide only after validating the complete list, including later rows.
+            if (matchCount !== 1 || match === null) {
+                return response(35000, 'group member match unavailable or ambiguous', null, echo);
+            }
+
+            return response(0, '', match, echo);
         } catch {
             return unavailable();
         }

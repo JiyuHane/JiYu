@@ -36,22 +36,29 @@ import { IOneBotNetworkAdapter } from '../../src/network/adapter';
 import { OneBotNetworkManager } from '../../src/network/network-manager';
 import { TempSessionStore } from '../../src/temp-session-store';
 import { V12_ADAPTER_NAME } from '../../src/v12-runtime/identity';
-import { activateOrderedPollOwner, pollOwnerStats } from '../../src/v12-runtime/poll-owner';
+import {
+    activateOrderedPollOwner,
+    activatePollOwner,
+    pollOwnerStats,
+} from '../../src/v12-runtime/poll-owner';
 import {
     capturePrivateRecallSource,
     getPrivateRecallSource,
 } from '../../src/v12-runtime/private-recall-source';
 import { V12Runtime } from '../../src/v12-runtime/runtime';
 import {
+    bindOrderedContext,
     captureBinding,
     captureSource,
     claimOrderedScope,
     installOrderedReady,
     prepareOrderedContext,
     receiveSourceEvent,
+    reserveOrderedContext,
     sameSourceEpoch,
     SourceGeneration,
     withOrderedScope,
+    type OrderedAdmission,
     type V12Source,
 } from '../../src/v12-runtime/source-generation';
 
@@ -150,7 +157,7 @@ class LegacySink extends IOneBotNetworkAdapter<NetworkBase> {
     }
 }
 
-async function fixture() {
+async function fixture(subscribeObserver = true) {
     const identity = IdentityService.memory(String(SELF));
     identity.rememberRequestIdentity({ uid: 'synthetic-peer', uin: PEER });
     const store = new MessageStore(':memory:');
@@ -211,8 +218,12 @@ async function fixture() {
     }
 
     const published: any[] = [];
-    options.subscribe((event) => published.push(event));
-    published.length = 0;
+
+    if (subscribeObserver) {
+        options.subscribe((event) => published.push(event));
+        published.length = 0;
+    }
+
     const v11: JsonObject[] = [];
     const tickets: Array<V12Source | undefined> = [];
     ctx = {
@@ -320,6 +331,60 @@ async function settle() {
     for (let i = 0; i < 12; i++) {
         await Promise.resolve();
     }
+}
+
+type FakeFixture = Awaited<ReturnType<typeof fixture>>;
+type EligibleAdmission = Extract<OrderedAdmission, { kind: 'eligible' }>;
+
+function installFakeOrderedOwner(f: FakeFixture) {
+    const active = activateOrderedPollOwner(f.runtime);
+
+    if (active.status !== 'ready') {
+        throw new Error('fake owner was not ready');
+    }
+
+    prepareOrderedContext(f.ctx, f.runtime);
+
+    if (!installOrderedReady(f.ctx, f.runtime, active.owner)) {
+        active.owner.invalidate();
+        throw new Error('fake ordered context was not ready');
+    }
+
+    return active.owner;
+}
+
+function reserveEligible(f: FakeFixture, source: V12Source): EligibleAdmission {
+    const admission = bindOrderedContext(f.ctx, reserveOrderedContext(f.ctx), source, true);
+    expect(admission.kind).toBe('eligible');
+
+    if (admission.kind !== 'eligible') {
+        throw new Error('fake input was not admitted');
+    }
+
+    return admission;
+}
+
+function deliverAdmitted(
+    f: FakeFixture,
+    event: JsonObject,
+    admission: EligibleAdmission,
+    source: V12Source | null,
+    payload = buildDispatchPayload(event),
+) {
+    return withOrderedScope(f.runtime, 'runtime', event, admission, () =>
+        source === null
+            ? f.runtime.onEvent(event, payload)
+            : f.runtime[receiveSourceEvent](event, payload, source),
+    );
+}
+
+function pollRequest() {
+    return {
+        limit: 0,
+        timeoutMs: 0,
+        maxOutputBytes: 65536,
+        responseDeadline: performance.now() + 5000,
+    };
 }
 
 afterEach(() => {
@@ -1054,7 +1119,180 @@ describe('private recall: real pipeline, manager and V12Runtime with fake transp
         }
     });
 
-    it('skips recall poll ingress without a gap while preserving ordinary ordered notices', async () => {
+    it.each([false, true])(
+        'fails an eligible recall closed with a WS observer present=%s',
+        async (subscribeObserver) => {
+            vi.useFakeTimers();
+            const f = await fixture(subscribeObserver);
+            let owner: ReturnType<typeof installFakeOrderedOwner> | undefined;
+
+            let unsubscribe = () => {};
+
+            try {
+                owner = installFakeOrderedOwner(f);
+                await f.seed(-21, 441, false);
+                await f.bus.emit(recall(441, false));
+                expect(f.v11[0].message_id).toBe(-21);
+                expect(f.legacy.messages).toHaveLength(1);
+                expect(f.published).toHaveLength(subscribeObserver ? 1 : 0);
+
+                if (subscribeObserver) {
+                    expect(f.published[0]).toMatchObject({
+                        detail_type: 'private_message_delete',
+                        message_id: '-21',
+                    });
+                }
+
+                expect(pollOwnerStats(f.runtime)).toMatchObject({
+                    accepted: 0,
+                    active: false,
+                    ordering_gap: true,
+                    ordering_reason: 'child_failed',
+                });
+                await settle();
+                expect(activateOrderedPollOwner(f.runtime).status).toBe('degraded');
+                const sink = new Sink();
+                expect((await owner.start(pollRequest(), sink).result).kind).toBe('epoch_invalid');
+                expect(sink.body).toBe('');
+
+                // A second current source still publishes independently after poll revocation.
+                const later: unknown[] = [];
+                unsubscribe = f.subscribe((value: any) => {
+                    if (value?.detail_type === 'private_message_delete') {
+                        later.push(value);
+                    }
+                });
+                await f.seed(-22, 442, true);
+                await f.bus.emit(recall(442, true));
+                expect(later).toHaveLength(1);
+                expect(later[0]).toMatchObject({
+                    detail_type: 'private_message_delete',
+                    message_id: '-22',
+                    user_id: String(SELF),
+                });
+
+                // Later ordinary data in this epoch cannot be polled as a success either.
+                await f.bus.emit({ kind: 'friend_add', selfUin: SELF, userUin: PEER, time: TIME });
+                await vi.advanceTimersByTimeAsync(0);
+                expect(pollOwnerStats(f.runtime)).toMatchObject({
+                    accepted: 0,
+                    ordering_gap: true,
+                    ordering_reason: 'child_failed',
+                });
+                const laterSink = new Sink();
+                expect((await owner.start(pollRequest(), laterSink).result).kind).toBe(
+                    'epoch_invalid',
+                );
+                expect(laterSink.body).toBe('');
+                expect(activateOrderedPollOwner(f.runtime).status).toBe('degraded');
+            } finally {
+                unsubscribe();
+                owner?.invalidate();
+                await settle();
+                await f.close();
+            }
+        },
+    );
+
+    it('skips unknown direction and cache misses without a new ordered gap', async () => {
+        vi.useFakeTimers();
+        const f = await fixture();
+        let owner: ReturnType<typeof installFakeOrderedOwner> | undefined;
+
+        try {
+            owner = installFakeOrderedOwner(f);
+            await f.seed(-23, 443, false);
+            await f.bus.emit(recall(443, undefined));
+            await f.bus.emit(recall(444, false));
+            expect(f.v11.map((event) => event.message_id)).toEqual([-23, 444]);
+            expect(f.published).toEqual([]);
+            expect(pollOwnerStats(f.runtime)).toMatchObject({
+                accepted: 0,
+                active: true,
+                ordering_gap: false,
+            });
+            await f.bus.emit({ kind: 'friend_add', selfUin: SELF, userUin: PEER, time: TIME });
+            await vi.advanceTimersByTimeAsync(0);
+            const sink = new Sink();
+            expect((await owner.start(pollRequest(), sink).result).kind).toBe('local_finish');
+            expect(JSON.parse(sink.body).data).toEqual([f.published[0]]);
+            expect(pollOwnerStats(f.runtime)).toMatchObject({ accepted: 1, ordering_gap: false });
+        } finally {
+            owner?.invalidate();
+            await settle();
+            await f.close();
+        }
+    });
+
+    it.each([
+        'missing provenance',
+        'missing receive scope',
+        'different ticket',
+        'expired ticket',
+        'changed event',
+    ] as const)('skips an eligible recall with %s without a new ordered gap', async (mode) => {
+        vi.useFakeTimers();
+        const f = await fixture();
+        let owner: ReturnType<typeof installFakeOrderedOwner> | undefined;
+
+        try {
+            await f.seed(-24, 445, false);
+            const restore = f.captureOnly();
+
+            try {
+                await f.bus.emit(recall(445, false));
+            } finally {
+                restore();
+            }
+
+            const original = f.v11[0];
+            const originalTicket = f.tickets[0]!;
+
+            if (mode === 'expired ticket') {
+                f.generation.setOnline(false);
+                f.generation.setOnline(true);
+            }
+
+            owner = installFakeOrderedOwner(f);
+            // Keep the reservation current to isolate runtime projection from
+            // the owner's existing missing/expired admission-source failure.
+            const currentTicket = f.generation.capture(f.runtime[captureBinding]())!;
+            const event = mode === 'missing provenance' ? { ...original } : original;
+
+            if (mode === 'changed event') {
+                event.user_id = PEER + 1;
+            }
+
+            const admission = reserveEligible(f, currentTicket);
+            const receivedTicket =
+                mode === 'missing receive scope'
+                    ? null
+                    : mode === 'different ticket'
+                      ? currentTicket
+                      : originalTicket;
+            await deliverAdmitted(f, event, admission, receivedTicket);
+            expect(f.published).toEqual([]);
+            expect(pollOwnerStats(f.runtime)).toMatchObject({
+                accepted: 0,
+                active: true,
+                ordering_gap: false,
+            });
+
+            // The current admitted owner is still usable by a normal event.
+            await f.bus.emit({ kind: 'friend_add', selfUin: SELF, userUin: PEER, time: TIME });
+            await vi.advanceTimersByTimeAsync(0);
+            const sink = new Sink();
+            expect((await owner.start(pollRequest(), sink).result).kind).toBe('local_finish');
+            expect(JSON.parse(sink.body).data).toEqual([f.published[0]]);
+            expect(pollOwnerStats(f.runtime)?.ordering_gap).toBe(false);
+        } finally {
+            owner?.invalidate();
+            await settle();
+            await f.close();
+        }
+    });
+
+    it('keeps pre-ready and duplicate event/ticket attempts as skips', async () => {
         vi.useFakeTimers();
         const f = await fixture();
         const active = activateOrderedPollOwner(f.runtime);
@@ -1064,57 +1302,181 @@ describe('private recall: real pipeline, manager and V12Runtime with fake transp
             throw new Error('fake owner was not ready');
         }
 
-        const previousLevel = getLogLevel();
-        setLogLevel('trace');
-        let rejectedDiagnostics = 0;
-        const unsubscribe = subscribeLogs((entry) => {
-            if (entry.message.includes('v12 private recall skipped')) {
-                rejectedDiagnostics++;
-                throw new Error('synthetic diagnostic subscriber failure');
-            }
-        });
-
         try {
             prepareOrderedContext(f.ctx, f.runtime);
-            expect(installOrderedReady(f.ctx, f.runtime, active.owner)).not.toBeNull();
-            await f.seed(-21, 441, false);
-            await f.bus.emit(recall(441, undefined));
-            await f.seed(-22, 442, false);
-            await f.bus.emit(recall(442, false));
-            await vi.advanceTimersByTimeAsync(0);
-            expect(f.v11.map((event) => event.message_id)).toEqual([-21, -22]);
+            await f.seed(-25, 446, false);
+            await f.bus.emit(recall(446, false));
             expect(f.published).toHaveLength(1);
-            expect(f.published[0]).toMatchObject({
-                detail_type: 'private_message_delete',
-                message_id: '-22',
-            });
             expect(pollOwnerStats(f.runtime)).toMatchObject({ accepted: 0, ordering_gap: false });
-            const emptySink = new Sink();
-            const request = {
-                limit: 0,
-                timeoutMs: 0,
-                maxOutputBytes: 65536,
-                responseDeadline: performance.now() + 5000,
-            };
-            expect((await active.owner.start(request, emptySink).result).kind).toBe(
-                'empty_unresolved',
-            );
-            expect(emptySink.body).toBe('');
-            // A different supported event still follows its original ordered path.
+            expect(installOrderedReady(f.ctx, f.runtime, active.owner)).not.toBeNull();
+            const event = f.v11[0];
+            const ticket = f.tickets[0]!;
+            const admission = reserveEligible(f, ticket);
+            await deliverAdmitted(f, event, admission, ticket);
+            expect(f.published).toHaveLength(1);
+            expect(pollOwnerStats(f.runtime)).toMatchObject({
+                accepted: 0,
+                active: true,
+                ordering_gap: false,
+            });
             await f.bus.emit({ kind: 'friend_add', selfUin: SELF, userUin: PEER, time: TIME });
             await vi.advanceTimersByTimeAsync(0);
-            expect(f.published).toHaveLength(2);
-            expect(pollOwnerStats(f.runtime)).toMatchObject({ accepted: 1, ordering_gap: false });
             const sink = new Sink();
-            const outcome = await active.owner.start(request, sink).result;
-            expect(outcome.kind).toBe('local_finish');
+            expect((await active.owner.start(pollRequest(), sink).result).kind).toBe(
+                'local_finish',
+            );
             expect(JSON.parse(sink.body).data).toEqual([f.published[1]]);
-            // Zero is valid if skip diagnostics were removed; if present, the
-            // subscriber above throws and must not turn the skip into a gap.
-            expect(rejectedDiagnostics).toBeLessThanOrEqual(1);
+            expect(pollOwnerStats(f.runtime)?.ordering_gap).toBe(false);
         } finally {
-            unsubscribe();
-            setLogLevel(previousLevel);
+            active.owner.invalidate();
+            await settle();
+            await f.close();
+        }
+    });
+
+    it('rechecks the original event after conversion before failing an admission', async () => {
+        vi.useFakeTimers();
+        const f = await fixture();
+        let owner: ReturnType<typeof installFakeOrderedOwner> | undefined;
+
+        try {
+            await f.seed(-28, 449, false);
+            const restore = f.captureOnly();
+
+            try {
+                await f.bus.emit(recall(449, false));
+            } finally {
+                restore();
+            }
+
+            const event = f.v11[0];
+            const ticket = f.tickets[0]!;
+            const payload = buildDispatchPayload(event);
+            owner = installFakeOrderedOwner(f);
+            const admission = reserveEligible(f, ticket);
+            let checks = 0;
+            f.onVerify(() => {
+                // Conversion and its first post-conversion check already succeeded.
+                if (++checks === 3) {
+                    event.user_id = PEER + 1;
+                }
+            });
+            await deliverAdmitted(f, event, admission, ticket, payload);
+            f.onVerify(undefined);
+            expect(checks).toBeGreaterThanOrEqual(3);
+            expect(f.published).toEqual([]);
+            expect(pollOwnerStats(f.runtime)).toMatchObject({
+                accepted: 0,
+                active: true,
+                ordering_gap: false,
+            });
+            await f.bus.emit({ kind: 'friend_add', selfUin: SELF, userUin: PEER, time: TIME });
+            await vi.advanceTimersByTimeAsync(0);
+            const sink = new Sink();
+            expect((await owner.start(pollRequest(), sink).result).kind).toBe('local_finish');
+            expect(JSON.parse(sink.body).data).toEqual([f.published[0]]);
+        } finally {
+            f.onVerify(undefined);
+            owner?.invalidate();
+            await settle();
+            await f.close();
+        }
+    });
+
+    it.each(['source expires', 'event changes'] as const)(
+        'rechecks fanout after fail reenters and the %s',
+        async (mode) => {
+            vi.useFakeTimers();
+            const f = await fixture();
+            let owner: ReturnType<typeof installFakeOrderedOwner> | undefined;
+
+            try {
+                await f.seed(-26, 447, false);
+                const restore = f.captureOnly();
+
+                try {
+                    await f.bus.emit(recall(447, false));
+                } finally {
+                    restore();
+                }
+
+                const event = f.v11[0];
+                const ticket = f.tickets[0]!;
+                const payload = buildDispatchPayload(event);
+                owner = installFakeOrderedOwner(f);
+                const admission = reserveEligible(f, ticket);
+                let checks = 0;
+                let reentered = false;
+                f.onVerify(() => {
+                    checks++;
+
+                    // The first three checks belong to conversion/final eligibility;
+                    // the fourth is the lease.fail() source verification.
+                    if (checks === 4) {
+                        reentered = true;
+
+                        if (mode === 'source expires') {
+                            f.generation.setOnline(false);
+                            f.generation.setOnline(true);
+                        } else {
+                            event.user_id = PEER + 1;
+                        }
+
+                        void f.runtime[receiveSourceEvent](event, payload, ticket);
+                    }
+                });
+                await deliverAdmitted(f, event, admission, ticket, payload);
+                f.onVerify(undefined);
+                expect(reentered).toBe(true);
+                expect(checks).toBeGreaterThanOrEqual(4);
+                expect(f.published).toEqual([]);
+                expect(pollOwnerStats(f.runtime)).toMatchObject({
+                    accepted: 0,
+                    active: false,
+                    ordering_gap: true,
+                    ordering_reason: 'child_failed',
+                });
+                const sink = new Sink();
+                expect((await owner.start(pollRequest(), sink).result).kind).toBe('epoch_invalid');
+                expect(sink.body).toBe('');
+            } finally {
+                f.onVerify(undefined);
+                owner?.invalidate();
+                await settle();
+                await f.close();
+            }
+        },
+    );
+
+    it('leaves the legacy completion-order owner policy unchanged', async () => {
+        const f = await fixture();
+        const active = activatePollOwner(f.runtime);
+
+        if (active.status !== 'ready') {
+            await f.close();
+            throw new Error('fake legacy owner was not ready');
+        }
+
+        try {
+            await f.seed(-27, 448, false);
+            await f.bus.emit(recall(448, false));
+            expect(f.published[0]).toMatchObject({
+                detail_type: 'private_message_delete',
+                message_id: '-27',
+            });
+            expect(pollOwnerStats(f.runtime)).toMatchObject({
+                accepted: 0,
+                active: true,
+                ordering_gap: false,
+            });
+            await f.bus.emit({ kind: 'friend_add', selfUin: SELF, userUin: PEER, time: TIME });
+            const sink = new Sink();
+            expect((await active.owner.start(pollRequest(), sink).result).kind).toBe(
+                'local_finish',
+            );
+            expect(JSON.parse(sink.body).data).toEqual([f.published[1]]);
+            expect(pollOwnerStats(f.runtime)).toMatchObject({ accepted: 1, ordering_gap: false });
+        } finally {
             active.owner.invalidate();
             await settle();
             await f.close();
