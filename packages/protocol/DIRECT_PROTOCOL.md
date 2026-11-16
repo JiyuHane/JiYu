@@ -1722,7 +1722,13 @@ remain to be recovered and independently verified.
   A synthetic in-memory test composes the reference multiplexer's body callback,
   this parser, the pipeline and the event bus for text messages. Its verifier is
   a test stub; it does not prove authentication, production wiring, or the
-  ownership of other event types. The group-recall decoder preserves the first
+  ownership of other event types. A separate synthetic cross-package test feeds
+  parsed friend and group text through the real OneBot `registerEventPipeline`
+  using account-scoped fake contexts and dispatch, and applies v12 conversion to
+  those dispatches. It explicitly stops and drains the OneBot handlers; it does
+  not construct the production OneBot instance, exercise network adapters, or
+  prove live delivery. Its body-lifetime observations apply only to those text
+  fixtures. The group-recall decoder preserves the first
   entry's existing behavior and then emits subsequent entries with nonzero
   sequence numbers in list order. Additional entries with an absent or zero
   sequence are skipped; the decoder attempts a single count-only warning. The
