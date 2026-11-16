@@ -258,11 +258,8 @@ export async function getImageInfo(
         if (fresh) {
             url = fresh;
         }
-    } catch (err) {
-        log.warn(
-            'get_image URL refresh failed: %s',
-            err instanceof Error ? err.message : String(err),
-        );
+    } catch {
+        log.warn('get_image URL refresh failed');
     }
 
     return {

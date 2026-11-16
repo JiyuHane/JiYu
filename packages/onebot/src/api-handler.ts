@@ -33,6 +33,7 @@ function hasPrivateGroupActionDiagnostics(action: string): boolean {
 
 function hasSensitiveActionDiagnostics(action: string): boolean {
     return (
+        action === 'get_file' ||
         action === 'get_friend_list' ||
         action === 'get_group_list' ||
         action === 'get_group_info' ||
@@ -43,6 +44,7 @@ function hasSensitiveActionDiagnostics(action: string): boolean {
 
 function hasSensitiveActionInput(action: string): boolean {
     return (
+        action === 'get_file' ||
         action === 'get_group_info' ||
         action === 'get_stranger_info' ||
         hasPrivateGroupActionDiagnostics(action)

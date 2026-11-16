@@ -119,6 +119,56 @@ separate session: select that session when sending an action and use the
 complete `{ platform, user_id }` identity for account-specific event handling.
 A connection alone does not establish that a particular account is online.
 
+## `get_file` URL subset
+
+`@harehane/sdk/v12` exports `OneBot12GetFileUrlParams`,
+`OneBot12GetFileUrlData` and `OneBot12GetFileUrlResponse` as optional type
+annotations for the `get_file` URL subset. Parameters have a string `file_id`
+and `type: 'url'`. Successful response data has string `name` and `url` fields;
+for implementations that provide them, it may also contain `headers` as a
+string-to-string map and `sha256` as a string. The failed response branch keeps
+arbitrary JSON `data`. JSON extension fields remain permitted by the types.
+Jiyu currently returns only `name` and `url` on success, and rejects extra
+request parameters.
+
+Use the existing generic request method, for example:
+
+```ts
+import type { OneBot12GetFileUrlParams } from '@harehane/sdk/v12';
+
+const params: OneBot12GetFileUrlParams = {
+    file_id: 'KNOWN_SAME_ACCOUNT_MEDIA_FILE_ID',
+    type: 'url',
+};
+const response = await client.request('get_file', params);
+if (response.status === 'ok') {
+    const data = response.data;
+    if (
+        data !== null && typeof data === 'object' && !Array.isArray(data) &&
+        typeof data.name === 'string' && typeof data.url === 'string'
+    ) {
+        // Use data.name and data.url privately; URL query values may be credentials.
+    }
+}
+```
+
+The request method still returns the generic `OneBot12ActionResponse`. The
+normal response parser checks the envelope and JSON value, not action-specific
+fields, optional headers or hash, or URL syntax. Callers must validate any fields
+they use; a type assertion is not validation.
+
+Jiyu's current v12 server supports only this URL subset, not the complete
+`get_file` action: bytes and path modes, and other file operations, are not
+implemented. Supply an already-known ID, such as one from the same account's
+v11 media cache. Jiyu looks up that account's cached images and voice; a cache
+miss or another kind of ID may fail. Current v12 inbound messages do not produce
+media `file_id` values, so the ID must come from another source. Jiyu checks that
+a returned link has an acceptable HTTP(S) URL syntax, but does not verify its
+reachability, expiration, or the caller's permission to access it. A cached
+label containing `/` or NUL, or equal to `.` or `..`, becomes an empty unknown
+`name`; other labels may still be cache IDs rather than original filenames.
+Validate `name` for your own platform before using it as a filesystem path.
+
 ## Data and compatibility limits
 
 JSON text is supported; MessagePack is not implemented. The codec's local

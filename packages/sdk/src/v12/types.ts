@@ -50,6 +50,25 @@ export interface OneBot12ActionResponse extends OneBot12JsonObject {
     echo?: string;
 }
 
+/** Parameters for the URL subset of OneBot 12 get_file. */
+export interface OneBot12GetFileUrlParams extends OneBot12JsonObject {
+    file_id: string;
+    type: 'url';
+}
+
+/** URL data returned by a supporting OneBot 12 get_file implementation. */
+export interface OneBot12GetFileUrlData extends OneBot12JsonObject {
+    name: string;
+    url: string;
+    headers?: Record<string, string>;
+    sha256?: string;
+}
+
+/** Describes the response shape; the generic response parser does not validate file fields. */
+export type OneBot12GetFileUrlResponse =
+    | (OneBot12ActionResponse & { status: 'ok'; data: OneBot12GetFileUrlData })
+    | (OneBot12ActionResponse & { status: 'failed'; data: OneBot12JsonValue });
+
 /** Group information returned by OneBot 12 group actions. */
 export interface OneBot12GroupInfo extends OneBot12JsonObject {
     group_id: string;

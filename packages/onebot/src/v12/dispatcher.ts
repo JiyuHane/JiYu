@@ -44,6 +44,7 @@ const ACTIONS = [
     'leave_group',
     'send_message',
     'delete_message',
+    'get_file',
 ] as const;
 
 function response(
@@ -458,6 +459,27 @@ export class V12Dispatcher {
             return this.callDelete(id, echo);
         }
 
+        if (action === 'get_file') {
+            if (extraKeys(params, ['file_id', 'type'])) {
+                return response(10004, 'unsupported parameter', null, echo);
+            }
+
+            if (
+                typeof params.file_id !== 'string' ||
+                params.file_id.length === 0 ||
+                params.file_id.length > 4096 ||
+                typeof params.type !== 'string'
+            ) {
+                return response(10003, 'invalid file parameters', null, echo);
+            }
+
+            if (params.type !== 'url') {
+                return response(10004, 'unsupported file type', null, echo);
+            }
+
+            return this.getFile(params.file_id, echo);
+        }
+
         return this.send(params, echo);
     }
 
@@ -535,6 +557,158 @@ export class V12Dispatcher {
             );
         } catch {
             return response(20002, 'self info unavailable', null, echo);
+        }
+    }
+
+    private async getFile(fileId: string, echo?: string): Promise<V12Response> {
+        const invalid = () => response(20001, 'invalid file result', null, echo);
+        const unavailable = () => response(20002, 'file unavailable', null, echo);
+        const unsupported = () => response(10004, 'file URL unavailable', null, echo);
+
+        try {
+            const result: unknown = await this.options.api.handle('get_file', { file_id: fileId });
+
+            // Await may inspect a thenable before these proxy and descriptor checks.
+            if (
+                isProxy(result) ||
+                typeof result !== 'object' ||
+                result === null ||
+                Array.isArray(result)
+            ) {
+                return invalid();
+            }
+
+            const status = Object.getOwnPropertyDescriptor(result, 'status');
+            const retcode = Object.getOwnPropertyDescriptor(result, 'retcode');
+
+            if (!status || !('value' in status) || !retcode || !('value' in retcode)) {
+                return invalid();
+            }
+
+            if (
+                status.value === 'failed' &&
+                Number.isSafeInteger(retcode.value) &&
+                retcode.value > 0
+            ) {
+                return retcode.value === 1400 || retcode.value === 1404 ? invalid() : unavailable();
+            }
+
+            if (status.value !== 'ok' || retcode.value !== 0) {
+                return invalid();
+            }
+
+            const data = Object.getOwnPropertyDescriptor(result, 'data');
+            const value: unknown = data && 'value' in data ? data.value : undefined;
+
+            if (
+                isProxy(value) ||
+                typeof value !== 'object' ||
+                value === null ||
+                Array.isArray(value)
+            ) {
+                return invalid();
+            }
+
+            const name = Object.getOwnPropertyDescriptor(value, 'file_name');
+            const url = Object.getOwnPropertyDescriptor(value, 'url');
+
+            if (
+                !name ||
+                !('value' in name) ||
+                typeof name.value !== 'string' ||
+                name.value.length > 1024 ||
+                !url ||
+                !('value' in url) ||
+                typeof url.value !== 'string' ||
+                url.value.length > 8192
+            ) {
+                return invalid();
+            }
+
+            const address: string = url.value;
+
+            if (address.length === 0) {
+                return unsupported();
+            }
+
+            // URL parsing can repair malformed Unicode and strip ASCII
+            // whitespace or controls. Check the original string first, then
+            // return that exact string unchanged.
+            for (let i = 0; i < address.length; i += 1) {
+                const code = address.charCodeAt(i);
+
+                if (code <= 0x20 || code === 0x7f) {
+                    return invalid();
+                }
+
+                if (code === 0x25) {
+                    const pair = address.slice(i + 1, i + 3);
+
+                    if (!/^[0-9a-f]{2}$/i.test(pair)) {
+                        return invalid();
+                    }
+
+                    i += 2;
+                } else if (code >= 0xd800 && code <= 0xdbff) {
+                    const next = address.charCodeAt(i + 1);
+
+                    if (!(next >= 0xdc00 && next <= 0xdfff)) {
+                        return invalid();
+                    }
+
+                    i += 1;
+                } else if (code >= 0xdc00 && code <= 0xdfff) {
+                    return invalid();
+                }
+            }
+
+            let parsed: URL;
+
+            try {
+                parsed = new URL(address);
+            } catch {
+                return invalid();
+            }
+
+            if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+                return unsupported();
+            }
+
+            // Require explicit HTTP(S) authority syntax rather than relying on
+            // WHATWG repair of missing slashes or backslashes in a returned URL.
+            if (!/^https?:\/\//i.test(address) || address.includes('\\')) {
+                return invalid();
+            }
+
+            // URL normalizes an empty userinfo marker away. Check the raw authority.
+            const authority = address.slice(address.indexOf('://') + 3).split(/[/?#]/, 1)[0];
+
+            if (
+                !authority ||
+                !parsed.hostname ||
+                parsed.username ||
+                parsed.password ||
+                authority.includes('@')
+            ) {
+                return invalid();
+            }
+
+            // A v11 fallback can place a source URL or path in file_name.
+            // Neither '/' nor NUL can occur in a Linux filename, so do not
+            // present such a label as a known name or duplicate its URL query.
+            const rawName: string = name.value;
+            const projectedName =
+                rawName === '.' ||
+                rawName === '..' ||
+                rawName.includes('/') ||
+                rawName.includes('\0')
+                    ? ''
+                    : rawName;
+
+            // A syntactically valid URL does not establish client reachability.
+            return response(0, '', { name: projectedName, url: address }, echo);
+        } catch {
+            return unavailable();
         }
     }
 

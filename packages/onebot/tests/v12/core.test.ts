@@ -70,6 +70,7 @@ describe('V12 dispatcher with real v11 ApiHandler', () => {
             'leave_group',
             'send_message',
             'delete_message',
+            'get_file',
         ]);
         expect(await dispatcher.handle(request('get_version', {}, { echo: '' }))).toMatchObject({
             status: 'ok',
