@@ -416,6 +416,7 @@ export class PluginHost {
     private readonly generations = new Map<string, number>();
     private lifecycle: Promise<void> = Promise.resolve();
     private closing = false;
+    private reporting = false;
     private shutdownTask: Promise<void> | undefined;
     private readonly maxPending: number;
     private readonly maxPendingConfig: number;
@@ -1058,7 +1059,11 @@ export class PluginHost {
         }
 
         for (const [id, slot] of this.slots) {
-            if (!slot.accepting) {
+            if (this.closing) {
+                break;
+            }
+
+            if (this.slots.get(id) !== slot || !slot.accepting || slot.state !== 'active') {
                 continue;
             }
 
@@ -1068,34 +1073,106 @@ export class PluginHost {
                 continue;
             }
 
+            // Cloning and reading the clone can invoke user-defined getters. Reserve
+            // this slot before either operation so reentrant dispatch sees the bound.
+            slot.pending++;
+            let reserved = true;
+
+            const release = () => {
+                if (reserved) {
+                    reserved = false;
+                    slot.pending--;
+                }
+            };
+
             let copy: JsonObject;
+            let isMessage: boolean;
 
             try {
                 copy = structuredClone(event);
+                isMessage = Boolean(copy.message_type);
             } catch {
+                release();
                 dropped++;
                 this.report(id, 'invalid_event');
                 continue;
             }
 
-            const isMessage = Boolean(copy.message_type);
-            accepted++;
-            slot.pending++;
-            slot.tail = slot.tail.then(async () => {
-                try {
-                    await runSlot(slot, async () => {
-                        await slot.module.plugin_onevent?.(slot.context, copy);
+            if (
+                this.closing ||
+                this.slots.get(id) !== slot ||
+                !slot.accepting ||
+                slot.state !== 'active'
+            ) {
+                release();
+                dropped++;
+                continue;
+            }
 
-                        if (isMessage) {
-                            await slot.module.plugin_onmessage?.(slot.context, copy);
-                        }
-                    });
-                } catch {
-                    this.report(id, 'event');
-                } finally {
-                    slot.pending--;
+            try {
+                const previous = slot.tail;
+                let committed = false;
+                let started = false;
+
+                const run = async (previousFailed: boolean) => {
+                    // A substituted then implementation might call back before
+                    // it returns. Wait for the admission decision in that case.
+                    if (!committed) {
+                        await undefined;
+                    }
+
+                    if (!reserved || !committed || started) {
+                        return;
+                    }
+
+                    started = true;
+
+                    if (previousFailed) {
+                        this.report(id, 'event');
+                    }
+
+                    try {
+                        await runSlot(slot, async () => {
+                            await slot.module.plugin_onevent?.(slot.context, copy);
+
+                            if (isMessage) {
+                                await slot.module.plugin_onmessage?.(slot.context, copy);
+                            }
+                        });
+                    } catch {
+                        this.report(id, 'event');
+                    } finally {
+                        release();
+                    }
+                };
+
+                const next = previous.then(
+                    () => run(false),
+                    () => run(true),
+                );
+
+                // Promise species access can itself reenter and append to the old
+                // tail. Never overwrite that newer branch or admit after shutdown.
+                if (
+                    this.closing ||
+                    this.slots.get(id) !== slot ||
+                    !slot.accepting ||
+                    slot.state !== 'active' ||
+                    slot.tail !== previous
+                ) {
+                    release();
+                    dropped++;
+                    continue;
                 }
-            });
+
+                slot.tail = next;
+                committed = true;
+                accepted++;
+            } catch {
+                release();
+                dropped++;
+                this.report(id, 'event');
+            }
         }
 
         return { accepted, dropped };
@@ -1195,7 +1272,19 @@ export class PluginHost {
     private async cleanupSlot(id: string, slot: Slot): Promise<void> {
         slot.accepting = false;
         slot.state = 'stopping';
-        await slot.tail;
+
+        try {
+            await slot.tail;
+        } catch {
+            // An uncertain drain must not be mistaken for completed cleanup.
+            // Do not expose the rejected tail's value or start the cleanup hook.
+            slot.callable = false;
+            slot.cleanupFailed = true;
+            slot.state = 'cleanup_failed';
+            this.report(id, 'cleanup');
+            throw new PluginHostError('CLEANUP_FAILED');
+        }
+
         slot.callable = false;
         await Promise.all(slot.actionsInFlight);
 
@@ -1239,6 +1328,18 @@ export class PluginHost {
     }
 
     private report(id: string, phase: string): void {
-        this.emitLog('warn', id, [`Plugin host ${phase} failed`]);
+        // Owner loggers may synchronously reenter dispatch. Suppress nested host
+        // reports rather than recursively reporting the same failure indefinitely.
+        if (this.reporting) {
+            return;
+        }
+
+        this.reporting = true;
+
+        try {
+            this.emitLog('warn', id, [`Plugin host ${phase} failed`]);
+        } finally {
+            this.reporting = false;
+        }
     }
 }
