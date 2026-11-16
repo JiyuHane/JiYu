@@ -1314,6 +1314,16 @@ remain to be recovered and independently verified.
   Fixed-stage errors omit external exception and response text. Immutable payload
   strings and copies retained by a transport cannot be erased by this adapter.
   This mapping and its fake-transport tests do not establish live interoperability.
+- `src/direct/linux-qq-app-signature-verify.ts` implements the supplied research
+  archive's reported Linux application-file verification formula using a caller-
+  supplied RSA-2048 SPKI key: SHA-256 of data, lowercase hexadecimal ASCII, then
+  RSA-PSS SHA-256 with a 32-byte salt. It accepts bytes only, performs no file or
+  network access, and applies explicit local size and key round-trip restrictions.
+  Its in-memory tests use synthetic keys; the archive did not contain the reported
+  original target files and signatures for independent replay. This file verifier
+  is not an implementation of SSO packet `sign`, `token` or `extra`; the supplied
+  key is not authenticated merely by passing it to this function. Details and
+  evidence limits are recorded in [QQ_SIGNATURE_RESEARCH.md](./QQ_SIGNATURE_RESEARCH.md).
 - `src/direct/wt-login-keystore.ts` projects the UID from inner WT TLV `0x543`
   using the `9 → 11 → 1` message path declared by [LagrangeV2 ThirdPartyLoginResponse](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/System/ThirdPartyLoginResponse.cs)
   and its [login handler](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Logic/WtExchangeLogic.cs).
@@ -2104,10 +2114,15 @@ remain to be recovered and independently verified.
   classification `success` with no poison request. Its `registered` result is not
   peer authentication or an online-state claim. The login and registration profiles
   are independently supplied and can differ; this owner does not establish a common
-  device identity. The owner's private ticket copies are wiped after registration
-  classification or on failure, on a best-effort basis; no ticket accessor or
-  send/push operation is exposed. A future sending owner must explicitly manage
-  credentials rather than assuming this instance has retained them.
+  device identity. After registration it retains private copies of the fields
+  needed by the experimental text-send operation and the registration profile;
+  the unused A1 copy is wiped. `sendText` uses the same lease with a bounded,
+  account-bound request and does not expose tickets. Busy or purely local invalid
+  requests do not disrupt the current operation; an uncertain attempted send
+  closes the owner and requests poison without retry. Its response is a local
+  protocol projection, not proof of message delivery. Owner-held byte copies are
+  wiped best effort on close or failure. Push and production integration are not
+  implemented by this owner.
   The lifetime deadline and phase deadlines depend on event-loop progress. Close
   revokes local state and requests poison, but cannot stop work already inside an
   uncooperative callback or transport, nor erase their retained copies. A broker

@@ -439,6 +439,43 @@ atomic filesystem snapshot or a guarantee against concurrent changes that
 preserve metadata. Supply a stable copy for reproducible analysis. This is
 research tooling and is not connected to the application or plugin host.
 
+## Supplied Linux file-signature research archive
+
+The separately supplied `deliverable_4YDwe.zip` has SHA-256
+`291a2a38d4c4d3e0dcedd11460727f1034a52da1341a6b474845f8b00799efc2`.
+REA inventoried its ZIP entries (parent Evidence
+`ev_f5e1b8978b7d4f3767aad502dccdb1786128d09b3c509e996e3eb6c20f226de4`)
+and safely extracted its regular files without executing them. The archive
+contains reconstructed source, verification scripts, reports, a public key and
+recorded results. It does not contain the reported `wrapper.node`, its signed
+application files or the referenced signature manifests.
+
+The supplied report identifies its subject as Linux QQ 3.2.35-54395 x86-64,
+with a `wrapper.node` reportedly hashing to
+`dc5209e20002735e31a20c9cded0a807d1db4779277dec66c9221ea28a870328`.
+It describes **application-file signature verification**, not a demonstrated
+SSO request signer: the reported verifier applies RSA-2048 PSS with SHA-256,
+MGF1-SHA-256 and a 32-byte salt to the ASCII lowercase hexadecimal SHA-256 of
+the file. Its 5/5 and other validation counts are the archive author's records;
+they have not been reproduced against the absent original files here. The DER
+public-key file in the archive was independently hashed as 294 bytes with
+SHA-256 `1aa99e89c071cd65d4191b584b3a94141c7618821a57d26542fd406ad7374f69`
+(REA Evidence `ev_080fda916a2381f60f88443f206e3d319f73a28ef780072c69aaf463fa404dd4`).
+That identifies the supplied bytes, not their provenance or inclusion in the
+absent executable. The archive also contains a conflicting key-fingerprint
+comment and conflicting historical descriptions of a verdict map; later
+reconciliation text describes the map as per-file outcomes rather than proving
+the caller's decision.
+
+The independently implemented `src/direct/linux-qq-app-signature-verify.ts`
+provides the reported verification primitive with an explicit caller-selected
+public key. Synthetic-key tests validate the local implementation only. They do
+not establish the authenticity of that key, the reported target bytes, live
+behavior, or an SSO `sign`/`token`/`extra` generation algorithm. The archive's
+`GenerateSignatureSalt1/2` and callback references remain investigation leads,
+not a proven complete packet-signing chain. This Linux x86-64 research is also
+distinct from the Android AArch64 `libfekit.so` analyzed above.
+
 ## Public protocol reference
 
 [LagrangeV2 at commit `7011cdf87368cc0fb77273c1508e779a52328165`](https://github.com/LagrangeDev/LagrangeV2/tree/7011cdf87368cc0fb77273c1508e779a52328165)

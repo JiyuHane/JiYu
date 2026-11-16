@@ -11,7 +11,21 @@ import {
 } from './linux-easy-reference-register';
 import { decodeLinuxNTEasyLoginReferenceResponse } from './nt-linux-easy-login-reference';
 import { createRawSessionBroker, type RawSessionLease } from './raw-session-broker';
-import type { Sso12RawClient } from './sso12-packet-client';
+import type {
+    Sso12RawClient,
+    Sso12RawOptions,
+    Sso12RawResult,
+    Sso12RawTransport,
+} from './sso12-packet-client';
+import {
+    encodeDirectSendMessageRequest,
+    type DirectSendMessageRequestInput,
+} from './send-message-request';
+import {
+    referenceSendTextOnTransport,
+    type SsoReferenceSendTextOptions,
+    type SsoReferenceSendTextResult,
+} from './sso-reference-send-text-flow';
 
 export interface LinuxEasyAccountOwnerOptions {
     client: Sso12RawClient;
@@ -28,8 +42,16 @@ export type LinuxEasyAccountOwnerResult =
     | { kind: 'registered'; registerSequence: number }
     | { kind: 'failure'; stage: 'owner' | 'login' | 'register'; code: string };
 
+export interface LinuxEasyAccountOwnerSendTextOptions {
+    request: DirectSendMessageRequestInput;
+    maxResponseBodyBytes: number;
+    timeoutMs: number;
+    signal?: AbortSignal;
+}
+
 export interface LinuxEasyAccountOwner {
     start(options: LinuxEasyAccountOwnerOptions): Promise<LinuxEasyAccountOwnerResult>;
+    sendText(options: LinuxEasyAccountOwnerSendTextOptions): Promise<SsoReferenceSendTextResult>;
     close(): void;
 }
 
@@ -135,8 +157,10 @@ function validSignal(value: unknown): value is AbortSignal {
  * creates no socket and is not a production entry. The exact client must not be used
  * elsewhere, and the caller asserts usability and success quiescence. There is no
  * same-process isolation: callbacks can observe encrypted frames and signing bodies,
- * retain copies, reenter, and have arbitrary effects. A successful classification is
- * neither online state nor peer authentication. There is deliberately no send API.
+ * retain copies, reenter, and have arbitrary effects. Neither registration nor a send
+ * response proves online state, peer authentication, acceptance or delivery. This is not
+ * push, a real connection, or production wiring. The caller remains responsible for
+ * client exclusivity and successful transport quiescence.
  *
  * The owner acquires exactly one private broker lease and passes the original login
  * response directly to registration on that lease with the same UIN. The separately
@@ -160,6 +184,16 @@ export function createLinuxEasyAccountOwner(): LinuxEasyAccountOwner {
     let epoch = 0;
     let busy = false;
     let lease: RawSessionLease | undefined;
+    let session:
+        | {
+              uin: string;
+              uid: string;
+              profile: SsoReferenceSendTextOptions['profile'];
+              tickets: SsoReferenceSendTextOptions['login']['tickets'];
+              buildReserved: SsoReferenceSendTextOptions['buildReserved'];
+              verifyRaw: SsoReferenceSendTextOptions['verifyRaw'];
+          }
+        | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let listener: ReturnType<typeof addAbortListener> | undefined;
     let deadline = Infinity;
@@ -169,6 +203,7 @@ export function createLinuxEasyAccountOwner(): LinuxEasyAccountOwner {
     const stopped = new Promise<void>((resolve) => {
         resolveStopped = resolve;
     });
+    const stopSubscribers = new Set<() => void>();
 
     const clear = (): void => {
         for (const bytes of owned) {
@@ -200,7 +235,16 @@ export function createLinuxEasyAccountOwner(): LinuxEasyAccountOwner {
 
         listener = undefined;
         clear();
+        session = undefined;
+        const currentLease = lease;
+        lease = undefined;
         resolveStopped();
+
+        for (const notify of stopSubscribers) {
+            notify();
+        }
+
+        stopSubscribers.clear();
 
         try {
             controller.abort();
@@ -209,7 +253,7 @@ export function createLinuxEasyAccountOwner(): LinuxEasyAccountOwner {
         }
 
         try {
-            lease?.poison();
+            currentLease?.poison();
         } catch {
             /* best effort */
         }
@@ -233,6 +277,24 @@ export function createLinuxEasyAccountOwner(): LinuxEasyAccountOwner {
         }
     };
 
+    // Final clock sample is followed by a non-clock state/epoch fence; check() itself
+    // samples the clock and may consume the remaining operation budget.
+    const nowChecked = (generation: number): number => {
+        check(generation);
+        const now = performance.now();
+
+        if (currentState() === 'closed' || epoch !== generation || controller.signal.aborted) {
+            throw new Error('stopped');
+        }
+
+        if (now >= deadline) {
+            stop('timeout');
+            throw new Error('stopped');
+        }
+
+        return now;
+    };
+
     const tick = (generation: number): void => {
         try {
             check(generation);
@@ -250,6 +312,340 @@ export function createLinuxEasyAccountOwner(): LinuxEasyAccountOwner {
     return {
         close(): void {
             stop('closed');
+        },
+        async sendText(options): Promise<SsoReferenceSendTextResult> {
+            const failure = (
+                code: string,
+                writeState: 'not-written' | 'unknown',
+            ): SsoReferenceSendTextResult => ({ kind: 'failure', code, writeState });
+
+            // A competing call must not inspect its arguments or disturb the winner.
+            if (busy) {
+                return failure('busy', 'not-written');
+            }
+
+            if (state !== 'registered' || !session || !lease) {
+                return failure('closed', 'not-written');
+            }
+
+            busy = true;
+            const generation = epoch;
+            let committed = false;
+            let opActive = true;
+            let opTimedOut = false;
+            let opCancelled = false;
+            let opTimer: ReturnType<typeof setTimeout> | undefined;
+            let opListener: ReturnType<typeof addAbortListener> | undefined;
+            let onStopped: (() => void) | undefined;
+            const copies: Uint8Array[] = [];
+
+            try {
+                // Start the budget immediately after reserving this operation's slot.
+                const started = performance.now();
+                check(generation);
+                // No caller accessor or proxy trap is invoked while taking this snapshot.
+                const input = record(options, [
+                    'request',
+                    'maxResponseBodyBytes',
+                    'timeoutMs',
+                    'signal',
+                ]);
+                const request = record(input.request, [
+                    'route',
+                    'text',
+                    'clientSequence',
+                    'random',
+                ]);
+                const route = record(request.route, ['kind', 'peerUin', 'peerUid', 'groupUin']);
+                request.route = route;
+                const timeout = input.timeoutMs;
+                const maxResponseBodyBytes = input.maxResponseBodyBytes;
+                const signal = input.signal;
+
+                if (
+                    typeof timeout !== 'number' ||
+                    !Number.isInteger(timeout) ||
+                    timeout < 1 ||
+                    timeout > MAX_TIMER ||
+                    typeof maxResponseBodyBytes !== 'number' ||
+                    !Number.isSafeInteger(maxResponseBodyBytes) ||
+                    maxResponseBodyBytes < 0 ||
+                    maxResponseBodyBytes > 65536 ||
+                    (signal !== undefined && !validSignal(signal))
+                ) {
+                    return failure('invalid-options', 'not-written');
+                }
+
+                const opDeadline = started + timeout;
+
+                const checkOperation = (): number => {
+                    // Late callbacks from this operation must never affect a later one.
+                    if (!opActive) {
+                        throw new Error('stopped');
+                    }
+
+                    // nowChecked takes its final sample after check's reentrant clock.
+                    const now = nowChecked(generation);
+                    const aborted = signal !== undefined && getAborted.call(signal);
+
+                    // Signal inspection and the final clock may synchronously reenter close.
+                    if (
+                        !opActive ||
+                        currentState() === 'closed' ||
+                        epoch !== generation ||
+                        controller.signal.aborted
+                    ) {
+                        throw new Error('stopped');
+                    }
+
+                    if (opTimedOut || now >= opDeadline) {
+                        opTimedOut = true;
+
+                        if (committed) {
+                            stop('timeout');
+                        }
+
+                        throw new Error('stopped');
+                    }
+
+                    if (opCancelled || aborted) {
+                        opCancelled = true;
+
+                        if (committed) {
+                            stop('cancelled');
+                        }
+
+                        throw new Error('stopped');
+                    }
+
+                    return Math.min(MAX_TIMER, Math.max(1, Math.ceil(opDeadline - now)));
+                };
+
+                checkOperation();
+
+                // Use the actual encoder for the same validation as the borrowed flow.
+                // Its internal pooled allocations are not covered by this best-effort wipe.
+                let encoded: Uint8Array | undefined;
+
+                try {
+                    encoded = encodeDirectSendMessageRequest(
+                        request as unknown as DirectSendMessageRequestInput,
+                    );
+
+                    if (encoded.byteLength > 65536) {
+                        return failure('invalid-options', 'not-written');
+                    }
+                } finally {
+                    wipe(encoded);
+                }
+
+                checkOperation();
+
+                if (signal !== undefined) {
+                    opListener = addAbortListener(signal as AbortSignal, () => {
+                        if (!opActive) {
+                            return;
+                        }
+
+                        opCancelled = true;
+
+                        if (committed) {
+                            stop('cancelled');
+                        }
+                    });
+                }
+
+                const initialRemaining = checkOperation();
+                opTimer = setTimeout(() => {
+                    if (!opActive) {
+                        return;
+                    }
+
+                    opTimedOut = true;
+
+                    if (committed) {
+                        stop('timeout');
+                    }
+                }, initialRemaining);
+                checkOperation();
+                const saved = session;
+                const transport = lease;
+
+                if (!saved || !transport || currentState() !== 'registered') {
+                    throw new Error('stopped');
+                }
+
+                const copy = (bytes: Uint8Array): Uint8Array => {
+                    checkOperation();
+                    const result = copyBytes(bytes, 65535);
+                    owned.add(result);
+                    copies.push(result);
+                    checkOperation();
+                    return result;
+                };
+
+                const profile = { ...saved.profile, guid: copy(saved.profile.guid) };
+                const tickets = {
+                    a1: new Uint8Array(0),
+                    a2: copy(saved.tickets.a2),
+                    d2: copy(saved.tickets.d2),
+                    d2Key: copy(saved.tickets.d2Key),
+                };
+                const interrupted = new Promise<undefined>((resolve) => {
+                    onStopped = () => resolve(undefined);
+                    stopSubscribers.add(onStopped);
+                });
+                const guardedTransport: Sso12RawTransport = {
+                    transactRaw<C, T>(
+                        rawOptions: Sso12RawOptions<C, T>,
+                    ): Promise<Sso12RawResult<T>> {
+                        checkOperation();
+                        const fencedOptions: Sso12RawOptions<C, T> = {
+                            ...rawOptions,
+                            buildRequest: async (identity) => {
+                                checkOperation();
+                                const built = await rawOptions.buildRequest(identity);
+
+                                try {
+                                    checkOperation();
+                                } catch (error) {
+                                    // This frame is the guard's private output, not a caller's copy.
+                                    wipe(built.frame);
+                                    throw error;
+                                }
+
+                                return built;
+                            },
+                            verifyCandidate: async (candidate, context, identity) => {
+                                checkOperation();
+                                const result = await rawOptions.verifyCandidate(
+                                    candidate,
+                                    context,
+                                    identity,
+                                );
+                                checkOperation();
+                                return result;
+                            },
+                            consumeCandidate: async (candidate, context, identity) => {
+                                checkOperation();
+                                const result = await rawOptions.consumeCandidate(
+                                    candidate,
+                                    context,
+                                    identity,
+                                );
+                                checkOperation();
+                                return result;
+                            },
+                        };
+                        checkOperation();
+                        // Crossing into the lease makes every subsequent failure uncertain.
+                        committed = true;
+                        return transport.transactRaw(fencedOptions);
+                    },
+                };
+                const remaining = checkOperation();
+                // The flow synchronously snapshots its inputs before the first await. Its
+                // own late values and callback copies remain the producers' responsibility.
+                let pending: Promise<SsoReferenceSendTextResult>;
+
+                try {
+                    pending = referenceSendTextOnTransport(guardedTransport, {
+                        login: { status: 'tickets', uin: saved.uin, tickets },
+                        profile,
+                        uid: saved.uid,
+                        request: request as unknown as DirectSendMessageRequestInput,
+                        maxResponseBodyBytes,
+                        timeoutMs: remaining,
+                        signal: controller.signal,
+                        buildReserved: async (input) => {
+                            checkOperation();
+                            const signer = saved.buildReserved;
+                            const result = await signer(input);
+                            checkOperation();
+                            return result;
+                        },
+                        verifyRaw: async (input) => {
+                            checkOperation();
+                            const verifier = saved.verifyRaw;
+                            const result = await verifier(input);
+                            checkOperation();
+                            return result;
+                        },
+                    });
+                } finally {
+                    for (const bytes of copies) {
+                        wipe(bytes);
+                        owned.delete(bytes);
+                    }
+                }
+
+                const observed = pending.then(
+                    (result) => result,
+                    () => undefined,
+                );
+                const result = await Promise.race([observed, interrupted]);
+                checkOperation();
+
+                if (
+                    !committed &&
+                    result?.kind === 'failure' &&
+                    result.writeState === 'not-written'
+                ) {
+                    if (result.code === 'raw-timeout') {
+                        return failure('timeout', 'not-written');
+                    }
+
+                    if (result.code === 'raw-cancelled') {
+                        return failure('cancelled', 'not-written');
+                    }
+                }
+
+                if (!result || result.kind !== 'response' || !committed) {
+                    stop('send-failed');
+                    return failure('send-failed', 'unknown');
+                }
+
+                return result;
+            } catch {
+                if (committed) {
+                    stop('send-failed');
+                    return failure('send-failed', 'unknown');
+                }
+
+                return failure(
+                    currentState() === 'closed'
+                        ? 'closed'
+                        : opTimedOut
+                          ? 'timeout'
+                          : opCancelled
+                            ? 'cancelled'
+                            : 'invalid-options',
+                    'not-written',
+                );
+            } finally {
+                opActive = false;
+
+                if (onStopped) {
+                    stopSubscribers.delete(onStopped);
+                }
+
+                if (opTimer !== undefined) {
+                    clearTimeout(opTimer);
+                }
+
+                try {
+                    opListener?.[Symbol.dispose]();
+                } catch {
+                    /* best effort */
+                }
+
+                for (const bytes of copies) {
+                    wipe(bytes);
+                    owned.delete(bytes);
+                }
+
+                busy = false;
+            }
         },
         async start(options): Promise<LinuxEasyAccountOwnerResult> {
             // Reserve before inspecting any caller argument, including its descriptors.
@@ -584,10 +980,38 @@ export function createLinuxEasyAccountOwner(): LinuxEasyAccountOwner {
                     return fail('register-failed');
                 }
 
-                // This experimental owner exposes no send or receive operation yet,
-                // so retaining credentials after classification has no current use.
-                clear();
                 check(generation);
+                // Keep only the registration profile and tickets used by the send flow.
+                // Its a1 input is copied then wiped without use, so retain no original a1.
+                const guid = profile.guid as Uint8Array;
+                const keep = new Set([guid, decoded.a2, decoded.d2, decoded.d2Key]);
+
+                for (const bytes of owned) {
+                    if (!keep.has(bytes)) {
+                        wipe(bytes);
+                        owned.delete(bytes);
+                    }
+                }
+
+                check(generation);
+                session = {
+                    uin,
+                    uid: details.uid as string,
+                    profile: {
+                        guid,
+                        version: profile.version as string,
+                        subAppId: profile.subAppId as number,
+                    },
+                    tickets: {
+                        a1: new Uint8Array(0),
+                        a2: decoded.a2,
+                        d2: decoded.d2,
+                        d2Key: decoded.d2Key,
+                    },
+                    buildReserved:
+                        registration.buildReserved as SsoReferenceSendTextOptions['buildReserved'],
+                    verifyRaw: registration.verifyRaw as SsoReferenceSendTextOptions['verifyRaw'],
+                };
                 state = 'registered';
                 succeeded = true;
                 return { kind: 'registered', registerSequence: result.sequence };
