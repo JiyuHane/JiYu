@@ -1955,6 +1955,25 @@ remain to be recovered and independently verified.
   production session owner or proof of peer identity. This experimental reference
   flow is not wired into production Direct, does not mark an account online, and
   has not established live interoperability.
+- `src/direct/linux-easy-login-session.ts` is an in-process reference coordinator
+  for those two transactions on the caller's same borrowed lease. It snapshots
+  both stages' inputs, carries one monotonic deadline and requires an explicit
+  caller policy for the opaque key-exchange expiration before EasyLogin. Its
+  per-stage write states remain separate; unsuccessful claimed sessions request
+  lease poisoning, while a response leaves the lease with its caller and returns
+  an opaque status/body without asserting login or online success. The policy is
+  evaluated only once and does not establish later validity. The local WeakSet
+  claim covers the exact lease object in this module instance only, not wrappers,
+  other module instances or direct use of the underlying client. Lease provenance,
+  exclusivity, trusted successful quiescence, peer and account binding, expiry,
+  replay prevention and nonce uniqueness remain caller responsibilities. Lease
+  termination is observed asynchronously and is not a synchronous fence. The
+  deadline depends on event-loop progress; a noncooperative transport, guard or
+  callback can retain its own copies and continue effects after local settlement.
+  Its in-process observation assumes ordinary Promise internals; mutated Promise
+  constructors/species, arbitrary thenables and other same-process changes remain
+  outside that contract. Actual QQ interoperability and production Bridge wiring
+  remain unverified.
 - `src/direct/sso12-packet-client.ts` is a single-flight protocol-12 client for
   an already-connected socket, with caller-supplied account policy, classifier,
   signing metadata, device parameters and zero-key or D2-key encryption. It
