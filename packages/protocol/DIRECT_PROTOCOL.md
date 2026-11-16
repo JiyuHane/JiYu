@@ -2108,6 +2108,20 @@ remain to be recovered and independently verified.
   lease and an explicit caller policy; it does not authenticate its fake peer. The
   adapter does not persist tickets or connect the production Bridge; live
   interoperability is unverified.
+- `src/direct/linux-easy-key-capability.ts` is an unconnected internal reference
+  for a future EasyLogin/multiplexer handoff. A module-local lease claim and opaque
+  token hold a tentative D2 key; an explicit comparison can commit it, and a
+  failed commit after resolving that tentative slot revokes it. Explicit revoke is
+  still required on cancellation or other outer failures. The caller owns and must
+  wipe its original key, ticket and body copies; token garbage collection does not
+  guarantee erasure. Parsing under the tentative or active key returns only local
+  service/SSO metadata and a caller-owned payload, not the key; decryption and
+  parsing do not authenticate a peer. Input/response sequences still need
+  operation-specific matching by the future owner. The 16 MiB frame limit is not
+  a CPU, latency or peak-memory limit: callers need a smaller business-specific
+  cap before invoking the synchronous decoder. Existing QQ-TEA/SSO helpers retain
+  temporary allocations that this capability cannot comprehensively erase. This
+  module is not yet wired to the owner, mux, push queue, or production Bridge.
 - `src/direct/linux-easy-account-owner.ts` is an opt-in, one-shot local owner for
   an injected raw client. It creates one private broker lease and sequentially
   performs the reference key exchange, EasyLogin and registration on it, without
@@ -2120,8 +2134,10 @@ remain to be recovered and independently verified.
   device identity. After registration it retains private copies of the fields
   needed by the experimental text-send operation and the registration profile;
   the unused A1 copy is wiped. `sendText` uses the same lease with a bounded,
-  account-bound request and does not expose tickets. Busy or purely local invalid
-  requests do not disrupt the current operation; an uncertain attempted send
+  account-bound request and does not expose a ticket accessor. The existing
+  transport and raw verifier callbacks receive request frames whose service
+  header can contain the D2 ticket; these injected components must be trusted
+  with such data. Busy or purely local invalid requests do not disrupt the current operation; an uncertain attempted send
   closes the owner and requests poison without retry. Its response is a local
   protocol projection, not proof of message delivery. Owner-held byte copies are
   wiped best effort on close or failure. Push and production integration are not
