@@ -8,7 +8,12 @@ import type {
     NTLoginForwardRequest,
 } from '@snowluma/proto-defs/direct-login';
 import type { PushMsg } from '@snowluma/proto-defs/message';
-import type { SsoRegisterRequest, SsoRegisterResponse } from '@snowluma/proto-defs/sso-register';
+import type {
+    SsoHeartbeatRequest,
+    SsoHeartbeatResponse,
+    SsoRegisterRequest,
+    SsoRegisterResponse,
+} from '@snowluma/proto-defs/sso-register';
 import { protobuf_decode, protobuf_encode } from '@snowluma/proton';
 import { expect, vi } from 'vitest';
 import { KEY_EXCHANGE_COMMAND } from '../../../src/direct/key-exchange-flow';
@@ -34,7 +39,7 @@ import {
     type RawMultiplexPushRoute,
 } from '../../../src/direct/raw-multiplex-client';
 import { LINUX_EASY_LOGIN_COMMAND } from '../../../src/direct/sso-reference-linux-easy-login-flow';
-import { SSO_INFO_SYNC_COMMAND } from '../../../src/direct/sso-register';
+import { SSO_HEARTBEAT_COMMAND, SSO_INFO_SYNC_COMMAND } from '../../../src/direct/sso-register';
 import { IdentityService } from '../../../src/identity-service';
 import { MSG_PUSH_CMD } from '../../../src/msg-push';
 import type { IncomingPacketPipeline } from '../../../src/packet-pipeline';
@@ -44,6 +49,7 @@ export const UIN = '123456';
 export const KE = 0x80000001;
 export const EASY = 0x80000002;
 export const REGISTER = 0x80000003;
+export const HEARTBEAT = REGISTER + 1;
 export const PUSH = 0xf000000a;
 
 export type PeerProcessorInput = Pick<
@@ -287,7 +293,7 @@ export function fixture(
         const a2 = own(Uint8Array.of(0x21, 0, 0x22));
         const guid = own(Uint8Array.of(0xab, 0xcd));
         const nonce = own(Uint8Array.from({ length: 12 }, (_, i) => i));
-        const written = [deferred<void>(), deferred<void>(), deferred<void>()];
+        const written = [deferred<void>(), deferred<void>(), deferred<void>(), deferred<void>()];
         const easyVerifyEntered = deferred<void>();
         const firstClassified = deferred<void>();
         const deferredVerifyEntered = deferred<void>();
@@ -488,9 +494,15 @@ export function fixture(
                         syntheticPhase = 'a-replayed';
                     }
 
-                    expect(candidate).toBeDefined();
+                    if (!candidate) {
+                        return { kind: 'reject' as const };
+                    }
 
-                    if (candidate!.command === SSO_INFO_SYNC_COMMAND) {
+                    if (candidate.command === SSO_INFO_SYNC_COMMAND) {
+                        if (registeredSettled || identity.sequence !== REGISTER) {
+                            return { kind: 'reject' as const };
+                        }
+
                         expect(candidate).toEqual({
                             uin,
                             sequence: REGISTER,
@@ -498,10 +510,31 @@ export function fixture(
                             retCode: 0,
                         });
                         classified.push('register');
-                        return { kind: 'response', sequence: candidate!.sequence };
+                        return { kind: 'response', sequence: candidate.sequence };
                     }
 
-                    expect(candidate).toEqual(meta(candidate!.sequence));
+                    if (candidate.command === SSO_HEARTBEAT_COMMAND) {
+                        if (
+                            !registeredSucceeded ||
+                            identity.sequence !== HEARTBEAT ||
+                            candidate.sequence !== HEARTBEAT ||
+                            candidate.uin !== uin
+                        ) {
+                            return { kind: 'reject' as const };
+                        }
+
+                        classified.push('heartbeat');
+                        return { kind: 'response', sequence: candidate.sequence };
+                    }
+
+                    if (
+                        candidate.command !== MSG_PUSH_CMD ||
+                        !expectedFrames.has(candidate.sequence)
+                    ) {
+                        return { kind: 'reject' as const };
+                    }
+
+                    expect(candidate).toEqual(meta(candidate.sequence));
 
                     if (registeredSucceeded) {
                         expect(registeredSettled).toBe(true);
@@ -813,6 +846,36 @@ export function fixture(
             mux.feed(response(REGISTER, request.command, body, true));
         }
 
+        /** Feed one synthetic response, optionally coalescing a locally generated push. */
+        function feedHeartbeat(position?: 'before' | 'after') {
+            expect(registeredSucceeded).toBe(true);
+            expect(isLinuxEasyOwnerPushActive(owner)).toBe(true);
+            expect(frames[3]).toBeDefined();
+            expect(frames[3]![8]).toBe(1);
+            const request = unpack(frames[3]!, true);
+            expect(request.sequence).toBe(HEARTBEAT);
+            expect(request.command).toBe(SSO_HEARTBEAT_COMMAND);
+            expect(request.body.toString('hex')).toBe('08011202080018002000');
+            expect(protobuf_decode<SsoHeartbeatRequest>(request.body)).toMatchObject({
+                type: 1,
+                localSilence: { localSilence: 0 },
+                batteryState: 0,
+                time: 0n,
+            });
+            const body = own(protobuf_encode<SsoHeartbeatResponse>({ interval: 270n }));
+            const heartbeat = response(HEARTBEAT, request.command, body, true);
+            const pushed = position ? push(PUSH + 2) : undefined;
+            const chunk = own(
+                Buffer.concat([
+                    ...(position === 'before' && pushed ? [pushed.frame] : []),
+                    heartbeat,
+                    ...(position === 'after' && pushed ? [pushed.frame] : []),
+                ]),
+            );
+            mux.feed(chunk);
+            return { heartbeat, pushed };
+        }
+
         function start() {
             const pending = owner.start(options);
             starts.push(pending);
@@ -848,11 +911,13 @@ export function fixture(
             held,
             muxVerified,
             fullVerified,
+            callbackErrors,
             dispatch,
             onPush,
             feedKey,
             feedEasyAndPush,
             feedRegister,
+            feedHeartbeat,
             push,
             start,
             close,

@@ -1951,8 +1951,25 @@ remain to be recovered and independently verified.
   heartbeat using an owner-supplied account, credentials, signer and raw-response
   verifier. It validates local command, sequence and account binding and retains
   an observed interval as `bigint`, without inferring its unit; absent and zero
-  are distinct. This is a local contract, not an exact reproduction of V2's
-  missing-value or integer-cast semantics. Fixed V2
+  are distinct. Its optional integer `maxResponseBodyBytes` accepts `0..16 MiB` and
+  defaults to 16 MiB for this standalone borrowed helper. It bounds decoded
+  body bytes during decompression and for uncompressed data, including before a
+  nonzero SSO result is returned; zero allows only an empty decoded body and uses
+  a one-byte inflate cap followed by a nonempty check. For zero SSO return codes,
+  the heartbeat protobuf decoder also applies its separate 1 MiB input limit;
+  the stricter applicable limit wins, and passing a size limit does not by itself
+  make a body valid. Nonzero SSO results do not enter that protobuf decoder.
+  Outer-frame and other limits apply separately. The SSO decoder copies an
+  uncompressed body before checking its limit; outer TEA and transport processing
+  can also make frame copies. This output/decompression limit is not a whole-path
+  peak-memory or CPU bound. The helper now rejects lasting changes to the signer
+  input and to the verifier's temporary request and response copies; callbacks that
+  previously used those copies as in-place scratch must use separate storage.
+  Changes restored before a check, retained copies and the validity of a returned
+  signature remain unproven. The Linux Easy owner applies its stricter default and
+  maximum of 65536 decoded body bytes, as described below. This is a local
+  contract, not an exact reproduction of V2's missing-value or integer-cast
+  semantics. Fixed V2
   [schedules SSO heartbeat](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Logic/WtExchangeLogic.cs#L384-L422)
   immediately after its registration success and every 270 seconds thereafter;
   it discards the response instead of scheduling from its interval field. V2's
@@ -2201,16 +2218,45 @@ remain to be recovered and independently verified.
   peer authentication or an online-state claim. The login and registration profiles
   are independently supplied and can differ; this owner does not establish a common
   device identity. After registration it retains private copies of the fields
-  needed by the experimental text-send operation and the registration profile;
-  the unused A1 copy is wiped. `sendText` uses the same lease with a bounded,
+  needed by the experimental text-send and heartbeat operations and the registration
+  profile; the unused A1 copy is wiped. `sendText` uses the same lease with a bounded,
   account-bound request and does not expose a ticket accessor. The existing
   transport and raw verifier callbacks receive request frames whose service
   header can contain the D2 ticket; these injected components must be trusted
   with such data. Busy or purely local invalid requests do not disrupt the current
   operation; an uncertain attempted send
   closes the owner and requests poison without retry. Its response is a local
-  protocol projection, not proof of message delivery. Owner-held byte copies are
-  wiped best effort on close or failure. The separate deep-import-only
+  protocol projection, not proof of message delivery. After registration, an
+  explicit `owner.heartbeat({timeoutMs, signal?, maxResponseBodyBytes?})` makes
+  one borrowed reference heartbeat on that same private lease and account. It
+  shares the owner's single-flight slot with `start` and `sendText`; a competing
+  operation returns `busy` without inspecting its options. `timeoutMs` is required
+  and is an integer from 1 through 2147483647 milliseconds; `signal` is optional.
+  The optional integer response-body limit is `0..65536` bytes and defaults to
+  65536. It applies during decompression and to uncompressed bodies, including
+  nonzero SSO responses; zero permits only an empty decoded body. To implement
+  zero, the decoder uses a one-byte inflate cap and then rejects any nonempty
+  output. This is a local body bound, not a frame, peak-memory or CPU bound.
+
+  A successful local response preserves an observed `interval` as `bigint`
+  without assigning a unit; a missing interval is distinct from zero and does not
+  by itself close the owner. A nonzero SSO code is returned as `sso-error` and,
+  as local policy rather than an assertion about the server, stops the owner and
+  requests lease poisoning. Busy, invalid options and cancellation or expiry
+  before lease entry report not-written without disturbing an otherwise active
+  owner. A transport, validation, cancellation or deadline failure after lease
+  entry closes the owner, requests poison and reports an unknown write state;
+  lease entry alone is not proof that bytes were written. The owner's lifetime
+  deadline still applies.
+  Cancellation and deadline checks depend on local event-loop progress and do not
+  forcibly stop an uncooperative transport or callback or undo its effects. This
+  owner does not schedule heartbeats automatically, create a connection, or wire
+  them into production Core. A synthetic test combines the owner and actual raw mux
+  with an in-memory peer, placing a push before or after the heartbeat response in
+  one chunk; this exercises local routing, not a real QQ session. Its local result
+  does not authenticate a server, validate a signature, establish online state or
+  prove delivery; injected callbacks may have their own effects. Owner-held byte
+  copies are wiped best effort on close or failure. The separate deep-import-only
   `createLinuxEasyAccountOwnerWithKeyCapability` variant binds a tentative key to
   its own lease and commits it only after the local registration success result,
   using the EasyLogin sequence and a separate comparison copy. Its internal

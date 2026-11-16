@@ -1,10 +1,11 @@
+import { timingSafeEqual } from 'node:crypto';
 import { addAbortListener } from 'node:events';
 import { isProxy, isSharedArrayBuffer, isUint8Array } from 'node:util/types';
 import type { SsoReferenceRegisterBorrowedOptions } from './sso-reference-register-flow';
 import type { Sso12RawOptions, Sso12RawResult, Sso12RawTransport } from './sso12-packet-client';
 import { guardBorrowedTransport } from './guard-raw-transaction';
 import { decodeServiceResponse, encodeServiceRequest } from './service-frame';
-import { decodeSsoResponse, encodeSso12Request } from './sso';
+import { decodeSsoResponse, encodeSso12Request, MAX_SSO_BYTES } from './sso';
 import {
     decodeSsoHeartbeatResponse,
     encodeSsoHeartbeatReference,
@@ -16,6 +17,8 @@ export interface SsoReferenceHeartbeatOptions {
     profile: SsoReferenceRegisterBorrowedOptions['profile'];
     /** Internal owner-projected UID; never an external account selection. */
     uid: string;
+    /** Post-decompression body limit, 0..16 MiB; omitted retains the 16 MiB default. */
+    maxResponseBodyBytes?: number;
     timeoutMs: number;
     signal?: AbortSignal;
     buildReserved: SsoReferenceRegisterBorrowedOptions['buildReserved'];
@@ -37,6 +40,78 @@ const resizable = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'resiza
 const values = Uint8Array.prototype.values;
 const fill = Uint8Array.prototype.fill;
 const aborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted')!.get!;
+
+function assertSignerRequestUnchanged(
+    request: Parameters<SsoReferenceHeartbeatOptions['buildReserved']>[0],
+    uin: string,
+    uid: string,
+    sequence: number,
+    body: Uint8Array,
+    baseline: Uint8Array,
+): void {
+    const matches = (key: keyof typeof request, expected: unknown): boolean => {
+        const descriptor = Object.getOwnPropertyDescriptor(request, key);
+        return !!descriptor && Object.hasOwn(descriptor, 'value') && descriptor.value === expected;
+    };
+
+    try {
+        if (
+            !matches('uin', uin) ||
+            !matches('uid', uid) ||
+            !matches('command', SSO_HEARTBEAT_COMMAND) ||
+            !matches('sequence', sequence) ||
+            !matches('body', body)
+        ) {
+            throw new Error();
+        }
+
+        values.call(body);
+        values.call(baseline);
+
+        if (length.call(body) !== length.call(baseline) || !timingSafeEqual(body, baseline)) {
+            throw new Error();
+        }
+    } catch {
+        throw new Error('signer input changed');
+    }
+}
+
+function assertVerifierRequestUnchanged(
+    request: Parameters<SsoReferenceHeartbeatOptions['verifyRaw']>[0],
+    uin: string,
+    sequence: number,
+    requestCopy: Uint8Array,
+    requestBaseline: Uint8Array,
+    responseCopy: Uint8Array,
+    responseBaseline: Uint8Array,
+): void {
+    const matches = (key: keyof typeof request, expected: unknown): boolean => {
+        const descriptor = Object.getOwnPropertyDescriptor(request, key);
+        return !!descriptor && Object.hasOwn(descriptor, 'value') && descriptor.value === expected;
+    };
+
+    const unchanged = (copy: Uint8Array, baseline: Uint8Array): boolean => {
+        values.call(copy);
+        values.call(baseline);
+        return length.call(copy) === length.call(baseline) && timingSafeEqual(copy, baseline);
+    };
+
+    try {
+        if (
+            !matches('uin', uin) ||
+            !matches('sequence', sequence) ||
+            !matches('command', SSO_HEARTBEAT_COMMAND) ||
+            !matches('requestFrame', requestCopy) ||
+            !matches('responseFrame', responseCopy) ||
+            !unchanged(requestCopy, requestBaseline) ||
+            !unchanged(responseCopy, responseBaseline)
+        ) {
+            throw new Error();
+        }
+    } catch {
+        throw new Error('verifier input changed');
+    }
+}
 
 function wipe(value: Uint8Array | undefined): void {
     if (value) {
@@ -196,10 +271,16 @@ function validateIntervalWire(data: Uint8Array): void {
 /**
  * One borrowed, locally verified exchange. The owner retains exclusivity, transport
  * lifecycle and poisoning on failure, including a guard rejection after broker success.
- * Callbacks receive temporary copies; their outputs are opaque policy, not proof of
- * signature validity or server authentication. No timers, pushes, multi-account socket
- * ownership or online-state claims are implemented here. A stalled transport and its
- * external callback effects remain owner responsibilities.
+ * Callbacks receive temporary copies; lasting changes to their checked inputs are
+ * rejected. Restored changes and retained copies remain outside these checks. Their
+ * outputs are opaque policy, not proof of signature validity or server authentication.
+ * The transport identity UIN is not compared to login UIN here, preserving WT's '0'
+ * identity; a Linux owner enforces its own stricter binding around every raw callback.
+ * No timers, pushes, multi-account socket ownership or online-state claims are
+ * implemented here. A stalled transport and external callback effects remain owner
+ * responsibilities; abort does not guarantee cancellation of an uncooperative promise.
+ * The optional body limit applies during decompression, including nonzero SSO
+ * responses; zero permits only an empty body and uses a one-byte inflate cap.
  * PC service-level comparison only; it does not establish V2 wire compatibility:
  * https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Services/System/SsoHeartBeatService.cs#L7-L22
  */
@@ -254,6 +335,7 @@ export async function referenceHeartbeatOnTransport(
             'login',
             'profile',
             'uid',
+            'maxResponseBodyBytes',
             'timeoutMs',
             'signal',
             'buildReserved',
@@ -277,6 +359,8 @@ export async function referenceHeartbeatOnTransport(
         wipe(a1);
         const uin = login.uin;
         const uid = input.uid;
+        const maxResponseBodyBytes =
+            input.maxResponseBodyBytes === undefined ? MAX_SSO_BYTES : input.maxResponseBodyBytes;
         const version = profile.version;
         const subAppId = profile.subAppId;
         timeout = input.timeoutMs as number;
@@ -299,6 +383,10 @@ export async function referenceHeartbeatOnTransport(
             !Number.isInteger(timeout) ||
             timeout < 1 ||
             timeout > 0x7fffffff ||
+            typeof maxResponseBodyBytes !== 'number' ||
+            !Number.isSafeInteger(maxResponseBodyBytes) ||
+            maxResponseBodyBytes < 0 ||
+            maxResponseBodyBytes > MAX_SSO_BYTES ||
             typeof signer !== 'function' ||
             isProxy(signer) ||
             typeof verifier !== 'function' ||
@@ -370,22 +458,43 @@ export async function referenceHeartbeatOnTransport(
                     owned.push(body);
                     signerInput = Uint8Array.from(body);
                     owned.push(signerInput);
-                    const signed = await signer({
+                    const signerSequence = identity.sequence;
+                    const signerRequest = {
                         uin,
                         uid,
-                        sequence: identity.sequence,
+                        sequence: signerSequence,
                         command: SSO_HEARTBEAT_COMMAND,
                         body: signerInput,
-                    });
+                    };
+                    const signed = await signer(signerRequest);
                     assertActive();
+                    // Lasting changes are rejected; restored changes and callback-held
+                    // copies remain outside this local consistency check.
+                    assertSignerRequestUnchanged(
+                        signerRequest,
+                        uin,
+                        uid,
+                        signerSequence,
+                        signerInput,
+                        body,
+                    );
+                    // The callback output may alias signerInput; snapshot before wiping it.
                     metadata = copyBytes(signed, MAX_FIELD);
                     const localGuid = copy(guid),
                         localKey = copy(key),
                         localD2 = copy(d2),
                         localA2 = copy(a2);
                     assertActive();
+                    assertSignerRequestUnchanged(
+                        signerRequest,
+                        uin,
+                        uid,
+                        signerSequence,
+                        signerInput,
+                        body,
+                    );
                     inner = encodeSso12Request({
-                        sequence: identity.sequence | 0,
+                        sequence: signerSequence | 0,
                         subAppId: subAppId as number,
                         a2: localA2,
                         command: SSO_HEARTBEAT_COMMAND,
@@ -402,6 +511,14 @@ export async function referenceHeartbeatOnTransport(
                         body: inner,
                     });
                     assertActive();
+                    assertSignerRequestUnchanged(
+                        signerRequest,
+                        uin,
+                        uid,
+                        signerSequence,
+                        signerInput,
+                        body,
+                    );
                     return { frame: requestFrame, context: null };
                 } finally {
                     [body, signerInput, metadata, inner, ...local].forEach(wipe);
@@ -417,14 +534,25 @@ export async function referenceHeartbeatOnTransport(
                     owned.push(requestCopy);
                     responseCopy = Uint8Array.from(candidate);
                     owned.push(responseCopy);
-                    const accepted = await verifier({
+                    const verifierSequence = identity.sequence;
+                    const verifierRequest = {
                         uin,
-                        sequence: identity.sequence,
+                        sequence: verifierSequence,
                         command: SSO_HEARTBEAT_COMMAND,
                         requestFrame: requestCopy,
                         responseFrame: responseCopy,
-                    });
+                    };
+                    const accepted = await verifier(verifierRequest);
                     assertActive();
+                    assertVerifierRequestUnchanged(
+                        verifierRequest,
+                        uin,
+                        verifierSequence,
+                        requestCopy,
+                        requestFrame!,
+                        responseCopy,
+                        candidate,
+                    );
                     return accepted === true;
                 } finally {
                     wipe(requestCopy);
@@ -440,7 +568,12 @@ export async function referenceHeartbeatOnTransport(
                         throw new Error('invalid envelope');
                     }
 
-                    const response = decodeSsoResponse(outer.body);
+                    // The decoder enforces at least one output byte. A zero limit
+                    // therefore uses that minimum while rejecting any nonempty output.
+                    const response = decodeSsoResponse(
+                        outer.body,
+                        Math.max(1, maxResponseBodyBytes),
+                    );
 
                     try {
                         if (
@@ -448,6 +581,10 @@ export async function referenceHeartbeatOnTransport(
                             response.command !== SSO_HEARTBEAT_COMMAND
                         ) {
                             throw new Error('invalid binding');
+                        }
+
+                        if (response.body.byteLength > maxResponseBodyBytes) {
+                            throw new Error('response body exceeds size limit');
                         }
 
                         if (response.retCode !== 0) {

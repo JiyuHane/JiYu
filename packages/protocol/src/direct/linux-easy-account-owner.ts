@@ -29,6 +29,7 @@ import {
 } from './raw-session-broker';
 import type {
     Sso12RawClient,
+    Sso12RawIdentity,
     Sso12RawOptions,
     Sso12RawResult,
     Sso12RawTransport,
@@ -42,6 +43,10 @@ import {
     type SsoReferenceSendTextOptions,
     type SsoReferenceSendTextResult,
 } from './sso-reference-send-text-flow';
+import {
+    referenceHeartbeatOnTransport,
+    type SsoReferenceHeartbeatResult,
+} from './sso-reference-heartbeat-flow';
 
 export interface LinuxEasyAccountOwnerOptions {
     client: Sso12RawClient;
@@ -65,9 +70,18 @@ export interface LinuxEasyAccountOwnerSendTextOptions {
     signal?: AbortSignal;
 }
 
+export interface LinuxEasyAccountOwnerHeartbeatOptions {
+    timeoutMs: number;
+    signal?: AbortSignal;
+    /** Post-decompression response-body limit, 0..65536; defaults to 65536. */
+    maxResponseBodyBytes?: number;
+}
+
 export interface LinuxEasyAccountOwner {
     start(options: LinuxEasyAccountOwnerOptions): Promise<LinuxEasyAccountOwnerResult>;
     sendText(options: LinuxEasyAccountOwnerSendTextOptions): Promise<SsoReferenceSendTextResult>;
+    /** One explicitly requested exchange; neither peer authentication nor online status is proven. */
+    heartbeat(options: LinuxEasyAccountOwnerHeartbeatOptions): Promise<SsoReferenceHeartbeatResult>;
     close(): void;
 }
 
@@ -337,8 +351,11 @@ function validSignal(value: unknown): value is AbortSignal {
  * creates no socket and is not a production entry. The exact client must not be used
  * elsewhere, and the caller asserts usability and success quiescence. There is no
  * same-process isolation: callbacks can observe encrypted frames and signing bodies,
- * retain copies, reenter, and have arbitrary effects. Neither registration nor a send
- * response proves online state, peer authentication, acceptance or delivery. This is not
+ * retain copies, reenter, and have arbitrary effects. Neither registration, a send
+ * response nor a heartbeat proves online state, peer authentication, acceptance or delivery.
+ * Heartbeats are explicit one-exchange calls, without automatic scheduling. A nonzero
+ * heartbeat SSO return is returned to the caller and locally revokes the owner by policy,
+ * following the WT reference owner rather than claiming upstream server behavior. This is not
  * push, a real connection, or production wiring. The caller remains responsible for
  * client exclusivity and successful transport quiescence.
  *
@@ -826,6 +843,360 @@ function createOwner(withKeyCapability: boolean): LinuxEasyAccountOwner {
                 if (committed) {
                     stop('send-failed');
                     return failure('send-failed', 'unknown');
+                }
+
+                return failure(
+                    currentState() === 'closed'
+                        ? 'closed'
+                        : opTimedOut
+                          ? 'timeout'
+                          : opCancelled
+                            ? 'cancelled'
+                            : 'invalid-options',
+                    'not-written',
+                );
+            } finally {
+                opActive = false;
+
+                if (onStopped) {
+                    stopSubscribers.delete(onStopped);
+                }
+
+                if (opTimer !== undefined) {
+                    clearTimeout(opTimer);
+                }
+
+                try {
+                    opListener?.[Symbol.dispose]();
+                } catch {
+                    /* best effort */
+                }
+
+                for (const bytes of copies) {
+                    wipe(bytes);
+                    owned.delete(bytes);
+                }
+
+                busy = false;
+            }
+        },
+        async heartbeat(options): Promise<SsoReferenceHeartbeatResult> {
+            const failure = (
+                code: string,
+                writeState: 'not-written' | 'unknown',
+            ): SsoReferenceHeartbeatResult => ({ kind: 'failure', code, writeState });
+
+            // A competing operation must not inspect its arguments or disturb the winner.
+            if (busy) {
+                return failure('busy', 'not-written');
+            }
+
+            if (state !== 'registered' || !session || !lease) {
+                return failure('closed', 'not-written');
+            }
+
+            busy = true;
+            const generation = epoch;
+            let committed = false;
+            let opActive = true;
+            let opTimedOut = false;
+            let opCancelled = false;
+            let opTimer: ReturnType<typeof setTimeout> | undefined;
+            let opListener: ReturnType<typeof addAbortListener> | undefined;
+            let onStopped: (() => void) | undefined;
+            const copies: Uint8Array[] = [];
+
+            try {
+                const started = performance.now();
+                check(generation);
+                const input = record(options, ['timeoutMs', 'signal', 'maxResponseBodyBytes']);
+                const timeout = input.timeoutMs;
+                const signal = input.signal;
+                const maxResponseBodyBytes =
+                    input.maxResponseBodyBytes === undefined ? 65536 : input.maxResponseBodyBytes;
+
+                if (
+                    typeof timeout !== 'number' ||
+                    !Number.isInteger(timeout) ||
+                    timeout < 1 ||
+                    timeout > MAX_TIMER ||
+                    typeof maxResponseBodyBytes !== 'number' ||
+                    !Number.isSafeInteger(maxResponseBodyBytes) ||
+                    maxResponseBodyBytes < 0 ||
+                    maxResponseBodyBytes > 65536 ||
+                    (signal !== undefined && !validSignal(signal))
+                ) {
+                    return failure('invalid-options', 'not-written');
+                }
+
+                const opDeadline = started + timeout;
+
+                const checkOperation = (): number => {
+                    if (!opActive) {
+                        throw new Error('stopped');
+                    }
+
+                    const now = nowChecked(generation);
+                    const aborted = signal !== undefined && getAborted.call(signal);
+
+                    if (
+                        !opActive ||
+                        currentState() === 'closed' ||
+                        epoch !== generation ||
+                        controller.signal.aborted
+                    ) {
+                        throw new Error('stopped');
+                    }
+
+                    if (opTimedOut || now >= opDeadline) {
+                        opTimedOut = true;
+
+                        if (committed) {
+                            stop('timeout');
+                        }
+
+                        throw new Error('stopped');
+                    }
+
+                    if (opCancelled || aborted) {
+                        opCancelled = true;
+
+                        if (committed) {
+                            stop('cancelled');
+                        }
+
+                        throw new Error('stopped');
+                    }
+
+                    return Math.min(MAX_TIMER, Math.max(1, Math.ceil(opDeadline - now)));
+                };
+
+                checkOperation();
+
+                if (signal !== undefined) {
+                    opListener = addAbortListener(signal as AbortSignal, () => {
+                        if (!opActive) {
+                            return;
+                        }
+
+                        opCancelled = true;
+
+                        if (committed) {
+                            stop('cancelled');
+                        }
+                    });
+                }
+
+                const initialRemaining = checkOperation();
+                opTimer = setTimeout(() => {
+                    if (!opActive) {
+                        return;
+                    }
+
+                    opTimedOut = true;
+
+                    if (committed) {
+                        stop('timeout');
+                    }
+                }, initialRemaining);
+                checkOperation();
+                const saved = session;
+                const transport = lease;
+
+                if (!saved || !transport || currentState() !== 'registered') {
+                    throw new Error('stopped');
+                }
+
+                const copy = (bytes: Uint8Array): Uint8Array => {
+                    checkOperation();
+                    const result = copyBytes(bytes, 65535);
+                    owned.add(result);
+                    copies.push(result);
+                    checkOperation();
+                    return result;
+                };
+
+                const profile = { ...saved.profile, guid: copy(saved.profile.guid) };
+                const tickets = {
+                    a1: new Uint8Array(0),
+                    a2: copy(saved.tickets.a2),
+                    d2: copy(saved.tickets.d2),
+                    d2Key: copy(saved.tickets.d2Key),
+                };
+                const interrupted = new Promise<undefined>((resolve) => {
+                    onStopped = () => resolve(undefined);
+                    stopSubscribers.add(onStopped);
+                });
+
+                // The standalone heartbeat intentionally accepts WT's raw identity UIN '0'.
+                // This Linux owner instead binds each phase to its own exact account and lease.
+                const assertBinding = (identity: Sso12RawIdentity): void => {
+                    checkOperation();
+
+                    if (
+                        currentState() !== 'registered' ||
+                        session !== saved ||
+                        lease !== transport ||
+                        typeof identity !== 'object' ||
+                        identity === null ||
+                        isProxy(identity)
+                    ) {
+                        throw new Error('invalid owner binding');
+                    }
+
+                    const account = getDescriptor(identity, 'uin');
+
+                    if (!account || !hasOwn(account, 'value') || account.value !== saved.uin) {
+                        throw new Error('invalid owner binding');
+                    }
+
+                    checkOperation();
+
+                    if (
+                        currentState() !== 'registered' ||
+                        session !== saved ||
+                        lease !== transport
+                    ) {
+                        throw new Error('invalid owner binding');
+                    }
+                };
+
+                const guardedTransport: Sso12RawTransport = {
+                    transactRaw<C, T>(
+                        rawOptions: Sso12RawOptions<C, T>,
+                    ): Promise<Sso12RawResult<T>> {
+                        checkOperation();
+                        const fencedOptions: Sso12RawOptions<C, T> = {
+                            ...rawOptions,
+                            buildRequest: async (identity) => {
+                                assertBinding(identity);
+                                const built = await rawOptions.buildRequest(identity);
+
+                                try {
+                                    assertBinding(identity);
+                                } catch (error) {
+                                    // This frame belongs to the guard, not a callback copy.
+                                    wipe(built.frame);
+                                    throw error;
+                                }
+
+                                return built;
+                            },
+                            verifyCandidate: async (candidate, context, identity) => {
+                                assertBinding(identity);
+                                const result = await rawOptions.verifyCandidate(
+                                    candidate,
+                                    context,
+                                    identity,
+                                );
+                                assertBinding(identity);
+                                return result;
+                            },
+                            consumeCandidate: async (candidate, context, identity) => {
+                                assertBinding(identity);
+                                const result = await rawOptions.consumeCandidate(
+                                    candidate,
+                                    context,
+                                    identity,
+                                );
+                                assertBinding(identity);
+                                return result;
+                            },
+                        };
+                        checkOperation();
+
+                        if (
+                            currentState() !== 'registered' ||
+                            session !== saved ||
+                            lease !== transport
+                        ) {
+                            throw new Error('invalid owner binding');
+                        }
+
+                        // Once the exact lease is entered, a subsequent failure is uncertain.
+                        committed = true;
+                        return transport.transactRaw(fencedOptions);
+                    },
+                };
+                const remaining = checkOperation();
+                let pending: Promise<SsoReferenceHeartbeatResult>;
+
+                try {
+                    // The borrowed flow snapshots credentials synchronously before its first await.
+                    pending = referenceHeartbeatOnTransport(guardedTransport, {
+                        login: { status: 'tickets', uin: saved.uin, tickets },
+                        profile,
+                        uid: saved.uid,
+                        maxResponseBodyBytes,
+                        timeoutMs: remaining,
+                        signal: controller.signal,
+                        buildReserved: async (input) => {
+                            checkOperation();
+                            const signer = saved.buildReserved;
+                            const result = await signer(input);
+                            checkOperation();
+                            return result;
+                        },
+                        verifyRaw: async (input) => {
+                            checkOperation();
+                            const verifier = saved.verifyRaw;
+                            const result = await verifier(input);
+                            checkOperation();
+                            return result;
+                        },
+                    });
+                } finally {
+                    for (const bytes of copies) {
+                        wipe(bytes);
+                        owned.delete(bytes);
+                    }
+                }
+
+                const observed = pending.then(
+                    (result) => result,
+                    () => undefined,
+                );
+                const result = await Promise.race([observed, interrupted]);
+                checkOperation();
+
+                if (
+                    !committed &&
+                    result?.kind === 'failure' &&
+                    result.writeState === 'not-written'
+                ) {
+                    if (result.code === 'raw-timeout') {
+                        return failure('timeout', 'not-written');
+                    }
+
+                    if (result.code === 'raw-cancelled') {
+                        return failure('cancelled', 'not-written');
+                    }
+                }
+
+                if (!result || result.kind !== 'response' || !committed) {
+                    stop('heartbeat-failed');
+                    return failure('heartbeat-failed', 'unknown');
+                }
+
+                if (result.value.status === 'sso-error') {
+                    // WT-style local policy; this does not assert an upstream disconnect.
+                    stop('heartbeat-sso-error');
+                    return result;
+                }
+
+                if (
+                    result.value.status !== 'success' &&
+                    result.value.status !== 'missing-interval'
+                ) {
+                    stop('heartbeat-failed');
+                    return failure('heartbeat-failed', 'unknown');
+                }
+
+                return result;
+            } catch {
+                if (committed) {
+                    stop('heartbeat-failed');
+                    return failure('heartbeat-failed', 'unknown');
                 }
 
                 return failure(
