@@ -70,6 +70,45 @@ successful send. Other values are ignored, and the field is omitted when absent;
 group messages never acquire it. This is partial event conversion support, not a
 claim that HTTP event polling or live QQ behavior has been verified.
 
+A private `friend_recall` may produce `notice.private_message_delete` only
+through the account-local runtime path. The originating upstream
+`friend_recall` must carry an explicit boolean `recalledBySelf`; its account,
+peer and event time must match the v11 event, and the exact `sourceTicket`
+captured for that same event must be present and still current. The same
+instance's message store must already have matched an existing candidate, and
+the v11 event must retain that candidate's nonzero signed 32-bit `message_id`;
+negative IDs are valid. Missing or tampered provenance, cloned or modified
+events, expired or mismatched tickets, and store misses skip this v12 event
+without changing normal v11 behavior. Passing a standalone or copied v11
+`friend_recall` object to `convertV11Event` alone does not establish the
+required provenance. The source ticket is an internal correlation marker, not
+an authentication boundary against other code in the same process.
+
+The upstream direction selects the v12 `user_id`: the account when
+`recalledBySelf` is true, the peer when false. `sub_type` is empty, and the v11
+message ID is preserved as a string. Store matching uses only the peer, client
+sequence, direction and recall time to select an existing candidate whose
+stored timestamp is no later than the recall time. Its existing recall-time
+validation requires a nonnegative safe integer, so the store path rejects
+fractional recall times even though the source/conversion checks permit fractions
+in the normal v12 time range. The match does not prove global uniqueness or
+identify the original QQ message. If multiple stored candidates satisfy the
+same peer, client sequence, direction and recall-time criteria, successive calls
+handling the same recall may select and remove different historical message IDs.
+The tombstone upsert alone does not guarantee idempotence. This is
+existing store behavior, not evidence that QQ sends duplicate recalls. The
+direction remains dependent on the existing QQ decoder; real-client direction
+and QQ-side behavior have not been verified.
+
+After final source and event revalidation, the runtime may publish this notice
+through v12 subscriber and WebSocket fanout; publication does not establish
+client delivery. This event is intentionally excluded from the runtime's
+internal poll paths: an ordered admission, when present, is skipped rather than
+resolved with the event, and the legacy poll buffer does not enqueue it. The
+poll owner's structural validator remains available for direct trusted fixtures;
+that does not establish runtime poll admission. Production HTTP event polling
+remains unimplemented.
+
 A valid v11 `group_recall` maps to `notice.group_message_delete` after account,
 time, field and identifier validation. It uses `recall` when sender and operator match;
 otherwise the subtype is empty rather than asserting an administrator action.
@@ -104,8 +143,10 @@ inputs. An existing v11 group `message_sent` event with subtype `normal` is
 translated as a group message only when its `user_id` equals the configured
 account. Converted message, notice and generated meta event timestamps must be
 nonnegative, finite and at most JavaScript's safe integer maximum; fractional
-values within that range remain accepted. This local bound keeps the v12 projection
-within the SDK and internal poll JSON number limits; it does not alter v11 events.
+values within that range remain accepted by conversion, subject to stricter
+upstream or store validation such as for private recall above. This local bound
+keeps the v12 projection within the SDK and internal poll JSON number limits; it
+does not alter v11 events.
 This reports the existing self echo; it does not independently confirm send,
 receipt or delivery. A private friend self echo with the same account identity and
 a visible valid v11 `target_id` maps to a private message with the target retained

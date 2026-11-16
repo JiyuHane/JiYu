@@ -55,6 +55,7 @@ import { ReactionStore } from './reaction-store';
 import { sameSelfSentMessage, selfSentEventKey, SELF_SENT_ECHO_WINDOW_MS } from './self-sent-event';
 import type { ApiResponse, JsonObject, JsonValue, MessageMeta, OneBotConfig } from './types';
 import { V12Runtime } from './v12-runtime/runtime';
+import { getPrivateRecallSource } from './v12-runtime/private-recall-source';
 import {
     createPollGate,
     failOrderedPollIngress,
@@ -903,6 +904,7 @@ export class OneBotInstance {
                     trackAction: (label, start) => this.trackAction(label, start),
                     canAccept: () => !this.disposeRequested,
                     captureCurrentSource: () => this.captureEventSource(),
+                    getPrivateRecallSource: (event) => getPrivateRecallSource(this.ctx, event),
                     pollGate: this.v12PollGate,
                     isSourceCurrent: (source, binding) =>
                         !this.disposeRequested &&

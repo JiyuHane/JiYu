@@ -1,4 +1,5 @@
 import { APP_VERSION } from '@snowluma/common/version';
+import { isProxy } from 'node:util/types';
 import { IOneBotNetworkAdapter, type AdapterStatus, type NetworkAdapterContext } from '../network';
 import { V12Transport } from '../v12-network';
 import { V12Dispatcher } from '../v12/dispatcher';
@@ -11,6 +12,11 @@ import {
 import type { V12Self } from '../v12/types';
 import type { JsonObject } from '../types';
 import { safeV12Error, V12_ADAPTER_NAME, type V12ManagedConfig } from './identity';
+import {
+    convertPrivateRecallEvent,
+    matchesPrivateRecallEvent,
+    type PrivateRecallProvenance,
+} from './private-recall-source';
 import {
     captureBinding,
     claimOrderedScope,
@@ -34,6 +40,27 @@ import {
     type PollGate,
 } from './poll-owner';
 
+function hasFriendRecallType(event: JsonObject): boolean {
+    try {
+        if (isProxy(event)) {
+            return false;
+        }
+
+        const post = Object.getOwnPropertyDescriptor(event, 'post_type');
+        const notice = Object.getOwnPropertyDescriptor(event, 'notice_type');
+        return (
+            post !== undefined &&
+            'value' in post &&
+            post.value === 'notice' &&
+            notice !== undefined &&
+            'value' in notice &&
+            notice.value === 'friend_recall'
+        );
+    } catch {
+        return false;
+    }
+}
+
 /** A v12 listener participates in the same network manager FIFO as v11. */
 export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     private readonly self: V12Self;
@@ -45,7 +72,10 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
         event: JsonObject;
         payload: DispatchPayload;
         source: V12Source;
+        privateRecallOwner?: object;
     }> = [];
+    readonly #privateRecallInFlight = new WeakSet<object>();
+    readonly #privateRecallPublished = new WeakMap<object, V12Source>();
     private statusEmitting = false;
     private statusPending = false;
     private statusImmediate: ReturnType<typeof setImmediate> | null = null;
@@ -67,6 +97,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             canAccept: () => boolean;
             isSourceCurrent?: (source: V12Source | undefined, binding: object | null) => boolean;
             captureCurrentSource?: () => V12Source | undefined;
+            getPrivateRecallSource?: (event: JsonObject) => PrivateRecallProvenance | undefined;
             pollGate?: PollGate;
         },
     ) {
@@ -343,7 +374,82 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
         }
     }
 
-    onEvent(event: JsonObject, payload?: DispatchPayload): void | Promise<void> {
+    onEvent(event: JsonObject, payload?: DispatchPayload): void {
+        if (this.#privateRecallInFlight.has(event)) {
+            const duplicate = claimOrderedScope(this, 'runtime', event);
+
+            if (duplicate) {
+                skipOrderedAdmission(duplicate);
+            }
+
+            return;
+        }
+
+        let owned = false;
+
+        const claimPrivateRecall = (): boolean => {
+            if (owned) {
+                return true;
+            }
+
+            if (this.#privateRecallInFlight.has(event)) {
+                return false;
+            }
+
+            this.#privateRecallInFlight.add(event);
+            owned = true;
+            return true;
+        };
+
+        const friendRecall = hasFriendRecallType(event);
+
+        if (friendRecall && !claimPrivateRecall()) {
+            const duplicate = claimOrderedScope(this, 'runtime', event);
+
+            if (duplicate) {
+                skipOrderedAdmission(duplicate);
+            }
+
+            return;
+        }
+
+        try {
+            this.handleEvent(event, payload, friendRecall, claimPrivateRecall);
+        } finally {
+            if (owned) {
+                this.#privateRecallInFlight.delete(event);
+            }
+        }
+    }
+
+    private handleEvent(
+        event: JsonObject,
+        payload: DispatchPayload | undefined,
+        friendRecall: boolean,
+        claimPrivateRecall: () => boolean,
+    ): void {
+        const currentScope = this.#sourceScopes.at(-1);
+        const scope =
+            currentScope?.event === event && currentScope.payload === payload
+                ? currentScope
+                : undefined;
+        let privateRecallOwner: object | undefined;
+
+        if (scope?.privateRecallOwner !== undefined) {
+            const duplicate = claimOrderedScope(this, 'runtime', event);
+
+            if (duplicate) {
+                skipOrderedAdmission(duplicate);
+            }
+
+            return;
+        }
+
+        if (friendRecall && scope) {
+            privateRecallOwner = {};
+            scope.privateRecallOwner = privateRecallOwner;
+        }
+
         const admission = claimOrderedScope(this, 'runtime', event);
 
         if (!admission || admission.kind === 'failed') {
@@ -358,31 +464,135 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             return;
         }
 
-        const scope = this.#sourceScopes.at(-1);
-        const source =
-            scope?.event === event && scope.payload === payload ? scope.source : undefined;
+        const source = scope?.source;
 
         try {
-            const converted = convertV11Event(event, this.self);
+            let recallSource: PrivateRecallProvenance | undefined;
 
-            if (converted) {
-                try {
-                    if (admission?.kind === 'eligible' && admission.target === this) {
-                        admission.lease.resolve(converted);
-                    } else if (
-                        (!admission || admission.kind === 'disabled') &&
-                        !hasOrderedPollOwner(this)
-                    ) {
-                        // Only an unprepared legacy input may use completion-order FIFO.
-                        // A proven pre-ready input never enters a later consumer group.
-                        enqueuePollEvent(this, converted, source);
-                    }
-                } catch {
-                    failOrderedAdmission(admission);
-                    // The optional poll path must never suppress existing fanout.
+            try {
+                // Looking up the original object also detects a notice whose type was
+                // changed after provenance was recorded. Other event paths remain intact.
+                recallSource = this.options.getPrivateRecallSource?.(event);
+            } catch (error) {
+                if (friendRecall) {
+                    throw error;
+                }
+            }
+
+            const privateRecall = friendRecall || recallSource !== undefined;
+
+            if (privateRecall && !claimPrivateRecall()) {
+                if (admission) {
+                    skipOrderedAdmission(admission);
                 }
 
-                this.publish(converted);
+                return;
+            }
+
+            if (privateRecall && scope && !privateRecallOwner) {
+                if (scope.privateRecallOwner !== undefined) {
+                    if (admission) {
+                        skipOrderedAdmission(admission);
+                    }
+
+                    return;
+                }
+
+                privateRecallOwner = {};
+                scope.privateRecallOwner = privateRecallOwner;
+            }
+
+            const recallScopeCurrent = (): boolean => {
+                if (
+                    !scope ||
+                    !privateRecallOwner ||
+                    scope.privateRecallOwner !== privateRecallOwner ||
+                    source === undefined ||
+                    recallSource?.sourceTicket !== source ||
+                    this.#sourceScopes.at(-1) !== scope ||
+                    scope.event !== event ||
+                    scope.payload !== payload ||
+                    scope.source !== source ||
+                    !this.isEnabled ||
+                    !this.accepting
+                ) {
+                    return false;
+                }
+
+                return (
+                    this.isSourceCurrent(source) &&
+                    this.#sourceScopes.at(-1) === scope &&
+                    scope.privateRecallOwner === privateRecallOwner &&
+                    this.isEnabled &&
+                    this.accepting
+                );
+            };
+
+            let converted: ReturnType<typeof convertV11Event>;
+
+            if (privateRecall) {
+                converted =
+                    recallSource && recallScopeCurrent()
+                        ? convertPrivateRecallEvent(event, this.self, recallSource)
+                        : null;
+
+                // Verification may synchronously reenter. Check the same live scope,
+                // epoch and original event again after it returns.
+                if (
+                    converted &&
+                    (!recallScopeCurrent() || !matchesPrivateRecallEvent(event, recallSource!))
+                ) {
+                    converted = null;
+                }
+            } else {
+                converted = convertV11Event(event, this.self);
+            }
+
+            if (converted) {
+                if (privateRecall) {
+                    // Poll delivery lacks a final guard on the original v11 object.
+                    // Treat this supported WS-only projection as an intentional skip.
+                    if (admission) {
+                        skipOrderedAdmission(admission);
+                    }
+
+                    if (
+                        recallSource &&
+                        source !== undefined &&
+                        recallScopeCurrent() &&
+                        matchesPrivateRecallEvent(event, recallSource) &&
+                        this.#privateRecallPublished.get(event) !== source
+                    ) {
+                        const verifiedSource = recallSource;
+                        // Mark this local event/ticket attempt before any subscriber or
+                        // guard callback can reenter. This is not QQ-level deduplication.
+                        this.#privateRecallPublished.set(event, source);
+                        this.publish(
+                            converted,
+                            () =>
+                                recallScopeCurrent() &&
+                                matchesPrivateRecallEvent(event, verifiedSource),
+                        );
+                    }
+                } else {
+                    try {
+                        if (admission?.kind === 'eligible' && admission.target === this) {
+                            admission.lease.resolve(converted);
+                        } else if (
+                            (!admission || admission.kind === 'disabled') &&
+                            !hasOrderedPollOwner(this)
+                        ) {
+                            // Only an unprepared legacy input may use completion-order FIFO.
+                            // A proven pre-ready input never enters a later consumer group.
+                            enqueuePollEvent(this, converted, source);
+                        }
+                    } catch {
+                        failOrderedAdmission(admission);
+                        // The optional poll path must never suppress existing fanout.
+                    }
+
+                    this.publish(converted);
+                }
             } else if (admission) {
                 skipOrderedAdmission(admission);
             }
@@ -574,7 +784,39 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
         return safeV12Error(error);
     }
 
-    private publish(event: unknown): void {
+    private publish(event: unknown, guard?: () => boolean): void {
+        if (guard) {
+            const subscribers = [...this.subscribers].map(
+                (subscriber) => [subscriber, this.subscriberGenerations.get(subscriber)] as const,
+            );
+
+            for (const [subscriber, generation] of subscribers) {
+                try {
+                    if (!guard()) {
+                        break;
+                    }
+                } catch {
+                    break;
+                }
+
+                // The guard may reenter and replace this exact subscription.
+                if (
+                    generation === undefined ||
+                    this.subscriberGenerations.get(subscriber) !== generation
+                ) {
+                    continue;
+                }
+
+                try {
+                    subscriber(event);
+                } catch {
+                    this.warnStatus('v12 event subscriber failed');
+                }
+            }
+
+            return;
+        }
+
         for (const subscriber of this.subscribers) {
             try {
                 subscriber(event);

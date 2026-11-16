@@ -63,6 +63,17 @@ export interface V12FriendIncreaseEvent {
     user_id: string;
 }
 
+export interface V12PrivateMessageDeleteEvent {
+    id: string;
+    time: number;
+    type: 'notice';
+    detail_type: 'private_message_delete';
+    sub_type: '';
+    self: V12Self;
+    message_id: string;
+    user_id: string;
+}
+
 export interface V12GroupMessageDeleteEvent {
     id: string;
     time: number;
@@ -107,6 +118,7 @@ export interface V12GroupMemberIncreaseEvent {
 export type V12ConvertedEvent =
     | V12MessageEvent
     | V12FriendIncreaseEvent
+    | V12PrivateMessageDeleteEvent
     | V12GroupMessageDeleteEvent
     | V12GroupMemberDecreaseEvent
     | V12GroupMemberIncreaseEvent;

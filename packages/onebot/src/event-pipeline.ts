@@ -13,6 +13,11 @@ import { backfillReplyTarget } from './modules/message-actions';
 import { deliverPttTransText, pttTransKey } from './modules/ptt-trans-waiter';
 import type { MessageMeta } from './types';
 import {
+    capturePrivateRecallSource,
+    rememberPrivateRecallSource,
+    type PrivateRecallSnapshot,
+} from './v12-runtime/private-recall-source';
+import {
     bindOrderedContext,
     failOrderedAdmission,
     reserveOrderedContext,
@@ -208,6 +213,7 @@ async function convertAndDispatch(
     event: QQEventVariant,
     state: EventTraceState,
     messageIdOverride?: number,
+    recallSnapshot?: PrivateRecallSnapshot,
 ): Promise<void> {
     let preparedEvent = event;
 
@@ -255,6 +261,17 @@ async function convertAndDispatch(
 
     if (messageIdOverride !== undefined && event.kind === 'friend_recall') {
         converted.message_id = messageIdOverride;
+
+        try {
+            rememberPrivateRecallSource(ctx, converted, recallSnapshot, messageIdOverride);
+        } catch {
+            // Optional v12 provenance must not change the established v11 handoff.
+            try {
+                log.warn('v12 private recall provenance unavailable');
+            } catch {
+                // Diagnostics must not change event delivery.
+            }
+        }
     }
 
     log.trace(() => [
@@ -468,13 +485,39 @@ async function handleFriendRecall(
     event: Extract<QQEventVariant, { kind: 'friend_recall' }>,
     state: EventTraceState,
 ): Promise<void> {
+    let recallSnapshot: PrivateRecallSnapshot | undefined;
+
+    try {
+        recallSnapshot = capturePrivateRecallSource(ctx, event, state.sourceTicket);
+    } catch {
+        // A provenance failure must not alter the existing v11 store operation.
+        try {
+            log.warn('v12 private recall provenance unavailable');
+        } catch {
+            // Diagnostics must not change event delivery.
+        }
+    }
+
     const clientSequence = event.clientSeq ?? event.msgSeq;
+    let storePeer: number;
+    let storeDirection: boolean;
+    let storeTime: number;
+    // Capture the values actually passed to the existing call. Assignments in
+    // its arguments preserve receiver/method and event-property evaluation order.
     const recalled = await ctx.messageStore.recordPrivateRecall(
-        event.userUin,
+        (storePeer = event.userUin),
         clientSequence,
-        event.recalledBySelf === true,
-        event.time,
+        (storeDirection = event.recalledBySelf === true),
+        (storeTime = event.time),
     );
+    const matchingSnapshot =
+        recallSnapshot &&
+        recallSnapshot.peerUin === storePeer &&
+        recallSnapshot.clientSequence === clientSequence &&
+        recallSnapshot.recalledBySelf === storeDirection &&
+        Object.is(recallSnapshot.time, storeTime)
+            ? recallSnapshot
+            : undefined;
     let messageIdOverride: number | undefined;
 
     if (recalled !== null) {
@@ -483,7 +526,7 @@ async function handleFriendRecall(
         log.debug('friend recall cache miss peer=%d clientSeq=%d', event.userUin, clientSequence);
     }
 
-    return convertAndDispatch(ctx, log, event, state, messageIdOverride);
+    return convertAndDispatch(ctx, log, event, state, messageIdOverride, matchingSnapshot);
 }
 
 async function handleGroupMsgEmojiLike(

@@ -182,6 +182,16 @@ function validOrderedEvent(event: unknown, self: OrderedSelf): boolean {
         );
     }
 
+    if (event.type === 'notice' && event.detail_type === 'private_message_delete') {
+        return (
+            event.sub_type === '' &&
+            event.time <= Number.MAX_SAFE_INTEGER &&
+            parseAccountId(event.user_id) !== null &&
+            parseMessageId(event.message_id) !== null &&
+            exact(event, [...common, 'message_id', 'user_id'])
+        );
+    }
+
     if (
         event.type !== 'notice' ||
         parseAccountId(event.group_id) === null ||
