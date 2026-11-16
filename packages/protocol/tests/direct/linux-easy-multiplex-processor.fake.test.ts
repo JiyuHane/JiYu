@@ -98,7 +98,7 @@ function waitUntil(predicate: () => boolean): Promise<void> {
     });
 }
 
-function fixture(allowIncompleteFollowingFrame = false) {
+function fixture(allowIncompleteFollowingFrame = false, deferSyntheticFirst = false) {
     const allocations: Uint8Array[] = [];
 
     const own = <T extends Uint8Array>(bytes: T): T => {
@@ -128,7 +128,14 @@ function fixture(allowIncompleteFollowingFrame = false) {
     const easyVerifyEntered = deferred<void>();
     const easyVerifyGate = deferred<boolean>();
     const firstClassified = deferred<void>();
+    const deferredVerifyEntered = deferred<void>();
+    const deferredVerifyGate = deferred<boolean>();
     const dispatched = deferred<void>();
+    // A private synthetic test phase, not a claim about any peer's frame order.
+    let syntheticPhase: 'awaiting-a' | 'awaiting-easy' | 'easy-seen' | 'a-replayed' = 'awaiting-a';
+    const aAttempts: { phase: string; sequence: number | undefined; frame: Uint8Array }[] = [];
+    const callbackFrames: { marker: string; frame: Uint8Array; route: RawMultiplexPushRoute }[] =
+        [];
     const frames: Uint8Array[] = [];
     const classified: string[] = [];
     const pushOrigins: { id: number; sequence: number | undefined }[] = [];
@@ -234,6 +241,24 @@ function fixture(allowIncompleteFollowingFrame = false) {
         const expected = expectedFrames.get(route.id);
         expect(expected).toBeDefined();
         expect(Array.from(frame)).toEqual(Array.from(expected!));
+
+        if (deferSyntheticFirst) {
+            const marker = [PUSH, PUSH + 1].find((id) => {
+                const snapshot = expectedFrames.get(id);
+                return (
+                    snapshot !== undefined &&
+                    frame.length === snapshot.length &&
+                    frame.every((value, index) => value === snapshot[index])
+                );
+            });
+            expect(marker).toBeDefined();
+            callbackFrames.push({
+                marker: marker === PUSH ? 'A' : 'B',
+                frame: own(Uint8Array.from(frame)),
+                route: { ...route },
+            });
+        }
+
         return processor.onPush(frame, route);
     });
     const mux = createRawMultiplexClient({
@@ -246,6 +271,7 @@ function fixture(allowIncompleteFollowingFrame = false) {
         maxPushFrames: 8,
         maxPushBytes: 262144,
         ...(allowIncompleteFollowingFrame ? { allowIncompleteFollowingFrame: true } : {}),
+        ...(deferSyntheticFirst ? { allowDeferredFrames: true } : {}),
         write: (bytes) => {
             const index = frames.length;
             frames.push(own(Uint8Array.from(bytes)));
@@ -261,10 +287,42 @@ function fixture(allowIncompleteFollowingFrame = false) {
             if (frame[8] === 2) {
                 expect(identity.sequence === KE || identity.sequence === EASY).toBe(true);
                 classified.push(identity.sequence === KE ? 'ke' : 'easy');
+
+                if (deferSyntheticFirst && identity.sequence === EASY) {
+                    expect(syntheticPhase).toBe('awaiting-easy');
+                    syntheticPhase = 'easy-seen';
+                }
+
                 return { kind: 'response', sequence: identity.sequence! };
             }
 
             const candidate = classifyLinuxEasyOwnerD2Candidate(owner, frame);
+            const firstFrame = expectedFrames.get(PUSH);
+            const isSyntheticA =
+                deferSyntheticFirst &&
+                firstFrame !== undefined &&
+                frame.length === firstFrame.length &&
+                frame.every((value, index) => value === firstFrame[index]);
+
+            if (isSyntheticA) {
+                aAttempts.push({
+                    phase: syntheticPhase,
+                    sequence: identity.sequence,
+                    frame: own(Uint8Array.from(frame)),
+                });
+
+                if (syntheticPhase === 'awaiting-a') {
+                    expect(candidate).toBeUndefined();
+                    expect(isLinuxEasyOwnerPushActive(owner)).toBe(false);
+                    syntheticPhase = 'awaiting-easy';
+                    return { kind: 'defer' };
+                }
+
+                expect(syntheticPhase).toBe('easy-seen');
+                expect(candidate).toEqual(meta(PUSH));
+                syntheticPhase = 'a-replayed';
+            }
+
             expect(candidate).toBeDefined();
 
             if (candidate!.command === SSO_INFO_SYNC_COMMAND) {
@@ -310,6 +368,12 @@ function fixture(allowIncompleteFollowingFrame = false) {
             expect(expected).toBeDefined();
             expect(Array.from(frame)).toEqual(Array.from(expected!));
             muxVerified.push(route.id);
+
+            if (deferSyntheticFirst && route.id === PUSH) {
+                deferredVerifyEntered.resolve();
+                return deferredVerifyGate.promise;
+            }
+
             return true;
         },
         onPush,
@@ -524,8 +588,13 @@ function fixture(allowIncompleteFollowingFrame = false) {
         mux.feed(
             own(
                 Buffer.concat([
+                    ...(deferSyntheticFirst ? [first.frame] : []),
                     response(EASY, request.command, body, false),
-                    ...(incomplete ? [first.frame.subarray(0, 1)] : [first.frame, second.frame]),
+                    ...(incomplete
+                        ? [first.frame.subarray(0, 1)]
+                        : deferSyntheticFirst
+                          ? [second.frame]
+                          : [first.frame, second.frame]),
                 ]),
             ),
         );
@@ -567,6 +636,7 @@ function fixture(allowIncompleteFollowingFrame = false) {
 
         try {
             easyVerifyGate.resolve(true);
+            deferredVerifyGate.resolve(true);
         } catch (error) {
             errors.push(error);
         }
@@ -627,7 +697,11 @@ function fixture(allowIncompleteFollowingFrame = false) {
         easyVerifyEntered,
         easyVerifyGate,
         firstClassified,
+        deferredVerifyEntered,
+        deferredVerifyGate,
         dispatched,
+        aAttempts,
+        callbackFrames,
         classified,
         pushOrigins,
         held,
@@ -840,6 +914,159 @@ describe('synthetic raw multiplex + Linux Easy owner + push processor', () => {
         },
         20000,
     );
+
+    it('replays a deferred synthetic D2 frame before a following push', async () => {
+        const f = fixture(false, true);
+        const pending = f.start();
+        const errors: unknown[] = [];
+
+        try {
+            await bounded(f.written[0]!.promise);
+            f.feedKey();
+            await bounded(f.written[1]!.promise);
+            // This is one synthetic feed, not an assertion about a real peer's order.
+            const { first, second } = f.feedEasyAndPush();
+            await bounded(f.easyVerifyEntered.promise);
+            await bounded(turn());
+            expect(f.classified).toEqual(['ke', 'easy']);
+            expect(f.aAttempts).toHaveLength(1);
+            expect(f.aAttempts[0]).toMatchObject({ phase: 'awaiting-a', sequence: EASY });
+            expect(Array.from(f.aAttempts[0]!.frame)).toEqual(Array.from(first.frame));
+            expect(f.frames).toHaveLength(2);
+            expect(f.muxVerified).toEqual([]);
+            expect(f.onPush).not.toHaveBeenCalled();
+            expect(f.fullVerified).toEqual([]);
+            expect(f.dispatch).not.toHaveBeenCalled();
+            expect(f.settled()).toBe(false);
+            expect(f.processor.status()).toBe('buffering');
+            expect(f.processor.activate()).toBe(false);
+
+            f.easyVerifyGate.resolve(true);
+            await bounded(f.deferredVerifyEntered.promise);
+            await bounded(turn());
+            expect(f.aAttempts).toHaveLength(2);
+            expect(f.aAttempts[1]).toMatchObject({ phase: 'easy-seen', sequence: EASY });
+            expect(Array.from(f.aAttempts[1]!.frame)).toEqual(Array.from(first.frame));
+            expect(f.classified).toEqual(['ke', 'easy', `push:${PUSH}`]);
+            expect(f.muxVerified).toEqual([PUSH]);
+            // A's independent raw verification has not returned; it is not in the FIFO yet.
+            expect(f.frames).toHaveLength(2);
+            expect(f.onPush).not.toHaveBeenCalled();
+            expect(f.settled()).toBe(false);
+            expect(f.fullVerified).toEqual([]);
+            expect(f.dispatch).not.toHaveBeenCalled();
+
+            f.deferredVerifyGate.resolve(true);
+            await Promise.all([
+                bounded(f.written[2]!.promise),
+                bounded(waitUntil(() => f.onPush.mock.calls.length === 2)),
+            ]);
+            expect(f.classified).toEqual(['ke', 'easy', `push:${PUSH}`, `push:${PUSH + 1}`]);
+            expect(f.pushOrigins).toEqual([
+                { id: PUSH, sequence: EASY },
+                { id: PUSH + 1, sequence: EASY },
+            ]);
+            expect(f.muxVerified).toEqual([PUSH, PUSH + 1]);
+            expect(f.callbackFrames.map(({ marker }) => marker)).toEqual(['A', 'B']);
+            expect(f.callbackFrames.map(({ route }) => route)).toEqual([
+                { kind: 'push', name: MSG_PUSH_CMD, id: PUSH },
+                { kind: 'push', name: MSG_PUSH_CMD, id: PUSH + 1 },
+            ]);
+            expect(Array.from(f.callbackFrames[0]!.frame)).toEqual(Array.from(first.frame));
+            expect(Array.from(f.callbackFrames[1]!.frame)).toEqual(Array.from(second.frame));
+            expect(f.onPush.mock.results.map((result) => result.value)).toEqual([
+                undefined,
+                undefined,
+            ]);
+            expect(f.frames).toHaveLength(3);
+            expect(f.held.slice(0, 2)).toEqual([KE, EASY]);
+            expect(f.settled()).toBe(false);
+            expect(f.processor.status()).toBe('buffering');
+            expect(isLinuxEasyOwnerPushActive(f.owner)).toBe(false);
+
+            for (const [frame, id] of [
+                [first.frame, PUSH],
+                [second.frame, PUSH + 1],
+            ] as const) {
+                expect(classifyLinuxEasyOwnerD2Candidate(f.owner, frame)).toEqual(f.meta(id));
+                expect(extractLinuxEasyOwnerPushBody(f.owner, frame, f.meta(id))).toBeUndefined();
+            }
+
+            expect(f.fullVerified).toEqual([]);
+            expect(f.dispatch).not.toHaveBeenCalled();
+            expect(f.processor.activate()).toBe(false);
+
+            f.feedRegister(true);
+            expect(await bounded(pending)).toEqual({
+                kind: 'registered',
+                registerSequence: REGISTER,
+            });
+            expect(f.options.register.verifyRaw).toHaveBeenCalledOnce();
+            expect(f.classified).toEqual([
+                'ke',
+                'easy',
+                `push:${PUSH}`,
+                `push:${PUSH + 1}`,
+                'register',
+            ]);
+            expect(f.settled()).toBe(true);
+            expect(isLinuxEasyOwnerPushActive(f.owner)).toBe(true);
+
+            for (const [item, id] of [
+                [first, PUSH],
+                [second, PUSH + 1],
+            ] as const) {
+                const extracted = extractLinuxEasyOwnerPushBody(f.owner, item.frame, f.meta(id));
+
+                try {
+                    expect(extracted).toBeDefined();
+                    expect(extracted!.meta).toEqual(f.meta(id));
+                    expect(Array.from(extracted!.body)).toEqual(Array.from(item.body));
+                } finally {
+                    extracted?.body.fill(0);
+                }
+            }
+
+            expect(f.processor.activate()).toBe(true);
+            await bounded(f.dispatched.promise);
+            await bounded(turn());
+            expect(f.fullVerified).toEqual([PUSH, PUSH + 1]);
+            expect(f.dispatch.mock.calls.map(([meta]) => meta)).toEqual([
+                { serviceCmd: MSG_PUSH_CMD, seqId: PUSH },
+                { serviceCmd: MSG_PUSH_CMD, seqId: PUSH + 1 },
+            ]);
+            expect(f.dispatch.mock.calls.map(([, events]) => events)).toMatchObject(
+                [PUSH, PUSH + 1].map((sequence) => [
+                    {
+                        kind: 'friend_message',
+                        selfUin: Number(UIN),
+                        senderUin: 10001,
+                        elements: [{ type: 'text', text: `synthetic ${sequence}` }],
+                    },
+                ]),
+            );
+            expect(f.processor.status()).toBe('active');
+            expect(f.mux.closed).toBe(false);
+        } catch (error) {
+            errors.push(error);
+        } finally {
+            try {
+                await f.close();
+            } catch (error) {
+                errors.push(error);
+            }
+
+            try {
+                await bounded(pending.catch(() => undefined));
+            } catch (error) {
+                errors.push(error);
+            }
+        }
+
+        if (errors.length) {
+            throw new AggregateError(errors, 'synthetic deferred-frame test or cleanup failed');
+        }
+    }, 20000);
 
     it('retains the Easy origin of a synthetic split push across registration', async () => {
         const f = fixture(true);

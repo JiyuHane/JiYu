@@ -12,7 +12,8 @@ export type RawMultiplexPushRoute = Readonly<{ kind: 'push'; name: string; id: n
 export type RawMultiplexRoute =
     | Readonly<{ kind: 'response'; sequence: number }>
     | RawMultiplexPushRoute
-    | Readonly<{ kind: 'reject' }>;
+    | Readonly<{ kind: 'reject' }>
+    | Readonly<{ kind: 'defer' }>;
 export type RawMultiplexIdentity = Readonly<{ uin: string; sequence?: number }>;
 
 export interface RawMultiplexClientOptions {
@@ -39,6 +40,15 @@ export interface RawMultiplexClientOptions {
      * frameAssemblyTimeoutMs is configured. The default is false.
      */
     allowIncompleteFollowingFrame?: boolean;
+    /**
+     * Permit explicit defer routes for frames captured during a live written transaction.
+     * Parked frames retain both frame and push capacity until replay. The default is false.
+     * Classification, push verification, and onPush must not wait for this transaction,
+     * its owner to start/register, or the same FIFO. This avoids dependency cycles and
+     * bounded-capacity exhaustion; enqueue synchronously and process business work later.
+     * Callback side effects cannot be revoked and callback progress is caller-owned.
+     */
+    allowDeferredFrames?: boolean;
     write(frame: Uint8Array): void | Promise<void>;
     classify(
         frame: Uint8Array,
@@ -141,7 +151,7 @@ function uint(value: unknown, min: number, max: number): value is number {
     return typeof value === 'number' && Number.isSafeInteger(value) && value >= min && value <= max;
 }
 
-function routeSnapshot(value: unknown): RawMultiplexRoute {
+function routeSnapshot(value: unknown, allowDeferredFrames: boolean): RawMultiplexRoute {
     const r = dataRecord(value, ['kind', 'sequence', 'name', 'id']);
     const keys = Object.keys(r);
 
@@ -162,6 +172,10 @@ function routeSnapshot(value: unknown): RawMultiplexRoute {
 
     if (r.kind === 'reject' && keys.length === 1) {
         return Object.freeze({ kind: 'reject' });
+    }
+
+    if (allowDeferredFrames && r.kind === 'defer' && keys.length === 1) {
+        return Object.freeze({ kind: 'defer' });
     }
 
     throw new Error('invalid route');
@@ -186,6 +200,7 @@ type Pending = {
     resolve: (result: Sso12RawResult<unknown>) => void;
 };
 type Incoming = { bytes: Uint8Array; pending?: Pending; written: boolean };
+type Parked = { item: Incoming; route?: RawMultiplexPushRoute };
 type Push = { bytes: Uint8Array; route: RawMultiplexPushRoute };
 
 /**
@@ -217,6 +232,7 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
         'maxPushBytes',
         'frameAssemblyTimeoutMs',
         'allowIncompleteFollowingFrame',
+        'allowDeferredFrames',
         'write',
         'classify',
         'holdFollowingFrames',
@@ -241,6 +257,8 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
             !uint(config.frameAssemblyTimeoutMs, 1, MAX_TIMER)) ||
         (config.allowIncompleteFollowingFrame !== undefined &&
             typeof config.allowIncompleteFollowingFrame !== 'boolean') ||
+        (config.allowDeferredFrames !== undefined &&
+            typeof config.allowDeferredFrames !== 'boolean') ||
         typeof config.write !== 'function' ||
         typeof config.classify !== 'function' ||
         (config.holdFollowingFrames !== undefined &&
@@ -276,6 +294,8 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
     let reservedBytes = 0;
     let reservedFrames = 0;
     const incoming: Incoming[] = [];
+    const parked: Parked[] = [];
+    let deferred: { owner: Pending; phase: 'scanning' | 'replay' } | undefined;
     let activeIncoming: Incoming | undefined;
     let processing = false;
     let incomingTurns = 0;
@@ -343,6 +363,12 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
         for (const frame of incoming.splice(0)) {
             wipe(frame.bytes);
         }
+
+        for (const entry of parked.splice(0)) {
+            wipe(entry.item.bytes);
+        }
+
+        deferred = undefined;
 
         for (const push of pushes.splice(0)) {
             wipe(push.bytes);
@@ -461,6 +487,8 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
             p.candidate ||
             processing ||
             incoming.length ||
+            parked.length ||
+            deferred ||
             (!config.allowIncompleteFollowingFrame && (partial || prefixUsed)) ||
             !live(p)
         ) {
@@ -547,6 +575,10 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
                 p.responseWorker = false;
 
                 if (p.holdFollowingFrames && p.hasValue && live(p)) {
+                    if (deferred?.owner === p && deferred.phase === 'scanning') {
+                        deferred.phase = 'replay';
+                    }
+
                     p.holdFollowingFrames = false;
                     pump();
                 }
@@ -629,44 +661,109 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
             let current: Incoming | undefined;
 
             try {
-                while (currentAlive() && !pending?.holdFollowingFrames && incoming.length) {
+                while (currentAlive() && !pending?.holdFollowingFrames) {
+                    if (deferred?.phase === 'replay' && parked.length === 0) {
+                        deferred = undefined;
+                    }
+
+                    const replay = deferred?.phase === 'replay';
+
+                    if (!replay && incoming.length === 0) {
+                        break;
+                    }
+
                     if (++incomingTurns >= 32) {
                         incomingTurns = 0;
                         await yieldTurn();
 
-                        if (!currentAlive()) {
+                        if (!currentAlive() || pending?.holdFollowingFrames) {
                             break;
                         }
                     }
 
-                    current = incoming.shift()!;
+                    const entry = replay ? parked.shift()! : undefined;
+                    current = entry ? entry.item : incoming.shift()!;
                     activeIncoming = current;
                     const item = current;
-                    const view = copyForCallback(item.bytes);
+                    const owner = deferred?.owner;
                     let route: RawMultiplexRoute;
 
-                    try {
-                        if (!currentAlive()) {
+                    if (entry?.route) {
+                        route = entry.route;
+                    } else {
+                        const view = copyForCallback(item.bytes);
+
+                        try {
+                            if (!currentAlive()) {
+                                break;
+                            }
+
+                            const identity = Object.freeze(
+                                item.pending
+                                    ? { uin, sequence: item.pending.identity.sequence }
+                                    : { uin },
+                            );
+                            route = routeSnapshot(
+                                await classify(view, identity),
+                                config.allowDeferredFrames === true,
+                            );
+                        } finally {
+                            releaseCopy(view);
+                        }
+                    }
+
+                    if (!currentAlive() || activeIncoming !== item) {
+                        break;
+                    }
+
+                    if (owner && (!live(owner) || deferred?.owner !== owner)) {
+                        break;
+                    }
+
+                    if (replay && route.kind === 'response') {
+                        shutdown('protocol-error', 'unexpected-response');
+                        break;
+                    }
+
+                    if (route.kind === 'reject' || (replay && route.kind === 'defer')) {
+                        shutdown('protocol-error', 'frame-rejected');
+                        break;
+                    }
+
+                    if (
+                        !replay &&
+                        (route.kind === 'defer' ||
+                            (deferred?.phase === 'scanning' && route.kind === 'push'))
+                    ) {
+                        const p = item.pending;
+
+                        if (
+                            !p ||
+                            p !== pending ||
+                            !item.written ||
+                            p.responseSeen ||
+                            !live(p) ||
+                            (deferred && deferred.owner !== p)
+                        ) {
+                            shutdown('protocol-error', 'frame-rejected');
                             break;
                         }
 
-                        const identity = Object.freeze(
-                            item.pending
-                                ? { uin, sequence: item.pending.identity.sequence }
-                                : { uin },
-                        );
-                        route = routeSnapshot(await classify(view, identity));
-                    } finally {
-                        releaseCopy(view);
-                    }
+                        if (
+                            pushFrames + 1 > maxPushFrames ||
+                            pushBytes + item.bytes.length > maxPushBytes
+                        ) {
+                            shutdown('protocol-error', 'push-capacity');
+                            break;
+                        }
 
-                    if (!currentAlive()) {
-                        break;
-                    }
-
-                    if (route.kind === 'reject') {
-                        shutdown('protocol-error', 'frame-rejected');
-                        break;
+                        deferred ??= { owner: p, phase: 'scanning' };
+                        pushFrames++;
+                        pushBytes += item.bytes.length;
+                        parked.push({ item, route: route.kind === 'push' ? route : undefined });
+                        current = undefined;
+                        activeIncoming = undefined;
+                        continue;
                     }
 
                     if (route.kind === 'push') {
@@ -674,7 +771,7 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
                         let accepted: unknown;
 
                         try {
-                            if (!currentAlive()) {
+                            if (!currentAlive() || (replay && (!owner || !live(owner)))) {
                                 break;
                             }
 
@@ -683,13 +780,28 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
                             releaseCopy(verifyCopy);
                         }
 
-                        if (!currentAlive()) {
+                        if (
+                            !currentAlive() ||
+                            activeIncoming !== item ||
+                            (replay && (!owner || !live(owner) || deferred?.owner !== owner))
+                        ) {
                             break;
                         }
 
                         if (accepted !== true) {
                             shutdown('protocol-error', 'push-rejected');
                             break;
+                        }
+
+                        if (replay) {
+                            // Transfer the existing push charge and bytes; only the frame charge ends.
+                            pushes.push({ bytes: item.bytes, route });
+                            reservedBytes -= item.bytes.length;
+                            reservedFrames--;
+                            current = undefined;
+                            activeIncoming = undefined;
+                            deliver();
+                            continue;
                         }
 
                         if (
@@ -709,7 +821,7 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
                         if (closed || activeIncoming !== current) {
                             break;
                         }
-                    } else {
+                    } else if (route.kind === 'response') {
                         const p = item.pending;
 
                         if (
@@ -718,7 +830,8 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
                             !item.written ||
                             route.sequence !== p.identity.sequence ||
                             p.responseSeen ||
-                            !live(p)
+                            !live(p) ||
+                            (deferred && deferred.owner !== p)
                         ) {
                             shutdown('protocol-error', 'unexpected-response');
                             break;
@@ -728,10 +841,11 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
                         p.candidate = item.bytes;
                         current = undefined;
                         activeIncoming = undefined;
+                        const forcedHold = deferred?.owner === p;
+                        p.holdFollowingFrames = forcedHold || !!holdFollowingFrames;
 
                         if (holdFollowingFrames) {
                             // Reserve the barrier before invoking caller code: it may reenter feed.
-                            p.holdFollowingFrames = true;
                             const hold: unknown = holdFollowingFrames(p.identity);
 
                             // Observe a mistaken native async policy even if it reentrantly
@@ -749,11 +863,14 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
                                 throw new Error('invalid response barrier result');
                             }
 
-                            p.holdFollowingFrames = hold;
+                            p.holdFollowingFrames = forcedHold || hold;
                         }
 
                         runResponse(p);
                         continue;
+                    } else {
+                        shutdown('protocol-error', 'frame-rejected');
+                        break;
                     }
 
                     wipe(item.bytes);
@@ -774,7 +891,10 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
                 activeIncoming = undefined;
                 processing = false;
 
-                if (!closed && incoming.length) {
+                if (
+                    !closed &&
+                    (incoming.length || (deferred?.phase === 'replay' && parked.length))
+                ) {
                     pump();
                 } else if (!closed) {
                     tryCommit();

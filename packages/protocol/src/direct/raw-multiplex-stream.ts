@@ -81,6 +81,7 @@ export function createRawMultiplexStream(
         'maxPushBytes',
         'frameAssemblyTimeoutMs',
         'allowIncompleteFollowingFrame',
+        'allowDeferredFrames',
         'classify',
         'holdFollowingFrames',
         'verifyPush',

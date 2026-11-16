@@ -1587,6 +1587,21 @@ remain to be recovered and independently verified.
   policy can instead hold later frames until a selected response's consumption
   finishes. The caller must stage required state during consumption, keep business
   delivery separately gated, and ensure its writer does not depend on a held frame.
+  Separately, `allowDeferredFrames` is disabled by default. When explicitly enabled,
+  a caller's classifier may defer an otherwise unclassified complete frame captured
+  during the current written transaction before its response. The mux retains that
+  frame against both frame and push quotas, temporarily parks subsequent classified
+  pushes in arrival order, and lets the matching response pass. After successful
+  response verification and consumption it retries each deferred frame once, accepts
+  only a push route, verifies each push, and enqueues them in order before settling
+  the transaction. The independent push handler may still be running or fail later.
+  Classification, push verification and the push handler must not wait for the same
+  transaction, owner registration or FIFO; callbacks must enqueue promptly and defer
+  business work. Deferred frames are not authenticated by this local policy, and an
+  uncooperative callback or sustained input may still lead to timeout or capacity
+  failure. No production classifier automatically selects deferred frames. A synthetic
+  Linux EasyLogin fixture exercises an unknown candidate before a response, but does
+  not establish that QQ sends this ordering or that the candidate is authentic.
   A held partial frame or sustained input can delay settlement until timeout. The
   opt-in `allowIncompleteFollowingFrame` permits settlement after a matched response
   is verified and consumed while a subsequent frame remains incomplete. The frame
@@ -2217,9 +2232,9 @@ remain to be recovered and independently verified.
   the one in-flight item. The local drain switch does not establish registration,
   an active key or source authentication. Release and close wipe queue-owned
   frames best effort, but not copies or transferred storage held elsewhere. This
-  queue is not connected to the owner or ingress by default; in particular, it
-  does not solve unknown D2 frames arriving before the EasyLogin response stages
-  a key. `takeDetailed` atomically distinguishes an item from an empty, disabled,
+  queue is not connected to the owner or ingress by default. The separate raw mux
+  defer policy requires explicit caller classification and is not enabled by this
+  queue. `takeDetailed` atomically distinguishes an item from an empty, disabled,
   busy, closed or failed take; a failed take retains the FIFO and its quota.
 - `src/direct/linux-easy-push-processor.ts` is a separate experimental in-memory
   composition of an exclusive owner, candidate queue, caller verifier and guarded
