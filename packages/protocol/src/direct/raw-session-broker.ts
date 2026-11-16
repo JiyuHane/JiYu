@@ -1,5 +1,10 @@
 import { types as utilTypes } from 'node:util';
 import { addAbortListener } from 'node:events';
+import {
+    isEmptyLinuxEasyKeyBoundTo,
+    revokeLinuxEasyKey,
+    type LinuxEasyKeyToken,
+} from './linux-easy-key-capability';
 import type {
     Sso12RawClient,
     Sso12RawOptions,
@@ -37,6 +42,8 @@ interface TerminalContext {
     readonly signal: AbortSignal | undefined;
     terminal: 'released' | 'poisoned' | undefined;
     ownedProof: RawSessionTerminalProof | undefined;
+    keyBound: boolean;
+    keyToken: LinuxEasyKeyToken | undefined;
     claim(): RawSessionTerminalProof | undefined;
 }
 
@@ -60,8 +67,61 @@ export interface RawSessionTerminalAuthority {
     consume(lease: unknown, proof: unknown): boolean;
 }
 
+/** Internal binding authority for one exact empty Easy key capability. */
+export interface RawSessionKeyBinding {
+    bind(lease: unknown, token: unknown, uin: unknown): boolean;
+}
+
 function objectKey(value: unknown): value is object {
     return (typeof value === 'object' && value !== null) || typeof value === 'function';
+}
+
+function createKeyBinding(owner: object): RawSessionKeyBinding {
+    return {
+        bind(lease, token, uin) {
+            if (!objectKey(lease)) {
+                return false;
+            }
+
+            const context = terminalContexts.get(lease);
+
+            if (
+                !context ||
+                context.owner !== owner ||
+                context.terminal !== undefined ||
+                context.keyBound ||
+                !isEmptyLinuxEasyKeyBoundTo(token, lease, uin)
+            ) {
+                return false;
+            }
+
+            try {
+                if (
+                    performance.now() >= context.deadline ||
+                    (context.signal !== undefined && signalState(context.signal))
+                ) {
+                    return false;
+                }
+            } catch {
+                return false;
+            }
+
+            // Clock and signal inspection may synchronously terminate or bind this lease.
+            if (
+                terminalContexts.get(lease) !== context ||
+                context.owner !== owner ||
+                context.terminal !== undefined ||
+                context.keyBound ||
+                !isEmptyLinuxEasyKeyBoundTo(token, lease, uin)
+            ) {
+                return false;
+            }
+
+            context.keyBound = true;
+            context.keyToken = token as LinuxEasyKeyToken;
+            return true;
+        },
+    };
 }
 
 function createTerminalAuthority(owner: object): RawSessionTerminalAuthority {
@@ -221,10 +281,18 @@ export function createRawSessionBroker(
 export function createRawSessionBrokerInternal(
     client: Sso12RawClient,
     config: { trustedSuccessQuiescence: true; isUsable: () => boolean },
-): { broker: RawSessionBroker; terminal: RawSessionTerminalAuthority } {
+): {
+    broker: RawSessionBroker;
+    terminal: RawSessionTerminalAuthority;
+    keyBinding: RawSessionKeyBinding;
+} {
     const owner = {};
     const broker = createBroker(client, config, owner);
-    return { broker, terminal: createTerminalAuthority(owner) };
+    return {
+        broker,
+        terminal: createTerminalAuthority(owner),
+        keyBinding: createKeyBinding(owner),
+    };
 }
 
 function createBroker(
@@ -291,6 +359,18 @@ function createBroker(
                 terminal = reason;
                 terminalContext.terminal = reason;
                 terminalContext.ownedProof = ownedProof;
+
+                // Detach first so reentrant cleanup cannot see or revoke the token twice.
+                const keyToken = terminalContext.keyToken;
+                terminalContext.keyToken = undefined;
+
+                if (keyToken !== undefined) {
+                    try {
+                        revokeLinuxEasyKey(keyToken);
+                    } catch {
+                        // Invocation is synchronous; cleanup and proof do not prove erasure.
+                    }
+                }
 
                 if (timer !== undefined) {
                     clearTimeout(timer);
@@ -705,6 +785,9 @@ function createBroker(
                 signal,
                 terminal: undefined,
                 ownedProof: undefined,
+                // Own data properties avoid inherited setters during bind and finish.
+                keyBound: false,
+                keyToken: undefined,
                 claim() {
                     if (terminal || terminalContexts.get(lease) !== terminalContext) {
                         return undefined;

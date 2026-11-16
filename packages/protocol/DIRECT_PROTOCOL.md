@@ -2167,9 +2167,14 @@ remain to be recovered and independently verified.
   `classifyLinuxEasyOwnerD2Candidate` returns only account, sequence, command and
   return-code metadata, never the body, key or ticket. The input frame and decoded
   SSO body are each limited to 64 KiB by local policy, not by an established QQ
-  protocol limit. Metadata is sensitive and must not be logged. A tentative
-  classification is not authentication and is not delivered as a business event.
-  Push queues and production integration are not implemented by either variant.
+  protocol limit. Metadata is sensitive and must not be logged. The internal broker
+  binds only the exact lease, account and initially empty capability. On its own
+  local terminal transition it invokes revocation synchronously before abort,
+  operation cancellation or client close; a failed revocation does not prove
+  erasure. An external `whenClosed` event is still observed asynchronously. A
+  tentative classification is not authentication and is not delivered as a
+  business event. Push queues and production integration are not implemented by
+  either variant.
   The lifetime deadline and phase deadlines depend on event-loop progress. Close
   revokes local state and requests poison, but cannot stop work already inside an
   uncooperative callback or transport, nor erase their retained copies. A broker

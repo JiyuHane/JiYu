@@ -20,7 +20,11 @@ import {
     type LinuxEasyReferenceRegisterOptions,
 } from './linux-easy-reference-register';
 import { decodeLinuxNTEasyLoginReferenceResponse } from './nt-linux-easy-login-reference';
-import { createRawSessionBroker, type RawSessionLease } from './raw-session-broker';
+import {
+    createRawSessionBroker,
+    createRawSessionBrokerInternal,
+    type RawSessionLease,
+} from './raw-session-broker';
 import type {
     Sso12RawClient,
     Sso12RawOptions,
@@ -224,7 +228,16 @@ export function createLinuxEasyAccountOwner(): LinuxEasyAccountOwner {
     return createOwner(false);
 }
 
-/** Internal reference composition; not wired into production or a public callback. */
+/**
+ * Internal reference composition; not wired into production or a public callback.
+ * After exact-lease binding, broker-local finish synchronously invokes the fixed key
+ * revocation before abort, cancellation or client close. This includes broker close,
+ * release, timeout and upstream abort when they actively finish the lease. A throwing
+ * revocation does not guarantee actual erasure. This guarantee begins at local finish:
+ * whenClosed observes underlying closure asynchronously, not at the instant a network
+ * disconnect occurs. Capability phases and results do not authenticate a peer or prove
+ * online state. Copies held elsewhere and uncooperative callbacks remain outside it.
+ */
 export function createLinuxEasyAccountOwnerWithKeyCapability(): LinuxEasyAccountOwner {
     return createOwner(true);
 }
@@ -274,8 +287,7 @@ function createOwner(withKeyCapability: boolean): LinuxEasyAccountOwner {
         state = 'closed';
         epoch++;
         stopReason = reason;
-        // Remove the exact-owner entry and revoke before abort, poison or other cleanup.
-        Reflect.apply(weakMapDelete, classifiers, [owner]);
+        // Revoke before abort, poison, classifier removal or other cleanup.
         const currentCapability = capability;
         capability = undefined;
 
@@ -286,6 +298,8 @@ function createOwner(withKeyCapability: boolean): LinuxEasyAccountOwner {
                 /* continue teardown */
             }
         }
+
+        Reflect.apply(weakMapDelete, classifiers, [owner]);
 
         if (timer !== undefined) {
             clearTimeout(timer);
@@ -882,8 +896,8 @@ function createOwner(withKeyCapability: boolean): LinuxEasyAccountOwner {
                 tick(generation);
                 check(generation);
                 const usable = input.isUsable as () => boolean;
-                const broker = createRawSessionBroker(input.client as Sso12RawClient, {
-                    trustedSuccessQuiescence: true,
+                const brokerConfig = {
+                    trustedSuccessQuiescence: true as const,
                     isUsable: () => {
                         check(generation);
                         const result: unknown = usable();
@@ -903,7 +917,13 @@ function createOwner(withKeyCapability: boolean): LinuxEasyAccountOwner {
                         check(generation);
                         return result === true;
                     },
-                });
+                };
+                const internal = withKeyCapability
+                    ? createRawSessionBrokerInternal(input.client as Sso12RawClient, brokerConfig)
+                    : undefined;
+                const broker = internal
+                    ? internal.broker
+                    : createRawSessionBroker(input.client as Sso12RawClient, brokerConfig);
                 check(generation);
                 // acquire may call arbitrary getters and callbacks before it returns.
                 const acquired = broker.acquire({ deadline, signal: controller.signal });
@@ -938,11 +958,39 @@ function createOwner(withKeyCapability: boolean): LinuxEasyAccountOwner {
                         uin,
                         generation: {},
                     });
-                    loginCapability = created;
+                    // Own the returned token immediately: stop may reenter during bind.
+                    // The catch also revokes this exact token if close already ran before
+                    // creation returned or during binding, when stop is now idempotent.
                     capability = created;
 
                     try {
+                        if (
+                            !internal ||
+                            currentState() !== 'starting' ||
+                            epoch !== generation ||
+                            lease !== acquired ||
+                            controller.signal.aborted
+                        ) {
+                            throw new Error('stopped');
+                        }
+
+                        // No login, classifier registration or other owner callback may
+                        // run before the broker accepts this exact lease/token/account.
+                        if (!internal.keyBinding.bind(acquired, created, uin)) {
+                            throw new Error('binding failed');
+                        }
+
                         check(generation);
+
+                        if (
+                            currentState() !== 'starting' ||
+                            lease !== acquired ||
+                            capability !== created
+                        ) {
+                            throw new Error('stopped');
+                        }
+
+                        loginCapability = created;
                         Reflect.apply(weakMapSet, classifiers, [
                             owner,
                             (frame: Uint8Array): D2Candidate | undefined => {
@@ -1018,13 +1066,35 @@ function createOwner(withKeyCapability: boolean): LinuxEasyAccountOwner {
                         ]);
                         check(generation);
                     } catch (error) {
-                        Reflect.apply(weakMapDelete, classifiers, [owner]);
+                        // Only the token created by this owner is ours to revoke, including
+                        // when close reentered before the returned token was assigned.
+                        try {
+                            revokeLinuxEasyKey(created);
+                        } catch {
+                            /* Continue local teardown even if erasure failed. */
+                        }
 
                         if (capability === created) {
                             capability = undefined;
                         }
 
-                        revokeLinuxEasyKey(created);
+                        try {
+                            Reflect.apply(weakMapDelete, classifiers, [owner]);
+                        } catch {
+                            /* Continue teardown if classifier removal fails. */
+                        }
+
+                        try {
+                            stop('failed');
+                        } finally {
+                            // A reentrant close may already have made stop a no-op.
+                            try {
+                                acquired.poison();
+                            } catch {
+                                /* best effort */
+                            }
+                        }
+
                         throw error;
                     }
                 }

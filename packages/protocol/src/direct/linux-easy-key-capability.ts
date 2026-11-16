@@ -172,6 +172,25 @@ function bound(value: Slot, lease: unknown, uin: unknown): boolean {
     return identity(lease) && value.lease === lease && value.uin === uin;
 }
 
+/** Check exact private binding without reading caller properties or exposing key material. */
+export function isEmptyLinuxEasyKeyBoundTo(token: unknown, lease: unknown, uin: unknown): boolean {
+    try {
+        if (!identity(token) || !identity(lease)) {
+            return false;
+        }
+
+        const value = apply(weakGet, slots, [token]) as Slot | undefined;
+        return (
+            value !== undefined &&
+            value.phase === 'empty' &&
+            value.lease === lease &&
+            value.uin === uin
+        );
+    } catch {
+        return false;
+    }
+}
+
 // Reconstruct a private view from intrinsics, never caller-defined properties or
 // iterators. Fixed ordinary ArrayBuffer only; rejects detached and shared storage.
 // Key inputs additionally require a plain Uint8Array, not Buffer or a subclass.
