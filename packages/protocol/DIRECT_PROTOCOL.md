@@ -416,9 +416,10 @@ intervening control flow without replacement or aliasing. In bounded linear
 samples from each callee entry, `0x68418ac` saves the command, decimal 32-bit
 value and body string, then reaches code using a global object at `0x917b5e0`.
 Additional bounded instruction windows described below identify an MD5-like
-computation candidate, not a complete signature algorithm. In the sample from
-`0x683fa74`, code uses the command and body and contains several
-command-string comparisons whose values and reachability were not established.
+computation candidate, not a complete signature algorithm. In the initial sample
+from `0x683fa74`, code uses the command and body and contains several
+command-string comparisons. Later bounded windows below recover three compared
+values; runtime reachability is not established.
 The sample from `0x6830c58` accesses global objects at `0x917b530` and
 `0x917b860` and contains a possible `time` call; the sample does not prove the
 clock value reaches the returned token. The initial entry samples were limited
@@ -491,18 +492,103 @@ comparisons constrain only the prefix before the first NUL, not necessarily the
 complete original string object. Under the indicated equal-branch and normal
 pointer/lifetime conditions, their flattened state paths converge on a call at
 `0x684011a` to `0x6be3c6c` with a global object, a body copy and a command copy.
-An entry window in that helper compares the command against a length and pointer
-stored in zero-filled global memory through a `memcmp`-named PLT entry. The
-runtime values, dynamic PLT binding, remaining helper behavior and any
-cryptographic operation are unknown.
+In the helper's entry window, the saved `RDI` is the result object, `RDX` is
+the body-string argument and `RCX` is the command-string argument. The first
+command comparison at `0x6be3d2c–0x6be3dbb` reads the command length, the
+expected length at global `0x917bb68`, the expected pointer at `0x917bb60`, and
+then the command pointer. Different lengths select a false result. Equal zero
+lengths select true without calling `memcmp`; equal nonzero lengths call the
+`memcmp`-named PLT entry `0x8e10110` on all bytes and select true only for a zero
+return. This comparison includes embedded NUL bytes, unlike the upstream
+`strcmp` checks. The expected pointer and length are separate reads, not a
+proven atomic snapshot; their runtime values remain unknown.
+
+The inspected flattened transitions at `0x6be425a` and `0x6d04b74` choose main
+state `0x69702191` for this first match, or `0x1de070ba` for a mismatch. The
+latter continues to a different global-command comparison and is not established
+as the helper's final rejection. The matching state reaches `0x6be3f19`, which
+assigns the body string to a local string through the `_M_assign`-named PLT
+entry `0x8e12010`. After normal return, `0x6be3f33` sets a local discriminator
+to one and main state `0xfccb4311`. At `0x6be4295–0x6be42c9`, that state's
+handler saves the copied body's length and starts nested state `0x8f55aae4`;
+`0x6be680f` dispatches it to `0x6d017e3`. A zero length selects nested state
+`0x3a0f83d9`, while a nonzero length selects `0x6a14ac65`. The following
+observation concerns only the zero-length path.
+
+Through `0x6be67b0`, the zero-length state reaches `0x6d0179b`, which passes
+`0x91563d0` to helper `0x6d07606`. That helper conditionally calls the
+`pthread_mutex_lock`-named PLT entry depending on a separately read runtime
+qword at `0x9153310`; the call's success and its applicability to other writers
+are not established. Next, let `G` denote the 160 bytes beginning at
+`0x917bbe0`. A nonzero `G[0]` selects nested state `0x56904548`. Otherwise,
+`0x6be67dc–0x6be6807` calls the `bcmp`-named PLT entry on `G[0:159]` and
+`G[1:160]`; a nonzero result selects the same state, while zero selects
+`0xeb441fd4`, a path not reconstructed here. For an unchanged snapshot and the
+expected `bcmp` binding, the selected state therefore means only that at least
+one byte in `G` is nonzero, not that the block is initialized or valid.
+
+State `0x56904548` reaches `0x6d017fd`, which uses the
+`basic_string::_M_construct<const char*>`-named PLT entry `0x8e11fc0` to
+construct the result from `[0x917bc08, 0x917bc28)`, or `G[0x28:0x48]`: exactly
+32 bytes, including any NUL bytes. Those 32 bytes can all be zero even when
+another byte made `G` nonzero. At `0x6d01821` the code calls `0x6d076a2`,
+which conditionally invokes a `pthread_mutex_unlock`-named PLT entry. Under the
+inspected subsequent states `0x49c4fd2e` and `0x2031f10d`, `0x6d051a2`
+cleans the local string and the stack-canary-success path returns at
+`0x6d051f1`. The command-mismatch, nonempty-body and all-zero-block paths are
+not resolved by this branch.
+
+The named entries above are observations from this ELF's `.rela.plt`
+`R_X86_64_JUMP_SLOT` records: indices `0x10` and `0x12` name `memcmp` and
+`bcmp`, `0x200` and `0x1fb` name the respective `_M_assign` and
+`_M_construct<const char*>` specializations, and `0xe0` and `0xe4` name
+`pthread_mutex_lock` and `pthread_mutex_unlock`. Their corresponding relocation
+file offsets are `0x850568`, `0x850598`, `0x8533e8`, `0x853370`, `0x8518e8`
+and `0x851948`. These names do not establish actual runtime binding. This ELF's
+executable `PT_LOAD` maps file `0x299d300` to VA `0x299e300` for `0x6475100`
+bytes, so the code addresses in these windows use VA = file offset + `0x1000`.
+The expected-command slots and `G` lie in a different, zero-filled portion of a
+writable load segment; file bytes and the code mapping do not determine their
+runtime values. Capstone and Zydis independently decoded the 34-record comparison
+window and 93 additional records from the selected state and return windows;
+instruction addresses, sizes and bytes matched each other and the original ELF
+bytes. This is bounded static evidence, not a complete control-flow graph or
+observed execution.
+
+The offline [empty-body global-slice candidate](src/direct/target-empty-body-global-slice-candidate.ts)
+models only this conditional branch with caller-supplied command, expected-command
+bytes, body length and a 160-byte block. It returns a fresh 32-byte slice when
+the modeled conditions hold and `null` for other valid cases, which remain
+unresolved rather than representing a target return. Its command-size and input
+validation limits are local policy, not recovered target limits. Separate,
+purely synthetic Python checks exercised the modeled predicate, including
+embedded NULs, an all-zero block and a nonzero byte outside the returned slice;
+they did not execute this TypeScript implementation or the native target. The
+separate synthetic Vitest suite exercises the TypeScript candidate with local
+fixtures, not the native target. This model is not connected to a signer and does
+not establish the actual command or global contents.
 
 Other bounded windows conditionally move the helper result into a local string,
 append its bytes to a return string and copy that result to the caller's output
 region at `+0x100`. This is a candidate data dependency on the region previously
 associated with the `extra` diagnostic, not proof of the executed path, a
-complete extra algorithm, the contents of the user's supplied ZIP, or a working
-QQ signature. Normal returns, unchanged intermediate pointers and contents, no
-destructive aliasing and the expected dynamic bindings remain assumptions.
+complete extra algorithm or a working QQ signature. The interpretation requires
+normal returns, the named dynamic bindings, valid memory, stable intermediate
+pointers and contents, and no destructive aliasing or interfering writes. In
+particular, the observations do not prove that the conditional lock runs or
+that every writer uses it.
+
+The separately supplied file-signature research archive contains a report that
+also refers to constructor `0x351fb20`, vtable address point `0x8e80f38` and
+two command-literal leads. These are report assertions; the archive did not
+contain the reported original ELF or application-signature files. The report
+includes its own corrections and an unresolved address discrepancy between
+`0x6e8cbc0` and `0x6e8dbc0`; neither address is resolved here. Its reported
+application-file verification hashes a file with SHA-256, encodes the digest as
+lowercase hexadecimal ASCII and verifies RSA-PSS using SHA-256. This is not
+established as an SSO `extra` operation or a packet-signing algorithm. See
+[QQ_SIGNATURE_RESEARCH.md](./QQ_SIGNATURE_RESEARCH.md) for the archive's scope
+and the independent synthetic verifier's limits.
 
 A complete inventory of this ELF's 885 defined default/protected dynamic exports contains no symbol whose
 value equals `0x6613200` or `0x66137b0` (REA evidence
