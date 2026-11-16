@@ -1933,6 +1933,23 @@ remain to be recovered and independently verified.
   encoded frame and 256 fields per inspected message; selected fields reject
   duplicates and wrong wire types, and all varints must be minimally encoded.
   These stricter rules are not a complete description of V2 or QQ behavior.
+- `src/direct/sso-reference-linux-easy-login-flow.ts` composes those PC helpers
+  into one transaction on a caller-supplied borrowed raw transport. Its signer
+  receives the complete serialized NT forward request, including the session
+  ticket, before SSO framing; the raw verifier receives copies of both frames.
+  These callbacks and the transport are trust boundaries. The transaction binds
+  its configured UIN and sequence, rejects lasting signer-body mutation, verifies
+  the raw candidate according to the caller's policy, then returns NT status and
+  an opaque caller-owned body without deciding success or persisting tickets.
+  Missing status fields, omitted code and absent versus empty body remain distinct;
+  unusual-device data is preserved as opaque bytes, not automatically handled.
+  The caller supplies a nonce unique under the session key and owns account/peer
+  binding, expiry and replay policy. A local timeout or abort cleans reachable owned
+  views best-effort but does not establish transport quiescence or revoke callback
+  side effects. Guard-owned buffers may remain until an uncooperative transport
+  settles; after any uncertain write, the owner must resolve that transport before
+  reuse. This experimental reference flow is not wired into production Direct,
+  does not mark an account online, and has not established live interoperability.
 - `src/direct/sso12-packet-client.ts` is a single-flight protocol-12 client for
   an already-connected socket, with caller-supplied account policy, classifier,
   signing metadata, device parameters and zero-key or D2-key encryption. It
