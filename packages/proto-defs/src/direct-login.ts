@@ -1,4 +1,4 @@
-import type { pb, pb_optional, bytes, int_32, int_64, uint_32 } from '@snowluma/proton';
+import type { pb, pb_optional, bytes, int_32, int_64, uint_32, uint_64 } from '@snowluma/proton';
 
 // Field declarations only; no QQ build interoperability is implied.
 // https://github.com/LagrangeDev/Lagrange.Core/blob/fe789c4a23796fbc82fa09e70a9c44c8a5cf2948/Lagrange.Core/Internal/Packets/Login/NTEcdh.cs
@@ -81,6 +81,29 @@ export interface LinuxNTLoginReferenceForward {
     sessionTicket: pb<1, bytes>;
     buffer: pb<3, bytes>;
     type: pb<4, uint_32>;
+}
+
+// Minimal response-only projection. Other fields intentionally remain unknown.
+// https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/Login/NTEcdh.cs#L53-L61
+// https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/Login/NTLogin.cs#L76-L94
+// https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/Login/NTLogin.cs#L167-L182
+// https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/Login/NTLogin.cs#L538-L544
+// https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Services/Login/NTLoginCommon.cs#L55-L76
+export interface LinuxNTLoginReferenceResponseForward {
+    buffer?: pb_optional<3, bytes>;
+}
+
+export interface LinuxNTLoginReferenceResponseError {
+    code?: pb_optional<1, uint_64>;
+}
+
+export interface LinuxNTLoginReferenceResponseHead {
+    errorInfo?: pb<4, LinuxNTLoginReferenceResponseError>;
+}
+
+export interface LinuxNTLoginReferenceResponseCommon {
+    head?: pb<1, LinuxNTLoginReferenceResponseHead>;
+    body?: pb_optional<2, bytes>;
 }
 
 // Field declarations independently derived from LagrangeV2; original authors retain ownership.

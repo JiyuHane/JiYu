@@ -1853,8 +1853,29 @@ remain to be recovered and independently verified.
   bind its returned material to this account, expiry or a trusted peer; GCM also
   does not authenticate the outer ticket or establish server identity. Synthetic
   tests exercise Node cryptography and Proton, not a running V2 implementation,
-  actual QQ login or the supplied native signing library. No response decoding,
-  session orchestration or production Bridge integration is provided here.
+  actual QQ login or the supplied native signing library.
+- `src/direct/nt-linux-login-response-reference.ts` is a separate offline PC
+  response projection based on the reference's
+  [decode path](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Services/Login/NTLoginCommon.cs#L55-L76).
+  With a caller-supplied session key, it authenticates the GCM-encrypted field 3
+  before interpreting the common message. It returns an opaque body, preserving
+  absent versus present-empty, and distinguishes missing head, missing error
+  information, and a `uint64` code with its wire-presence flag. A present empty
+  error message projects the reference's default zero code with `codePresent: false`;
+  this is a decoded value, not a login-success determination. Nonzero codes still
+  carry any decoded body. This local parser rejects repeated or wrong-wire selected
+  fields, non-minimal varints and protobuf groups, unlike the more permissive
+  upstream decoder. The selected outer fields are 1 (ticket), 3 (encrypted buffer),
+  4 (uint32 type), and 5 (security buffer); only field 3 is required, but any of
+  these fields is subject to the duplicate and wire checks. Unselected fields
+  with wire types 0, 1, 2 or 5 are skipped as
+  opaque data, including repeated fields. Its 1 MiB per-input/plaintext and field
+  count bounds are local admission rules, not a whole-process memory bound. Outer
+  ticket and type are not authenticated by this GCM payload; identity, account
+  binding, replay protection, key provenance and expiry are caller responsibilities.
+  Owned reachable byte temporaries are wiped best-effort, excluding caller buffers,
+  returned body and runtime/crypto-internal copies. No session orchestration or
+  production Bridge integration is provided by either reference helper.
 - `src/direct/sso12-packet-client.ts` is a single-flight protocol-12 client for
   an already-connected socket, with caller-supplied account policy, classifier,
   signing metadata, device parameters and zero-key or D2-key encryption. It
