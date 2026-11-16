@@ -24,19 +24,129 @@ export class V12UnsupportedEventError extends Error {
     }
 }
 
+// Read own or inherited data properties without executing Proxy traps or getters.
+// This retains observable legacy text/at values while rejecting accessors.
+function segmentProperty(segment: object, name: string): unknown {
+    let current: object | null = segment;
+    let depth = 0;
+
+    while (current !== null && depth++ < 256 && !isProxy(current)) {
+        const descriptor = Object.getOwnPropertyDescriptor(current, name);
+
+        if (descriptor) {
+            return 'value' in descriptor ? descriptor.value : undefined;
+        }
+
+        current = Object.getPrototypeOf(current);
+    }
+
+    return undefined;
+}
+
+// Only public JSON fields are projected. Hidden symbols hold persistence-only
+// snapshots in production; check their visibility without reading their values.
+function visibleOwnData(value: unknown, fields: readonly string[]): Record<string, unknown> | null {
+    if (isProxy(value) || !isObject(value)) {
+        return null;
+    }
+
+    const prototype = Object.getPrototypeOf(value);
+
+    if (prototype !== Object.prototype && prototype !== null) {
+        return null;
+    }
+
+    const keys = Object.keys(value);
+
+    if (
+        keys.length !== fields.length ||
+        keys.some((key) => !fields.includes(key)) ||
+        Object.getOwnPropertySymbols(value).some((key) =>
+            Object.prototype.propertyIsEnumerable.call(value, key),
+        )
+    ) {
+        return null;
+    }
+
+    // Hidden string extras are outside the JSON shape, but accessors are still
+    // rejected without evaluation. Hidden symbols are never value-inspected.
+    for (const key of Object.getOwnPropertyNames(value)) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+
+        if (!descriptor || !('value' in descriptor)) {
+            return null;
+        }
+    }
+
+    const result = Object.create(null) as Record<string, unknown>;
+
+    for (const field of fields) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, field);
+
+        if (!descriptor?.enumerable || !('value' in descriptor)) {
+            return null;
+        }
+
+        result[field] = descriptor.value;
+    }
+
+    return result;
+}
+
+function ordinaryImageUrl(segment: object): string | null {
+    const outer = visibleOwnData(segment, ['type', 'data']);
+
+    if (!outer || outer.type !== 'image') {
+        return null;
+    }
+
+    const data = visibleOwnData(outer.data, ['file', 'url', 'sub_type', 'summary']);
+
+    if (
+        !data ||
+        typeof data.file !== 'string' ||
+        typeof data.url !== 'string' ||
+        data.url.length === 0 ||
+        data.sub_type !== 0 ||
+        (data.summary !== '' && data.summary !== '[图片]')
+    ) {
+        return null;
+    }
+
+    return data.url;
+}
+
 /** A known but unsupported V11 event returns null; malformed input throws. */
-export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEvent | null {
-    if (!isSelf(self) || !isObject(input) || typeof input.post_type !== 'string') {
+export function convertV11Event(
+    input: unknown,
+    self: V12Self,
+    options?: { issueImageFileId: (url: string) => string },
+): V12ConvertedEvent | null {
+    if (isProxy(self) || !isObject(self)) {
+        throw new Error('invalid V11 event or V12 account identity');
+    }
+
+    // Capture identity before inspecting the event: event getters can reenter
+    // caller code, but cannot change the identity used for this projection.
+    const eventSelf = { ...self };
+
+    if (!isSelf(eventSelf) || !isObject(input)) {
+        throw new Error('invalid V11 event or V12 account identity');
+    }
+
+    const postType = input.post_type;
+
+    if (typeof postType !== 'string') {
         throw new Error('invalid V11 event or V12 account identity');
     }
 
     const sourceSelf = fromV11AccountId(input.self_id);
 
-    if (sourceSelf === null || sourceSelf !== self.user_id) {
+    if (sourceSelf === null || sourceSelf !== eventSelf.user_id) {
         throw new Error('V11 event account does not match V12 account');
     }
 
-    if (input.post_type === 'notice') {
+    if (postType === 'notice') {
         if (input.notice_type === 'friend_add') {
             const fields = ['time', 'self_id', 'post_type', 'notice_type', 'user_id'];
             const userId = fromV11AccountId(input.user_id);
@@ -57,7 +167,7 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
                 type: 'notice',
                 detail_type: 'friend_increase',
                 sub_type: '',
-                self: { ...self },
+                self: { ...eventSelf },
                 user_id: userId,
             };
         }
@@ -107,7 +217,7 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
                 type: 'notice',
                 detail_type: 'group_member_increase',
                 sub_type: '',
-                self: { ...self },
+                self: { ...eventSelf },
                 group_id: groupId,
                 user_id: userId,
                 operator_id: operatorId,
@@ -159,7 +269,7 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
                 type: 'notice',
                 detail_type: 'group_member_decrease',
                 sub_type: '',
-                self: { ...self },
+                self: { ...eventSelf },
                 group_id: groupId,
                 user_id: userId,
                 operator_id: operatorId,
@@ -207,7 +317,7 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
             detail_type: 'group_message_delete',
             // A different operator does not establish that they are an administrator.
             sub_type: operatorId === userId ? 'recall' : '',
-            self: { ...self },
+            self: { ...eventSelf },
             group_id: groupId,
             message_id: messageId,
             user_id: userId,
@@ -215,13 +325,13 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
         };
     }
 
-    if (input.post_type === 'meta_event' || input.post_type === 'request') {
+    if (postType === 'meta_event' || postType === 'request') {
         return null;
     }
 
-    const isSent = input.post_type === 'message_sent';
+    const isSent = postType === 'message_sent';
 
-    if (!isSent && input.post_type !== 'message') {
+    if (!isSent && postType !== 'message') {
         throw new Error('unsupported V11 event type');
     }
 
@@ -246,7 +356,7 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
         throw new Error('invalid V11 message event');
     }
 
-    if (isSent && sentUserId !== self.user_id) {
+    if (isSent && sentUserId !== eventSelf.user_id) {
         throw new V12UnsupportedEventError();
     }
 
@@ -265,7 +375,7 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
             const id = Object.getOwnPropertyDescriptor(sender.value, 'user_id');
             const projected = id?.enumerable && 'value' in id ? fromV11AccountId(id.value) : null;
 
-            if (projected !== null && projected !== self.user_id) {
+            if (projected !== null && projected !== eventSelf.user_id) {
                 throw new V12UnsupportedEventError();
             }
         }
@@ -287,14 +397,17 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
     const messageId = fromV11MessageId(input.message_id);
     const userId = isSent ? sentUserId : fromV11AccountId(input.user_id);
     const groupId = detail === 'group' ? fromV11AccountId(input.group_id) : null;
+    const messageTime = input.time;
+    const sourceMessage = input.message;
 
     if (
         messageId === null ||
         userId === null ||
         (detail === 'group' && groupId === null) ||
-        !isV12Time(input.time) ||
+        !isV12Time(messageTime) ||
         typeof input.raw_message !== 'string' ||
-        !Array.isArray(input.message)
+        isProxy(sourceMessage) ||
+        !Array.isArray(sourceMessage)
     ) {
         throw new Error('invalid V11 message event');
     }
@@ -304,41 +417,94 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
         !isSent && detail === 'private'
             ? Object.getOwnPropertyDescriptor(input, 'auto_reply')
             : undefined;
+    // Read array elements by their own data descriptors instead of invoking a
+    // caller-controlled iterator or index getter. Non-enumerable array indices
+    // remain visible in JSON arrays and are therefore accepted here.
+    const sourceSegments: unknown[] = [];
+
+    for (let index = 0; index < sourceMessage.length; index += 1) {
+        const item = Object.getOwnPropertyDescriptor(sourceMessage, String(index));
+
+        if (!item || !('value' in item)) {
+            throw new Error('invalid V11 message event');
+        }
+
+        sourceSegments.push(item.value);
+    }
+
     const message: V12MessageEvent['message'] = [];
     const alt: string[] = [];
+    const images: { index: number; url: string }[] = [];
 
-    for (const segment of input.message) {
-        if (
-            !isObject(segment) ||
-            (segment.type !== 'text' && segment.type !== 'at') ||
-            !isObject(segment.data) ||
-            (segment.type === 'text' && typeof segment.data.text !== 'string')
-        ) {
+    for (let index = 0; index < sourceSegments.length; index += 1) {
+        const segment = sourceSegments[index];
+
+        if (isProxy(segment) || !isObject(segment)) {
             throw new Error('unsupported or invalid V11 message segment');
         }
 
-        if (
-            Object.keys(segment).some((key) => key !== 'type' && key !== 'data') ||
-            Object.keys(segment.data).some(
-                (key) => key !== (segment.type === 'text' ? 'text' : 'qq'),
-            )
-        ) {
-            throw new Error('unsupported V11 message segment field');
-        }
+        const type = segmentProperty(segment, 'type');
 
-        if (segment.type === 'text') {
-            // The earlier guard narrows this field at runtime, not across the segment type.
-            if (typeof segment.data.text !== 'string') {
+        if (type === 'image') {
+            if (isSent || !options) {
                 throw new Error('unsupported or invalid V11 message segment');
             }
 
-            message.push({ type: 'text', data: { text: segment.data.text } });
-            alt.push(segment.data.text);
-        } else if (segment.data.qq === 'all') {
-            message.push({ type: 'mention_all', data: {} });
-            alt.push('@全体成员');
+            const url = ordinaryImageUrl(segment);
+
+            if (url === null) {
+                throw new Error('unsupported or invalid V11 message segment');
+            }
+
+            images.push({ index: message.length, url });
+            // This placeholder stays local until every segment and issued ID is valid.
+            message.push({ type: 'image', data: { file_id: '' } });
+            alt.push('[图片]');
+            continue;
+        }
+
+        if (type !== 'text' && type !== 'at') {
+            throw new Error('unsupported or invalid V11 message segment');
+        }
+
+        // A getter could mutate a later segment, so only snapshot data properties.
+        const data = segmentProperty(segment, 'data');
+
+        if (isProxy(data) || !isObject(data)) {
+            throw new Error('unsupported or invalid V11 message segment');
+        }
+
+        const hasUnsupportedFields =
+            Object.keys(segment).some((key) => key !== 'type' && key !== 'data') ||
+            Object.keys(data).some((key) => key !== (type === 'text' ? 'text' : 'qq'));
+
+        if (type === 'text') {
+            const text = segmentProperty(data, 'text');
+
+            if (typeof text !== 'string') {
+                throw new Error('unsupported or invalid V11 message segment');
+            }
+
+            if (hasUnsupportedFields) {
+                throw new Error('unsupported V11 message segment field');
+            }
+
+            message.push({ type: 'text', data: { text } });
+            alt.push(text);
         } else {
-            const mentionedUser = fromV11AccountId(segment.data.qq);
+            if (hasUnsupportedFields) {
+                throw new Error('unsupported V11 message segment field');
+            }
+
+            const qq = segmentProperty(data, 'qq');
+
+            if (qq === 'all') {
+                message.push({ type: 'mention_all', data: {} });
+                alt.push('@全体成员');
+                continue;
+            }
+
+            const mentionedUser = fromV11AccountId(qq);
 
             if (mentionedUser === null) {
                 throw new Error('unsupported or invalid V11 message segment');
@@ -349,13 +515,15 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
         }
     }
 
-    return {
+    // Capture the validated event before calling the issuer, which may mutate its
+    // caller's input. No partially populated event is exposed if issuance fails.
+    const converted: V12MessageEvent = {
         id: randomUUID(),
-        time: input.time,
+        time: messageTime,
         type: 'message',
         detail_type: detail,
         sub_type: '',
-        self: { ...self },
+        self: { ...eventSelf },
         message_id: messageId,
         message,
         // V11 raw_message is CQ-escaped. These mention labels are local plain-text
@@ -368,6 +536,27 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
             ? { 'qq.auto_reply': true as const }
             : {}),
     };
+
+    if (images.length > 0) {
+        const issue = options?.issueImageFileId;
+
+        if (typeof issue !== 'function') {
+            throw new Error('unsupported or invalid V11 message segment');
+        }
+
+        // Validate the complete message before the first synchronous issuance.
+        for (const image of images) {
+            const fileId = issue(image.url);
+
+            if (typeof fileId !== 'string' || fileId.length === 0 || fileId.length > 4096) {
+                throw new Error('invalid V12 image file id');
+            }
+
+            message[image.index] = { type: 'image', data: { file_id: fileId } };
+        }
+    }
+
+    return converted;
 }
 
 /** The transport supplies actual version/status and decides when to emit these. */

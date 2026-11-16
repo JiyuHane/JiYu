@@ -73,13 +73,13 @@ response is not proof that a requested deletion did or did not happen. Its
 response inspection rejects a final Proxy value after JavaScript's `await` has
 performed thenable handling, which may itself execute a `then` getter.
 
-`get_file` currently supports only `type: "url"` and calls the existing
-account-local v11 media lookup once. The opaque `file_id` must be a nonempty
-string of at most 4,096 UTF-16 code units; supported hits come from that
-account's cached image or voice metadata. V12 message events and uploads do not
-currently supply these IDs, so callers must obtain one through an existing v11
-path or another source. Success returns only `name` and the original HTTP(S)
-`url`; URL syntax is checked, but availability, validity period, required
+`get_file` currently supports only `type: "url"`. Ordinary opaque `file_id`
+values are passed once to the existing account-local v11 media lookup; supported
+hits come from that account's cached image or voice metadata. The ID must be a
+nonempty string of at most 4,096 UTF-16 code units. Supported v12 incoming image
+events can also supply a separate transient image handle as described below;
+v12 uploads do not yet supply IDs. Success returns only `name` and the original
+HTTP(S) `url`; URL syntax is checked, but availability, validity period, required
 credentials, or access from the application are not verified. Cached names can
 be identifiers or other stored labels rather than original filenames. A label
 containing `/` or NUL, or equal to `.` or `..`, is projected as an empty unknown
@@ -94,8 +94,16 @@ URL-refresh warning no longer records its exception; observers and other
 lower-level logging or configured URL-refresh services can still see data.
 
 Incoming friend/private and normal/group messages with text and v11 `at`
-segments are converted to v12 `text`, `mention` and `mention_all` segments;
-unsupported segments visible at this v12 conversion boundary are rejected.
+segments are converted to v12 `text`, `mention` and `mention_all` segments.
+Ordinary incoming images are additionally projected as `image` segments when
+an internal source ticket remains current and the observed v11 fields match the
+supported ordinary image shape. This checks the public JSON-visible keys and
+reads required image fields as own data properties; non-enumerable internal
+metadata is not projected or treated as evidence of QQ origin. The local
+`alt_message` renders each such image as `[图片]`. Flash images, marketplace
+faces, nonzero subtypes, custom summaries, sent-message echoes and other
+unsupported segments visible at this boundary are rejected for the whole v12
+event; v11 behavior is unchanged.
 An upstream decoder or v11 conversion may already have omitted a segment, so
 this is not an end-to-end guarantee against losing message semantics. The
 conversion preserves the v11 field, not an independently verified QQ mention:
@@ -111,14 +119,38 @@ successful send. Other values are ignored, and the field is omitted when absent;
 group messages never acquire it. This is partial event conversion support, not a
 claim that HTTP event polling or live QQ behavior has been verified.
 
+Each supported image event carries a `jiyu-image:v1:` file ID that seals the
+HTTP(S) URL observed in its v11 segment. A later `get_file` on the same active
+v12 runtime returns that exact URL and an empty unknown name, without querying
+the v11 media alias, refreshing the URL, or downloading the file. This new branch
+does not invoke v11 action observers or v11 `get_file` action logs. URLs above
+3,000 UTF-8 bytes or rejected by the existing URL syntax checks are unsupported.
+The ID protects an observed URL string, not the original image bytes, QQ source
+identity, future URL content or access. Local AES-GCM is used only for this
+handle and is unrelated to QQ signing or its encryption algorithms.
+
+The ID is a transferable bearer reference: anyone who can call `get_file` on
+the issuing runtime can recover the URL, and its length is visible. The same
+runtime retains its key across a listener close/reopen and online-status changes;
+permanent runtime quiesce/force-close revokes it, while replacement or restart
+uses a new key. Each key issues at most 2²⁴ handles; exhaustion rejects new
+image projections without revoking previously issued handles. Key-buffer clearing
+is best effort and does not erase copies held
+by JavaScript, native crypto or consumers. The `jiyu-image:v1:` prefix is now
+reserved: an invalid, tampered, revoked or foreign handle fails rather than
+falling back to v11, so a pre-existing v11 alias with that prefix is no longer
+accepted through v12 `get_file`. Existing v11 actions themselves are unchanged.
+The original v11 event and debug/observer channels may still contain the URL.
+
 For an ordinary event delivered with an internal source ticket, v12 WebSocket
 fanout now rechecks its original listener binding and online epoch before
 publishing and before each subscriber. An expired, foreign or unverifiable
 provided ticket is not published to v12 subscribers; v11 dispatch is unchanged.
 Events with no ticket retain the legacy unguarded fanout. A synchronous reentry
 with the exact same event and payload can inherit the surrounding ticket scope.
-The poll admission and settlement path is unchanged, and a poll result already
-committed before a later WebSocket check is not rolled back. This fence depends
+For image projections the source is also rechecked before poll admission;
+other existing admission and settlement behavior is unchanged, and a poll result
+already committed before a later WebSocket check is not rolled back. This fence depends
 on the instance's synchronous source verifier; it does not establish upstream
 QQ identity, suppress same-epoch delivery to a later-joining client, or cancel
 an asynchronous subscriber that already began work.

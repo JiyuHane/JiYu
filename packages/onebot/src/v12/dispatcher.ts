@@ -1,6 +1,8 @@
 import { isProxy } from 'node:util/types';
 import type { ApiResponse, JsonObject, JsonValue } from '../types';
 import type { V12CoreOptions, V12Response } from './types';
+import { classifyFileUrl } from './file-url';
+import { isV12ImageToken } from './image-file-token';
 import {
     MAX_REQUEST_STRING_LENGTH,
     fromV11MessageId,
@@ -565,6 +567,20 @@ export class V12Dispatcher {
         const unavailable = () => response(20002, 'file unavailable', null, echo);
         const unsupported = () => response(10004, 'file URL unavailable', null, echo);
 
+        if (isV12ImageToken(fileId)) {
+            // The reserved namespace is never retried as a legacy alias: doing
+            // so could turn a damaged or foreign handle into a different file.
+            try {
+                const url = this.options.resolveImageFileUrl?.(fileId);
+                const checked = classifyFileUrl(url);
+                return checked.kind === 'valid'
+                    ? response(0, '', { name: '', url: checked.url }, echo)
+                    : invalid();
+            } catch {
+                return unavailable();
+            }
+        }
+
         try {
             const result: unknown = await this.options.api.handle('get_file', { file_id: fileId });
 
@@ -625,73 +641,17 @@ export class V12Dispatcher {
                 return invalid();
             }
 
-            const address: string = url.value;
+            const checked = classifyFileUrl(url.value);
 
-            if (address.length === 0) {
+            if (checked.kind === 'unsupported') {
                 return unsupported();
             }
 
-            // URL parsing can repair malformed Unicode and strip ASCII
-            // whitespace or controls. Check the original string first, then
-            // return that exact string unchanged.
-            for (let i = 0; i < address.length; i += 1) {
-                const code = address.charCodeAt(i);
-
-                if (code <= 0x20 || code === 0x7f) {
-                    return invalid();
-                }
-
-                if (code === 0x25) {
-                    const pair = address.slice(i + 1, i + 3);
-
-                    if (!/^[0-9a-f]{2}$/i.test(pair)) {
-                        return invalid();
-                    }
-
-                    i += 2;
-                } else if (code >= 0xd800 && code <= 0xdbff) {
-                    const next = address.charCodeAt(i + 1);
-
-                    if (!(next >= 0xdc00 && next <= 0xdfff)) {
-                        return invalid();
-                    }
-
-                    i += 1;
-                } else if (code >= 0xdc00 && code <= 0xdfff) {
-                    return invalid();
-                }
-            }
-
-            let parsed: URL;
-
-            try {
-                parsed = new URL(address);
-            } catch {
+            if (checked.kind !== 'valid') {
                 return invalid();
             }
 
-            if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-                return unsupported();
-            }
-
-            // Require explicit HTTP(S) authority syntax rather than relying on
-            // WHATWG repair of missing slashes or backslashes in a returned URL.
-            if (!/^https?:\/\//i.test(address) || address.includes('\\')) {
-                return invalid();
-            }
-
-            // URL normalizes an empty userinfo marker away. Check the raw authority.
-            const authority = address.slice(address.indexOf('://') + 3).split(/[/?#]/, 1)[0];
-
-            if (
-                !authority ||
-                !parsed.hostname ||
-                parsed.username ||
-                parsed.password ||
-                authority.includes('@')
-            ) {
-                return invalid();
-            }
+            const address = checked.url;
 
             // A v11 fallback can place a source URL or path in file_name.
             // Neither '/' nor NUL can occur in a Linux filename, so do not

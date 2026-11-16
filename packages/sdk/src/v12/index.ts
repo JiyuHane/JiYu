@@ -12,6 +12,7 @@ export type {
     OneBot12GroupMemberInfo,
     OneBot12GroupMemberInfoResponse,
     OneBot12GroupMemberListResponse,
+    OneBot12ImageSegment,
     OneBot12JsonObject,
     OneBot12JsonValue,
     OneBot12LatestEventsParams,

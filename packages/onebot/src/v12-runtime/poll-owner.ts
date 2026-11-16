@@ -170,6 +170,15 @@ function validOrderedEvent(event: unknown, self: OrderedSelf): boolean {
                 );
             }
 
+            if (segment.type === 'image') {
+                return (
+                    exact(segment.data, ['file_id']) &&
+                    typeof segment.data.file_id === 'string' &&
+                    segment.data.file_id.length > 0 &&
+                    segment.data.file_id.length <= 4096
+                );
+            }
+
             return segment.type === 'mention_all' && exact(segment.data, []);
         });
     }

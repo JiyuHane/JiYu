@@ -159,15 +159,27 @@ they use; a type assertion is not validation.
 
 Jiyu's current v12 server supports only this URL subset, not the complete
 `get_file` action: bytes and path modes, and other file operations, are not
-implemented. Supply an already-known ID, such as one from the same account's
-v11 media cache. Jiyu looks up that account's cached images and voice; a cache
-miss or another kind of ID may fail. Current v12 inbound messages do not produce
-media `file_id` values, so the ID must come from another source. Jiyu checks that
-a returned link has an acceptable HTTP(S) URL syntax, but does not verify its
-reachability, expiration, or the caller's permission to access it. A cached
+implemented. Supply an already-known legacy ID from the same account's v11
+media cache, or the transient ID from a supported incoming v12 image. A cache
+miss or another kind of ID may fail. An incoming image ID is a transferable
+same-runtime handle for the URL observed during conversion; it does not identify
+verified file bytes and expires when that runtime is permanently quiesced,
+force-closed or replaced.
+Jiyu checks that a returned link has an acceptable HTTP(S) URL syntax, but does
+not verify its reachability, expiration, or the caller's permission to access it.
+A cached
 label containing `/` or NUL, or equal to `.` or `..`, becomes an empty unknown
 `name`; other labels may still be cache IDs rather than original filenames.
 Validate `name` for your own platform before using it as a filesystem path.
+
+`OneBot12ImageSegment` is available as an optional static type. The generic SDK
+parser does not validate its `file_id`. Jiyu currently emits this segment only
+for a limited set of source-qualified ordinary incoming images. Its
+`jiyu-image:v1:` IDs are bearer references to an observed URL, not proof of file
+identity or QQ origin; a handle only works with its issuing active runtime and
+is invalid after that runtime is quiesced, force-closed or replaced. This reserved prefix is
+not forwarded to v11, including when decoding fails. Outbound image segments,
+voice/video, flash and marketplace-face conversions remain unsupported.
 
 ## Data and compatibility limits
 

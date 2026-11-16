@@ -8,6 +8,7 @@ import {
 } from '../network';
 import { V12Transport } from '../v12-network';
 import { V12Dispatcher } from '../v12/dispatcher';
+import { V12ImageFileTokens } from '../v12/image-file-token';
 import {
     convertV11Event,
     createConnectEvent,
@@ -72,6 +73,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     private readonly self: V12Self;
     private readonly version = { impl: 'jiyu', version: APP_VERSION };
     private readonly dispatcher: V12Dispatcher;
+    private imageFileTokens: V12ImageFileTokens | null = null;
     private readonly subscribers = new Set<(event: unknown) => void>();
     private readonly subscriberGenerations = new Map<(event: unknown) => void, object>();
     private readonly heartbeatEnableReloadScopes = new Set<{
@@ -119,7 +121,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
         },
     ) {
         super(V12_ADAPTER_NAME, config, ctx);
-        this.self = { platform: 'qq', user_id: ctx.uin };
+        this.self = Object.freeze({ platform: 'qq', user_id: ctx.uin });
         registerPollHost(
             this,
             {
@@ -136,6 +138,18 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             api: ctx.api,
             getStatus: options.getStatus,
             getSentMessageTime: options.getSentMessageTime,
+            resolveImageFileUrl: (fileId) => {
+                const tokens = this.imageFileTokens;
+
+                if (!tokens || !this.isEnabled || !this.accepting) {
+                    return null;
+                }
+
+                const url = tokens.redeem(fileId);
+                return this.imageFileTokens === tokens && this.isEnabled && this.accepting
+                    ? url
+                    : null;
+            },
         });
         registerOrderedRuntime(this, (source) => recordPreparedScopeLoss(this, source));
     }
@@ -442,6 +456,8 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
         this.sourceAttempt = null;
         this.sourceBinding = null;
         this.accepting = false;
+        this.imageFileTokens?.revoke();
+        this.imageFileTokens = null;
         this.cancelHeartbeat();
         this.cancelStatus();
         this.transport?.quiesce();
@@ -455,6 +471,8 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
         this.sourceAttempt = null;
         this.sourceBinding = null;
         this.accepting = false;
+        this.imageFileTokens?.revoke();
+        this.imageFileTokens = null;
         this.cancelHeartbeat();
         this.cancelStatus();
         this.transport?.forceClose();
@@ -584,6 +602,25 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
 
         const source = scope?.source;
 
+        const sourceScopeCurrent = (): boolean => {
+            const ownsScope = (): boolean =>
+                scope !== undefined &&
+                source !== undefined &&
+                this.#sourceScopes.at(-1) === scope &&
+                scope.event === event &&
+                scope.payload === payload &&
+                scope.source === source &&
+                this.isEnabled &&
+                this.accepting;
+
+            if (!ownsScope()) {
+                return false;
+            }
+
+            // This verifier correlates the local source epoch, not QQ identity.
+            return this.isSourceCurrent(source) && ownsScope();
+        };
+
         try {
             let recallSource: PrivateRecallProvenance | undefined;
 
@@ -663,7 +700,54 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                     converted = null;
                 }
             } else {
-                converted = convertV11Event(event, this.self);
+                let issuedImage = false;
+                converted = convertV11Event(event, this.self, {
+                    issueImageFileId: (url) => {
+                        // Unlike legacy text input, an image capability is issued
+                        // only while the supplied internal source epoch is current.
+                        if (!sourceScopeCurrent()) {
+                            throw new Error('v12 image source unavailable');
+                        }
+
+                        if (!this.imageFileTokens) {
+                            const candidate = new V12ImageFileTokens(this.self.user_id);
+
+                            if (!sourceScopeCurrent()) {
+                                candidate.revoke();
+                                throw new Error('v12 image source unavailable');
+                            }
+
+                            // Verification may reenter and install a different issuer.
+                            if (this.imageFileTokens) {
+                                candidate.revoke();
+                            } else {
+                                this.imageFileTokens = candidate;
+                            }
+                        }
+
+                        const issuer = this.imageFileTokens;
+
+                        if (!issuer || !sourceScopeCurrent()) {
+                            throw new Error('v12 image source unavailable');
+                        }
+
+                        const fileId = issuer.issue(url);
+                        const current = sourceScopeCurrent();
+
+                        if (!current || this.imageFileTokens !== issuer) {
+                            throw new Error('v12 image source unavailable');
+                        }
+
+                        issuedImage = true;
+                        return fileId;
+                    },
+                });
+
+                // This must precede poll resolution: an already committed item
+                // cannot be recalled by the later WebSocket fanout guard.
+                if (issuedImage && !sourceScopeCurrent()) {
+                    throw new Error('v12 image source unavailable');
+                }
             }
 
             if (converted) {
@@ -717,24 +801,6 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                     if (scope && source !== undefined) {
                         // Tickets identify an internal admission epoch; they do not
                         // authenticate the upstream event or same-process callers.
-                        const sourceScopeCurrent = (): boolean => {
-                            const ownsScope = (): boolean =>
-                                this.#sourceScopes.at(-1) === scope &&
-                                scope.event === event &&
-                                scope.payload === payload &&
-                                scope.source === source &&
-                                this.isEnabled &&
-                                this.accepting;
-
-                            if (!ownsScope()) {
-                                return false;
-                            }
-
-                            const current = this.isSourceCurrent(source);
-                            // Verification can synchronously reenter the runtime.
-                            return current && ownsScope();
-                        };
-
                         if (sourceScopeCurrent()) {
                             this.publish(converted, sourceScopeCurrent);
                         }

@@ -27,11 +27,15 @@ export interface V12CoreOptions {
     getStatus(): { good: boolean; online: boolean } | Promise<{ good: boolean; online: boolean }>;
     /** Resolve the account store's recorded Unix-seconds send-time estimate, or null. */
     getSentMessageTime(messageId: number): number | null | Promise<number | null>;
+    /** Resolve an implementation-issued image file ID for the current account. */
+    resolveImageFileUrl?(fileId: string): string | null;
 }
 
 export type V12TextSegment = { type: 'text'; data: { text: string } };
+export type V12ImageSegment = { type: 'image'; data: { file_id: string } };
 export type V12MessageSegment =
     | V12TextSegment
+    | V12ImageSegment
     | { type: 'mention'; data: { user_id: string } }
     | { type: 'mention_all'; data: Record<string, never> };
 
