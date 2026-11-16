@@ -81,7 +81,7 @@ const pushBodyExtractors = new WeakMap<
     LinuxEasyAccountOwner,
     (frame: Uint8Array, expected: D2Candidate) => OwnerPushBody | undefined
 >();
-const pushActiveChecks = new WeakMap<LinuxEasyAccountOwner, () => boolean>();
+const pushActiveChecks = new WeakMap<LinuxEasyAccountOwner, (expectedUin?: string) => boolean>();
 const weakMapGet = WeakMap.prototype.get;
 const weakMapSet = WeakMap.prototype.set;
 const weakMapDelete = WeakMap.prototype.delete;
@@ -100,8 +100,36 @@ export function isLinuxEasyOwnerPushActive(owner: LinuxEasyAccountOwner): boolea
         }
 
         const checkActive = Reflect.apply(weakMapGet, pushActiveChecks, [owner]) as
-            (() => boolean) | undefined;
+            ((expectedUin?: string) => boolean) | undefined;
         return checkActive?.() === true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Deep internal composition only: this local state and account match is a
+ * guessable boolean oracle, not authentication or an online assertion, and it
+ * does not establish a same-process boundary. No account value, key, lease, or
+ * token is returned.
+ */
+export function isLinuxEasyOwnerPushActiveForUin(
+    owner: LinuxEasyAccountOwner,
+    expectedUin: string,
+): boolean {
+    try {
+        if (
+            typeof expectedUin !== 'string' ||
+            typeof owner !== 'object' ||
+            owner === null ||
+            isProxy(owner)
+        ) {
+            return false;
+        }
+
+        const checkActive = Reflect.apply(weakMapGet, pushActiveChecks, [owner]) as
+            ((expectedUin?: string) => boolean) | undefined;
+        return checkActive?.(expectedUin) === true;
     } catch {
         return false;
     }
@@ -1287,11 +1315,12 @@ function createOwner(withKeyCapability: boolean): LinuxEasyAccountOwner {
                         checkBinding();
                         Reflect.apply(weakMapSet, pushActiveChecks, [
                             owner,
-                            (): boolean => {
+                            (expectedUin?: string): boolean => {
                                 // The exact lease/token/account and owner epoch come from
                                 // this creation closure, not from the capability's passive
                                 // generation object, which does not validate freshness.
                                 const localStateMatches = (): boolean =>
+                                    (expectedUin === undefined || expectedUin === uin) &&
                                     currentState() === 'registered' &&
                                     epoch === generation &&
                                     !apply(getAborted, pushSignal, []) &&

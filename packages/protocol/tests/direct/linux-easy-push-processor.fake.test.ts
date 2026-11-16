@@ -19,6 +19,7 @@ import {
 import {
     createLinuxEasyAccountOwnerWithKeyCapability,
     isLinuxEasyOwnerPushActive,
+    isLinuxEasyOwnerPushActiveForUin,
 } from '../../src/direct/linux-easy-account-owner';
 import { createLinuxEasyPushProcessor } from '../../src/direct/linux-easy-push-processor';
 import { qqTeaDecrypt, qqTeaEncrypt } from '../../src/direct/qq-tea';
@@ -54,6 +55,15 @@ function fixture(
     makeOwner: typeof createLinuxEasyAccountOwnerWithKeyCapability = createLinuxEasyAccountOwnerWithKeyCapability,
 ) {
     const allocations: Uint8Array[] = [];
+    const rawChecks: boolean[] = [];
+
+    const checkRaw = (ok: boolean): void => {
+        rawChecks.push(ok);
+
+        if (!ok) {
+            throw new Error('invalid synthetic raw request');
+        }
+    };
 
     const own = <T extends Uint8Array>(bytes: T): T => {
         allocations.push(bytes);
@@ -144,7 +154,7 @@ function fixture(
         const d2End = 9 + frame.readUInt32BE(9);
         const accountStart = d2End + 1;
         const accountEnd = accountStart + frame.readUInt32BE(accountStart);
-        expect(frame.subarray(accountStart + 4, accountEnd).toString()).toBe(uin);
+        checkRaw(frame.subarray(accountStart + 4, accountEnd).toString() === uin);
         const inner = own(
             Buffer.from(own(qqTeaDecrypt(frame.subarray(accountEnd), registered ? d2Key : zero))),
         );
@@ -165,9 +175,9 @@ function fixture(
         take();
         take(2);
         take();
-        expect(offset).toBe(inner.readUInt32BE(0));
+        checkRaw(offset === inner.readUInt32BE(0));
         const body = take();
-        expect(offset).toBe(inner.length);
+        checkRaw(offset === inner.length);
         return { sequence, command, body };
     };
 
@@ -179,6 +189,7 @@ function fixture(
         readonly entered = deferred();
         readonly gate = deferred();
         readonly errors: unknown[] = [];
+        readonly rawChecks = rawChecks;
         holdRegister = false;
         calls = 0;
         onClose: (() => void) | undefined;
@@ -201,8 +212,8 @@ function fixture(
                 const built = await options.buildRequest(identity);
                 own(built.frame);
                 const request = unpack(built.frame, index === 2);
-                expect(request.sequence).toBe(sequence);
-                expect(request.command).toBe(commands[index]);
+                checkRaw(request.sequence === sequence);
+                checkRaw(request.command === commands[index]);
                 let body: Uint8Array;
 
                 if (index === 0) {
@@ -456,6 +467,80 @@ describe('Linux Easy synthetic push processor', () => {
             processor.stop();
             await processor.drain();
             await f.cleanup();
+        }
+    });
+
+    it('keeps a different account buffered while the same owner activates its matching ingress', async () => {
+        const registered = fixture();
+        const different = fixture('234567');
+        const dispatched = deferred();
+        const ownerClosed = deferred();
+        const wrongVerify = vi.fn(() => true);
+        const matchingVerify = vi.fn(() => true);
+        let wrong: ReturnType<typeof registered.make> | undefined;
+        let matching: ReturnType<typeof registered.make> | undefined;
+        registered.dispatch.mockImplementation(async () => {
+            dispatched.resolve();
+        });
+        registered.client.onClose = () => ownerClosed.resolve();
+
+        try {
+            expect(await registered.owner.start(registered.options)).toEqual({
+                kind: 'registered',
+                registerSequence: sequences[2],
+            });
+            expect(registered.client.errors).toEqual([]);
+            expect(registered.client.rawChecks.length).toBeGreaterThan(0);
+            expect(registered.client.rawChecks.every((ok) => ok)).toBe(true);
+            expect(isLinuxEasyOwnerPushActive(registered.owner)).toBe(true);
+            expect(isLinuxEasyOwnerPushActiveForUin(registered.owner, registered.uin)).toBe(true);
+            expect(isLinuxEasyOwnerPushActiveForUin(registered.owner, different.uin)).toBe(false);
+            wrong = createLinuxEasyPushProcessor({
+                owner: registered.owner,
+                uin: different.uin,
+                ingress: different.ingress,
+                queue: different.queue,
+                verifyRaw: wrongVerify,
+            });
+            matching = registered.make(matchingVerify);
+            const candidate = registered.push();
+            expect(wrong.onPush(candidate, route(pushSequence))).toBeUndefined();
+            expect(matching.onPush(candidate, route(pushSequence))).toBeUndefined();
+            expect(wrong.status()).toBe('buffering');
+            expect(wrong.activate()).toBe(false);
+            expect(wrong.status()).toBe('buffering');
+            expect(wrongVerify).not.toHaveBeenCalled();
+            expect(different.dispatch).not.toHaveBeenCalled();
+            expect(matchingVerify).not.toHaveBeenCalled();
+            expect(matching.activate()).toBe(true);
+            expect(matching.status()).toBe('active');
+            const result = await Promise.race([
+                dispatched.promise.then(() => 'dispatched'),
+                ownerClosed.promise.then(() => 'closed'),
+            ]);
+            expect(result).toBe('dispatched');
+            expect(matchingVerify).toHaveBeenCalledTimes(1);
+            expect(registered.dispatch).toHaveBeenCalledTimes(1);
+            expect(isLinuxEasyOwnerPushActiveForUin(registered.owner, registered.uin)).toBe(true);
+            expect(wrong.activate()).toBe(false);
+            expect(wrong.status()).toBe('buffering');
+            expect(wrongVerify).not.toHaveBeenCalled();
+            expect(different.dispatch).not.toHaveBeenCalled();
+            wrong.stop();
+            await wrong.drain();
+            expect(wrong.status()).toBe('stopped');
+            expect(() => wrong!.onPush(candidate, route(pushSequence))).toThrow(
+                'direct push processor stopped',
+            );
+            expect(wrongVerify).not.toHaveBeenCalled();
+            expect(different.dispatch).not.toHaveBeenCalled();
+        } finally {
+            wrong?.stop();
+            matching?.stop();
+            await wrong?.drain();
+            await matching?.drain();
+            await registered.cleanup();
+            await different.cleanup();
         }
     });
 

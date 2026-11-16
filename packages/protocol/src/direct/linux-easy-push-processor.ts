@@ -8,7 +8,7 @@ import {
 import {
     classifyLinuxEasyOwnerD2Candidate,
     extractLinuxEasyOwnerPushBody,
-    isLinuxEasyOwnerPushActive,
+    isLinuxEasyOwnerPushActiveForUin,
     type LinuxEasyAccountOwner,
 } from './linux-easy-account-owner';
 import { createLinuxEasyPushQueue, type LinuxEasyPushQueueOptions } from './linux-easy-push-queue';
@@ -140,7 +140,9 @@ function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
  * owner state, a true verifier result, nor the ingress authentication assertion is
  * independent proof of a peer, source authenticity, online status or delivery.
  * The synchronous verifier is trusted and receives a private complete encrypted frame
- * that may contain account data. stop best-effort wipes the verifier copy and
+ * before the owner reclassifies it. A misrouted frame may contain another account's
+ * data even though the accompanying metadata reflects this processor's expected UIN.
+ * The caller must route frames to the correct owner. stop best-effort wipes the verifier copy and
  * extracted body already reachable by this processor synchronously, including during
  * reentry. A body not yet returned by the extractor is wiped after it returns.
  * The callback can retain or rewrite bytes; its other copies and transferred memory
@@ -222,6 +224,7 @@ export function createLinuxEasyPushProcessor(
     }
 
     const ownerClose = closeDescriptor.value as () => void;
+    const accountUin: string = uin;
     const trustedOwner = owner as LinuxEasyAccountOwner;
     const verifier = verify as LinuxEasyPushProcessorOptions['verifyRaw'];
     const queue = createLinuxEasyPushQueue(queueInput as unknown as LinuxEasyPushQueueOptions);
@@ -247,7 +250,7 @@ export function createLinuxEasyPushProcessor(
     try {
         ingress = createGuardedDirectPushIngress(
             ingressInput as unknown as DirectPushIngressOptions,
-            () => state === 'active' && isLinuxEasyOwnerPushActive(trustedOwner),
+            () => state === 'active' && isLinuxEasyOwnerPushActiveForUin(trustedOwner, accountUin),
         );
     } catch (error) {
         observePromise(error);
@@ -350,7 +353,7 @@ export function createLinuxEasyPushProcessor(
         let result = false;
 
         try {
-            result = isLinuxEasyOwnerPushActive(trustedOwner) === true;
+            result = isLinuxEasyOwnerPushActiveForUin(trustedOwner, accountUin) === true;
         } catch {
             result = false;
         } finally {
@@ -629,7 +632,7 @@ export function createLinuxEasyPushProcessor(
             let ready: boolean;
 
             try {
-                ready = isLinuxEasyOwnerPushActive(trustedOwner);
+                ready = isLinuxEasyOwnerPushActiveForUin(trustedOwner, accountUin);
             } finally {
                 checking = false;
             }

@@ -26,6 +26,7 @@ import {
     createLinuxEasyAccountOwner,
     createLinuxEasyAccountOwnerWithKeyCapability,
     isLinuxEasyOwnerPushActive,
+    isLinuxEasyOwnerPushActiveForUin,
     type LinuxEasyAccountOwner,
 } from '../../src/direct/linux-easy-account-owner';
 import { qqTeaDecrypt, qqTeaEncrypt } from '../../src/direct/qq-tea';
@@ -52,6 +53,15 @@ function deferred() {
 
 function fixture(uin = '123456') {
     const allocations: Uint8Array[] = [];
+    const rawChecks: boolean[] = [];
+
+    const checkRaw = (ok: boolean): void => {
+        rawChecks.push(ok);
+
+        if (!ok) {
+            throw new Error('invalid synthetic raw request');
+        }
+    };
 
     const own = <T extends Uint8Array>(bytes: T): T => {
         allocations.push(bytes);
@@ -133,11 +143,11 @@ function fixture(uin = '123456') {
 
     function unpack(input: Uint8Array, register: boolean) {
         const frame = own(Buffer.from(input));
-        expect(frame.readUInt32BE(0)).toBe(frame.length);
+        checkRaw(frame.readUInt32BE(0) === frame.length);
         const d2End = 9 + frame.readUInt32BE(9);
         const accountStart = d2End + 1;
         const accountEnd = accountStart + frame.readUInt32BE(accountStart);
-        expect(frame.subarray(accountStart + 4, accountEnd).toString()).toBe(uin);
+        checkRaw(frame.subarray(accountStart + 4, accountEnd).toString() === uin);
         const decrypted = own(qqTeaDecrypt(frame.subarray(accountEnd), register ? d2Key : zero));
         const inner = own(Buffer.from(decrypted));
         const sequence = inner.readUInt32BE(4);
@@ -145,8 +155,8 @@ function fixture(uin = '123456') {
 
         const take = (width: 2 | 4 = 4) => {
             const length = width === 2 ? inner.readUInt16BE(offset) : inner.readUInt32BE(offset);
-            expect(length).toBeGreaterThanOrEqual(width);
-            expect(offset + length).toBeLessThanOrEqual(inner.length);
+            checkRaw(length >= width);
+            checkRaw(offset + length <= inner.length);
             const value = inner.subarray(offset + width, offset + length);
             offset += length;
             return value;
@@ -159,9 +169,9 @@ function fixture(uin = '123456') {
         take();
         take(2);
         take();
-        expect(offset).toBe(inner.readUInt32BE(0));
+        checkRaw(offset === inner.readUInt32BE(0));
         const body = take();
-        expect(offset).toBe(inner.length);
+        checkRaw(offset === inner.length);
         return { sequence, command, body };
     }
 
@@ -172,14 +182,19 @@ function fixture(uin = '123456') {
         });
         readonly entered = deferred();
         readonly gate = deferred();
+        readonly sendEntered = deferred();
+        readonly sendGate = deferred();
         readonly errors: unknown[] = [];
+        readonly rawChecks = rawChecks;
         holdRegister = false;
+        holdSend = false;
         calls = 0;
         onSend: (() => void) | undefined;
         onClose: (() => void) | undefined;
         readonly close = vi.fn(() => {
             this.onClose?.();
             this.gate.resolve();
+            this.sendGate.resolve();
             this.resolveClosed({ kind: 'local', code: 'synthetic-close' });
         });
 
@@ -192,6 +207,12 @@ function fixture(uin = '123456') {
 
             if (index === 3) {
                 this.onSend?.();
+
+                if (this.holdSend) {
+                    this.sendEntered.resolve();
+                    await this.sendGate.promise;
+                }
+
                 return { kind: 'failure', code: 'synthetic-send-failure', writeState: 'unknown' };
             }
 
@@ -206,8 +227,8 @@ function fixture(uin = '123456') {
                 const built = await options.buildRequest(identity);
                 own(built.frame);
                 const request = unpack(built.frame, index === 2);
-                expect(request.sequence).toBe(sequence);
-                expect(request.command).toBe(COMMANDS[index]);
+                checkRaw(request.sequence === sequence);
+                checkRaw(request.command === COMMANDS[index]);
                 let body: Uint8Array;
 
                 if (index === 0) {
@@ -370,6 +391,7 @@ function fixture(uin = '123456') {
             client.onClose = undefined;
             client.onSend = undefined;
             client.gate.resolve();
+            client.sendGate.resolve();
             client.close();
             sign.mockClear();
             verify.mockClear();
@@ -379,6 +401,12 @@ function fixture(uin = '123456') {
             }
         },
     };
+}
+
+function expectRegisteredRaw(f: ReturnType<typeof fixture>) {
+    expect(f.client.errors).toEqual([]);
+    expect(f.client.rawChecks.length).toBeGreaterThan(0);
+    expect(f.client.rawChecks.every((ok) => ok)).toBe(true);
 }
 
 async function waitEntered(entered: Promise<void>, pending: Promise<{ kind: string }>) {
@@ -427,22 +455,98 @@ describe('Linux Easy owner push-active local state with synthetic client', () =>
     it('is false before and during staged registration, true after settlement, and false on close', async () => {
         const f = fixture();
         const owner = createLinuxEasyAccountOwnerWithKeyCapability();
+        let pending: ReturnType<typeof owner.start> | undefined;
         f.client.holdRegister = true;
 
         try {
             expect(isLinuxEasyOwnerPushActive(owner)).toBe(false);
-            const pending = owner.start(f.options);
+            expect(isLinuxEasyOwnerPushActiveForUin(owner, '123456')).toBe(false);
+            pending = owner.start(f.options);
             await waitEntered(f.client.entered.promise, pending);
             expect(f.client.calls).toBe(3);
             expect(isLinuxEasyOwnerPushActive(owner)).toBe(false);
+            expect(isLinuxEasyOwnerPushActiveForUin(owner, '123456')).toBe(false);
             f.client.gate.resolve();
             expect(await pending).toEqual({ kind: 'registered', registerSequence: SEQUENCES[2] });
-            expect(f.client.errors).toEqual([]);
+            expectRegisteredRaw(f);
             expect(isLinuxEasyOwnerPushActive(owner)).toBe(true);
+            expect(isLinuxEasyOwnerPushActiveForUin(owner, '123456')).toBe(true);
+            expect(isLinuxEasyOwnerPushActiveForUin(owner, '234567')).toBe(false);
+            expect(isLinuxEasyOwnerPushActiveForUin(owner, '123456')).toBe(true);
             owner.close();
             expect(isLinuxEasyOwnerPushActive(owner)).toBe(false);
+            expect(isLinuxEasyOwnerPushActiveForUin(owner, '123456')).toBe(false);
+            expect(isLinuxEasyOwnerPushActiveForUin(owner, '123456')).toBe(false);
         } finally {
             f.client.gate.resolve();
+            owner.close();
+            await pending;
+            f.cleanup();
+        }
+    });
+
+    it('rejects non-string account arguments without inspecting or converting them', async () => {
+        const f = fixture();
+        const owner = createLinuxEasyAccountOwnerWithKeyCapability();
+        const observations: string[] = [];
+        const boxed = Object('123456') as object;
+        Object.defineProperties(boxed, {
+            [Symbol.toPrimitive]: {
+                get() {
+                    observations.push('toPrimitive getter');
+                    throw new Error('unexpected conversion');
+                },
+            },
+            toString: {
+                get() {
+                    observations.push('toString getter');
+                    throw new Error('unexpected conversion');
+                },
+            },
+            valueOf: {
+                get() {
+                    observations.push('valueOf getter');
+                    throw new Error('unexpected conversion');
+                },
+            },
+        });
+        const proxy = new Proxy(boxed, {
+            get() {
+                observations.push('get trap');
+                throw new Error('unexpected proxy access');
+            },
+            getPrototypeOf() {
+                observations.push('prototype trap');
+                throw new Error('unexpected proxy access');
+            },
+            getOwnPropertyDescriptor() {
+                observations.push('descriptor trap');
+                throw new Error('unexpected proxy access');
+            },
+            ownKeys() {
+                observations.push('keys trap');
+                throw new Error('unexpected proxy access');
+            },
+            has() {
+                observations.push('has trap');
+                throw new Error('unexpected proxy access');
+            },
+        });
+        const inputs: unknown[] = [undefined, null, 123456, boxed, proxy];
+
+        try {
+            expect((await owner.start(f.options)).kind).toBe('registered');
+            expectRegisteredRaw(f);
+            expect(isLinuxEasyOwnerPushActive(owner)).toBe(true);
+            expect(isLinuxEasyOwnerPushActiveForUin(owner, '123456')).toBe(true);
+            const results = inputs.map((input) =>
+                isLinuxEasyOwnerPushActiveForUin(owner, input as string),
+            );
+            expect(results).toEqual([false, false, false, false, false]);
+            expect(observations).toEqual([]);
+            expect(isLinuxEasyOwnerPushActive(owner)).toBe(true);
+            expect(isLinuxEasyOwnerPushActiveForUin(owner, '123456')).toBe(true);
+        } finally {
             owner.close();
             f.cleanup();
         }
@@ -452,23 +556,48 @@ describe('Linux Easy owner push-active local state with synthetic client', () =>
         const f = fixture();
         const owner = createLinuxEasyAccountOwnerWithKeyCapability();
         const inSend: boolean[] = [];
+        const boundInSend: boolean[] = [];
         const inClose: boolean[] = [];
-        f.client.onSend = () => inSend.push(isLinuxEasyOwnerPushActive(owner));
-        f.client.onClose = () => inClose.push(isLinuxEasyOwnerPushActive(owner));
+        const boundInClose: boolean[] = [];
+        let pending: ReturnType<typeof owner.sendText> | undefined;
+        f.client.holdSend = true;
+
+        f.client.onSend = () => {
+            inSend.push(isLinuxEasyOwnerPushActive(owner));
+            boundInSend.push(isLinuxEasyOwnerPushActiveForUin(owner, '123456'));
+        };
+
+        f.client.onClose = () => {
+            inClose.push(isLinuxEasyOwnerPushActive(owner));
+            boundInClose.push(isLinuxEasyOwnerPushActiveForUin(owner, '123456'));
+        };
 
         try {
             expect((await owner.start(f.options)).kind).toBe('registered');
+            expectRegisteredRaw(f);
             expect(isLinuxEasyOwnerPushActive(owner)).toBe(true);
-            expect(await owner.sendText(f.send)).toMatchObject({
+            expect(isLinuxEasyOwnerPushActiveForUin(owner, '123456')).toBe(true);
+            pending = owner.sendText(f.send);
+            await waitEntered(f.client.sendEntered.promise, pending);
+            expect(inSend).toEqual([true]);
+            expect(boundInSend).toEqual([true]);
+            expect(isLinuxEasyOwnerPushActive(owner)).toBe(true);
+            expect(isLinuxEasyOwnerPushActiveForUin(owner, '123456')).toBe(true);
+            expect(isLinuxEasyOwnerPushActiveForUin(owner, '234567')).toBe(false);
+            f.client.sendGate.resolve();
+            expect(await pending).toMatchObject({
                 kind: 'failure',
                 writeState: 'unknown',
             });
             expect(f.client.calls).toBe(4);
-            expect(inSend).toEqual([true]);
             expect(inClose).toEqual([false]);
+            expect(boundInClose).toEqual([false]);
             expect(isLinuxEasyOwnerPushActive(owner)).toBe(false);
+            expect(isLinuxEasyOwnerPushActiveForUin(owner, '123456')).toBe(false);
         } finally {
+            f.client.sendGate.resolve();
             owner.close();
+            await pending;
             f.cleanup();
         }
     });
@@ -631,17 +760,30 @@ describe('Linux Easy owner push-active local state with synthetic client', () =>
             expect((await a.start(f.options)).kind).toBe('registered');
             expect((await b.start(g.options)).kind).toBe('registered');
             expect((await legacy.start(legacyFixture.options)).kind).toBe('registered');
+            expectRegisteredRaw(f);
+            expectRegisteredRaw(g);
+            expectRegisteredRaw(legacyFixture);
             expect(isLinuxEasyOwnerPushActive(a)).toBe(true);
             expect(isLinuxEasyOwnerPushActive(b)).toBe(true);
+            expect(isLinuxEasyOwnerPushActiveForUin(a, '123456')).toBe(true);
+            expect(isLinuxEasyOwnerPushActiveForUin(a, '234567')).toBe(false);
+            expect(isLinuxEasyOwnerPushActiveForUin(b, '234567')).toBe(true);
+            expect(isLinuxEasyOwnerPushActiveForUin(b, '123456')).toBe(false);
             expect(isLinuxEasyOwnerPushActive(legacy)).toBe(false);
+            expect(isLinuxEasyOwnerPushActiveForUin(legacy, '345678')).toBe(false);
             expect(isLinuxEasyOwnerPushActive(forged)).toBe(false);
+            expect(isLinuxEasyOwnerPushActiveForUin(forged, '123456')).toBe(false);
             expect(isLinuxEasyOwnerPushActive(proxy)).toBe(false);
+            expect(isLinuxEasyOwnerPushActiveForUin(proxy, '123456')).toBe(false);
             expect(traps).toBe(0);
             a.close();
             expect(isLinuxEasyOwnerPushActive(a)).toBe(false);
+            expect(isLinuxEasyOwnerPushActiveForUin(a, '123456')).toBe(false);
             expect(isLinuxEasyOwnerPushActive(b)).toBe(true);
+            expect(isLinuxEasyOwnerPushActiveForUin(b, '234567')).toBe(true);
             b.close();
             expect(isLinuxEasyOwnerPushActive(b)).toBe(false);
+            expect(isLinuxEasyOwnerPushActiveForUin(b, '234567')).toBe(false);
         } finally {
             a.close();
             b.close();
@@ -678,19 +820,27 @@ describe('Linux Easy owner push-active local state with synthetic client', () =>
         try {
             expect((await closing.start(f.options)).kind).toBe('registered');
             expect((await expired.start(g.options)).kind).toBe('registered');
+            expectRegisteredRaw(f);
+            expectRegisteredRaw(g);
             expect(isLinuxEasyOwnerPushActive(closing)).toBe(true);
             expect(isLinuxEasyOwnerPushActive(expired)).toBe(true);
+            expect(isLinuxEasyOwnerPushActiveForUin(closing, '123456')).toBe(true);
+            expect(isLinuxEasyOwnerPushActiveForUin(expired, '234567')).toBe(true);
             reenter = true;
-            expect(isLinuxEasyOwnerPushActive(closing)).toBe(false);
+            expect(isLinuxEasyOwnerPushActiveForUin(closing, '123456')).toBe(false);
             expect(didClose).toBe(true);
             reenter = false;
             crossDeadline = true;
-            expect(isLinuxEasyOwnerPushActive(expired)).toBe(false);
+            expect(isLinuxEasyOwnerPushActiveForUin(expired, '234567')).toBe(false);
             expect(samples).toBeGreaterThanOrEqual(2);
             crossDeadline = false;
             now = 1000;
             expect(isLinuxEasyOwnerPushActive(expired)).toBe(false);
+            expect(isLinuxEasyOwnerPushActiveForUin(expired, '234567')).toBe(false);
+            expect(isLinuxEasyOwnerPushActiveForUin(expired, '234567')).toBe(false);
             expect(isLinuxEasyOwnerPushActive(closing)).toBe(false);
+            expect(isLinuxEasyOwnerPushActiveForUin(closing, '123456')).toBe(false);
+            expect(isLinuxEasyOwnerPushActiveForUin(closing, '123456')).toBe(false);
         } finally {
             clock.mockRestore();
             closing.close();

@@ -1,3 +1,4 @@
+import { isPromise } from 'node:util/types';
 import { createLogger, renderTraceBytes, runWithTraceRequest } from '@snowluma/common/logger';
 import type { PacketSender, SendPacketResult } from '@snowluma/common/packet-sender';
 import { packetTimeoutMs } from '@snowluma/bridge/packet-timeout';
@@ -18,6 +19,11 @@ import {
     type DirectPushIngress,
     type DirectPushIngressOptions,
 } from '@snowluma/protocol/direct/direct-push-ingress';
+import {
+    createLinuxEasyPushProcessor,
+    type LinuxEasyPushProcessor,
+    type LinuxEasyPushProcessorOptions,
+} from '@snowluma/protocol/direct/linux-easy-push-processor';
 import type { OnlineDeviceInfo } from '@snowluma/protocol/events';
 import { buildApiHub, type ApiHub } from './apis';
 import { AiVoiceChatType, type AiVoiceCategory, type StrangerStatus } from './apis/extras';
@@ -28,6 +34,7 @@ export type { UploadedFileMeta } from './bridge-context';
 const log = createLogger('Bridge');
 const runtimeLog = createLogger('Bridge.Runtime');
 const VERBOSE_WARMUP = process.env.SNOWLUMA_VERBOSE_WARMUP === '1';
+const nativePromiseThen = Promise.prototype.then;
 
 interface ProcessConnection {
     pid: number;
@@ -169,6 +176,267 @@ export class Bridge implements BridgeInterface {
             return handle;
         } finally {
             // Disposal can be reentered from the factory and must never be awaited here.
+            finishCreating();
+        }
+    }
+
+    /**
+     * @internal Explicit composition only; the caller coordinates activation.
+     * After successful creation, the processor owns the owner's lifecycle. Bridge
+     * disposal stops the processor and requests that owner to close. If no handle is
+     * delivered, the caller remains responsible for the owner; some construction
+     * failures can already have closed it. Disposal waits for admitted processor
+     * work, which can remain pending if dependencies do not settle. Source
+     * authentication and a true verifier result are caller assertions, not proof
+     * of authentication, online state, or delivery. Native Promise intrinsics and
+     * species are trusted runtime assumptions. No production transport is installed
+     * by this method.
+     */
+    openLinuxEasyPushProcessor(
+        options: Pick<LinuxEasyPushProcessorOptions, 'owner' | 'verifyRaw' | 'queue'> & {
+            ingress: Pick<
+                DirectPushIngressOptions,
+                | 'sourceAuthenticationHandled'
+                | 'maxBodyBytes'
+                | 'maxPendingBytes'
+                | 'maxPending'
+                | 'maxEventsPerPush'
+            >;
+        },
+    ): LinuxEasyPushProcessor {
+        if (this.disposePromise_) {
+            throw new Error('Bridge is disposed');
+        }
+
+        if (this.directIngressClaimed_) {
+            throw new Error('Direct push ingress already claimed');
+        }
+
+        // Reserve the shared ingress slot before reading any caller-controlled values.
+        this.directIngressClaimed_ = true;
+        let finishCreating!: () => void;
+        this.directIngressCreating_ = new Promise<void>((resolve) => {
+            finishCreating = resolve;
+        });
+        let lifecycle: Pick<LinuxEasyPushProcessor, 'stop' | 'drain'> | undefined;
+        let creatingProcessor = true;
+        let stopRequested = false;
+        let terminal = false;
+        let stopping = false;
+        let stopFailed = false;
+        let stopFailure: unknown;
+        let stopFn: LinuxEasyPushProcessor['stop'] | undefined;
+        let drainFn: LinuxEasyPushProcessor['drain'] | undefined;
+
+        try {
+            const identity = this.identity;
+            const pipeline = this.pipeline;
+            const uin = identity.uin;
+            const owner = options.owner;
+            const verifyRaw = options.verifyRaw;
+            const queue = options.queue;
+            const ingress = options.ingress;
+            const sourceAuthenticationHandled = ingress.sourceAuthenticationHandled;
+            const maxBodyBytes = ingress.maxBodyBytes;
+            const maxPendingBytes = ingress.maxPendingBytes;
+            const maxPending = ingress.maxPending;
+            const maxEventsPerPush = ingress.maxEventsPerPush;
+
+            // A caller getter may have disposed the Bridge during the snapshot.
+            if (this.disposePromise_) {
+                throw new Error('Bridge is disposed');
+            }
+
+            const processor = createLinuxEasyPushProcessor({
+                owner,
+                uin,
+                ingress: {
+                    uin,
+                    identity,
+                    pipeline,
+                    pipelineIdentityBound: true,
+                    sourceAuthenticationHandled,
+                    maxBodyBytes,
+                    maxPendingBytes,
+                    maxPending,
+                    maxEventsPerPush,
+                },
+                queue,
+                verifyRaw,
+            });
+            const createdLifecycle = {
+                stop: () => {
+                    terminal = true;
+                    stopRequested = true;
+
+                    // A factory-result getter can reenter disposal before stop is
+                    // available. Its intent is fulfilled as soon as stop is read.
+                    if (!stopFn || stopping || (creatingProcessor && stopFailed)) {
+                        return;
+                    }
+
+                    stopping = true;
+
+                    try {
+                        const result: unknown = Reflect.apply(stopFn, processor, []);
+
+                        if (result !== undefined) {
+                            if (isPromise(result)) {
+                                try {
+                                    Reflect.apply(nativePromiseThen, result, [
+                                        undefined,
+                                        () => undefined,
+                                    ]);
+                                } catch {
+                                    // Promise species are a trusted runtime assumption.
+                                }
+                            }
+
+                            throw new Error('Direct push processor stop unavailable');
+                        }
+                    } catch (error) {
+                        // Preserve the first failure even if a later stop succeeds.
+                        if (!stopFailed) {
+                            stopFailed = true;
+                            stopFailure = error;
+                        }
+
+                        if (!creatingProcessor) {
+                            throw error;
+                        }
+
+                        // Disposal must still wait for the creation reservation.
+                    } finally {
+                        stopping = false;
+                    }
+                },
+                drain: () => {
+                    if (!stopFn) {
+                        throw new Error('Direct push processor stop unavailable');
+                    }
+
+                    if (stopFailed) {
+                        throw new Error('Direct push processor stop unavailable', {
+                            cause: stopFailure,
+                        });
+                    }
+
+                    if (!drainFn) {
+                        throw new Error('Direct push processor drain unavailable');
+                    }
+
+                    const pending: unknown = Reflect.apply(drainFn, processor, []);
+
+                    if (!isPromise(pending)) {
+                        throw new Error('Direct push processor drain unavailable');
+                    }
+
+                    // Do not read a public promise's own then or expose it to callers.
+                    return new Promise<void>((resolve, reject) => {
+                        try {
+                            Reflect.apply(nativePromiseThen, pending, [
+                                () => resolve(),
+                                (reason: unknown) => reject(reason),
+                            ]);
+                        } catch (error) {
+                            reject(error);
+                        }
+                    });
+                },
+            };
+            lifecycle = createdLifecycle;
+            // Publish before method access so disposal can reserve a stop request.
+            this.directIngress_ = createdLifecycle;
+
+            const stop = processor.stop;
+
+            if (typeof stop !== 'function') {
+                throw new TypeError('Direct push processor stop unavailable');
+            }
+
+            stopFn = stop;
+
+            if (stopRequested || this.disposePromise_) {
+                // A factory or stop getter may have reentered disposal before
+                // the lifecycle had a usable stop method.
+                createdLifecycle.stop();
+            }
+
+            const drain = processor.drain;
+
+            if (typeof drain !== 'function') {
+                throw new TypeError('Direct push processor drain unavailable');
+            }
+
+            drainFn = drain;
+
+            if (this.disposePromise_) {
+                throw new Error('Bridge is disposed');
+            }
+
+            const { onPush, activate, status } = processor;
+
+            if (
+                typeof onPush !== 'function' ||
+                typeof activate !== 'function' ||
+                typeof status !== 'function'
+            ) {
+                throw new TypeError('Direct push processor methods unavailable');
+            }
+
+            const handle: LinuxEasyPushProcessor = Object.freeze({
+                onPush: (...args: Parameters<LinuxEasyPushProcessor['onPush']>) => {
+                    if (terminal || this.disposePromise_) {
+                        throw new Error('direct push processor stopped');
+                    }
+
+                    Reflect.apply(onPush, processor, args);
+                },
+                activate: () => {
+                    if (terminal || this.disposePromise_) {
+                        return false;
+                    }
+
+                    const activated = Reflect.apply(activate, processor, []);
+                    return !terminal && !this.disposePromise_ && activated;
+                },
+                status: () => Reflect.apply(status, processor, []),
+                stop: createdLifecycle.stop,
+                // The public promise is independent of the one observed by disposal.
+                drain: async () => {
+                    await createdLifecycle.drain();
+                },
+            });
+
+            if (this.disposePromise_) {
+                throw new Error('Bridge is disposed');
+            }
+
+            if (stopFailed) {
+                throw new Error('Direct push processor stop unavailable', { cause: stopFailure });
+            }
+
+            return handle;
+        } catch (error) {
+            // Also retire a produced processor if handle construction itself fails.
+            if (lifecycle) {
+                lifecycle.stop();
+
+                if (!stopFn || stopFailed) {
+                    const stopError = stopFailed
+                        ? stopFailure
+                        : new Error('Direct push processor stop unavailable');
+                    throw new AggregateError(
+                        [error, stopError],
+                        'Direct push processor creation and stop failed',
+                    );
+                }
+            }
+
+            throw error;
+        } finally {
+            // A reentrant disposal waits for this reservation before draining.
+            creatingProcessor = false;
             finishCreating();
         }
     }

@@ -1857,6 +1857,19 @@ remain to be recovered and independently verified.
   already-entered pipeline work can still emit after stop. Without an attached
   packet sender, outgoing packet-backed actions do not gain send capability from
   this receive-only port. Local status or action listings do not prove QQ login.
+  An additional internal `openLinuxEasyPushProcessor` port creates the guarded
+  processor with the Bridge's own identity and pipeline, sharing the same one-shot
+  claim with the existing ingress. The caller supplies the owner, queue limits,
+  complete-frame verifier and source-authentication assertion; none is proof of
+  peer identity. The processor checks the owner's active account against the
+  Bridge UIN before activation and during guarded work. Its raw verifier still sees
+  a candidate before owner classification, so the caller must route frames to the
+  correct owner. Once created, the processor owns that owner's lifecycle: stopping
+  it or disposing the Bridge requests that the owner close. If construction yields
+  no handle, the caller retains responsibility for the owner, which a failed factory
+  may already have closed. Disposal waits for admitted processor work but does not make
+  an uncooperative dependency finish. This port does not start a session, connect a
+  transport, provide a packet sender or establish online state.
   Synthetic tests compose real memory-only Bridge objects with the OneBot event
   pipeline and fake OneBot contexts, including independently gated subscriber
   completion; they do not start a OneBot instance or exercise network adapters.
