@@ -99,8 +99,19 @@ same user ID as a string. The upstream new-friend decoder resolves the peer UIN
 with a routing fallback and may fall back to the packet header time; this mapping
 preserves the v11 fields without independently verifying QQ identity, event, or
 time. Canonical positive safe-integer IDs are required, including for string
-inputs. Other notices, requests and self-sent events are not yet translated to
-v12. Unsupported actions, parameters and message segments return explicit errors. File APIs, HTTP event
+inputs. An existing v11 group `message_sent` event with subtype `normal` is
+translated as a group message only when its `user_id` equals the configured
+account and its nonnegative finite timestamp does not exceed JavaScript's safe
+integer maximum. This local bound keeps this new projection within the SDK and
+internal poll JSON number limits; it does not alter ordinary incoming messages.
+This reports the existing self echo; it does not independently confirm send,
+receipt or delivery. Private self-sent events remain unsupported because
+v11's `target_id` has no equivalent standard v12 recipient field. A group
+self echo with an unsupported segment fails conversion rather than producing a
+partial event; if the internal ordered poll owner is active, this failure marks
+an ordering gap instead of silently skipping the event. The poll owner is not
+wired to a production HTTP polling action. Other notices and requests are not
+yet translated to v12. Unsupported actions, parameters and message segments return explicit errors. File APIs, HTTP event
 polling and HTTP Webhook are not implemented by this listener. Capability and
 error details remain authoritative at runtime.
 

@@ -215,28 +215,44 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
         return null;
     }
 
-    if (input.post_type === 'message_sent') {
-        // V11 private self events carry the recipient separately in target_id;
-        // v12's private event does not define an equivalent recipient field.
-        throw new V12UnsupportedEventError();
-    }
+    const isSent = input.post_type === 'message_sent';
 
-    if (input.post_type !== 'message') {
+    if (!isSent && input.post_type !== 'message') {
         throw new Error('unsupported V11 event type');
     }
 
     const detail = input.message_type;
+
+    if (isSent && detail !== 'group') {
+        // Private self events carry target_id, with no equivalent v12 recipient field.
+        throw new V12UnsupportedEventError();
+    }
 
     if (
         (detail !== 'private' && detail !== 'group') ||
         (detail === 'private' && input.sub_type !== 'friend') ||
         (detail === 'group' && input.sub_type !== 'normal')
     ) {
+        if (isSent) {
+            throw new V12UnsupportedEventError();
+        }
+
         throw new Error('unsupported V11 message type');
     }
 
+    // Jiyu opts in to observed group self echoes, not send or delivery confirmation.
+    const sentUserId = isSent ? fromV11AccountId(input.user_id) : null;
+
+    if (isSent && sentUserId === null) {
+        throw new Error('invalid V11 message event');
+    }
+
+    if (isSent && sentUserId !== self.user_id) {
+        throw new V12UnsupportedEventError();
+    }
+
     const messageId = fromV11MessageId(input.message_id);
-    const userId = fromV11AccountId(input.user_id);
+    const userId = isSent ? sentUserId : fromV11AccountId(input.user_id);
     const groupId = detail === 'group' ? fromV11AccountId(input.group_id) : null;
 
     if (
@@ -246,6 +262,7 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
         typeof input.time !== 'number' ||
         !Number.isFinite(input.time) ||
         input.time < 0 ||
+        (isSent && input.time > Number.MAX_SAFE_INTEGER) ||
         typeof input.raw_message !== 'string' ||
         !Array.isArray(input.message)
     ) {
