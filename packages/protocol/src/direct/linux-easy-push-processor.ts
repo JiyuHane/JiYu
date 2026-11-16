@@ -43,6 +43,9 @@ const validateView = Bytes.prototype.values;
 const setBytes = Bytes.prototype.set;
 const fillBytes = Bytes.prototype.fill;
 const promiseThen = Promise.prototype.then;
+const scheduleImmediate = setImmediate;
+const cancelImmediate = clearImmediate;
+const YIELD_BATCH_SIZE = 16;
 
 function record(value: unknown, keys: readonly string[]): Record<string, unknown> {
     if (typeof value !== 'object' || value === null || isProxy(value)) {
@@ -148,8 +151,10 @@ function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
  * this processor's drain or later work in this same FIFO: they can wait on themselves.
  * Standard unmodified Promise, Array and other intrinsics, including Promise species,
  * and absence of synchronous async_hooks reentry are caller/runtime assumptions.
- * This microtask-only pump has no fairness bound: continuously ready work can delay
- * other event-loop tasks, and lifecycle observation depends on event-loop progress.
+ * After each fixed batch of fully processed, released items, the worker yields to an
+ * event-loop task. This bound excludes an uncooperative synchronous verifier, time
+ * spent in a parser or processing wait, event-loop performance and pipeline work
+ * already entered. Lifecycle observation still depends on event-loop progress.
  * status reports only the last local state and gate check, not online status or a
  * remote connection. Owner termination while idle is noticed at the next check or
  * explicit stop, not automatically; callers coordinate shutdown and await drain.
@@ -230,6 +235,13 @@ export function createLinuxEasyPushProcessor(
     let verifyingCopy: Uint8Array | undefined;
     let pendingBody: Uint8Array | undefined;
     let worker: Promise<void> | undefined;
+    let completedSinceYield = 0;
+    let ownedImmediate:
+        | {
+              handle: ReturnType<typeof setImmediate> | undefined;
+              resolve: () => void;
+          }
+        | undefined;
     let ingress: ReturnType<typeof createGuardedDirectPushIngress>;
 
     try {
@@ -262,6 +274,21 @@ export function createLinuxEasyPushProcessor(
 
         state = 'stopped';
         kick = false;
+        const immediate = ownedImmediate;
+        ownedImmediate = undefined;
+
+        if (immediate) {
+            try {
+                if (immediate.handle !== undefined) {
+                    cancelImmediate(immediate.handle);
+                }
+            } catch {
+                /* independent cleanup */
+            } finally {
+                immediate.resolve();
+            }
+        }
+
         const copy = verifyingCopy;
         const body = pendingBody;
         verifyingCopy = undefined;
@@ -341,6 +368,33 @@ export function createLinuxEasyPushProcessor(
     function fail(): never {
         markFailed();
         throw new Error('direct push processor stopped');
+    }
+
+    function yieldToEventLoop(): Promise<void> {
+        return new Promise<void>((resolve, reject) => {
+            const immediate = {
+                handle: undefined as ReturnType<typeof setImmediate> | undefined,
+                resolve,
+            };
+            ownedImmediate = immediate;
+
+            try {
+                immediate.handle = scheduleImmediate(() => {
+                    if (ownedImmediate === immediate) {
+                        ownedImmediate = undefined;
+                        completedSinceYield = 0;
+                        resolve();
+                    }
+                });
+            } catch (error) {
+                if (ownedImmediate === immediate) {
+                    ownedImmediate = undefined;
+                }
+
+                markFailed();
+                reject(error);
+            }
+        });
     }
 
     async function work(): Promise<void> {
@@ -478,6 +532,12 @@ export function createLinuxEasyPushProcessor(
                     }
                 } finally {
                     lease.release();
+                }
+
+                completedSinceYield += 1;
+
+                if (completedSinceYield >= YIELD_BATCH_SIZE) {
+                    await yieldToEventLoop();
                 }
             }
         } catch (error) {

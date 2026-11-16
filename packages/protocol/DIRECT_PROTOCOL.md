@@ -2221,10 +2221,14 @@ remain to be recovered and independently verified.
   parser or pipeline, or erase data retained by a callback.
   A dependency must not wait for this processor's own drain or subsequent FIFO
   work: doing so can deadlock. Drain can remain pending on an uncooperative pipeline
-  or initialization. The microtask-only pump has no fairness bound, and an idle
-  owner termination is observed at the next check or explicit stop. Source
-  authentication, real transport wiring, delivery and QQ interoperability remain
-  unverified. No unknown pre-response D2 classification is added by this module.
+  or initialization. After each 16 completed and released items, the worker yields
+  to the event loop; this does not bound an individual callback or pipeline wait.
+  An idle owner termination is observed at the next check or explicit stop. A
+  synthetic test also composes the real mux, owner and processor with a fake peer,
+  including pushes following an EasyLogin response in the same in-memory input.
+  Source authentication, real transport wiring, delivery and QQ interoperability
+  remain unverified. No unknown pre-response D2 classification is added by this
+  module.
 - `src/direct/sso12-packet-client.ts` is a single-flight protocol-12 client for
   an already-connected socket, with caller-supplied account policy, classifier,
   signing metadata, device parameters and zero-key or D2-key encryption. It
