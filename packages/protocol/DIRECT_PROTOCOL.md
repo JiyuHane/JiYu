@@ -413,16 +413,18 @@ same stack slots into output regions `+0x200`, `+0x100`, and `+0x00`,
 corresponding to the candidate sign, extra, and token slots. Associating the
 calls with those copies requires the intermediate values to survive the
 intervening control flow without replacement or aliasing. In bounded linear
-samples from each callee entry, `0x68418ac` saves the command, decimal 32-bit value and body string,
-then reaches code using a global object at `0x917b5e0`; its visible bit-length
-operations do not identify a particular hash or signature algorithm. In the
-sample from `0x683fa74`, code uses the command and body and contains several
+samples from each callee entry, `0x68418ac` saves the command, decimal 32-bit
+value and body string, then reaches code using a global object at `0x917b5e0`.
+Additional bounded instruction windows described below identify an MD5-like
+computation candidate, not a complete signature algorithm. In the sample from
+`0x683fa74`, code uses the command and body and contains several
 command-string comparisons whose values and reachability were not established.
 The sample from `0x6830c58` accesses global objects at `0x917b530` and
 `0x917b860` and contains a possible `time` call; the sample does not prove the
-clock value reaches the returned token. Each window is limited to at most
-`0x1000` linear bytes and is not a complete control-flow graph or proof that
-every observed branch executes. The callees contain flattened control flow and
+clock value reaches the returned token. The initial entry samples were limited
+to at most `0x1000` linear bytes per callee; neither those samples nor the
+additional instruction windows below are complete control-flow graphs or proof
+that every observed branch executes. The callees contain flattened control flow and
 have not been fully reconstructed; these local calls do not establish the
 algorithm, exclude deeper network or asynchronous effects, or prove that the
 supplied file-signature ZIP implements this callback. In another initialization
@@ -430,6 +432,42 @@ window, an `O3CmdListNotify` pointer is passed to `0x686365f`,
 whose inspected entry byte is `c3` (`ret`); the call alone is not evidence that
 a notification was registered or processed. None of these static observations
 is a live invocation or a successful signature.
+
+Further static windows in `0x68418ac` show an MD5-like candidate computation.
+The caller's `0x68563b4–0x68563e0` path formats a 32-bit value with `%d` and
+passes its stack string at `0x6856439`; if the intermediate objects and their
+pointers remain unchanged, `0x68419ae–0x68419ec` reads the string's pointer and
+low 32 bits of its length and forms a bit count using a left shift by three and
+a right shift by 29. The ELF data at VA/file offset `0xbc6e20` contains
+`0123456789abcdeffedcba9876543210`, corresponding to the conventional MD5
+four-word initialization vector in little-endian order. The inspected
+`0x6841b47–0x6841be8` window assembles bytes into little-endian words. At
+`0x68427d3–0x6843085`, sampled steps of an inline compression copy contain
+constants and rotations matching representative MD5 steps from all four
+rounds, followed by four-word feed-forward. This is a sample, not a proof of
+every step or message-word index.
+
+That copy processes full input blocks. A signed 32-bit `%d` representation
+has at most 11 characters, so the ordinary candidate decimal input would not
+itself fill a 64-byte block. A distinct padding-block compression copy at
+`0x6845220–0x68452d1` has the first four MD5 constants and rotations; its
+remaining steps have not been checked for equivalence to the full-block copy.
+Other windows select a `56 − n` or `120 − n` padding length from
+`n = (oldBits >> 3) & 63`, copy an eight-byte bit count, and reference a data
+block at VA `0x9156390` containing `0x80` followed by 63 zero bytes. The data
+block's original file offset is `0x9153390`. Windows at
+`0x68466f6–0x6846796` serialize four state words byte by byte, and
+`0x684694b–0x684695b` pass a 16-byte stack interval to a PLT target whose
+`R_X86_64_JUMP_SLOT` names a `basic_string::_M_construct<const char*>`
+specialization. The target's dynamic export metadata independently identifies
+that specialization and the caller's `__to_xstring`-style formatting helper
+(REA Evidence `ev_44f6b2a8375b0ed7b4c9f7af2dc21fef36d6ca6afb989f0e19e875dcd522d82d`);
+actual runtime PLT binding remains unknown. Under the local pointer, aliasing
+and normal-return conditions, this constructs a string from 16 raw bytes rather
+than demonstrating a hex conversion. These are static code and byte
+observations; they do not prove the remaining padding-block steps, the complete
+data flow to the returned slot, the selected runtime branch, or the final QQ
+signing algorithm. No native code was executed to establish them.
 
 A complete inventory of this ELF's 885 defined default/protected dynamic exports contains no symbol whose
 value equals `0x6613200` or `0x66137b0` (REA evidence
