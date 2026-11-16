@@ -13,6 +13,11 @@ import {
 } from '@snowluma/protocol/msg-push';
 import { KICK_NT_CMD, parseKickNT } from '@snowluma/protocol/kick-nt';
 import { IncomingPacketPipeline, type CmdParser } from '@snowluma/protocol/packet-pipeline';
+import {
+    createDirectPushIngress,
+    type DirectPushIngress,
+    type DirectPushIngressOptions,
+} from '@snowluma/protocol/direct/direct-push-ingress';
 import type { OnlineDeviceInfo } from '@snowluma/protocol/events';
 import { buildApiHub, type ApiHub } from './apis';
 import { AiVoiceChatType, type AiVoiceCategory, type StrangerStatus } from './apis/extras';
@@ -45,6 +50,9 @@ export class Bridge implements BridgeInterface {
     private readonly sysMsgDedup_ = new SysMsgDedup();
     private onlineClients_: readonly Readonly<OnlineDeviceInfo>[] | null = null;
     private disposePromise_: Promise<void> | null = null;
+    private directIngressClaimed_ = false;
+    private directIngressCreating_: Promise<void> | null = null;
+    private directIngress_: Pick<DirectPushIngress, 'stop' | 'drain'> | null = null;
     private readonly pendingPackets_ = new Set<Promise<void>>();
     private readonly clientMessageTasks_ = new Map<
         string,
@@ -93,24 +101,128 @@ export class Bridge implements BridgeInterface {
         });
     }
 
+    /**
+     * @internal Explicit composition only. The owner is responsible for source
+     * authentication; neither this port nor the Bridge establishes peer or online state.
+     * A claim is retained even if construction fails or the ingress is stopped.
+     */
+    openDirectPushIngress(
+        options: Pick<
+            DirectPushIngressOptions,
+            | 'sourceAuthenticationHandled'
+            | 'maxBodyBytes'
+            | 'maxPendingBytes'
+            | 'maxPending'
+            | 'maxEventsPerPush'
+        >,
+    ): DirectPushIngress {
+        if (this.disposePromise_) {
+            throw new Error('Bridge is disposed');
+        }
+
+        if (this.directIngressClaimed_) {
+            throw new Error('Direct push ingress already claimed');
+        }
+
+        // Install both guards before any caller-controlled getter or factory call.
+        this.directIngressClaimed_ = true;
+        let finishCreating!: () => void;
+        this.directIngressCreating_ = new Promise<void>((resolve) => {
+            finishCreating = resolve;
+        });
+
+        try {
+            const ingress = createDirectPushIngress({
+                uin: this.identity.uin,
+                identity: this.identity,
+                pipeline: this.pipeline,
+                pipelineIdentityBound: true,
+                sourceAuthenticationHandled: options.sourceAuthenticationHandled,
+                maxBodyBytes: options.maxBodyBytes,
+                maxPendingBytes: options.maxPendingBytes,
+                maxPending: options.maxPending,
+                maxEventsPerPush: options.maxEventsPerPush,
+            });
+            const { activate, submit, stop, drain } = ingress;
+            const lifecycle = {
+                stop: () => stop.call(ingress),
+                drain: () => drain.call(ingress),
+            };
+            this.directIngress_ = lifecycle;
+            // Keep lifecycle references private and prevent accidental handle mutation.
+            const handle: DirectPushIngress = Object.freeze({
+                activate: () => activate.call(ingress),
+                submit: (...args: Parameters<DirectPushIngress['submit']>) =>
+                    submit.call(ingress, ...args),
+                stop: lifecycle.stop,
+                // Do not expose the cached promise used by Bridge disposal.
+                drain: async () => {
+                    await lifecycle.drain();
+                },
+            });
+
+            if (this.disposePromise_) {
+                lifecycle.stop();
+                throw new Error('Bridge is disposed');
+            }
+
+            return handle;
+        } finally {
+            // Disposal can be reentered from the factory and must never be awaited here.
+            finishCreating();
+        }
+    }
+
     dispose(): Promise<void> {
         if (this.disposePromise_) {
             return this.disposePromise_;
         }
 
-        this.settleRosterWarmup({ friendsLoaded: false, groupsLoaded: false });
-        this.connections.clear();
-        this.onlineClients_ = null;
-        this.disposePromise_ = (async () => {
+        let resolveDispose!: () => void;
+        let rejectDispose!: (reason: unknown) => void;
+        const disposal = new Promise<void>((resolve, reject) => {
+            resolveDispose = resolve;
+            rejectDispose = reject;
+        });
+        // Publish the shared gate before invoking anything that can reenter.
+        this.disposePromise_ = disposal;
+        const pendingPackets = [...this.pendingPackets_];
+        const creating = this.directIngressCreating_;
+        let setupFailed = false;
+        let setupError: unknown;
+
+        try {
+            this.directIngress_?.stop();
+            this.settleRosterWarmup({ friendsLoaded: false, groupsLoaded: false });
+            this.connections.clear();
+            this.onlineClients_ = null;
+        } catch (error) {
+            setupFailed = true;
+            setupError = error;
+        }
+
+        void (async () => {
             try {
-                await Promise.allSettled(this.pendingPackets_);
+                if (setupFailed) {
+                    throw setupError;
+                }
+
+                await Promise.allSettled(pendingPackets);
+                await creating;
+
+                // A factory that reentered dispose publishes and stops its port
+                // before resolving the creation reservation.
+                if (this.directIngress_) {
+                    await this.directIngress_.drain();
+                }
+
                 this.apis.contacts.dispose();
                 await this.identity.close();
             } finally {
                 this.events.clear();
             }
-        })();
-        return this.disposePromise_;
+        })().then(resolveDispose, rejectDispose);
+        return disposal;
     }
 
     registerCmd(cmd: string, parser: CmdParser): void {

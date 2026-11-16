@@ -1769,9 +1769,23 @@ remain to be recovered and independently verified.
   a buffer already wiped upstream. A separate synthetic OneBot test composes this
   ingress with the real event pipeline and v12 conversion using fake account contexts;
   it tracks ingress and OneBot drains separately. Identity, pipeline and ordinary
-  Promise internals are trusted in-process dependencies. There is no production
-  Bridge wiring, peer authentication or live QQ interoperability established by
-  this component.
+  Promise internals are trusted in-process dependencies. Core `Bridge` now exposes
+  an internal, opt-in, single-claim composition port bound to that Bridge's identity
+  and packet pipeline. Its owner must supply authentication and limits; activation
+  does not attach a transport, sender, PID or online status. Bridge disposal stops
+  the port and awaits ingress-owned work before closing identity and its event bus;
+  already-entered pipeline work can still emit after stop. Without an attached
+  packet sender, outgoing packet-backed actions do not gain send capability from
+  this receive-only port. Local status or action listings do not prove QQ login.
+  Synthetic tests compose real memory-only Bridge objects with the OneBot event
+  pipeline and fake OneBot contexts, including independently gated subscriber
+  completion; they do not start a OneBot instance or exercise network adapters.
+  Bridge disposal does not await OneBot subscribers or detached roster work, and
+  hanging dependencies can delay disposal.
+  Legacy and Direct pushes use separate dedup instances and may duplicate events;
+  their relative ordering and cross-generation identity isolation are not guaranteed.
+  This port is not automatically claimed by the production session manager, and it
+  does not establish peer authentication or live QQ interoperability.
 - `src/direct/raw-multiplex-stream.ts` adapts a caller-supplied, already-established
   byte stream to that client without opening or connecting a socket. It requires
   exclusive ownership and uses the shared direct-socket ownership registry for
