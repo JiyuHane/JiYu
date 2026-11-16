@@ -31,4 +31,17 @@ describe('LeaveGroup namespace', () => {
         const env = protobuf_decode<OidbBase<OidbLeaveGroup>>(bytes);
         expect(env.body).toMatchObject({ groupUin: 12345 });
     });
+
+    it.each([
+        [1, 1],
+        [0xffffffff, 0xffffffff],
+        [0x10000002a, 42],
+    ])('encodes group %d as uint32 %d with an in-memory sender', async (groupId, expected) => {
+        const deps = makeDeps();
+        await LeaveGroup.invoke(deps, { groupId });
+        expect(deps.sendRawPacket).toHaveBeenCalledTimes(1);
+        const [wire, bytes] = deps.sendRawPacket.mock.calls[0]!;
+        expect(wire).toBe('OidbSvcTrpcTcp.0x1097_1');
+        expect(protobuf_decode<OidbBase<OidbLeaveGroup>>(bytes).body?.groupUin).toBe(expected);
+    });
 });

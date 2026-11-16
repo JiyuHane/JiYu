@@ -2,6 +2,7 @@ import { isProxy } from 'node:util/types';
 import type { ApiResponse, JsonObject, JsonValue } from '../types';
 import type { V12CoreOptions, V12Response } from './types';
 import {
+    MAX_REQUEST_STRING_LENGTH,
     fromV11MessageId,
     isObject,
     isSelf,
@@ -40,6 +41,7 @@ const ACTIONS = [
     'get_group_member_list',
     'get_group_member_info',
     'set_group_name',
+    'leave_group',
     'send_message',
     'delete_message',
 ] as const;
@@ -223,7 +225,12 @@ export class V12Dispatcher {
             if (typeof input === 'object' && input !== null) {
                 const descriptor = Object.getOwnPropertyDescriptor(input, 'echo');
 
-                if (descriptor && 'value' in descriptor && typeof descriptor.value === 'string') {
+                if (
+                    descriptor &&
+                    'value' in descriptor &&
+                    typeof descriptor.value === 'string' &&
+                    descriptor.value.length <= MAX_REQUEST_STRING_LENGTH
+                ) {
                     fallbackEcho = descriptor.value;
                 }
             }
@@ -420,6 +427,21 @@ export class V12Dispatcher {
             }
 
             return this.setGroupName(groupId, params.group_name, echo);
+        }
+
+        if (action === 'leave_group') {
+            if (extraKeys(params, ['group_id'])) {
+                return response(10004, 'unsupported parameter', null, echo);
+            }
+
+            const groupId = parseAccountId(params.group_id);
+
+            // OidbLeaveGroup.groupUin is uint32; larger IDs would be truncated downstream.
+            if (groupId === null || groupId > 0xffffffff) {
+                return response(10003, 'invalid group_id', null, echo);
+            }
+
+            return this.leaveGroup(groupId, echo);
         }
 
         if (action === 'delete_message') {
@@ -1083,6 +1105,68 @@ export class V12Dispatcher {
                 return data && 'value' in data && data.value === null
                     ? response(0, '', null, echo)
                     : invalidResult();
+            }
+
+            if (
+                status.value !== 'failed' ||
+                !Number.isSafeInteger(retcode.value) ||
+                retcode.value <= 0
+            ) {
+                return invalidResult();
+            }
+
+            if (retcode.value === 1400) {
+                return response(
+                    10003,
+                    'invalid action input; outcome may be uncertain; do not retry automatically',
+                    null,
+                    echo,
+                );
+            }
+
+            return response(retcode.value === 1404 ? 20001 : 20002, unknownOutcome, null, echo);
+        } catch {
+            return response(20002, unknownOutcome, null, echo);
+        }
+    }
+
+    private async leaveGroup(groupId: number, echo?: string): Promise<V12Response> {
+        const unknownOutcome = 'action outcome unavailable; do not retry automatically';
+        const invalidResult = () => response(20001, unknownOutcome, null, echo);
+
+        try {
+            const result: unknown = await this.options.api.handle('set_group_leave', {
+                group_id: groupId,
+            });
+
+            // Await may inspect a thenable; afterward inspect only own data properties.
+            if (
+                isProxy(result) ||
+                typeof result !== 'object' ||
+                result === null ||
+                Array.isArray(result)
+            ) {
+                return invalidResult();
+            }
+
+            const status = Object.getOwnPropertyDescriptor(result, 'status');
+            const retcode = Object.getOwnPropertyDescriptor(result, 'retcode');
+            const data = Object.getOwnPropertyDescriptor(result, 'data');
+
+            if (
+                !status ||
+                !('value' in status) ||
+                !retcode ||
+                !('value' in retcode) ||
+                !data ||
+                !('value' in data) ||
+                data.value === undefined
+            ) {
+                return invalidResult();
+            }
+
+            if (status.value === 'ok' && retcode.value === 0) {
+                return data.value === null ? response(0, '', null, echo) : invalidResult();
             }
 
             if (

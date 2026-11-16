@@ -1,6 +1,8 @@
 import { isProxy } from 'node:util/types';
 import type { V12Self } from './types';
 
+export const MAX_REQUEST_STRING_LENGTH = 1048576;
+
 /** Snapshot JSON-shaped input without evaluating accessors or Proxy traps.
  * Callers must catch failures. Limits also apply to in-process callers. */
 export function snapshotRequest(value: unknown): unknown {
@@ -19,7 +21,7 @@ export function snapshotRequest(value: unknown): unknown {
         }
 
         if (typeof current === 'string') {
-            if (current.length > 1048576) {
+            if (current.length > MAX_REQUEST_STRING_LENGTH) {
                 throw new Error('request limit exceeded');
             }
 

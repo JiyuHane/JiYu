@@ -21,10 +21,14 @@ import {
 } from './streaming';
 const moduleLog = createLogger('Bridge.Action');
 
-// Member queries redact their inputs as well as their results; the group ID
-// itself is private even for the list form.
-function isGroupMemberQuery(action: string): boolean {
-    return action === 'get_group_member_list' || action === 'get_group_member_info';
+// Member queries and the canonical leave action redact their inputs as well as
+// their results; the group ID itself is private.
+function hasPrivateGroupActionDiagnostics(action: string): boolean {
+    return (
+        action === 'get_group_member_list' ||
+        action === 'get_group_member_info' ||
+        action === 'set_group_leave'
+    );
 }
 
 function hasSensitiveActionDiagnostics(action: string): boolean {
@@ -33,13 +37,15 @@ function hasSensitiveActionDiagnostics(action: string): boolean {
         action === 'get_group_list' ||
         action === 'get_group_info' ||
         action === 'get_stranger_info' ||
-        isGroupMemberQuery(action)
+        hasPrivateGroupActionDiagnostics(action)
     );
 }
 
 function hasSensitiveActionInput(action: string): boolean {
     return (
-        action === 'get_group_info' || action === 'get_stranger_info' || isGroupMemberQuery(action)
+        action === 'get_group_info' ||
+        action === 'get_stranger_info' ||
+        hasPrivateGroupActionDiagnostics(action)
     );
 }
 
@@ -207,9 +213,9 @@ export class ApiHandler {
     private readonly observers = new Set<ActionObserver>();
 
     // A child logger also renders its account UIN and routes to a per-account
-    // file. Keep member-query diagnostics on the same scope without that data.
+    // file. Keep these private group diagnostics on the same scope without it.
     private actionLogger(action: string): Logger {
-        return isGroupMemberQuery(action) ? moduleLog : this.log;
+        return hasPrivateGroupActionDiagnostics(action) ? moduleLog : this.log;
     }
 
     /** Observe handled actions (debug). Returns an unsubscribe. */
@@ -379,7 +385,7 @@ export class ApiHandler {
                               this.actionLogger(action).trace(() => [
                                   'action_stream_frame action=%s frame=%s',
                                   action,
-                                  isGroupMemberQuery(action)
+                                  hasPrivateGroupActionDiagnostics(action)
                                       ? '[redacted]'
                                       : renderParamsVerbose(frame),
                               ]);

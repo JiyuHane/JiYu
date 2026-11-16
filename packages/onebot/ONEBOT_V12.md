@@ -44,9 +44,9 @@ The core currently handles `get_version`, `get_status`, `get_supported_actions`,
 `get_self_info`, `get_user_info`, `get_friend_list`, `get_group_info`,
 `get_group_list`, `get_group_member_list`, `get_group_member_info`,
 `send_message` for private and group text messages and group mentions,
-`delete_message`, and `set_group_name`. The latter requires a canonical positive
-uint32 group ID encoded as a string and a string group name, including an empty
-string; it forwards one request to the existing account-local v11 handler. The
+`delete_message`, `set_group_name`, and `leave_group`. Setting a group name
+requires a canonical positive uint32 group ID encoded as a string and a string
+group name, including an empty string; it forwards one request to the existing account-local v11 handler. The
 uint32 limit prevents truncation in the downstream group-name encoding.
 Success requires that handler to return an explicit `ok`/zero retcode with null
 `data`. This is the handler's result, not independent confirmation of QQ-side
@@ -413,6 +413,28 @@ member-query inputs and terminal results, but observers and other components may
 still receive or expose the original v11 data. SDK member response types describe
 shapes only: the generic SDK parser checks the envelope and JSON, not the member
 fields. See the [candidate group actions](https://12.onebot.dev/interface/group/actions/).
+
+`leave_group` accepts only a canonical positive decimal `group_id` string in
+`1..4294967295`; unsupported parameters, including `is_dismiss`, return 10004
+before ID validation, and an invalid ID returns 10003. The uint32 bound reflects
+the downstream encoder, not a general OneBot ID limit. Each accepted request
+calls the account-local v11 `set_group_leave` exactly once and does not retry it.
+Only an own-data `status: 'ok'`, zero `retcode` and `data: null` response is a
+local success. Malformed responses and failures are reported without upstream
+error details; after a handler starts, its outcome can remain uncertain even
+when the caller receives an error or times out. The transport's separate output
+byte limit includes the echo and complete JSON envelope; an oversized result may
+close the response even after an effect has occurred. A successful response is
+not an independent confirmation of QQ-side membership.
+
+The v11 action sends a leave request without an `is_dismiss` parameter or a
+local group-owner check. Rejecting that extra v12 parameter does not establish
+what QQ does when the account owns the group. After the underlying request, the
+existing bridge emits a local self-leave event, waits for event subscribers and
+updates its local group state; event delivery and durable persistence have their
+own failure and waiting boundaries. Action-layer diagnostics redact this action's
+inputs, outputs and exception details, but observers and deeper transport or
+event logging can still expose data. Real QQ behavior remains unverified.
 
 For private `send_message`, the target `user_id` must be a canonical positive
 uint32 decimal string; larger values return `10003` before the v11 handler is

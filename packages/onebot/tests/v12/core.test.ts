@@ -67,6 +67,7 @@ describe('V12 dispatcher with real v11 ApiHandler', () => {
             'get_group_member_list',
             'get_group_member_info',
             'set_group_name',
+            'leave_group',
             'send_message',
             'delete_message',
         ]);
