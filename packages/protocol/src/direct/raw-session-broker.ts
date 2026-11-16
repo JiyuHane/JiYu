@@ -331,7 +331,22 @@ function createBroker(
                 try {
                     const remaining = deadline - performance.now();
 
-                    if (remaining <= 0 || (signal !== undefined && signalState(signal))) {
+                    if (terminal) {
+                        return;
+                    }
+
+                    if (remaining <= 0) {
+                        finish('poisoned');
+                        return;
+                    }
+
+                    const signalAborted = signal !== undefined && signalState(signal);
+
+                    if (terminal) {
+                        return;
+                    }
+
+                    if (signalAborted) {
                         finish('poisoned');
                         return;
                     }
@@ -491,6 +506,11 @@ function createBroker(
                             finish('poisoned');
                             throw new Error('inactive callback');
                         }
+
+                        // Clock and signal inspection may reenter and terminate this operation.
+                        if (!active || terminal) {
+                            throw new Error('inactive callback');
+                        }
                     };
 
                     const fenced = async <A extends unknown[], R>(
@@ -528,7 +548,7 @@ function createBroker(
 
                         opTick();
 
-                        // All failures before invoking client are known local non-writes.
+                        // Before reading the client method, the broker has not entered transport.
                         if (
                             terminal ||
                             sessionExpired() ||
@@ -560,8 +580,25 @@ function createBroker(
                         };
                         let underlying: Promise<Sso12RawResult<T>>;
 
+                        check();
+                        let method: Sso12RawClient['transactRaw'];
+
                         try {
-                            underlying = observe(client.transactRaw(options));
+                            method = client.transactRaw;
+                        } catch {
+                            finish('poisoned');
+                            return failure('transport-failed', 'unknown');
+                        }
+
+                        // This guard prevents entering the returned function after the getter
+                        // expires or terminates the operation. It cannot undo getter effects,
+                        // same-process global monkey-patching, or work already entered.
+                        check();
+
+                        try {
+                            underlying = observe<Sso12RawResult<T>>(
+                                Reflect.apply(method, client, [options]),
+                            );
                         } catch {
                             finish('poisoned');
                             return failure('transport-failed', 'unknown');
@@ -571,12 +608,15 @@ function createBroker(
                         const settled = underlying.then(
                             (result): Sso12RawResult<T> => {
                                 try {
+                                    // Clock and signal reads can synchronously terminate the lease.
                                     if (
                                         !active ||
                                         terminal ||
                                         sessionExpired() ||
                                         performance.now() >= opDeadline ||
-                                        (opSignal && signalState(opSignal))
+                                        (opSignal && signalState(opSignal)) ||
+                                        !active ||
+                                        terminal
                                     ) {
                                         finish('poisoned');
                                         return failure('interrupted', 'unknown');
@@ -608,7 +648,9 @@ function createBroker(
                                         terminal ||
                                         sessionExpired() ||
                                         performance.now() >= opDeadline ||
-                                        (opSignal && signalState(opSignal))
+                                        (opSignal && signalState(opSignal)) ||
+                                        !active ||
+                                        terminal
                                     ) {
                                         finish('poisoned');
                                         return failure('interrupted', 'unknown');
@@ -711,8 +753,43 @@ function createBroker(
                 }
 
                 tick();
-                // Native promises are observed without consulting an own `then` getter.
+
+                if (terminal) {
+                    return lease;
+                }
+
                 const closed = client.whenClosed;
+
+                try {
+                    if (!terminal && sessionExpired()) {
+                        finish('poisoned');
+                    }
+                } catch {
+                    finish('poisoned');
+                }
+
+                if (terminal) {
+                    // Do not assimilate foreign thenables after termination. Genuine promises
+                    // get best-effort rejection observation; species may execute or throw,
+                    // and the resulting child and hidden promises are not controlled here.
+                    if (utilTypes.isPromise(closed)) {
+                        try {
+                            nativeThen.call(
+                                closed,
+                                () => {},
+                                () => {},
+                            );
+                        } catch {
+                            /* best effort */
+                        }
+                    }
+
+                    return lease;
+                }
+
+                // Native promises are observed without consulting an own `then` getter.
+                // Local state does not prove external closure; assimilation already entered
+                // while active can itself terminate the lease and still run later effects.
                 void observe(closed).then(
                     () => finish('poisoned'),
                     () => finish('poisoned'),

@@ -1294,6 +1294,26 @@ remain to be recovered and independently verified.
   enumeration, or any effects and retained copies owned by the injected transport.
   Pure fake-transport fixtures test the local mapping and actual reserve-builder
   composition; no server, signing, target client or online behavior is exercised.
+- `src/direct/lagrange-v2-default-signer.ts` separately adapts the fixed V2
+  [default PC provider contract](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Common/BotSignProvider.cs#L575-L617):
+  the caller-injected transport receives only `cmd`, signed-int32 `seq` and
+  uppercase hexadecimal `src`, and supplies `value.sign`, `value.token` and
+  `value.extra` as hexadecimal strings. Unlike Milky, that DTO does not carry
+  UIN, GUID or QUA. Account binding is nonetheless enforced locally; payloads
+  and callbacks should not be treated as anonymous or isolated from their owner.
+  This adapter makes no network request itself, chooses no endpoint or command
+  policy, and implements no signing algorithm or retry. Its local contract is
+  deliberately stricter than the reference: the account must be canonical and
+  at most `Number.MAX_SAFE_INTEGER`, the command must be nonempty and at most
+  65536 UTF-8 bytes, the body is bounded to 16 MiB, and negative zero sequences
+  are rejected. Both response objects and all three fields must exist as plain
+  data, each decoded field is limited to 65536 bytes, and sign must be nonempty;
+  the reference's missing-field defaults and empty sign are not reproduced.
+  Unknown data properties are ignored, but accessors and proxies are rejected;
+  Promise assimilation and any transport effects remain the caller's responsibility.
+  Fixed-stage errors omit external exception and response text. Immutable payload
+  strings and copies retained by a transport cannot be erased by this adapter.
+  This mapping and its fake-transport tests do not establish live interoperability.
 - `src/direct/wt-login-keystore.ts` projects the UID from inner WT TLV `0x543`
   using the `9 → 11 → 1` message path declared by [LagrangeV2 ThirdPartyLoginResponse](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/System/ThirdPartyLoginResponse.cs)
   and its [login handler](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Logic/WtExchangeLogic.cs).
@@ -1523,9 +1543,14 @@ remain to be recovered and independently verified.
   provide a truthful synchronous usability check and a trusted successful-settlement
   quiescence contract; the broker does not authenticate the peer, verify callback
   ordering or prove writes. It accepts same-realm standard AbortSignals whose
-  prototype and listener methods remain unchanged while in use. Timers are not
-  hard realtime and callback-owned late allocations require producer cleanup.
-  The separate internal broker factory can issue a single-use proof that its own
+  prototype and listener methods remain unchanged while in use. The broker samples
+  local termination again after reading a client transaction method and before
+  accepting a successful result; an already-terminated lease does not assimilate
+  a foreign `whenClosed` thenable after its getter returns. Getter side effects and
+  work already entered cannot be undone, Promise rejection observation is best
+  effort, and asynchronous close observation is not a physical transport fence.
+  Timers are not hard realtime and callback-owned late allocations require producer
+  cleanup. The separate internal broker factory can issue a single-use proof that its own
   authority claimed the first local broker terminal transition for a particular
   lease before its sampled deadline and cancellation. It does not establish
   cleanup completion, peer identity, response authenticity or the order in which
@@ -2070,6 +2095,27 @@ remain to be recovered and independently verified.
   lease and an explicit caller policy; it does not authenticate its fake peer. The
   adapter does not persist tickets or connect the production Bridge; live
   interoperability is unverified.
+- `src/direct/linux-easy-account-owner.ts` is an opt-in, one-shot local owner for
+  an injected raw client. It creates one private broker lease and sequentially
+  performs the reference key exchange, EasyLogin and registration on it, without
+  accepting a caller-fabricated login result. It preflights independently known
+  registration fields before attempting login and requires an explicit zero login
+  status, valid ticket shapes, caller policy acceptance, and the local registration
+  classification `success` with no poison request. Its `registered` result is not
+  peer authentication or an online-state claim. The login and registration profiles
+  are independently supplied and can differ; this owner does not establish a common
+  device identity. The owner's private ticket copies are wiped after registration
+  classification or on failure, on a best-effort basis; no ticket accessor or
+  send/push operation is exposed. A future sending owner must explicitly manage
+  credentials rather than assuming this instance has retained them.
+  The lifetime deadline and phase deadlines depend on event-loop progress. Close
+  revokes local state and requests poison, but cannot stop work already inside an
+  uncooperative callback or transport, nor erase their retained copies. A broker
+  may discard a late value before the owner sees it, so its producer remains
+  responsible for that value. Lease close observation is asynchronous, not a
+  synchronous transport fence; the original client or other wrappers can bypass
+  this module's local lease discipline. This owner neither creates a connection nor
+  attaches to the production Bridge, and does not establish QQ interoperability.
 - `src/direct/sso12-packet-client.ts` is a single-flight protocol-12 client for
   an already-connected socket, with caller-supplied account policy, classifier,
   signing metadata, device parameters and zero-key or D2-key encryption. It
