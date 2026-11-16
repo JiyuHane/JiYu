@@ -2096,6 +2096,22 @@ remain to be recovered and independently verified.
   Owned reachable byte temporaries are wiped best-effort, excluding caller buffers,
   returned body and runtime/crypto-internal copies. No session orchestration or
   production Bridge integration is provided by either reference helper.
+- `decodeLinuxNTLoginReferenceResponseWithTips` is an opt-in offline projection
+  of the same authenticated common response. In addition to the original status
+  and body, it exposes ErrorInfo fields 2 and 3 as `tips.title` and `tips.content`:
+  `null` means a field is absent, while an empty string remains present-empty.
+  `tips` itself is `null` when the head or ErrorInfo is absent. The optional
+  projection does not decide whether a status is successful or whether a caller
+  should display, log, or act on server-provided text. It is not wired into the
+  EasyLogin transaction, owner, or production Bridge. Each text field is locally
+  limited to 4096 UTF-8 bytes and decoded strictly; repeated or wrong-wire selected
+  fields are rejected. The original response helper still treats these fields as
+  unknown, preserving its prior behavior. GCM integrity under the supplied key
+  does not establish its provenance, the server identity, account binding, or
+  freshness. Output and intermediate strings, including those created before a
+  failed projection, cannot be reliably wiped; callers own the returned body. The reference behavior is based on [the fixed error fields](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/Login/NTLogin.cs#L167-L182)
+  and the [EasyLogin parse branch](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Services/Login/EasyLoginService.cs#L22-L33),
+  not observed QQ traffic.
 - `src/direct/nt-linux-easy-login-reference.ts` independently encodes the PC
   EasyLogin opaque request body and projects four ticket fields from its response,
   based on the reference's [service](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Services/Login/EasyLoginService.cs#L9-L33)

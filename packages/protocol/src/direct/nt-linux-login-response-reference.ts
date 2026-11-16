@@ -2,6 +2,7 @@ import { createDecipheriv } from 'node:crypto';
 import { isProxy, isSharedArrayBuffer, isUint8Array } from 'node:util/types';
 import type {
     LinuxNTLoginReferenceResponseCommon,
+    LinuxNTLoginReferenceResponseCommonWithTips,
     LinuxNTLoginReferenceResponseForward,
 } from '@snowluma/proto-defs/direct-login';
 import { protobuf_decode } from '@snowluma/proton';
@@ -21,7 +22,13 @@ export interface LinuxNTLoginReferenceResponse {
     body: Uint8Array | null;
 }
 
+export interface LinuxNTLoginReferenceResponseWithTips extends LinuxNTLoginReferenceResponse {
+    /** Null means ErrorInfo was absent; null child values mean the fields were absent. */
+    tips: { title: string | null; content: string | null } | null;
+}
+
 const LIMIT = 1024 * 1024;
+const TIP_LIMIT = 4096;
 const typedPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
 const bufferGetter = Object.getOwnPropertyDescriptor(typedPrototype, 'buffer')!.get!;
 const offsetGetter = Object.getOwnPropertyDescriptor(typedPrototype, 'byteOffset')!.get!;
@@ -181,6 +188,20 @@ function sameBytes(value: Uint8Array, data: Uint8Array, span: Span): boolean {
     return true;
 }
 
+function decodeTip(data: Uint8Array, span: Span | undefined): string | null {
+    if (!span) {
+        return null;
+    }
+
+    if (span.end - span.start > TIP_LIMIT) {
+        throw new Error();
+    }
+
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(
+        data.subarray(span.start, span.end),
+    );
+}
+
 /**
  * Offline response-body projection, not a login success classifier. The strict
  * local policy rejects duplicates/wrong wires on selected fields and non-shortest
@@ -198,6 +219,50 @@ function sameBytes(value: Uint8Array, data: Uint8Array, span: Span): boolean {
 export function decodeLinuxNTLoginReferenceResponse(
     input: LinuxNTLoginReferenceResponseInput,
 ): LinuxNTLoginReferenceResponse {
+    return decodeLinuxNTLoginReferenceResponseCore(input, false);
+}
+
+/**
+ * Opt-in offline projection of the common response's ErrorInfo title and content.
+ * A missing ErrorInfo gives null tips; an absent child gives null, while an explicit
+ * empty string remains empty. The 4096-byte per-field cap, strict UTF-8 (retaining
+ * an initial BOM), and duplicate/wire checks on these fields are local restrictions,
+ * not a claim of identical V2 or QQ parsing. Unknown fields remain uninterpreted.
+ *
+ * The caller supplies the session key and must manage and clear the returned body.
+ * GCM validates ciphertext under that key, not peer identity, account binding,
+ * freshness, replay protection, or unauthenticated outer metadata. No status is
+ * classified and no hint is displayed, logged, opened, or acted upon. Returned
+ * strings are untrusted and cannot be reliably erased, including temporary
+ * strings retained after a failed projection. Reachable byte cleanup remains
+ * best effort and excludes caller-owned, returned, and runtime copies.
+ *
+ * Independent field projection, not the reference SDK implementation:
+ * https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/Login/NTLogin.cs#L76-L94
+ * https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/Login/NTLogin.cs#L167-L182
+ * https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/Login/NTLogin.cs#L538-L544
+ * https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Services/Login/NTLoginCommon.cs#L55-L76
+ * https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Services/Login/EasyLoginService.cs#L22-L33
+ */
+export function decodeLinuxNTLoginReferenceResponseWithTips(
+    input: LinuxNTLoginReferenceResponseInput,
+): LinuxNTLoginReferenceResponseWithTips {
+    return decodeLinuxNTLoginReferenceResponseCore(input, true);
+}
+
+function decodeLinuxNTLoginReferenceResponseCore(
+    input: LinuxNTLoginReferenceResponseInput,
+    withTips: false,
+): LinuxNTLoginReferenceResponse;
+function decodeLinuxNTLoginReferenceResponseCore(
+    input: LinuxNTLoginReferenceResponseInput,
+    withTips: true,
+): LinuxNTLoginReferenceResponseWithTips;
+
+function decodeLinuxNTLoginReferenceResponseCore(
+    input: LinuxNTLoginReferenceResponseInput,
+    withTips: boolean,
+): LinuxNTLoginReferenceResponse | LinuxNTLoginReferenceResponseWithTips {
     let key: Uint8Array | undefined;
     let forward: Uint8Array | undefined;
     let encrypted: Uint8Array | null | undefined;
@@ -296,9 +361,17 @@ export function decodeLinuxNTLoginReferenceResponse(
         const bodySpan = common.get(2)?.span;
         const head = headSpan ? scan(plain, headSpan, { 4: 2 }, budget) : undefined;
         const errorSpan = head?.get(4)?.span;
-        const error = errorSpan ? scan(plain, errorSpan, { 1: 0 }, budget) : undefined;
+        // The legacy entry must continue to treat fields 2 and 3 as unknown.
+        const error = errorSpan
+            ? scan(plain, errorSpan, withTips ? { 1: 0, 2: 2, 3: 2 } : { 1: 0 }, budget)
+            : undefined;
         const code = error?.get(1)?.value;
-        const decoded = protobuf_decode<LinuxNTLoginReferenceResponseCommon>(plain);
+        const title = withTips ? decodeTip(plain, error?.get(2)?.span) : null;
+        const content = withTips ? decodeTip(plain, error?.get(3)?.span) : null;
+        // Each entry uses its own schema so that the legacy decoder never interprets tips.
+        const decoded: LinuxNTLoginReferenceResponseCommonWithTips = withTips
+            ? protobuf_decode<LinuxNTLoginReferenceResponseCommonWithTips>(plain)
+            : protobuf_decode<LinuxNTLoginReferenceResponseCommon>(plain);
         decodedBody = decoded.body;
 
         if (
@@ -308,7 +381,10 @@ export function decodeLinuxNTLoginReferenceResponse(
             (bodySpan && (!decodedBody || !sameBytes(decodedBody, plain, bodySpan))) ||
             (errorSpan &&
                 ((code !== undefined) !== (decoded.head?.errorInfo?.code != null) ||
-                    (code !== undefined && decoded.head?.errorInfo?.code !== code)))
+                    (code !== undefined && decoded.head?.errorInfo?.code !== code))) ||
+            (withTips &&
+                ((decoded.head?.errorInfo?.title ?? null) !== title ||
+                    (decoded.head?.errorInfo?.content ?? null) !== content))
         ) {
             throw new Error();
         }
@@ -324,7 +400,10 @@ export function decodeLinuxNTLoginReferenceResponse(
             outputBody.set(decodedBody);
         }
 
-        const result: LinuxNTLoginReferenceResponse = { status, body: outputBody };
+        const result: LinuxNTLoginReferenceResponse | LinuxNTLoginReferenceResponseWithTips =
+            withTips
+                ? { status, body: outputBody, tips: errorSpan ? { title, content } : null }
+                : { status, body: outputBody };
         succeeded = true;
         return result;
     } catch {

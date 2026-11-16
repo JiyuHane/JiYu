@@ -106,6 +106,25 @@ export interface LinuxNTLoginReferenceResponseCommon {
     body?: pb_optional<2, bytes>;
 }
 
+// Separate opt-in response projection. It leaves the existing code-only schema intact.
+// https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/Login/NTLogin.cs#L76-L94
+// https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/Login/NTLogin.cs#L167-L182
+// https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/Login/NTLogin.cs#L538-L544
+export interface LinuxNTLoginReferenceResponseErrorWithTips {
+    code?: pb_optional<1, uint_64>;
+    title?: pb_optional<2, string>;
+    content?: pb_optional<3, string>;
+}
+
+export interface LinuxNTLoginReferenceResponseHeadWithTips {
+    errorInfo?: pb<4, LinuxNTLoginReferenceResponseErrorWithTips>;
+}
+
+export interface LinuxNTLoginReferenceResponseCommonWithTips {
+    head?: pb<1, LinuxNTLoginReferenceResponseHeadWithTips>;
+    body?: pb_optional<2, bytes>;
+}
+
 // Independent EasyLogin field declarations; overall upstream license undetermined.
 // https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Services/Login/EasyLoginService.cs#L13-L25
 // https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/Login/NTLogin.cs#L306-L315
