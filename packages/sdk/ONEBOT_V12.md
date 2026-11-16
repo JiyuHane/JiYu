@@ -119,6 +119,72 @@ separate session: select that session when sending an action and use the
 complete `{ platform, user_id }` identity for account-specific event handling.
 A connection alone does not establish that a particular account is online.
 
+## Sending a single location with Jiyu
+
+`@harehane/sdk/v12` exports `OneBot12LocationSegment`, a TypeScript shape for
+[OneBot 12 `location`](https://12.onebot.dev/interface/message/segments/#location).
+It describes `latitude` and `longitude` as numbers and `title` and `content` as
+strings. This is a static type, not runtime validation: the generic segment parser
+checks the common segment and JSON structure, not location-specific fields. The
+type's open JSON object also permits extra fields that Jiyu rejects; satisfying it
+does not establish that a segment is acceptable to the server.
+
+For Jiyu, submit exactly one `location` segment with no other segments, either as
+a segment object or as a single-element array, to a private or group conversation:
+
+```ts
+import type { OneBot12LocationSegment } from '@harehane/sdk/v12';
+
+const location: OneBot12LocationSegment = {
+    type: 'location',
+    data: {
+        latitude: 23.1291,
+        longitude: 113.2644,
+        title: 'Example',
+        content: 'Example address',
+    },
+};
+const response = await client.request('send_message', {
+    detail_type: 'private',
+    user_id: '123456',
+    message: [location],
+});
+```
+
+For a group, use `detail_type: 'group'` and `group_id` instead of `user_id`.
+After earlier request and target checks, Jiyu requires exactly the four data
+fields shown: finite numeric latitude in `[-90, 90]`, finite numeric longitude in
+`[-180, 180]`, and strings for both title and content, including empty strings.
+Their combined UTF-8 length must be at most 64 KiB (65,536 bytes). Missing or
+invalid values, out-of-range coordinates and this text limit return `10006`;
+extra segment or data fields return `10007`. An otherwise valid location mixed
+with text or mentions, or with a second location, returns `10005` without a v11
+send. Segment checks run in order, so an earlier invalid segment or other
+preflight failure can take precedence; non-finite in-process inputs can fail
+snapshot validation with `10001`. Separate request and transport limits also
+apply. These ranges, length and combination restrictions are Jiyu policies, not
+claims about requirements of the OneBot standard. `get_supported_actions` reports
+action names, not per-segment support. Other outbound media, including image and
+voice, remain unsupported by Jiyu v12.
+
+Jiyu passes the accepted location as a v11 `location` segment. The existing v11
+parser builds a `com.tencent.map` / `LocationShare` JSON card, encoded as a
+`lightApp`. Coordinate numbers are converted with JavaScript `String`: `-0`
+becomes `"0"`, small values can use exponent notation, and the original JSON
+number spelling and digits beyond binary64 precision are lost. The SDK has its
+own JSON number policies described below. The current inbound rich-body decoder
+can drop all sibling ordinary text when any card decodes successfully, so Jiyu
+does not allow mixed location messages. Incoming QQ JSON cards are still not
+mapped automatically to v12 location segments. This describes local translation,
+not a guarantee of QQ client receipt, display, readability or delivery.
+
+The existing v11 handler's TRACE input and action observers can see coordinates,
+title and address in the clear; the WebUI debug tap and other paths may also
+expose them. A send-log preview of `[JSON消息]` is not end-to-end redaction. A
+failure or timeout after a send begins can leave its outcome uncertain; neither
+the SDK nor Jiyu retries automatically. Existing v11 message behavior is
+unchanged. See the [server details](../onebot/ONEBOT_V12.md#sending-a-single-location).
+
 ## `get_file` URL subset
 
 `@harehane/sdk/v12` exports `OneBot12GetFileUrlParams`,

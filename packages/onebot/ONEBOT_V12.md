@@ -58,8 +58,9 @@ the previous transport before reopening.
 The core currently handles `get_version`, `get_status`, `get_supported_actions`,
 `get_self_info`, `get_user_info`, `get_friend_list`, `get_group_info`,
 `get_group_list`, `get_group_member_list`, `get_group_member_info`,
-`send_message` for private and group text messages and group mentions,
-`delete_message`, `set_group_name`, `leave_group`, and the restricted URL mode
+`send_message` for private and group text, group mentions, and a single standalone
+location segment in either conversation type, `delete_message`, `set_group_name`,
+`leave_group`, and the restricted URL mode
 of `get_file`. Setting a group name
 requires a canonical positive uint32 group ID encoded as a string and a string
 group name, including an empty string; it forwards one request to the existing account-local v11 handler. The
@@ -583,6 +584,74 @@ numeric user, the existing element builder selects its mention-all path; this
 is a potential downstream behavior, not an assertion that the service returns
 that value. UID population, actual mention target, QQ rendering, permissions and
 successful delivery remain unverified.
+
+### Sending a single location
+
+Jiyu supports the OneBot 12 [`location` segment](https://12.onebot.dev/interface/message/segments/#location)
+for private and group `send_message` only when the entire message is exactly one
+location segment. The message may be the segment itself or a single-element
+array. The segment must have only `type` and `data`; `data` must contain exactly
+`{latitude: number, longitude: number, title: string, content: string}`. Both
+coordinates must be finite: latitude is in `[-90, 90]` and longitude in
+`[-180, 180]`, inclusive. Both text strings may be empty. Their combined UTF-8
+length may not exceed 64 KiB (65,536 bytes), summing each string's UTF-8 byte
+length separately. This does not count the eventual JSON card or transport
+envelope.
+
+```json
+{
+  "action": "send_message",
+  "params": {
+    "detail_type": "group",
+    "group_id": "123456",
+    "message": [{
+      "type": "location",
+      "data": {"latitude": 1e-7, "longitude": -0, "title": "Example", "content": ""}
+    }]
+  }
+}
+```
+
+Use `detail_type: "private"` and `user_id` in place of the group fields for a
+private send. After earlier request and target validation, missing, wrong-type,
+out-of-range or over-budget location data returns `10006`; extra segment or data
+fields return `10007`. A location mixed with text or mentions, or with another
+location, returns `10005` without a v11 send when the relevant segments pass their
+earlier checks. Validation is sequential: an earlier malformed field can return
+`10006` or `10007` first, a valid private mention returns `10005` immediately,
+and request snapshot or transport limits can reject before segment validation.
+For example, non-finite in-process numbers fail the snapshot with `10001`. These
+coordinate ranges, text limit and combination rules are local support policies,
+not assertions about the OneBot standard. `get_supported_actions` lists actions,
+not supported segment combinations. Other outbound media, including image and
+voice, remain unsupported by v12.
+
+Once preflight succeeds, v12 calls the existing account-local v11 send handler
+with one `{type: 'location', data: {lat: latitude, lon: longitude, title,
+content}}` segment. The existing v11 parser converts each coordinate using
+JavaScript `String` and builds a `com.tencent.map` / `LocationShare` JSON card,
+which the existing element builder encodes as a `lightApp`. For the numeric
+values in the example, its `meta.Location` contains `lat: "1e-7"`, `lng: "0"`,
+`title: "Example"` and `address: ""`. In particular, `-0` becomes `"0"` and
+small values may use exponent notation. Input JSON number spelling is not
+preserved, and digits beyond binary64 precision can be rounded before conversion.
+This local path does not establish that a QQ client receives, displays, can read
+or delivers the card.
+
+The existing inbound rich-body decoder drops all sibling ordinary text in the
+same element list once it successfully decodes a card, including text that was
+not merely a compatibility fallback. This is one reason mixed input is not
+admitted. Incoming QQ JSON cards remain unsupported by v12 event conversion and
+are not automatically mapped back to `location`. Direct v11 message behavior is
+unchanged.
+
+The v11 handler's existing TRACE input and action observers can see the original
+coordinates, title and address; the WebUI debug tap and other paths may expose
+them too. A send-log preview of `[JSON消息]` is not end-to-end redaction. A
+failure, invalid result or timeout after the handler starts can leave the send
+outcome uncertain; no automatic retry is attempted.
+
+### Send results and limits
 
 `send_message` reports the timestamp already stored by Jiyu. That record may
 come from the QQ response or a local-clock fallback and is not necessarily a

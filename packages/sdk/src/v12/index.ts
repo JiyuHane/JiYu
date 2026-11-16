@@ -17,6 +17,7 @@ export type {
     OneBot12JsonValue,
     OneBot12LatestEventsParams,
     OneBot12LatestEventsResponse,
+    OneBot12LocationSegment,
     OneBot12MentionAllSegment,
     OneBot12MentionSegment,
     OneBot12Message,

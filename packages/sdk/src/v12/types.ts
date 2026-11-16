@@ -42,6 +42,17 @@ export interface OneBot12VoiceSegment extends OneBot12MessageSegment {
     data: OneBot12JsonObject & { file_id: string };
 }
 
+/** Describes a location segment; the generic segment parser does not validate location fields. */
+export interface OneBot12LocationSegment extends OneBot12MessageSegment {
+    type: 'location';
+    data: OneBot12JsonObject & {
+        latitude: number;
+        longitude: number;
+        title: string;
+        content: string;
+    };
+}
+
 /** Incoming messages are segment arrays; outgoing message parameters may also be a string or single segment. */
 export type OneBot12Message = OneBot12MessageSegment[];
 export type OneBot12OutgoingMessage = OneBot12Message | OneBot12MessageSegment | string;

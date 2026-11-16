@@ -1431,6 +1431,7 @@ export class V12Dispatcher {
         }
 
         const message: JsonObject[] = [];
+        let hasLocation = false;
 
         for (const segment of segments) {
             if (!isObject(segment) || typeof segment.type !== 'string' || !isObject(segment.data)) {
@@ -1440,13 +1441,20 @@ export class V12Dispatcher {
             if (
                 segment.type !== 'text' &&
                 segment.type !== 'mention' &&
-                segment.type !== 'mention_all'
+                segment.type !== 'mention_all' &&
+                segment.type !== 'location'
             ) {
                 return response(10005, 'unsupported message segment', null, echo);
             }
 
             const allowedData =
-                segment.type === 'text' ? ['text'] : segment.type === 'mention' ? ['user_id'] : [];
+                segment.type === 'text'
+                    ? ['text']
+                    : segment.type === 'mention'
+                      ? ['user_id']
+                      : segment.type === 'location'
+                        ? ['latitude', 'longitude', 'title', 'content']
+                        : [];
 
             if (extraKeys(segment, ['type', 'data']) || extraKeys(segment.data, allowedData)) {
                 return response(10007, 'unsupported message segment field', null, echo);
@@ -1458,6 +1466,39 @@ export class V12Dispatcher {
                 }
 
                 message.push({ type: 'text', data: { text: segment.data.text } });
+            } else if (segment.type === 'location') {
+                const { latitude, longitude, title, content } = segment.data;
+
+                if (
+                    typeof latitude !== 'number' ||
+                    !Number.isFinite(latitude) ||
+                    latitude < -90 ||
+                    latitude > 90 ||
+                    typeof longitude !== 'number' ||
+                    !Number.isFinite(longitude) ||
+                    longitude < -180 ||
+                    longitude > 180 ||
+                    typeof title !== 'string' ||
+                    typeof content !== 'string'
+                ) {
+                    return response(10006, 'invalid location segment', null, echo);
+                }
+
+                const maxLocationTextBytes = 64 * 1024;
+
+                if (
+                    title.length + content.length > maxLocationTextBytes ||
+                    Buffer.byteLength(title, 'utf8') + Buffer.byteLength(content, 'utf8') >
+                        maxLocationTextBytes
+                ) {
+                    return response(10006, 'invalid location segment', null, echo);
+                }
+
+                hasLocation = true;
+                message.push({
+                    type: 'location',
+                    data: { lat: latitude, lon: longitude, title, content },
+                });
             } else if (segment.type === 'mention') {
                 const userId = parseAccountId(segment.data.user_id);
 
@@ -1479,6 +1520,11 @@ export class V12Dispatcher {
 
                 message.push({ type: 'at', data: { qq: 'all' } });
             }
+        }
+
+        // A v11 location becomes a JSON card; mixed or multiple cards have unknown behavior.
+        if (hasLocation && message.length !== 1) {
+            return response(10005, 'unsupported segment combination', null, echo);
         }
 
         // RoutingC2C.uin is uint32; preserve segment validation before blocking truncation.
