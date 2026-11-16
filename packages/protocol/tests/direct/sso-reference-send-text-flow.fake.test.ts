@@ -285,7 +285,6 @@ describe('synthetic reference send-text over in-memory multiplex transport', () 
                     });
                     signerCopy = body;
                     signerSnapshot = Uint8Array.from(body);
-                    body.fill(0xa5); // A fake metadata callback; no assertion about real signing.
                     return Uint8Array.of(8);
                 },
             );

@@ -28,6 +28,13 @@ support Windows hosts, and no IDA provider was configured. A later REA 6.8.0
 `inspect_native_exports` inventory for the same digest reports 2,025 defined,
 visible dynamic exports and `JNI_OnLoad` at `0x62b3c` with declared size 71,336
 bytes (parent Evidence `ev_8efef99bbff0e21a44b63bbfe5f4f97dc2443815a564f2810b1e60e8ed15c78e`).
+A complete 2,025-row projection of that export inventory (Evidence
+`ev_007834fb40cc88ce77dcae43ce2dc6082941b1f7f699000bded96384bd6ae000`)
+contains no exported symbol starting in either `[0x2b0000, 0x2c0000)` or
+`[0x2f0000, 0x300000)`, the respective windows containing the JNI candidate
+`0x2b6454` and lookup window `0x2f3a70`. This does not exclude symbols starting
+outside those windows, local or hidden symbols, or indirect paths, and does not
+establish whether the two candidates are related.
 Exact-name filtering found no defined visible export named `AES_encrypt`,
 `AES_decrypt`, `AES_set_encrypt_key`, `EVP_EncryptInit_ex`, or
 `EVP_aes_128_cbc`. This covers the dynamic export table only: it does not
@@ -440,7 +447,13 @@ contains a protocol client and interfaces to external signing providers. Its
 uses an HTTP signing service; the separate
 [Core provider](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Common/BotSignProvider.cs)
 and [Android provider](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Common/AndroidBotSignProvider.cs)
-have different request contracts. An HTTP client contract is not evidence of
+have different request contracts. In that fixed revision,
+[`PacketContext.SendPacket`](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Context/PacketContext.cs#L49-L78)
+passes the command, signed `int` sequence and unwrapped `packet.Data` to the
+configured provider before constructing the SSO and outer service frames.
+The default PC provider and Milky provider are distinct configured interfaces;
+that source observation neither establishes server enforcement nor the native
+signing algorithm. An HTTP client contract is not evidence of
 the server's signing algorithm or of this sample's native ABI. The inspected
 commit did not contain a root license file or a `.so` file; no rights to copy
 its implementation are assumed here. The sample's version, native call graph,

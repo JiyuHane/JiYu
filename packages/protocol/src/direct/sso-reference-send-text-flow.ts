@@ -1,3 +1,4 @@
+import { timingSafeEqual } from 'node:crypto';
 import { addAbortListener } from 'node:events';
 import { isProxy, isSharedArrayBuffer, isUint8Array } from 'node:util/types';
 import type { SsoReferenceRegisterBorrowedOptions } from './sso-reference-register-flow';
@@ -35,6 +36,8 @@ export type SsoReferenceSendTextResult = Sso12RawResult<SsoSendTextOutcome>;
 const MAX_FIELD = 65535;
 const MAX_BODY = 64 * 1024;
 const COMMAND = 'MessageSvc.PbSendMsg';
+const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const hasOwn = Object.hasOwn;
 const typed = Object.getPrototypeOf(Uint8Array.prototype) as object;
 const length = Object.getOwnPropertyDescriptor(typed, 'byteLength')!.get!;
 const offset = Object.getOwnPropertyDescriptor(typed, 'byteOffset')!.get!;
@@ -43,6 +46,41 @@ const resizable = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'resiza
 const values = Uint8Array.prototype.values;
 const fill = Uint8Array.prototype.fill;
 const aborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted')!.get!;
+
+function assertSignerRequestUnchanged(
+    request: Parameters<SsoReferenceSendTextOptions['buildReserved']>[0],
+    uin: string,
+    uid: string,
+    sequence: number,
+    body: Uint8Array,
+    baseline: Uint8Array,
+): void {
+    const matches = (key: keyof typeof request, expected: unknown): boolean => {
+        const descriptor = getOwnPropertyDescriptor(request, key);
+        return !!descriptor && hasOwn(descriptor, 'value') && descriptor.value === expected;
+    };
+
+    try {
+        if (
+            !matches('uin', uin) ||
+            !matches('uid', uid) ||
+            !matches('command', COMMAND) ||
+            !matches('sequence', sequence) ||
+            !matches('body', body)
+        ) {
+            throw new Error();
+        }
+
+        values.call(body);
+        values.call(baseline);
+
+        if (length.call(body) !== length.call(baseline) || !timingSafeEqual(body, baseline)) {
+            throw new Error();
+        }
+    } catch {
+        throw new Error('signer input changed');
+    }
+}
 
 function wipe(value: Uint8Array | undefined): void {
     if (value) {
@@ -493,16 +531,18 @@ async function sendTextCore(
                     actualUin = identity.uin;
                     signerInput = Uint8Array.from(body);
                     owned.push(signerInput);
+                    const signerSequence = identity.sequence;
+                    const signerRequest = {
+                        uin,
+                        uid,
+                        sequence: signerSequence,
+                        command: COMMAND,
+                        body: signerInput,
+                    };
                     let signed: Uint8Array;
 
                     try {
-                        signed = await signer({
-                            uin,
-                            uid,
-                            sequence: identity.sequence,
-                            command: COMMAND,
-                            body: signerInput,
-                        });
+                        signed = await signer(signerRequest);
                     } finally {
                         if (binding) {
                             assertBinding(identity.uin);
@@ -510,14 +550,34 @@ async function sendTextCore(
                     }
 
                     assertActive();
+                    // Lasting scalar changes are also rejected; restored changes and
+                    // the bytes actually used by the signer remain outside this check.
+                    assertSignerRequestUnchanged(
+                        signerRequest,
+                        uin,
+                        uid,
+                        signerSequence,
+                        signerInput,
+                        body,
+                    );
+
+                    // Snapshot the output before cleanup: it may alias signerInput.
                     metadata = copyBytes(signed, MAX_FIELD);
                     const localGuid = copy(guid),
                         localKey = copy(key),
                         localD2 = copy(d2),
                         localA2 = copy(a2);
                     assertActive();
+                    assertSignerRequestUnchanged(
+                        signerRequest,
+                        uin,
+                        uid,
+                        signerSequence,
+                        signerInput,
+                        body,
+                    );
                     inner = encodeSso12Request({
-                        sequence: identity.sequence | 0,
+                        sequence: signerSequence | 0,
                         subAppId: subAppId as number,
                         a2: localA2,
                         command: COMMAND,
@@ -539,6 +599,14 @@ async function sendTextCore(
                         assertBinding(identity.uin);
                     }
 
+                    assertSignerRequestUnchanged(
+                        signerRequest,
+                        uin,
+                        uid,
+                        signerSequence,
+                        signerInput,
+                        body,
+                    );
                     return { frame: requestFrame, context: null };
                 } finally {
                     [body, signerInput, metadata, inner, ...local].forEach(wipe);

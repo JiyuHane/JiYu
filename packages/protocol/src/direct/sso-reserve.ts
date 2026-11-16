@@ -7,10 +7,25 @@ import { protobuf_encode } from '@snowluma/proton';
 // https://github.com/LagrangeDev/Lagrange.Core/blob/fe789c4a23796fbc82fa09e70a9c44c8a5cf2948/Lagrange.Core/Internal/Packets/Struct/SsoPacker.cs
 const MAX_METADATA_FIELD_BYTES = 64 * 1024;
 const MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024;
+const Uint8ArrayConstructor = Uint8Array;
+const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const hasOwn = Object.hasOwn;
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
 const typedArrayByteLength = Object.getOwnPropertyDescriptor(
-    Object.getPrototypeOf(Uint8Array.prototype),
+    typedArrayPrototype,
     'byteLength',
 )!.get!;
+const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
+const typedArrayValues = Uint8Array.prototype.values;
+const typedArrayFill = Uint8Array.prototype.fill;
+const arrayBufferByteLength = Object.getOwnPropertyDescriptor(
+    ArrayBuffer.prototype,
+    'byteLength',
+)!.get!;
+const arrayBufferResizable = Object.getOwnPropertyDescriptor(
+    ArrayBuffer.prototype,
+    'resizable',
+)?.get;
 
 export interface SsoSigningRequest {
     uin: string;
@@ -31,7 +46,13 @@ export interface SsoReserveBuilderOptions {
     uid?: string;
     /** The caller must decide which commands need a signature for its profile. */
     classifySigning: (command: string) => 'sign' | 'unsigned';
-    /** Caller-provided signer; no signing algorithm or remote service is built in. */
+    /**
+     * Caller-provided signer; no signing algorithm or remote service is built in.
+     * Its request fields must remain own data properties with their original values,
+     * and its private body copy must remain unchanged and attached at each check. This
+     * strictly rejects lasting scalar changes; it does not establish what was signed or
+     * detect changes restored before a check or made afterwards.
+     */
     sign?: (request: SsoSigningRequest) => Promise<SsoSignature>;
     /** Caller-provided profile values; neither is automatically set for any platform. */
     msgType?: number;
@@ -74,13 +95,69 @@ function snapshotSignatureField(value: unknown, name: string, nonempty: boolean)
         throw new TypeError(`invalid signature ${name}`);
     }
 
-    const snapshot = new Uint8Array(value);
+    const snapshot = new Uint8ArrayConstructor(value);
 
     if ((nonempty && snapshot.byteLength === 0) || snapshot.byteLength > MAX_METADATA_FIELD_BYTES) {
         throw new TypeError(`invalid signature ${name}`);
     }
 
     return snapshot;
+}
+
+function assertSignerBodyUnchanged(
+    body: Uint8Array,
+    baseline: Uint8Array,
+    expectedLength: number,
+): void {
+    try {
+        // Intrinsics reject detached views, including a detached zero-length view.
+        typedArrayValues.call(body);
+        const storage = typedArrayBuffer.call(body) as ArrayBuffer;
+        arrayBufferByteLength.call(storage); // Reject shared or invalid storage.
+
+        if (
+            arrayBufferResizable?.call(storage) ||
+            typedArrayByteLength.call(body) !== expectedLength
+        ) {
+            throw new Error();
+        }
+
+        // Both arrays are locally allocated ordinary views, and no caller code runs
+        // during this bounded comparison. Never consult shadowable body properties.
+        for (let i = 0; i < expectedLength; i++) {
+            if (body[i] !== baseline[i]) {
+                throw new Error();
+            }
+        }
+    } catch {
+        throw new Error('signer input changed');
+    }
+}
+
+function assertSignerRequestUnchanged(
+    request: SsoSigningRequest,
+    uin: string,
+    command: string,
+    sequence: number,
+    body: Uint8Array,
+    baseline: Uint8Array,
+    expectedLength: number,
+): void {
+    const matches = (key: keyof SsoSigningRequest, expected: unknown): boolean => {
+        const descriptor = getOwnPropertyDescriptor(request, key);
+        return !!descriptor && hasOwn(descriptor, 'value') && descriptor.value === expected;
+    };
+
+    if (
+        !matches('uin', uin) ||
+        !matches('command', command) ||
+        !matches('sequence', sequence) ||
+        !matches('body', body)
+    ) {
+        throw new Error('signer input changed');
+    }
+
+    assertSignerBodyUnchanged(body, baseline, expectedLength);
 }
 
 function makeTraceParent(): string {
@@ -92,7 +169,10 @@ function makeTraceParent(): string {
  * Create an account-bound builder compatible with TcpPacketClient.buildReserved.
  * Signature classification is explicit and a missing/invalid required signature
  * fails rather than silently emitting an unsigned request. The signer sees a copy
- * of the exact command body; mutations do not affect the packet being sent.
+ * of the command body and persistent mutations at callback completion are rejected.
+ * Callers must retain the matching payload through encoding; concurrent changes to
+ * the caller's input, including shared storage, are outside this local check.
+ * This does not prove signature authenticity or detect restored or later changes.
  */
 export function createSsoReserveBuilder(
     options: SsoReserveBuilderOptions,
@@ -143,43 +223,83 @@ export function createSsoReserveBuilder(
         }
 
         // Snapshot before invoking caller callbacks, including for unsigned requests.
-        const body = new Uint8Array(inputBody);
+        const body = new Uint8ArrayConstructor(inputBody);
 
         if (body.byteLength > MAX_REQUEST_BODY_BYTES) {
             throw new TypeError('invalid SSO request body');
         }
 
-        const traceParent = createTraceParent();
-        validateString(traceParent, 'trace parent', false);
-        const disposition = classifySigning(command);
-        let secureInfo: DirectSsoSecureInfo | undefined;
+        let signerWasCalled = false;
 
-        if (disposition === 'sign') {
-            if (typeof sign !== 'function') {
-                throw new Error('required SSO signer is missing');
+        try {
+            const traceParent = createTraceParent();
+            validateString(traceParent, 'trace parent', false);
+            const disposition = classifySigning(command);
+            let secureInfo: DirectSsoSecureInfo | undefined;
+
+            if (disposition === 'sign') {
+                if (typeof sign !== 'function') {
+                    throw new Error('required SSO signer is missing');
+                }
+
+                const baseline = new Uint8ArrayConstructor(body);
+                const expectedLength = typedArrayByteLength.call(baseline) as number;
+                const signerRequest = { uin, command, sequence, body };
+
+                try {
+                    signerWasCalled = true;
+                    const signature = await sign(signerRequest);
+
+                    assertSignerRequestUnchanged(
+                        signerRequest,
+                        uin,
+                        command,
+                        sequence,
+                        body,
+                        baseline,
+                        expectedLength,
+                    );
+
+                    if (!signature || typeof signature !== 'object') {
+                        throw new TypeError('invalid SSO signature');
+                    }
+
+                    // Snapshot each field before reading the next caller-controlled property.
+                    // A field may alias body, which remains available to the callback.
+                    const signBytes = snapshotSignatureField(signature.sign, 'sign', true);
+                    const token = snapshotSignatureField(signature.token, 'token', false);
+                    const extra = snapshotSignatureField(signature.extra, 'extra', false);
+                    // Signature field getters can run caller code after the first check.
+                    assertSignerRequestUnchanged(
+                        signerRequest,
+                        uin,
+                        command,
+                        sequence,
+                        body,
+                        baseline,
+                        expectedLength,
+                    );
+                    secureInfo = { sign: signBytes, token, extra };
+                } finally {
+                    typedArrayFill.call(baseline, 0);
+                }
+            } else if (disposition !== 'unsigned') {
+                throw new Error('invalid signature classification');
             }
 
-            const signature = await sign({
-                uin,
-                command,
-                sequence,
-                body,
-            });
-
-            if (!signature || typeof signature !== 'object') {
-                throw new TypeError('invalid SSO signature');
+            const reserve: DirectSsoReserve = {
+                traceParent,
+                uid,
+                msgType,
+                secureInfo,
+                ntCoreVersion,
+            };
+            return protobuf_encode<DirectSsoReserve>(reserve);
+        } finally {
+            // Existing callbacks may retain their input after returning.
+            if (!signerWasCalled) {
+                typedArrayFill.call(body, 0);
             }
-
-            // Snapshot each field before reading the next caller-controlled property.
-            const signBytes = snapshotSignatureField(signature.sign, 'sign', true);
-            const token = snapshotSignatureField(signature.token, 'token', false);
-            const extra = snapshotSignatureField(signature.extra, 'extra', false);
-            secureInfo = { sign: signBytes, token, extra };
-        } else if (disposition !== 'unsigned') {
-            throw new Error('invalid signature classification');
         }
-
-        const reserve: DirectSsoReserve = { traceParent, uid, msgType, secureInfo, ntCoreVersion };
-        return protobuf_encode<DirectSsoReserve>(reserve);
     };
 }

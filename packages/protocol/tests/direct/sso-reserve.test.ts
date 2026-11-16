@@ -19,7 +19,6 @@ describe('SSO reserved metadata builder', () => {
                 sequence: 0xffffffff,
             });
             expect(input.body).toEqual(Uint8Array.of(1, 2));
-            input.body.fill(9);
             return { sign: Uint8Array.of(1), token: Uint8Array.of(2), extra: Uint8Array.of(3) };
         });
         const builder = createSsoReserveBuilder({
@@ -63,12 +62,14 @@ describe('SSO reserved metadata builder', () => {
         async (stage) => {
             const originalBody = Buffer.from([1, 2]);
             const input = { uin: '123456', command: 'original', sequence: 42, body: originalBody };
+
             const mutate = () => {
                 input.command = 'changed';
                 input.sequence = 99;
                 originalBody.fill(8);
                 input.body = Buffer.from([9]);
             };
+
             const classify = vi.fn((command: string) => {
                 if (stage === 'classifier') {
                     mutate();
@@ -81,7 +82,6 @@ describe('SSO reserved metadata builder', () => {
                     expect(signed.command).toBe('original');
                     expect(signed.sequence).toBe(42);
                     expect(signed.body).toEqual(Uint8Array.of(1, 2));
-                    signed.body.fill(7);
                     return {
                         sign: Uint8Array.of(1),
                         token: new Uint8Array(),
@@ -124,7 +124,6 @@ describe('SSO reserved metadata builder', () => {
                 expect(signed.command).toBe('original');
                 expect(signed.sequence).toBe(42);
                 expect(signed.body).toEqual(Uint8Array.of(1, 2));
-                signed.body.fill(7);
                 return { sign: Uint8Array.of(1), token: new Uint8Array(), extra: new Uint8Array() };
             },
         );
@@ -146,6 +145,111 @@ describe('SSO reserved metadata builder', () => {
         expect(originalBody).toEqual(Uint8Array.of(8, 8));
         expect(input.body).toEqual(Uint8Array.of(9));
     });
+
+    it.each(['synchronous', 'asynchronous'] as const)(
+        'rejects a persistent %s signer-body mutation before downstream send',
+        async (timing) => {
+            const body = Uint8Array.of(1, 2);
+            const input = { ...request, body };
+            const send = vi.fn();
+            const sign = vi.fn(async (signed: { body: Uint8Array }) => {
+                if (timing === 'asynchronous') {
+                    await Promise.resolve();
+                }
+
+                signed.body[0] = 9;
+                return { sign: Uint8Array.of(3), token: Uint8Array.of(4), extra: Uint8Array.of(5) };
+            });
+            const builder = createSsoReserveBuilder({
+                uin: input.uin,
+                classifySigning: () => 'sign',
+                createTraceParent: () => 'a',
+                sign,
+            });
+
+            // The builder encodes metadata only; this fake models the downstream send.
+            await expect(builder(input).then(send)).rejects.toThrow();
+            expect(sign).toHaveBeenCalledOnce();
+            expect(body).toEqual(Uint8Array.of(1, 2));
+            expect(input.body).toBe(body);
+            expect(send).not.toHaveBeenCalled();
+        },
+    );
+
+    it('rejects a persistent signer-body mutation by a signature field getter', async () => {
+        const body = Uint8Array.of(1, 2);
+        const builder = createSsoReserveBuilder({
+            uin: request.uin,
+            classifySigning: () => 'sign',
+            createTraceParent: () => 'a',
+            sign: async (input) => ({
+                sign: Uint8Array.of(3),
+                token: Uint8Array.of(4),
+                get extra() {
+                    input.body[0] = 9;
+                    return Uint8Array.of(5);
+                },
+            }),
+        });
+
+        await expect(builder({ ...request, body })).rejects.toThrow('signer input changed');
+        expect(body).toEqual(Uint8Array.of(1, 2));
+    });
+
+    it('preserves the signer callback error', async () => {
+        const failure = new Error('synthetic signer failure');
+        const builder = createSsoReserveBuilder({
+            uin: request.uin,
+            classifySigning: () => 'sign',
+            createTraceParent: () => 'a',
+            sign: async () => {
+                throw failure;
+            },
+        });
+
+        await expect(builder(request)).rejects.toBe(failure);
+    });
+
+    it('allows a signer-body mutation restored before the callback returns', async () => {
+        const body = Uint8Array.of(1, 2);
+        const builder = createSsoReserveBuilder({
+            uin: request.uin,
+            classifySigning: () => 'sign',
+            createTraceParent: () => 'a',
+            sign: async (input) => {
+                input.body[0] = 9;
+                input.body[0] = 1;
+                return { sign: Uint8Array.of(3), token: Uint8Array.of(4), extra: Uint8Array.of(5) };
+            },
+        });
+
+        // This boundary comparison does not establish what the callback actually signed.
+        const parsed = protobuf_decode<DirectSsoReserve>(await builder({ ...request, body }));
+        expect(parsed.secureInfo?.sign).toEqual(Uint8Array.of(3));
+        expect(body).toEqual(Uint8Array.of(1, 2));
+    });
+
+    it.each(['sign', 'token', 'extra'] as const)(
+        'snapshots a %s output aliased to the signer input before cleanup',
+        async (field) => {
+            const body = Uint8Array.of(1, 2);
+            const builder = createSsoReserveBuilder({
+                uin: request.uin,
+                classifySigning: () => 'sign',
+                createTraceParent: () => 'a',
+                sign: async (input) => ({
+                    sign: Uint8Array.of(3),
+                    token: Uint8Array.of(4),
+                    extra: Uint8Array.of(5),
+                    [field]: input.body,
+                }),
+            });
+
+            const parsed = protobuf_decode<DirectSsoReserve>(await builder({ ...request, body }));
+            expect(parsed.secureInfo?.[field]).toEqual(Uint8Array.of(1, 2));
+            expect(body).toEqual(Uint8Array.of(1, 2));
+        },
+    );
 
     it('does not sign an originally unsigned command mutated by the classifier', async () => {
         const input = { uin: '123456', command: 'unsigned', sequence: 42, body: Uint8Array.of(1) };
@@ -203,6 +307,7 @@ describe('SSO reserved metadata builder', () => {
             createTraceParent: trace,
             sign,
         });
+
         for (const invalid of [
             { ...request, uin: '999' },
             { ...request, command: '' },
@@ -341,6 +446,7 @@ describe('SSO reserved metadata builder', () => {
         const token = Uint8Array.of(3);
         const extra = Buffer.from([4]);
         const iterator = vi.fn(() => [99][Symbol.iterator]());
+
         for (const value of [signBytes, token, extra]) {
             Object.defineProperty(value, Symbol.iterator, { value: iterator });
         }
@@ -351,12 +457,14 @@ describe('SSO reserved metadata builder', () => {
                 if (++reads.sign !== 1) {
                     throw new Error('sign was read twice');
                 }
+
                 return signBytes;
             },
             get token() {
                 if (++reads.token !== 1) {
                     throw new Error('token was read twice');
                 }
+
                 signBytes.fill(9);
                 return token;
             },
@@ -364,6 +472,7 @@ describe('SSO reserved metadata builder', () => {
                 if (++reads.extra !== 1) {
                     throw new Error('extra was read twice');
                 }
+
                 token.fill(9);
                 return extra;
             },

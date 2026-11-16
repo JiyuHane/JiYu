@@ -1245,7 +1245,13 @@ remain to be recovered and independently verified.
   subclasses remain accepted, but customized subclass iterators are not used.
   Signature fields are read once and independently copied using their actual
   typed-array lengths; a nonempty sign and the per-field limit are enforced on
-  those copies. This does not establish the authenticity of a returned signature.
+  those copies. The signer must leave the callback request's own account, command,
+  sequence and body view unchanged, with body bytes intact at validation points;
+  lasting changes are rejected, including changes during signature-field getters.
+  Register and send-text reference flows also check the callback UID before
+  handing off a frame. This intentionally tightens the callback contract. The
+  check cannot observe changes made and restored between checks, later changes,
+  or the bytes actually used by a signer; it does not establish authenticity.
   Adapters targeting a signed-int32 API must preserve the sequence's bit pattern.
 - `src/direct/lagrange-v2-milky-signer.ts` independently adapts that callback to
   the V2 Milky external signing-service contract using a caller-injected

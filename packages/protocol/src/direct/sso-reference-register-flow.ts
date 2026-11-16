@@ -1,3 +1,4 @@
+import { timingSafeEqual } from 'node:crypto';
 import { addAbortListener } from 'node:events';
 import type { Socket } from 'node:net';
 import { isProxy } from 'node:util/types';
@@ -59,6 +60,8 @@ export type SsoReferenceRegisterBorrowedOptions = Omit<
 
 export type SsoReferenceRegisterResult = Sso12RawResult<SsoRegisterOutcome>;
 const MAX_FIELD = 65535;
+const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const hasOwn = Object.hasOwn;
 const typed = Object.getPrototypeOf(Uint8Array.prototype) as object;
 const lengthGetter = Object.getOwnPropertyDescriptor(typed, 'byteLength')!.get!;
 const bufferGetter = Object.getOwnPropertyDescriptor(typed, 'buffer')!.get!;
@@ -71,6 +74,44 @@ const sharedGetter = Object.getOwnPropertyDescriptor(
 const abortedGetter = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted')!.get!;
 const values = Uint8Array.prototype.values;
 const fill = Uint8Array.prototype.fill;
+
+function assertSignerRequestUnchanged(
+    request: Parameters<SsoReferenceRegisterOptions['buildReserved']>[0],
+    uin: string,
+    uid: string,
+    sequence: number,
+    body: Uint8Array,
+    baseline: Uint8Array,
+): void {
+    const matches = (key: keyof typeof request, expected: unknown): boolean => {
+        const descriptor = getOwnPropertyDescriptor(request, key);
+        return !!descriptor && hasOwn(descriptor, 'value') && descriptor.value === expected;
+    };
+
+    try {
+        if (
+            !matches('uin', uin) ||
+            !matches('uid', uid) ||
+            !matches('command', SSO_INFO_SYNC_COMMAND) ||
+            !matches('sequence', sequence) ||
+            !matches('body', body)
+        ) {
+            throw new Error();
+        }
+
+        values.call(body);
+        values.call(baseline);
+
+        if (
+            lengthGetter.call(body) !== lengthGetter.call(baseline) ||
+            !timingSafeEqual(body, baseline)
+        ) {
+            throw new Error();
+        }
+    } catch {
+        throw new Error('signer input changed');
+    }
+}
 
 function wipe(value: Uint8Array | undefined): void {
     if (value) {
@@ -500,13 +541,27 @@ async function registerFlow(
                         assertActive();
                     }
 
-                    const signed = await signer({
+                    const signerSequence = identity.sequence;
+                    const signerRequest = {
                         uin,
                         uid,
-                        sequence: identity.sequence,
+                        sequence: signerSequence,
                         command: SSO_INFO_SYNC_COMMAND,
                         body: signerInput,
-                    });
+                    };
+                    const signed = await signer(signerRequest);
+                    assertActive();
+                    // Lasting scalar changes are also rejected; restored changes and
+                    // the bytes actually used by the signer remain outside this check.
+                    assertSignerRequestUnchanged(
+                        signerRequest,
+                        uin,
+                        uid,
+                        signerSequence,
+                        signerInput,
+                        body,
+                    );
+
                     assertActive();
                     // Take the output snapshot before clearing any aliased callback input.
                     metadata = bytes(signed, MAX_FIELD);
@@ -515,8 +570,16 @@ async function registerFlow(
                     const localD2 = copy(d2),
                         localA2 = copy(a2);
                     assertActive();
+                    assertSignerRequestUnchanged(
+                        signerRequest,
+                        uin,
+                        uid,
+                        signerSequence,
+                        signerInput,
+                        body,
+                    );
                     inner = encodeSso12Request({
-                        sequence: identity.sequence | 0,
+                        sequence: signerSequence | 0,
                         subAppId: subAppId as number,
                         a2: localA2,
                         command: SSO_INFO_SYNC_COMMAND,
@@ -533,6 +596,14 @@ async function registerFlow(
                         body: inner,
                     });
                     assertActive();
+                    assertSignerRequestUnchanged(
+                        signerRequest,
+                        uin,
+                        uid,
+                        signerSequence,
+                        signerInput,
+                        body,
+                    );
                     return { frame: requestFrame, context: null };
                 } finally {
                     [body, signerInput, metadata, inner, ...local].forEach(wipe);
