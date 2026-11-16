@@ -1,4 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
+import { protobuf_decode } from '@snowluma/proton';
+import type { OidbBase } from '@snowluma/proto-defs/oidb';
+import type { OidbRenameGroup } from '@snowluma/proto-defs/oidb-actions/base';
+import { SetGroupName } from '../../../protocol/src/oidb-services/group-admin/set-group-name';
 import { ApiHandler, type ApiActionContext } from '../../src/api-handler';
 import { V12Dispatcher } from '../../src/v12/dispatcher';
 import type { V11ActionHandler, V12CoreOptions } from '../../src/v12/types';
@@ -40,7 +44,7 @@ describe('v12 set_group_name with synthetic v11 responses', () => {
         for (const [group_id, group_name, echo] of [
             ['42', 'fixture', 'reply'],
             ['1', '', ''],
-            ['9007199254740991', ' 群🪶e\u0301 ', 'unicode'],
+            ['4294967295', ' 群🪶e\u0301 ', 'unicode'],
         ] as const) {
             const { dispatcher, handle, getStatus } = setup(async () => ok());
             expect(
@@ -61,6 +65,82 @@ describe('v12 set_group_name with synthetic v11 responses', () => {
 
         const { dispatcher } = setup(async () => ok());
         expect(await dispatcher.handle(request(valid))).not.toHaveProperty('echo');
+    });
+
+    it('enforces the uint32 boundary before the v11 handler and preserves error priority', async () => {
+        const { dispatcher, handle } = setup(async () => ok());
+
+        for (const group_id of ['4294967296', '4294967338', '9007199254740991']) {
+            expect(
+                await dispatcher.handle(request({ group_id, group_name: 'x' }, { echo: '' })),
+            ).toEqual({
+                status: 'failed',
+                retcode: 10003,
+                data: null,
+                message: 'invalid group_id or group_name',
+                echo: '',
+            });
+        }
+
+        const oversized = { group_id: '4294967338', group_name: 'x' };
+        expect(
+            await dispatcher.handle(request({ ...oversized, extra: true }, { echo: 'param' })),
+        ).toMatchObject({ retcode: 10004, message: 'unsupported parameter', echo: 'param' });
+        expect(
+            await dispatcher.handle(request(oversized, { extra: true, echo: 'request' })),
+        ).toMatchObject({ retcode: 10004, message: 'unsupported request field', echo: 'request' });
+        expect(await dispatcher.handle(request(oversized, { echo: 1 }))).toMatchObject({
+            retcode: 10001,
+            message: 'invalid action request',
+        });
+
+        const prepared = dispatcher
+            .createInternalHttpPreflight()
+            .classify(request(oversized, { echo: '' }));
+        expect(prepared.kind).toBe('ordinary');
+
+        if (prepared.kind !== 'ordinary') {
+            throw new Error('expected ordinary token');
+        }
+
+        expect(await dispatcher.handlePreparedOrdinary(prepared.token)).toMatchObject({
+            retcode: 10003,
+            message: 'invalid group_id or group_name',
+            echo: '',
+        });
+        expect(handle).not.toHaveBeenCalled();
+    });
+
+    it('uses the real OIDB codec to expose truncation and preserve the accepted boundary', async () => {
+        const encode = (groupUin: number) =>
+            SetGroupName.encode({
+                command: SetGroupName.command,
+                subCommand: SetGroupName.subCommand,
+                body: { groupUin, body: { targetName: 'fixture' } },
+            });
+        const decode = (bytes: Uint8Array) => protobuf_decode<OidbBase<OidbRenameGroup>>(bytes);
+
+        // This direct codec control illustrates the downstream alias without sending anything.
+        expect(decode(encode(4294967338)).body).toMatchObject({
+            groupUin: 42,
+            body: { targetName: 'fixture' },
+        });
+
+        const { dispatcher, handle } = setup(async (_action, params) => {
+            const { group_id } = params as { group_id: number };
+            expect(decode(encode(group_id)).body).toMatchObject({
+                groupUin: 4294967295,
+                body: { targetName: 'fixture' },
+            });
+            return ok();
+        });
+        expect(
+            await dispatcher.handle(request({ group_id: '4294967295', group_name: 'fixture' })),
+        ).toEqual({ status: 'ok', retcode: 0, data: null, message: '' });
+        expect(handle).toHaveBeenCalledExactlyOnceWith('set_group_name', {
+            group_id: 4294967295,
+            group_name: 'fixture',
+        });
     });
 
     it('rejects noncanonical, unsafe or non-string group IDs before effects', async () => {

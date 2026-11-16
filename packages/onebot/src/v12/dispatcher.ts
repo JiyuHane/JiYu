@@ -390,7 +390,8 @@ export class V12Dispatcher {
 
             const groupId = parseAccountId(params.group_id);
 
-            if (groupId === null || typeof params.group_name !== 'string') {
+            // OidbRenameGroup.groupUin is uint32; larger IDs would be truncated downstream.
+            if (groupId === null || groupId > 0xffffffff || typeof params.group_name !== 'string') {
                 return response(10003, 'invalid group_id or group_name', null, echo);
             }
 
@@ -1071,6 +1072,11 @@ export class V12Dispatcher {
 
                 message.push({ type: 'at', data: { qq: 'all' } });
             }
+        }
+
+        // RoutingC2C.uin is uint32; preserve segment validation before blocking truncation.
+        if (params.detail_type === 'private' && target > 0xffffffff) {
+            return response(10003, 'invalid target or message', null, echo);
         }
 
         try {

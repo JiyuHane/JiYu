@@ -43,8 +43,9 @@ configuration writers and backup restores do not share a revision lock.
 The core currently handles `get_version`, `get_status`, `get_supported_actions`,
 `get_self_info`, `get_user_info`, `get_friend_list`, `get_group_info`, `get_group_list`, `send_message` for private and group text messages and group
 mentions, `delete_message`, and `set_group_name`. The latter requires a canonical positive
-safe-integer group ID encoded as a string and a string group name, including an
-empty string; it forwards one request to the existing account-local v11 handler.
+uint32 group ID encoded as a string and a string group name, including an empty
+string; it forwards one request to the existing account-local v11 handler. The
+uint32 limit prevents truncation in the downstream group-name encoding.
 Success requires that handler to return an explicit `ok`/zero retcode with null
 `data`. This is the handler's result, not independent confirmation of QQ-side
 state. A malformed response or failure leaves the outcome potentially uncertain;
@@ -101,9 +102,10 @@ preserves the v11 fields without independently verifying QQ identity, event, or
 time. Canonical positive safe-integer IDs are required, including for string
 inputs. An existing v11 group `message_sent` event with subtype `normal` is
 translated as a group message only when its `user_id` equals the configured
-account and its nonnegative finite timestamp does not exceed JavaScript's safe
-integer maximum. This local bound keeps this new projection within the SDK and
-internal poll JSON number limits; it does not alter ordinary incoming messages.
+account. Converted message, notice and generated meta event timestamps must be
+nonnegative, finite and at most JavaScript's safe integer maximum; fractional
+values within that range remain accepted. This local bound keeps the v12 projection
+within the SDK and internal poll JSON number limits; it does not alter v11 events.
 This reports the existing self echo; it does not independently confirm send,
 receipt or delivery. A private friend self echo with the same account identity and
 a visible valid v11 `target_id` maps to a private message with the target retained
@@ -298,6 +300,11 @@ fallback warning omits exception details; v11 response and observer semantics
 remain unchanged. Observers and debug streams can still see raw results and
 independently traverse or disclose them, and other layers retain their own risks.
 See the [group action definition](https://12.onebot.dev/interface/group/actions/#get_group_list).
+
+For private `send_message`, the target `user_id` must be a canonical positive
+uint32 decimal string; larger values return `10003` before the v11 handler is
+called, avoiding truncation in the downstream private routing field. This does
+not narrow the group target ID range.
 
 For group `send_message`, a v12 `mention` with `data.user_id` as a canonical
 positive decimal string in the UIN range 1 through 4294967295 maps to the

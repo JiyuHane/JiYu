@@ -169,9 +169,9 @@ describe('synthetic V11 group self-sent to V12', () => {
             time: 1700000000.25,
         });
         expect(() => convertV11Event({ ...sent, time: 1e20 }, self)).toThrow();
-        expect(
+        expect(() =>
             convertV11Event({ ...sent, post_type: 'message', user_id: 42, time: 1e20 }, self),
-        ).toMatchObject({ time: 1e20, user_id: '42' });
+        ).toThrow('invalid V11 message event');
     });
 
     it('accepts canonical string account identifiers, an empty message and empty text', () => {

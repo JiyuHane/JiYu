@@ -3,6 +3,17 @@ import { isProxy } from 'node:util/types';
 import type { V12ConvertedEvent, V12MessageEvent, V12Self } from './types';
 import { fromV11AccountId, fromV11MessageId, isObject, isSelf } from './validation';
 
+// V12 timestamps retain fractional Unix seconds, but must also survive the SDK's
+// JSON-number validation. Match the existing self-sent nonnegative safe range.
+function isV12Time(value: unknown): value is number {
+    return (
+        typeof value === 'number' &&
+        Number.isFinite(value) &&
+        value >= 0 &&
+        value <= Number.MAX_SAFE_INTEGER
+    );
+}
+
 /** Distinguishes unsupported self-sent semantics from malformed V11 input. */
 export class V12UnsupportedEventError extends Error {
     readonly reason = 'self_sent_message';
@@ -35,9 +46,7 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
                     (key) => typeof key !== 'string' || !fields.includes(key),
                 ) ||
                 userId === null ||
-                typeof input.time !== 'number' ||
-                !Number.isFinite(input.time) ||
-                input.time < 0
+                !isV12Time(input.time)
             ) {
                 throw new Error('invalid or unsupported V11 friend add event');
             }
@@ -83,9 +92,7 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
                 groupId === null ||
                 operatorId === null ||
                 userId === null ||
-                typeof input.time !== 'number' ||
-                !Number.isFinite(input.time) ||
-                input.time < 0 ||
+                !isV12Time(input.time) ||
                 (!unknownInvitor && !(input.invitor_status === 'known' && knownInvitor !== null))
             ) {
                 throw new Error('invalid or unsupported V11 group increase event');
@@ -141,9 +148,7 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
                 groupId === null ||
                 operatorId === null ||
                 userId === null ||
-                typeof input.time !== 'number' ||
-                !Number.isFinite(input.time) ||
-                input.time < 0
+                !isV12Time(input.time)
             ) {
                 throw new Error('invalid or unsupported V11 group decrease event');
             }
@@ -190,9 +195,7 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
             operatorId === null ||
             userId === null ||
             messageId === null ||
-            typeof input.time !== 'number' ||
-            !Number.isFinite(input.time) ||
-            input.time < 0
+            !isV12Time(input.time)
         ) {
             throw new Error('invalid or unsupported V11 group recall event');
         }
@@ -289,10 +292,7 @@ export function convertV11Event(input: unknown, self: V12Self): V12ConvertedEven
         messageId === null ||
         userId === null ||
         (detail === 'group' && groupId === null) ||
-        typeof input.time !== 'number' ||
-        !Number.isFinite(input.time) ||
-        input.time < 0 ||
-        (isSent && input.time > Number.MAX_SAFE_INTEGER) ||
+        !isV12Time(input.time) ||
         typeof input.raw_message !== 'string' ||
         !Array.isArray(input.message)
     ) {
@@ -375,7 +375,7 @@ export function createConnectEvent(
     version: { impl: string; version: string },
     now = Date.now() / 1000,
 ) {
-    if (!version.impl || !version.version || !Number.isFinite(now) || now < 0) {
+    if (!version.impl || !version.version || !isV12Time(now)) {
         throw new Error('invalid V12 connect event inputs');
     }
 
@@ -390,7 +390,7 @@ export function createConnectEvent(
 }
 
 export function createHeartbeatEvent(interval: number, now = Date.now() / 1000) {
-    if (!Number.isSafeInteger(interval) || interval <= 0 || !Number.isFinite(now) || now < 0) {
+    if (!Number.isSafeInteger(interval) || interval <= 0 || !isV12Time(now)) {
         throw new Error('invalid V12 heartbeat event inputs');
     }
 
@@ -413,8 +413,7 @@ export function createStatusUpdateEvent(
         !isSelf(self) ||
         typeof status.good !== 'boolean' ||
         typeof status.online !== 'boolean' ||
-        !Number.isFinite(now) ||
-        now < 0
+        !isV12Time(now)
     ) {
         throw new Error('invalid V12 status event inputs');
     }
