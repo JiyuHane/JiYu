@@ -46,7 +46,11 @@ export interface PluginContext {
     readonly configPath: string;
     readonly dataPath: string;
     readonly adapterName: string;
-    readonly pluginManager: { readonly config: unknown };
+    readonly pluginManager: {
+        readonly config: unknown;
+        getPluginDataPath(pluginId: string): string;
+        getPluginConfigPath(pluginId: string): string;
+    };
     readonly logger: Record<LogLevel, (...args: unknown[]) => void>;
     readonly actions: {
         call(
@@ -718,15 +722,46 @@ export class PluginHost {
                 const current = slot;
                 this.initializingSlots.set(id, slot);
                 const adapterName = 'Jiyu OneBot v11';
-                const manager = new Proxy(Object.freeze({ config: this.options.managerConfig }), {
-                    get(target, key, receiver) {
-                        if (key === 'config') {
-                            return Reflect.get(target, key, receiver);
-                        }
+                const manager = new Proxy(
+                    Object.freeze({
+                        config: this.options.managerConfig,
+                        getPluginDataPath: (pluginId: string): string => {
+                            if (typeof pluginId !== 'string' || pluginId !== id) {
+                                const error = new UnsupportedPluginFeatureError(
+                                    'pluginManager.getPluginDataPath',
+                                );
+                                error.stack = `${error.name}: ${error.message}`;
+                                throw error;
+                            }
 
-                        throw new UnsupportedPluginFeatureError('pluginManager.' + String(key));
+                            return dataReal;
+                        },
+                        getPluginConfigPath: (pluginId: string): string => {
+                            if (typeof pluginId !== 'string' || pluginId !== id) {
+                                const error = new UnsupportedPluginFeatureError(
+                                    'pluginManager.getPluginConfigPath',
+                                );
+                                error.stack = `${error.name}: ${error.message}`;
+                                throw error;
+                            }
+
+                            return configPath;
+                        },
+                    }),
+                    {
+                        get(target, key, receiver) {
+                            if (
+                                key === 'config' ||
+                                key === 'getPluginDataPath' ||
+                                key === 'getPluginConfigPath'
+                            ) {
+                                return Reflect.get(target, key, receiver);
+                            }
+
+                            throw new UnsupportedPluginFeatureError('pluginManager.' + String(key));
+                        },
                     },
-                });
+                );
 
                 const log =
                     (level: LogLevel) =>

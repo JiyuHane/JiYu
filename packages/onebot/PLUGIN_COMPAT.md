@@ -28,16 +28,26 @@ provider.
 
 The first compatibility subset uses OneBot v11 actions and events. It supports
 selected lifecycle callbacks and a limited account-scoped `actions.call`
-bridge, static JSON configuration schema, explicit configuration hooks, and a
-partial data-only `NapCatConfig` builder. The builder supports `text`, `number`,
-`boolean`, `select`, `multiSelect`, `html`, `plainText`, and `combine`. The
+bridge, two current-plugin path queries, static JSON configuration schema,
+explicit configuration hooks, and a partial data-only `NapCatConfig` builder.
+The builder supports `text`, `number`, `boolean`, `select`, `multiSelect`, `html`,
+`plainText`, and `combine`. The
 display methods return untrusted strings as data, not rendered or executed HTML;
 their empty labels cause rejection by the current configuration editor. Their
 UUID-derived keys are an independent strategy, not a claim about the upstream
 random algorithm or collision guarantees. Reactive flags are metadata only. It
 does not recreate the NapCat internal `core`, `oneBot`, `router`, complete
 plugin manager, dynamic configuration controllers or cross-plugin exports.
-Plugins that require those interfaces may fail explicitly.
+Plugins that require those interfaces may fail explicitly. The two manager path
+methods, `getPluginDataPath` and `getPluginConfigPath`, accept only the current
+plugin's exact ID and return the same strings already exposed as `dataPath` and
+`configPath`. Other IDs and other manager methods remain unsupported. Calling
+these methods performs no filesystem access and does not prove that a directory
+exists, that an activation is still live, or that resources have stopped; a
+retained old context can still hold its already disclosed strings. This narrower
+subset does not establish general NapCat compatibility or same-process
+isolation.
+
 A plugin that appears in the index is not necessarily usable in Jiyu. The supported
 hooks, entry-point rules, action behavior and queue limits are described in the
 [host implementation notes](./src/plugin-host/README.md).
@@ -150,7 +160,7 @@ Archive downloads, store installation, updates and online rollback are separate
 work; do not interpret catalog browsing or a local compatibility test as their
 completion. An internal [offline ZIP preflight](../core/src/webui/plugin-install/README.md)
 checks a limited ZIP32 stored/raw-DEFLATE subset and is not an installer;
-common community ZIPs with extra fields, descriptors or non-ASCII paths remain
-outside the profile. The host and index can be tested
+a single matching mtime-only `0x5455` extra field is supported, while other extra
+fields, descriptors and non-ASCII paths remain outside the profile. The host and index can be tested
 with synthetic local plugins without running QQ. Real plugin and QQ
 interoperability require separate validation.
