@@ -75,6 +75,7 @@ const sharedBufferLength = Object.getOwnPropertyDescriptor(
     'byteLength',
 )!.get!;
 const copyBytes = Uint8Array.prototype.set;
+const fillBytes = Uint8Array.prototype.fill;
 
 function record(value: unknown, allowed: readonly string[]): Record<string, unknown> {
     if (value === null || typeof value !== 'object' || isProxy(value)) {
@@ -161,6 +162,102 @@ function snapshot(view: ByteView | undefined, owned: Uint8Array[]): Uint8Array |
 
 function lengthDelimitedSize(tag: number, length: number | undefined): number {
     return length === undefined ? 0 : varintSize(tag * 8 + 2) + varintSize(length) + length;
+}
+
+function clearMsfSignBytes(value: Uint8Array | undefined): boolean {
+    if (value === undefined) {
+        return true;
+    }
+
+    try {
+        fillBytes.call(value, 0);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Decode caller-supplied bytes using only the successful 0x300-byte output model.
+ * The caller-supplied Linux x64 QQ 3.2.35 wrapper.node static observations link
+ * 0x352329a to 0x6856284, use of the output to eax == 0, and copying into the
+ * three result slots to 0x3523301–0x3523346. The model reads lengths at 0xff,
+ * 0x1ff and 0x2ff and opaque payloads at 0, 0x100 and 0x200, respectively.
+ *
+ * This function reads no binary, process or network, calls no target function,
+ * and generates or verifies no signature. It establishes no QQ authenticity;
+ * whether the target function is called dynamically remains unknown. Its three
+ * separate caller-owned results can be passed to
+ * encodeTargetSso12ReserveFromNativeSlots. Local snapshots and undelivered
+ * results are cleared best effort; the caller owns cleanup of delivered results.
+ */
+export function decodeTargetMsfSignOutput(
+    status: number,
+    bytes: Uint8Array,
+): NativeSignResultPayloads {
+    const snapshots: Uint8Array[] = [];
+    let at00: Uint8Array | undefined;
+    let at18: Uint8Array | undefined;
+    let at30: Uint8Array | undefined;
+    let result: NativeSignResultPayloads | undefined;
+    let snapshotsCleared = true;
+
+    try {
+        const view = inspectBytes(bytes);
+
+        if (status !== 0 || view.length !== 0x300) {
+            throw new TypeError('invalid output');
+        }
+
+        const copy = snapshot(view, snapshots);
+
+        if (copy === undefined) {
+            throw new TypeError('invalid output');
+        }
+
+        const length00 = copy[0xff];
+        const length18 = copy[0x1ff];
+        const length30 = copy[0x2ff];
+        at00 = new Uint8Array(length00);
+
+        for (let index = 0; index < length00; index++) {
+            at00[index] = copy[index];
+        }
+
+        at18 = new Uint8Array(length18);
+
+        for (let index = 0; index < length18; index++) {
+            at18[index] = copy[0x100 + index];
+        }
+
+        at30 = new Uint8Array(length30);
+
+        for (let index = 0; index < length30; index++) {
+            at30[index] = copy[0x200 + index];
+        }
+
+        result = { at00, at18, at30 };
+    } catch {
+        // Sanitize errors after cleanup without exposing input or native details.
+    } finally {
+        for (const copy of snapshots) {
+            if (!clearMsfSignBytes(copy)) {
+                snapshotsCleared = false;
+            }
+        }
+
+        if (result === undefined || !snapshotsCleared) {
+            clearMsfSignBytes(at00);
+            clearMsfSignBytes(at18);
+            clearMsfSignBytes(at30);
+        }
+    }
+
+    if (result === undefined || !snapshotsCleared) {
+        throw new Error('target msf sign output decoding failed');
+    }
+
+    return result;
 }
 
 /**

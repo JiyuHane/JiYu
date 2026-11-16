@@ -371,21 +371,67 @@ but agreement is not proof of binary compatibility or shared implementation.
 The path from `0x66672f0` reaches `0x66678b0`, whose call at `0x6667929` uses an
 unresolved receiver's virtual slot `+0x20`. Only **if** that receiver selects the
 observed V12 head encoder at `0x6669490` does its call at `0x6669727` pass the
-request to the field-24 builder at `0x666a1d0`. The virtual receiver, concrete
-signing callback, complete input provenance, runtime reachability, signature
-algorithm and usable signing service remain unestablished.
+request to the field-24 builder at `0x666a1d0`. That V12 virtual receiver,
+the callback actually selected at runtime, complete input provenance, runtime
+reachability, signature algorithm and usable signing service remain unestablished.
 
 The observed getter `0x6613810` copies a global object/control-pointer pair and
-increments a reference count; `0x66137b0` sets
-that pair from an input supplied elsewhere. A bounded inspection identifies
-`0x6613200` as one caller: it copies its caller-supplied pair into a temporary
-and passes that pair to `0x66137b0`. The getter and setter access the two global
-slots separately; these windows do not establish an atomic snapshot or exclude
-external synchronization. They also do not identify the input object's dynamic
-type, its constructor, or a connection to the `channel+0x38` receiver. Searches
-for the wrapper's callers were limited to selected instruction forms and address
-ranges; indirect calls, other encodings and other modules remain possible. A complete inventory of this
-ELF's 885 defined default/protected dynamic exports contains no symbol whose
+increments a reference count; `0x66137b0` sets that pair. Its caller `0x6613200`
+copies a caller-supplied pair into a temporary and passes it to the setter. The
+getter and setter access the two global slots separately; these windows do not
+establish an atomic snapshot or exclude external synchronization. A static byte
+scan of the executable PT_LOAD range for direct x86-64 `E8` relative calls to
+`0x6613200` identified four candidates at `0x3526fb5`, `0x3528b39`,
+`0x354ced3`, and `0x354e624`. In each corresponding inspected instruction
+window, the code first calls constructor `0x351fb20` and passes its constructed
+object/control pair to `0x6613200`. Byte-pattern hits are not instruction
+boundary proof by themselves; indirect calls, other encodings, other modules,
+and other ways to mutate or replace the global pair remain outside that scan.
+
+The constructor writes `0x8e80f38` as the object's virtual-table address point.
+For this exact ELF, the slot at VA `0x8e80f48` has file offset `0x8e7ef48` and a
+zero raw qword. Its `R_X86_64_RELATIVE` relocation at file offset `0x14a0f8` has
+addend `0x3523110`; applying that relocation statically yields this candidate
+for the virtual `+0x10` slot invoked at `0x66734e1`. This identifies a candidate
+callback type on those four paths, not the global object's actual runtime value.
+The code at `0x3523110` is associated with diagnostic strings
+`msf_security_sign_callback.cc` and `MSFSign`; it passes a command string, a
+buffer and length, an unclassified 32-bit value, and an output region to
+`0x6856284` at `0x352329a`. On zero return, `0x3523301–0x3523346` copies
+three bounded representations into the three-string result. The locally
+inspected success-length formatter associates them with the candidate names
+token, extra and sign as described above. The names do not by themselves prove
+cryptographic semantics or compatibility with another implementation.
+
+In the inspected `0x6856284` window, the caller return address is supplied to
+`dladdr`; its `0x68563e0` call passes the 32-bit value to `%d` decimal
+formatting, which interprets those bits as a signed integer. This alone does not
+identify the value as an SSO sequence. The windows at `0x6856444`, `0x6856461`,
+and `0x68564af` call internal targets `0x68418ac`,
+`0x683fa74`, and `0x6830c58` respectively. Later inspected copy sites read the
+same stack slots into output regions `+0x200`, `+0x100`, and `+0x00`,
+corresponding to the candidate sign, extra, and token slots. Associating the
+calls with those copies requires the intermediate values to survive the
+intervening control flow without replacement or aliasing. In bounded linear
+samples from each callee entry, `0x68418ac` saves the command, decimal 32-bit value and body string,
+then reaches code using a global object at `0x917b5e0`; its visible bit-length
+operations do not identify a particular hash or signature algorithm. In the
+sample from `0x683fa74`, code uses the command and body and contains several
+command-string comparisons whose values and reachability were not established.
+The sample from `0x6830c58` accesses global objects at `0x917b530` and
+`0x917b860` and contains a possible `time` call; the sample does not prove the
+clock value reaches the returned token. Each window is limited to at most
+`0x1000` linear bytes and is not a complete control-flow graph or proof that
+every observed branch executes. The callees contain flattened control flow and
+have not been fully reconstructed; these local calls do not establish the
+algorithm, exclude deeper network or asynchronous effects, or prove that the
+supplied file-signature ZIP implements this callback. In another initialization
+window, an `O3CmdListNotify` pointer is passed to `0x686365f`,
+whose inspected entry byte is `c3` (`ret`); the call alone is not evidence that
+a notification was registered or processed. None of these static observations
+is a live invocation or a successful signature.
+
+A complete inventory of this ELF's 885 defined default/protected dynamic exports contains no symbol whose
 value equals `0x6613200` or `0x66137b0` (REA evidence
 `ev_6829f3d51f172faae17c5de300ab034d8496bae4e5913bea953c39d2f68b7722`).
 This does not rule out local/hidden symbols, indirect calls, bindings or code in
@@ -1042,8 +1088,14 @@ remain to be recovered and independently verified.
   bytes for the observed `+0x00`, `+0x18` and `+0x30` string-like result slots
   and maps them to field-24 children 2, 3 and 1 respectively. It does not read a
   native object, implement a signer, choose a command or establish runtime field
-  semantics. The `GetSignInfo` length labels discussed above are candidates;
-  neither encoder is a complete model of the target reserve.
+  semantics. `decodeTargetMsfSignOutput` separately models the observed successful
+  768-byte callback output: a caller supplies status zero and a byte snapshot;
+  lengths at `0xff`, `0x1ff` and `0x2ff` select contents at `0x00`, `0x100`
+  and `0x200`. The three returned copies can be supplied to the slot encoder.
+  It does not call the callback or obtain native memory, and a caller-provided
+  buffer is not evidence that the target produced it. The `GetSignInfo` length
+  labels discussed above are candidates; neither encoder is a complete model of
+  the target reserve.
 - `src/direct/target-sso12-head.ts` encodes the statically observed V12 request
   header. The sequence, context numbers, opaque byte strings and already-encoded
   reserve are explicit inputs; it does not infer their semantics or create a
