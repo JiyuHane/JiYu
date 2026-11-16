@@ -2108,11 +2108,14 @@ remain to be recovered and independently verified.
   lease and an explicit caller policy; it does not authenticate its fake peer. The
   adapter does not persist tickets or connect the production Bridge; live
   interoperability is unverified.
-- `src/direct/linux-easy-key-capability.ts` is an unconnected internal reference
-  for a future EasyLogin/multiplexer handoff. A module-local lease claim and opaque
-  token hold a tentative D2 key; an explicit comparison can commit it, and a
-  failed commit after resolving that tentative slot revokes it. Explicit revoke is
-  still required on cancellation or other outer failures. The caller owns and must
+- `src/direct/linux-easy-key-capability.ts` and the internal
+  `referenceLinuxEasyLoginWithKeyCapability` entry implement part of an
+  EasyLogin/multiplexer handoff. A module-local lease claim and opaque token
+  identify a single login attempt; the consumer validates explicit zero status
+  and ticket shapes and stages the D2 key synchronously before returning. An
+  explicit key comparison can commit it, and a failed commit after resolving
+  that tentative slot revokes it. Flow failure or cancellation requests revoke;
+  the owner must also revoke on outer failures. The caller owns and must
   wipe its original key, ticket and body copies; token garbage collection does not
   guarantee erasure. Parsing under the tentative or active key returns only local
   service/SSO metadata and a caller-owned payload, not the key; decryption and
@@ -2120,8 +2123,15 @@ remain to be recovered and independently verified.
   operation-specific matching by the future owner. The 16 MiB frame limit is not
   a CPU, latency or peak-memory limit: callers need a smaller business-specific
   cap before invoking the synchronous decoder. Existing QQ-TEA/SSO helpers retain
-  temporary allocations that this capability cannot comprehensively erase. This
-  module is not yet wired to the owner, mux, push queue, or production Bridge.
+  temporary allocations that this capability cannot comprehensively erase. An
+  in-memory mux test verifies staging before a following frame is classified,
+  including while the login result is still pending. The mux can classify such
+  tentative candidates before the guard's final outcome; they must remain in a
+  bounded queue with no business delivery until registration, key comparison,
+  commit and an owner-liveness check succeed. A later failure must clear that
+  queue and revoke the key. The caller must verify that the supplied transport
+  really belongs to its claimed lease: the internal entry does not establish this
+  relationship. Production owner, push queue and Bridge wiring remain unfinished.
 - `src/direct/linux-easy-account-owner.ts` is an opt-in, one-shot local owner for
   an injected raw client. It creates one private broker lease and sequentially
   performs the reference key exchange, EasyLogin and registration on it, without
@@ -2137,7 +2147,8 @@ remain to be recovered and independently verified.
   account-bound request and does not expose a ticket accessor. The existing
   transport and raw verifier callbacks receive request frames whose service
   header can contain the D2 ticket; these injected components must be trusted
-  with such data. Busy or purely local invalid requests do not disrupt the current operation; an uncertain attempted send
+  with such data. Busy or purely local invalid requests do not disrupt the current
+  operation; an uncertain attempted send
   closes the owner and requests poison without retry. Its response is a local
   protocol projection, not proof of message delivery. Owner-held byte copies are
   wiped best effort on close or failure. Push and production integration are not

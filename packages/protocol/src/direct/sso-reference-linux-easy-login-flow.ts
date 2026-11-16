@@ -1,7 +1,17 @@
 import { addAbortListener } from 'node:events';
 import { isProxy } from 'node:util/types';
 import { guardBorrowedTransport } from './guard-raw-transaction';
-import { encodeLinuxNTEasyLoginReferenceRequest } from './nt-linux-easy-login-reference';
+import {
+    claimLinuxEasyKeyForLogin,
+    linuxEasyKeyState,
+    revokeLinuxEasyKey,
+    stageLinuxEasyKey,
+    type LinuxEasyKeyToken,
+} from './linux-easy-key-capability';
+import {
+    decodeLinuxNTEasyLoginReferenceResponse,
+    encodeLinuxNTEasyLoginReferenceRequest,
+} from './nt-linux-easy-login-reference';
 import {
     encodeLinuxNTLoginReferenceRequest,
     type LinuxNTLoginReferenceInput,
@@ -173,11 +183,94 @@ function disposeResult(result: LinuxNTLoginReferenceResponse | undefined): void 
  * wiping is best effort and excludes provider, codec, runtime and callback copies.
  * Reference: LagrangeV2 rev 7011cdf, EasyLoginService.cs and NTLoginCommon.cs.
  */
-export async function referenceLinuxEasyLoginOnTransport(
+export function referenceLinuxEasyLoginOnTransport(
     transport: Sso12RawTransport,
     options: SsoReferenceLinuxEasyLoginOptions,
 ): Promise<Sso12RawResult<LinuxNTLoginReferenceResponse>> {
+    return referenceLinuxEasyLoginFlow(transport, options);
+}
+
+/**
+ * Internal deep import for trusted composition, not a same-process security boundary
+ * or peer authentication. The owner creates the token for the exact lease and uin;
+ * transport may be a wrapper around that lease, whose relationship is asserted by
+ * the composition, not verified here. Only a tentative key is staged: the owner
+ * must validate registration and compare the key before committing it, or revoke it.
+ * A broker may release its barrier before the outer guard's final outcome is known;
+ * classified candidates in that window are not registered or trusted business events.
+ * Guard or transport failure can reach this flow only after promise settlement, so
+ * its revocation may follow classification in a microtask window. Revocation does
+ * not retract candidates already queued by another component; tentative candidates
+ * must remain gated until the owner has committed after registration.
+ */
+export async function referenceLinuxEasyLoginWithKeyCapability(
+    transport: Sso12RawTransport,
+    options: SsoReferenceLinuxEasyLoginOptions,
+    binding: { token: LinuxEasyKeyToken; lease: object },
+): Promise<Sso12RawResult<LinuxNTLoginReferenceResponse>> {
+    if (typeof binding !== 'object' || binding === null || isProxy(binding)) {
+        throw new TypeError('invalid EasyLogin capability binding');
+    }
+
+    const proto = Object.getPrototypeOf(binding) as object | null;
+    const keys = Reflect.ownKeys(binding);
+    const token = Object.getOwnPropertyDescriptor(binding, 'token');
+    const lease = Object.getOwnPropertyDescriptor(binding, 'lease');
+
+    if (
+        (proto !== Object.prototype && proto !== null) ||
+        keys.length !== 2 ||
+        !keys.includes('token') ||
+        !keys.includes('lease') ||
+        !token ||
+        !('value' in token) ||
+        !lease ||
+        !('value' in lease)
+    ) {
+        throw new TypeError('invalid EasyLogin capability binding');
+    }
+
+    const cleanupState: { failure?: Extract<Sso12RawResult<never>, { kind: 'failure' }> } = {};
+
+    try {
+        const result = await referenceLinuxEasyLoginFlow(
+            transport,
+            options,
+            {
+                token: token.value as LinuxEasyKeyToken,
+                lease: lease.value as object,
+            },
+            cleanupState,
+        );
+        return cleanupState.failure ?? result;
+    } catch (error) {
+        if (cleanupState.failure) {
+            return cleanupState.failure;
+        }
+
+        throw error;
+    }
+}
+
+async function referenceLinuxEasyLoginFlow(
+    transport: Sso12RawTransport,
+    options: SsoReferenceLinuxEasyLoginOptions,
+    binding?: { token: LinuxEasyKeyToken; lease: object },
+    cleanupState?: { failure?: Extract<Sso12RawResult<never>, { kind: 'failure' }> },
+): Promise<Sso12RawResult<LinuxNTLoginReferenceResponse>> {
     const started = performance.now();
+    let claimed = false;
+    let staged = false;
+    let capabilitySucceeded = false;
+    let capabilityResponse: LinuxNTLoginReferenceResponse | undefined;
+
+    const revoke = (): void => {
+        if (binding && claimed) {
+            claimed = false;
+            revokeLinuxEasyKey(binding.token);
+        }
+    };
+
     const owned = new Set<Uint8Array>();
     const controller = new AbortController();
     let active = true;
@@ -222,6 +315,7 @@ export async function referenceLinuxEasyLoginOnTransport(
 
         active = false;
         stopCode = code;
+        revoke();
         clear();
         controller.abort();
         resolveStopped({ kind: 'failure', code, writeState: invoked ? 'unknown' : 'not-written' });
@@ -256,7 +350,17 @@ export async function referenceLinuxEasyLoginOnTransport(
         if (
             typeof uin !== 'string' ||
             !/^[1-9][0-9]{0,18}$/.test(uin) ||
-            (uin.length === 19 && uin > '9223372036854775807') ||
+            (uin.length === 19 && uin > '9223372036854775807')
+        ) {
+            throw new TypeError('invalid EasyLogin configuration');
+        }
+
+        if (binding) {
+            claimLinuxEasyKeyForLogin({ token: binding.token, lease: binding.lease, uin });
+            claimed = true;
+        }
+
+        if (
             !text(version) ||
             !version.length ||
             Buffer.byteLength(version) > 0xfffd ||
@@ -578,6 +682,54 @@ export async function referenceLinuxEasyLoginOnTransport(
                             temporary.body === null ? null : track(snapshot(temporary.body, LIMIT)),
                     };
                     assertActive();
+
+                    if (binding) {
+                        if (
+                            !claimed ||
+                            output.status.kind !== 'code' ||
+                            output.status.codePresent !== true ||
+                            output.status.code !== 0n ||
+                            output.body === null
+                        ) {
+                            throw new Error('invalid EasyLogin capability response');
+                        }
+
+                        const decoded = decodeLinuxNTEasyLoginReferenceResponse(output.body);
+
+                        try {
+                            if (
+                                !decoded.ticketsPresent ||
+                                decoded.a1 === null ||
+                                decoded.a1.length > 0xffff ||
+                                decoded.a2 === null ||
+                                decoded.a2.length > 0xffff ||
+                                decoded.d2 === null ||
+                                decoded.d2.length === 0 ||
+                                decoded.d2.length > 0xffff ||
+                                decoded.d2Key === null ||
+                                decoded.d2Key.length !== 16
+                            ) {
+                                throw new Error('invalid EasyLogin capability response');
+                            }
+
+                            assertActive();
+                            stageLinuxEasyKey({
+                                token: binding.token,
+                                lease: binding.lease,
+                                uin,
+                                sequence: identity.sequence,
+                                key: decoded.d2Key,
+                            });
+                            staged = true;
+                            assertActive();
+                        } finally {
+                            wipe(decoded.a1);
+                            wipe(decoded.a2);
+                            wipe(decoded.d2);
+                            wipe(decoded.d2Key);
+                        }
+                    }
+
                     committed = true;
                     return output;
                 } finally {
@@ -624,10 +776,26 @@ export async function referenceLinuxEasyLoginOnTransport(
                 return { kind: 'failure', code: stopCode ?? 'raw-timeout', writeState: 'unknown' };
             }
 
+            if (
+                binding &&
+                (!claimed || !staged || linuxEasyKeyState(binding.token) !== 'tentative')
+            ) {
+                return {
+                    kind: 'failure',
+                    code: 'borrowed-transaction-failed',
+                    writeState: 'unknown',
+                };
+            }
+
             observedResponse = undefined;
 
             if (result.value.body !== null) {
                 owned.delete(result.value.body);
+            }
+
+            if (binding) {
+                capabilityResponse = result.value;
+                capabilitySucceeded = true;
             }
 
             return result;
@@ -647,13 +815,48 @@ export async function referenceLinuxEasyLoginOnTransport(
     } finally {
         active = false;
 
-        if (timer !== undefined) {
-            clearTimeout(timer);
+        if (!capabilitySucceeded) {
+            revoke();
         }
 
-        listener?.[Symbol.dispose]();
-        clear();
-        disposeResult(observedResponse);
-        controller.abort();
+        let cleanupSucceeded = false;
+
+        try {
+            if (timer !== undefined) {
+                clearTimeout(timer);
+            }
+
+            listener?.[Symbol.dispose]();
+            clear();
+            disposeResult(observedResponse);
+            controller.abort();
+            cleanupSucceeded = true;
+        } finally {
+            if (binding && capabilitySucceeded) {
+                let valid = false;
+
+                try {
+                    valid =
+                        cleanupSucceeded &&
+                        claimed &&
+                        staged &&
+                        (!signal || !aborted.call(signal)) &&
+                        performance.now() < deadline &&
+                        linuxEasyKeyState(binding.token) === 'tentative';
+                } catch {
+                    valid = false;
+                }
+
+                if (!valid) {
+                    revoke();
+                    disposeResult(capabilityResponse);
+                    cleanupState!.failure = {
+                        kind: 'failure',
+                        code: stopCode ?? 'borrowed-transaction-failed',
+                        writeState: invoked ? 'unknown' : 'not-written',
+                    };
+                }
+            }
+        }
     }
 }

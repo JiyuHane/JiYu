@@ -17,6 +17,11 @@ export interface LinuxEasyKeyBinding {
     /** Passive identity for this generation; never interpreted or invoked. */
     generation: object;
 }
+export interface LinuxEasyKeyLoginClaimInput {
+    token: LinuxEasyKeyToken;
+    lease: object;
+    uin: string;
+}
 export interface LinuxEasyKeyStageInput {
     token: LinuxEasyKeyToken;
     lease: object;
@@ -53,6 +58,7 @@ export interface LinuxEasyServiceResponse {
 
 type Slot = {
     phase: LinuxEasyKeyState;
+    loginClaimed: boolean;
     lease: object;
     uin: string;
     generation: object;
@@ -211,10 +217,39 @@ export function createLinuxEasyKeyCapability(input: LinuxEasyKeyBinding): LinuxE
         }
 
         const token = freeze({}) as LinuxEasyKeyToken;
-        const value: Slot = { phase: 'empty', lease, uin, generation };
+        const value: Slot = { phase: 'empty', loginClaimed: false, lease, uin, generation };
         apply(weakAdd, claimedLeases, [lease]);
         apply(weakSet, slots, [token, value]);
         return token;
+    } catch {
+        return fail();
+    }
+}
+
+/**
+ * Claim a capability for one login flow before invoking any external signer or
+ * transport. A successful claim is permanent, including after failure or revoke;
+ * the flow must revoke the capability on every subsequent failure. Failed claims
+ * leave all slots unchanged. Stage and commit remain usable without a claim by
+ * trusted deep-import callers; this is not a same-process security boundary.
+ *
+ * The generation identity is retained but not automatically validated. Claiming
+ * does not authenticate a server: the caller must ensure its transport belongs
+ * to the exact supplied lease.
+ */
+export function claimLinuxEasyKeyForLogin(input: LinuxEasyKeyLoginClaimInput): void {
+    try {
+        const args = fields(input, ['token', 'lease', 'uin']);
+        const value = lookup(args[0]);
+        const lease = args[1];
+        const uin = args[2];
+
+        // Equality with the factory-validated uin also validates its canonical form.
+        if (value.phase !== 'empty' || value.loginClaimed || !bound(value, lease, uin)) {
+            return fail();
+        }
+
+        value.loginClaimed = true;
     } catch {
         return fail();
     }
