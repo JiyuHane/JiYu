@@ -476,6 +476,28 @@ behavior, or an SSO `sign`/`token`/`extra` generation algorithm. The archive's
 not a proven complete packet-signing chain. This Linux x86-64 research is also
 distinct from the Android AArch64 `libfekit.so` analyzed above.
 
+The same archive reconstructs a related network-facing application-signature
+check: `DoAppSignatureCheck` reportedly reads cached application signature and
+application ID, constructs a `KQQConfig.SignatureReq` JCE request, prefixes its
+serialized bytes with a four-byte big-endian length including that prefix, and
+passes an MSF packet with command `PhSigLcId.Check`, field `0x38` equal to `"0"`,
+and numeric field `0x108` equal to 75 to a client callback. The reconstructed
+response handler is reported at entry `0x6729f40`; `0x672a01c` is its log-string
+reference, not the function entry. The attachment does not establish how the
+file verifier's result reaches the cached app signature, and the original binary
+was not supplied here to verify either claim independently. Other reconstructed
+callbacks may involve tickets and account state, but their relationship to SSO
+packet signature fields is not established by the available function bodies.
+
+`src/direct/linux-qq-app-signature-check-envelope.ts` implements only the reported
+length wrapper over **caller-supplied, already serialized opaque JCE bytes**, and
+returns the reported memory-field values as metadata. Its local size limit and
+input checks are implementation policy. The archive does not provide the
+`SignatureReq` field tags or complete serializer body, request vectors, callback
+ABI, sequence policy, or final MSF wire format; this helper neither constructs a
+JCE message nor sends or signs a request. Synthetic tests exercise only this
+local wrapper, not byte-for-byte compatibility with QQ.
+
 ## Public protocol reference
 
 [LagrangeV2 at commit `7011cdf87368cc0fb77273c1508e779a52328165`](https://github.com/LagrangeDev/LagrangeV2/tree/7011cdf87368cc0fb77273c1508e779a52328165)

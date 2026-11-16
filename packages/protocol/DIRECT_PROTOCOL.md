@@ -1322,8 +1322,11 @@ remain to be recovered and independently verified.
   Its in-memory tests use synthetic keys; the archive did not contain the reported
   original target files and signatures for independent replay. This file verifier
   is not an implementation of SSO packet `sign`, `token` or `extra`; the supplied
-  key is not authenticated merely by passing it to this function. Details and
-  evidence limits are recorded in [QQ_SIGNATURE_RESEARCH.md](./QQ_SIGNATURE_RESEARCH.md).
+  key is not authenticated merely by passing it to this function. The related
+  `linux-qq-app-signature-check-envelope.ts` wraps caller-supplied opaque JCE
+  bytes with the reported four-byte total-length prefix and returns reconstructed
+  MSF fields as metadata; it does not serialize JCE or establish a wire format.
+  Details and evidence limits are recorded in [QQ_SIGNATURE_RESEARCH.md](./QQ_SIGNATURE_RESEARCH.md).
 - `src/direct/wt-login-keystore.ts` projects the UID from inner WT TLV `0x543`
   using the `9 → 11 → 1` message path declared by [LagrangeV2 ThirdPartyLoginResponse](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Packets/System/ThirdPartyLoginResponse.cs)
   and its [login handler](https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Logic/WtExchangeLogic.cs).
