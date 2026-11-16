@@ -34,6 +34,7 @@ import {
     parseConfigView,
     parseConfigValue,
     parseConfigNumber,
+    type PluginConfigReadOnlyRow,
 } from '@/lib/plugin-index';
 
 const INDEX_REPOSITORY = 'https://github.com/HolyFoxTeam/napcat-plugin-community-index';
@@ -330,6 +331,13 @@ export interface ConfigConfirmationTicket {
     readonly operation: ConfigOperation;
     readonly binding: ConfigViewBinding | null;
     readonly epoch: number;
+}
+
+export function configTicketAfterClose(
+    previous: ConfigConfirmationTicket | null,
+    captured: ConfigConfirmationTicket | null,
+): ConfigConfirmationTicket | null {
+    return previous === captured ? null : previous;
 }
 
 /** A confirmation closure retains its own one-shot ticket, never a newer ref value. */
@@ -1347,15 +1355,75 @@ export function PluginMultiSelectControl({
     );
 }
 
-export function PluginPlainTextView({ texts }: { texts: readonly string[] }) {
+export function PluginPlainTextView({
+    texts,
+    rows,
+}: {
+    texts: readonly string[];
+    rows?: readonly PluginConfigReadOnlyRow[];
+}) {
+    const mixedRows = rows?.some((row) => row.kind === 'field') ? rows : undefined;
+
     return (
         <div className="flex flex-col gap-4">
             <p className="text-xs text-muted-foreground">本视图只读，配置未读取，也不会保存。</p>
-            {texts.map((text, index) => (
-                <p key={index} className="whitespace-pre-wrap text-sm">
-                    {text}
+            {mixedRows !== undefined && (
+                <p className="text-xs text-muted-foreground">
+                    以下字段、默认值和选项仅为静态声明，并非当前配置。
                 </p>
-            ))}
+            )}
+            {mixedRows === undefined
+                ? texts.map((text, index) => (
+                      <p key={index} className="whitespace-pre-wrap text-sm">
+                          {text}
+                      </p>
+                  ))
+                : mixedRows.map((row, index) =>
+                      row.kind === 'plainText' ? (
+                          <p key={index} className="break-all whitespace-pre-wrap text-sm">
+                              {row.text}
+                          </p>
+                      ) : (
+                          <div
+                              key={index}
+                              className="flex min-w-0 flex-col gap-1 rounded-lg border bg-card p-3 text-sm"
+                          >
+                              <p className="break-all whitespace-pre-wrap">
+                                  字段名称：{row.field.label}
+                              </p>
+                              <p className="break-all whitespace-pre-wrap">
+                                  配置键：{row.field.key}
+                              </p>
+                              <p>字段类型：{row.field.type}</p>
+                              {row.field.description !== undefined && (
+                                  <p className="break-all whitespace-pre-wrap">
+                                      描述：{row.field.description}
+                                  </p>
+                              )}
+                              {row.field.default !== undefined && (
+                                  <p className="break-all whitespace-pre-wrap">
+                                      声明的默认值：{JSON.stringify(row.field.default)}
+                                  </p>
+                              )}
+                              {row.field.options !== undefined && (
+                                  <div className="flex min-w-0 flex-col gap-1">
+                                      <p>静态选项：</p>
+                                      <ul className="flex min-w-0 flex-col gap-1">
+                                          {row.field.options.map((option, optionIndex) => (
+                                              <li
+                                                  key={optionIndex}
+                                                  className="break-all whitespace-pre-wrap"
+                                              >
+                                                  {option.label}（值：{JSON.stringify(option.value)}
+                                                  ）
+                                              </li>
+                                          ))}
+                                      </ul>
+                                  </div>
+                              )}
+                          </div>
+                      ),
+                  )}
         </div>
     );
 }
@@ -1376,6 +1444,7 @@ function PluginConfigDialog({
     const [modeGuard] = useState(() => createConfigModeGuard());
     const [tickets] = useState(() => createConfigTicketGuard());
     const [displayTexts, setDisplayTexts] = useState<string[] | null>(null);
+    const [displayRows, setDisplayRows] = useState<readonly PluginConfigReadOnlyRow[] | null>(null);
     const [fields, setFields] = useState<PluginConfigField[] | null>(null);
     const [generation, setGeneration] = useState<string | null>(null);
     const [schemaSource, setSchemaSource] = useState<'schema' | 'ui' | 'none' | null>(null);
@@ -1418,6 +1487,7 @@ function PluginConfigDialog({
         setFields(null);
         setDraft(null);
         setDisplayTexts(null);
+        setDisplayRows(null);
         setSchemaSource(null);
     };
 
@@ -1484,6 +1554,7 @@ function PluginConfigDialog({
                             modeGuard.open('display', result.generation);
                             setFields(null);
                             setDisplayTexts(parsed.displayTexts);
+                            setDisplayRows(parsed.readonlyRows ?? null);
                         } else {
                             setFields(parsed.fields);
 
@@ -1572,6 +1643,7 @@ function PluginConfigDialog({
             modeGuard.invalidate();
             tickets.invalidate();
             setDisplayTexts(null);
+            setDisplayRows(null);
             setGeneration(null);
             setFields(null);
             setDraft(null);
@@ -1650,7 +1722,9 @@ function PluginConfigDialog({
                         {notice}
                     </p>
                 )}
-                {displayTexts !== null && <PluginPlainTextView texts={displayTexts} />}
+                {displayTexts !== null && (
+                    <PluginPlainTextView texts={displayTexts} rows={displayRows ?? undefined} />
+                )}
                 {draft && fields && displayTexts === null && (
                     <div className="flex flex-col gap-4">
                         {fields.map((field) => {
@@ -1837,8 +1911,12 @@ function PluginConfigDialog({
                 <ConfirmDialog
                     open={confirm !== null}
                     onOpenChange={(open) => {
-                        if (!open && tickets.close(confirm)) {
-                            setConfirm((previous) => (previous === confirm ? null : previous));
+                        if (!open) {
+                            const capturedConfirm = confirm;
+                            tickets.close(capturedConfirm);
+                            setConfirm((previous) =>
+                                configTicketAfterClose(previous, capturedConfirm),
+                            );
                         }
                     }}
                     title={

@@ -565,10 +565,14 @@ function isConfigScalar(type: string, value: unknown): value is string | number 
     return type === 'number' && typeof value === 'number' && isSafeConfigNumber(value);
 }
 
+export type PluginConfigReadOnlyRow =
+    { kind: 'plainText'; text: string } | { kind: 'field'; field: PluginConfigField };
+
 export interface PluginConfigView {
     readonly fields: PluginConfigField[];
     readonly displayTexts: string[];
     readonly readOnly: boolean;
+    readonly readonlyRows?: readonly PluginConfigReadOnlyRow[];
 }
 
 /** Compare the two decoded JSON snapshots without invoking object accessors. */
@@ -662,6 +666,89 @@ function sameConfigSnapshot(left: unknown, right: unknown): boolean {
     return same(left, right, 0);
 }
 
+/** Copy a validated declaration without retaining mutable schema objects. */
+function snapshotReadOnlyDeclaration(field: PluginConfigField): PluginConfigField {
+    try {
+        if (!isPlainConfigRecord(field)) {
+            return unsupportedConfig();
+        }
+
+        const descriptors = Object.getOwnPropertyDescriptors(field);
+        const allowed = [
+            'key',
+            'label',
+            'type',
+            'default',
+            'description',
+            'reactive',
+            'hidden',
+            'options',
+        ];
+        const snapshot: Record<string, unknown> = {};
+
+        for (const name of Reflect.ownKeys(descriptors)) {
+            if (typeof name !== 'string' || !allowed.includes(name)) {
+                return unsupportedConfig();
+            }
+
+            const descriptor = descriptors[name];
+
+            if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) {
+                return unsupportedConfig();
+            }
+
+            const value: unknown = descriptor.value;
+
+            if (name === 'options') {
+                // Select and multi-select share the same static option rules.
+                const options = snapshotMultiSelectField({
+                    key: 'readonly-snapshot',
+                    label: 'Readonly snapshot',
+                    type: 'multi-select',
+                    options: value,
+                }).options;
+
+                if (!options) {
+                    return unsupportedConfig();
+                }
+
+                snapshot.options = options;
+            } else if (name === 'default' && Array.isArray(value)) {
+                const defaults = copyConfigOptionValues(value);
+
+                if (defaults === null) {
+                    return unsupportedConfig();
+                }
+
+                Object.freeze(defaults);
+                snapshot.default = defaults;
+            } else {
+                if (
+                    value !== undefined &&
+                    typeof value !== 'string' &&
+                    typeof value !== 'number' &&
+                    typeof value !== 'boolean'
+                ) {
+                    return unsupportedConfig();
+                }
+
+                snapshot[name] = value;
+            }
+        }
+
+        Object.freeze(snapshot);
+        const [validated] = parseConfigFields([snapshot]);
+
+        if (!validated) {
+            return unsupportedConfig();
+        }
+
+        return validated;
+    } catch {
+        return unsupportedConfig();
+    }
+}
+
 /** Sidecar is a read-only server observation, not an authentication or sandbox proof. */
 export function parseConfigView(fields: unknown, sidecar?: PluginDisplaySidecar): PluginConfigView {
     if (sidecar === undefined) {
@@ -715,6 +802,7 @@ export function parseConfigView(fields: unknown, sidecar?: PluginDisplaySidecar)
     const seen = new Set<string>();
     const editable: PluginConfigField[] = [];
     const displayTexts: string[] = [];
+    const readonlyRows: PluginConfigReadOnlyRow[] = [];
 
     for (let index = 0; index < fields.length; index++) {
         const field: unknown = fields[index];
@@ -749,12 +837,26 @@ export function parseConfigView(fields: unknown, sidecar?: PluginDisplaySidecar)
             }
 
             displayTexts.push(field.default);
+            readonlyRows.push({ kind: 'plainText', text: field.default });
         } else {
-            editable.push(...parseConfigFields([field]));
+            const [validated] = parseConfigFields([field]);
+
+            if (!validated) {
+                return unsupportedConfig();
+            }
+
+            const declaration = snapshotReadOnlyDeclaration(validated);
+            editable.push(validated);
+            readonlyRows.push({ kind: 'field', field: declaration });
         }
     }
 
-    return { fields: editable, displayTexts, readOnly: true };
+    for (const row of readonlyRows) {
+        Object.freeze(row);
+    }
+
+    Object.freeze(readonlyRows);
+    return { fields: editable, displayTexts, readOnly: true, readonlyRows };
 }
 
 export function parseConfigValue(fields: PluginConfigField[], value: unknown): PluginConfigValue {

@@ -93,20 +93,24 @@ defaults need not match the options, are displayed as declarations, and are
 never automatically saved; a multi-select default can also contain duplicates.
 The editor disables its controls while a configuration operation is busy or the
 account cannot execute; read and write confirmation and generation guards still
-apply. These are narrower UI rules than the builder's schema rules. When present, the
+apply. An invalidated confirmation can be dismissed without closing a newer
+confirmation ticket. These are narrower UI rules than the builder's schema rules. When present, the
 metadata properties must be own enumerable data properties with the value
 `false`; `hidden: false` leaves the field visible. Other `hidden` and `reactive`
 values remain unsupported; neither metadata property enters configuration values
 or enables dynamic controllers. Even a builder-produced field may be rejected. For a
 `plainText` item made by the current slot's own builder, a versioned sidecar
-can identify that item in the captured static schema. The editor displays its
-text only as a read-only snapshot and does not call the configuration getter or
-setter for that view; an unmarked item, unknown version or mismatched snapshot
-remains unsupported. This does not prevent direct `setConfig` API calls, other
-tabs, or plugin-side changes. The sidecar is not authentication or an isolation
-boundary against an untrusted backend or same-process plugin. HTML display is
-still unsupported in the editor. Other fields in such a view are not writable;
-editing them requires a separate server consistency design. The returned object
+can identify that item in the captured static schema. The editor displays the
+plain text and any accepted static field declarations in schema order as a
+read-only snapshot. Field labels, keys, types, descriptions, defaults and
+options are declarations, not current configuration values; this view calls
+neither the configuration getter nor setter. An unmarked item, unknown version
+or mismatched snapshot remains unsupported. This does not prevent direct
+`setConfig` API calls, other tabs, or plugin-side changes. The sidecar is not
+authentication or an isolation boundary against an untrusted backend or
+same-process plugin. HTML display is still unsupported in the editor. Other
+fields in such a view are not writable; editing them requires a separate server
+consistency design. The returned object
 must match the schema; unsupported schemas are not silently rewritten. A successful set means the plugin's hook returned, not
 that data was durably stored. There is no host-managed configuration-file
 fallback, version check, merge guarantee, dynamic controller or HTML editor.
