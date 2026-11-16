@@ -25,11 +25,18 @@ export interface RawMultiplexClientOptions {
     maxPushFrames: number;
     maxPushBytes: number;
     /**
+     * Optional per-frame assembly deadline, from its first prefix byte until the
+     * complete frame enters the incoming queue. Uses performance.now() and event-loop
+     * timers and boundary sampling, not a hard real-time guarantee. This does not prove
+     * a total memory bound, authentication, or QQ behavior. Owners must observe whenClosed.
+     */
+    frameAssemblyTimeoutMs?: number;
+    /**
      * Allow a transaction to settle while a following frame is incomplete. This is
      * trusted caller policy, not peer authentication. The retained frame keeps its
      * original transaction identity and may later fail and close the client; observe
-     * whenClosed. A retained partial frame has no independent assembly deadline;
-     * the caller must arrange any required timeout or close. The default is false.
+     * whenClosed. A retained partial frame has an assembly deadline only when
+     * frameAssemblyTimeoutMs is configured. The default is false.
      */
     allowIncompleteFollowingFrame?: boolean;
     write(frame: Uint8Array): void | Promise<void>;
@@ -208,6 +215,7 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
         'maxFrames',
         'maxPushFrames',
         'maxPushBytes',
+        'frameAssemblyTimeoutMs',
         'allowIncompleteFollowingFrame',
         'write',
         'classify',
@@ -229,6 +237,8 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
         !uint(maxFrames, 1, 65536) ||
         !uint(maxPushFrames, 1, 65536) ||
         !uint(maxPushBytes, 14, MAX_FRAME * 64) ||
+        (config.frameAssemblyTimeoutMs !== undefined &&
+            !uint(config.frameAssemblyTimeoutMs, 1, MAX_TIMER)) ||
         (config.allowIncompleteFollowingFrame !== undefined &&
             typeof config.allowIncompleteFollowingFrame !== 'boolean') ||
         typeof config.write !== 'function' ||
@@ -247,6 +257,7 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
         RawMultiplexClientOptions['holdFollowingFrames'] | undefined;
     const verifyPush = config.verifyPush as RawMultiplexClientOptions['verifyPush'];
     const onPush = config.onPush as RawMultiplexClientOptions['onPush'];
+    const frameAssemblyTimeoutMs = config.frameAssemblyTimeoutMs as number | undefined;
     let closed = false;
     let nextSequence = initialSequence;
     let issued = 0;
@@ -261,6 +272,7 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
     let used = 0;
     let origin: Pending | undefined;
     let originWritten = false;
+    let assembly: { deadline: number; timer?: ReturnType<typeof setTimeout> } | undefined;
     let reservedBytes = 0;
     let reservedFrames = 0;
     const incoming: Incoming[] = [];
@@ -301,12 +313,23 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
         p.consume = undefined;
     };
 
+    const clearAssembly = (): void => {
+        const previous = assembly;
+        assembly = undefined;
+
+        if (previous?.timer !== undefined) {
+            clearTimeout(previous.timer);
+            previous.timer = undefined;
+        }
+    };
+
     const shutdown = (kind: Sso12CloseReason['kind'], code: string): void => {
         if (closed) {
             return;
         }
 
         closed = true;
+        clearAssembly();
         wipe(prefix);
         wipe(partial);
         origin = undefined;
@@ -350,8 +373,65 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
         resolveClosed(Object.freeze({ kind, code }));
     };
 
+    const assemblyAlive = (): boolean => {
+        if (closed) {
+            return false;
+        }
+
+        if (assembly && performance.now() >= assembly.deadline) {
+            shutdown('protocol-error', 'frame-assembly-timeout');
+            return false;
+        }
+
+        return true;
+    };
+
+    const startAssembly = (): boolean => {
+        if (frameAssemblyTimeoutMs === undefined) {
+            return true;
+        }
+
+        // Object identity fences a queued callback from every later frame.
+        const epoch: { deadline: number; timer?: ReturnType<typeof setTimeout> } = {
+            deadline: performance.now() + frameAssemblyTimeoutMs,
+        };
+        assembly = epoch;
+
+        const arm = (): void => {
+            if (closed || assembly !== epoch) {
+                return;
+            }
+
+            const remaining = epoch.deadline - performance.now();
+
+            if (remaining <= 0) {
+                shutdown('protocol-error', 'frame-assembly-timeout');
+                return;
+            }
+
+            try {
+                epoch.timer = setTimeout(
+                    () => {
+                        if (closed || assembly !== epoch) {
+                            return;
+                        }
+
+                        epoch.timer = undefined;
+                        arm();
+                    },
+                    Math.min(MAX_TIMER, Math.max(1, Math.ceil(remaining))),
+                );
+            } catch {
+                shutdown('local', 'frame-assembly-timer-failed');
+            }
+        };
+
+        arm();
+        return !closed;
+    };
+
     const live = (p: Pending): boolean => {
-        if (closed || pending !== p) {
+        if (!assemblyAlive() || pending !== p) {
             return false;
         }
 
@@ -363,10 +443,14 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
         return true;
     };
 
-    const currentAlive = (): boolean => !closed && (!pending || live(pending));
+    const currentAlive = (): boolean => assemblyAlive() && (!pending || live(pending));
     const yieldTurn = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
     const tryCommit = (): void => {
+        if (!assemblyAlive()) {
+            return;
+        }
+
         const p = pending;
 
         if (
@@ -521,7 +605,9 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
                     }
                 }
             } catch {
-                shutdown('handler-error', 'push-handler-failed');
+                if (assemblyAlive()) {
+                    shutdown('handler-error', 'push-handler-failed');
+                }
             } finally {
                 delivering = false;
 
@@ -677,7 +763,9 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
                     activeIncoming = undefined;
                 }
             } catch {
-                shutdown('handler-error', 'frame-handler-failed');
+                if (assemblyAlive()) {
+                    shutdown('handler-error', 'frame-handler-failed');
+                }
             } finally {
                 if (current && activeIncoming === current) {
                     wipe(current.bytes);
@@ -704,7 +792,7 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
             shutdown('local', 'local-close');
         },
         end() {
-            if (closed) {
+            if (!assemblyAlive()) {
                 return;
             }
 
@@ -719,13 +807,25 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
                 throw new Error('closed');
             }
 
+            if (!assemblyAlive()) {
+                return;
+            }
+
             try {
                 const chunk = bytesView(input, maxBufferedBytes);
                 let cursor = 0;
 
                 while (cursor < chunk.length && !closed) {
+                    if (!assemblyAlive()) {
+                        return;
+                    }
+
                     if (!partial) {
                         if (prefixUsed === 0) {
+                            if (!startAssembly() || !assemblyAlive()) {
+                                return;
+                            }
+
                             origin = pending;
                             originWritten = pending?.written === true;
                         }
@@ -734,6 +834,10 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
                         prefix.set(chunk.subarray(cursor, cursor + n), prefixUsed);
                         prefixUsed += n;
                         cursor += n;
+
+                        if (!assemblyAlive()) {
+                            return;
+                        }
 
                         if (prefixUsed < 4) {
                             continue;
@@ -764,8 +868,19 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
                     used += n;
                     cursor += n;
 
+                    if (!assemblyAlive()) {
+                        return;
+                    }
+
                     if (used === partial.length) {
                         incoming.push({ bytes: partial, pending: origin, written: originWritten });
+
+                        // Check the publication boundary before releasing this frame's deadline.
+                        if (!assemblyAlive()) {
+                            return;
+                        }
+
+                        clearAssembly();
                         partial = undefined;
                         origin = undefined;
                         used = 0;
@@ -783,7 +898,7 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
             const failed = (code: string): Promise<Sso12RawResult<T>> =>
                 Promise.resolve({ kind: 'failure', code, writeState: 'not-written' });
 
-            if (closed) {
+            if (!assemblyAlive()) {
                 return failed('closed');
             }
 

@@ -1592,8 +1592,14 @@ remain to be recovered and independently verified.
   is verified and consumed while a subsequent frame remains incomplete. The frame
   retains the identity captured when its prefix began; a stale response cannot become
   a later transaction's response. A later bad frame can still close the client after
-  success. This option gives the incomplete frame no independent assembly deadline;
-  callers needing one must arrange a timeout or close. A synthetic Linux EasyLogin
+  success. A separate opt-in `frameAssemblyTimeoutMs` limits assembly from the
+  first prefix byte processed by `feed` until the complete frame is accepted, without
+  extending the deadline for incremental input or a transaction change. It is disabled
+  by default and does not bound later queue or callback work. The timer and boundary
+  checks depend on event-loop scheduling, not a hard real-time guarantee. On timeout
+  the client closes with `frame-assembly-timeout`; a timer-scheduling error closes
+  it locally with `frame-assembly-timer-failed`. Owners must observe `whenClosed`.
+  A synthetic Linux EasyLogin
   fixture exercises a push prefix before the register request and its remainder
   afterward; this is not evidence that a QQ server sends that ordering. Full-frame
   backlog and callback completion still gate settlement. The barrier itself supplies
