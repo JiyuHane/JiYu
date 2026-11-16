@@ -1728,7 +1728,9 @@ remain to be recovered and independently verified.
   those dispatches. It explicitly stops and drains the OneBot handlers; it does
   not construct the production OneBot instance, exercise network adapters, or
   prove live delivery. Its body-lifetime observations apply only to those text
-  fixtures. The group-recall decoder preserves the first
+  fixtures. Group-title parsing now emits a title only when the last rich token's
+  own JSON `text` field is a string; other field types are dropped rather than
+  crossing the typed event boundary. The group-recall decoder preserves the first
   entry's existing behavior and then emits subsequent entries with nonzero
   sequence numbers in list order. Additional entries with an absent or zero
   sequence are skipped; the decoder attempts a single count-only warning. The
@@ -1740,6 +1742,36 @@ remain to be recovered and independently verified.
   pipeline's member-cache refresh is detached and best-effort: same-group events
   can be coalesced, including a reentrant self-join that would otherwise request
   a group-list refresh. It is not a drain or delivery barrier.
+- `src/direct/direct-push-ingress.ts` supplies a disabled-by-default in-process
+  ingress for a caller-provided identity and packet pipeline. Activation is an
+  owner decision, not authentication or online-state evidence. The caller asserts
+  that the pipeline is bound to that identity and has handled source authentication;
+  this ingress independently checks local UIN, command, return code and sequence.
+  It snapshots borrowed bodies before asynchronous work, uses a per-instance dedup
+  and a serial queue, and bounds accepted body size, queued body bytes, pending
+  items and the post-parse event count. These are local limits, not a bound on
+  parser or structured-clone work, decoded graphs, subscribers or total process
+  memory. Structured cloning isolates cloneable event data from the owned body but
+  can change prototypes or Buffer representation and does not guarantee support
+  for future event types. `empty` combines distinct parser outcomes; `settled`
+  means only that the pipeline promise settled, not that events were delivered or
+  every pipeline error surfaced. Parsing can update identity or dedup before a later
+  failure, and stopping cannot reverse those effects or interrupt synchronous work.
+  Stop rejects new work and drops queued work; already-entered pipeline work can
+  still emit. Drain waits for ingress-owned work, not asynchronous bus subscribers
+  or detached roster refreshes, and can remain pending if initialization or a
+  pipeline dependency never settles. A dependency awaited by the pipeline must not
+  await another submission to the same FIFO or its drain, because it may then wait
+  on its own work. The raw multiplex callback requires an
+  adapter to consume the result and return `undefined`; synthetic tests exercise
+  that handoff with fabricated in-memory frames and policy callbacks. The source must supply a
+  valid borrowed body through the synchronous snapshot; this ingress cannot detect
+  a buffer already wiped upstream. A separate synthetic OneBot test composes this
+  ingress with the real event pipeline and v12 conversion using fake account contexts;
+  it tracks ingress and OneBot drains separately. Identity, pipeline and ordinary
+  Promise internals are trusted in-process dependencies. There is no production
+  Bridge wiring, peer authentication or live QQ interoperability established by
+  this component.
 - `src/direct/raw-multiplex-stream.ts` adapts a caller-supplied, already-established
   byte stream to that client without opening or connecting a socket. It requires
   exclusive ownership and uses the shared direct-socket ownership registry for

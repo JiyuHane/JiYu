@@ -264,8 +264,20 @@ function extractTitleFromTip(text: string): string {
     const last = tokens[tokens.length - 1];
 
     try {
-        const parsed = JSON.parse(last.slice(1, -1)) as { text?: string };
-        return parsed.text ?? '';
+        const parsed: unknown = JSON.parse(last.slice(1, -1));
+
+        if (
+            typeof parsed === 'object' &&
+            parsed !== null &&
+            !Array.isArray(parsed) &&
+            'text' in parsed &&
+            Object.hasOwn(parsed, 'text') &&
+            typeof parsed.text === 'string'
+        ) {
+            return parsed.text;
+        }
+
+        return '';
     } catch {
         return '';
     }
