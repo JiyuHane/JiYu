@@ -1282,6 +1282,66 @@ export function formatConfigDefault(value: NonNullable<PluginConfigField['defaul
     return Array.isArray(value) ? JSON.stringify(value) : String(value);
 }
 
+function ownConfigPlaceholder(field: PluginConfigField): string | undefined {
+    try {
+        const descriptor = Object.getOwnPropertyDescriptor(field, 'placeholder');
+        return descriptor &&
+            descriptor.enumerable &&
+            'value' in descriptor &&
+            typeof descriptor.value === 'string' &&
+            descriptor.value.length <= 1024
+            ? descriptor.value
+            : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+export function PluginConfigPlaceholderHint({ placeholder }: { placeholder?: string }) {
+    if (placeholder === undefined) {
+        return null;
+    }
+
+    return (
+        <span className="min-w-0 break-all text-xs text-muted-foreground">
+            提示：{JSON.stringify(placeholder)}
+        </span>
+    );
+}
+
+export function PluginConfigTextControl({
+    field,
+    value,
+    disabled,
+    onChange,
+}: {
+    field: PluginConfigField;
+    value: string;
+    disabled: boolean;
+    onChange: (value: string) => void;
+}) {
+    return field.type === 'text' ? (
+        <Textarea
+            value={value}
+            placeholder={ownConfigPlaceholder(field)}
+            maxLength={16384}
+            disabled={disabled}
+            onChange={(event) => onChange(event.currentTarget.value)}
+        />
+    ) : (
+        <Input
+            type="text"
+            inputMode={field.type === 'number' ? 'decimal' : undefined}
+            autoComplete="off"
+            value={value}
+            placeholder={ownConfigPlaceholder(field)}
+            maxLength={16384}
+            disabled={disabled}
+            onChange={(event) => onChange(event.currentTarget.value)}
+        />
+    );
+}
+
 export function PluginMultiSelectControl({
     field,
     tokens,
@@ -1400,6 +1460,9 @@ export function PluginPlainTextView({
                                       描述：{row.field.description}
                                   </p>
                               )}
+                              <PluginConfigPlaceholderHint
+                                  placeholder={ownConfigPlaceholder(row.field)}
+                              />
                               {row.field.default !== undefined && (
                                   <p className="break-all whitespace-pre-wrap">
                                       声明的默认值：{JSON.stringify(row.field.default)}
@@ -1762,6 +1825,13 @@ function PluginConfigDialog({
                                             （不会自动填入）
                                         </span>
                                     )}
+                                    {(field.type === 'boolean' ||
+                                        field.type === 'select' ||
+                                        field.type === 'multi-select') && (
+                                        <PluginConfigPlaceholderHint
+                                            placeholder={ownConfigPlaceholder(field)}
+                                        />
+                                    )}
                                     {field.type === 'multi-select' ? (
                                         Array.isArray(multiDraft) ? (
                                             <PluginMultiSelectControl
@@ -1839,34 +1909,12 @@ function PluginConfigDialog({
                                                 );
                                             }}
                                         />
-                                    ) : field.type === 'text' ? (
-                                        <Textarea
-                                            value={String(draft[field.key])}
-                                            maxLength={16384}
-                                            disabled={busy || !canExecute}
-                                            onChange={(event) => {
-                                                const value = event.currentTarget.value;
-                                                setDraft((previous) =>
-                                                    applyConfigDraftField(
-                                                        previous,
-                                                        field.key,
-                                                        value,
-                                                    ),
-                                                );
-                                            }}
-                                        />
                                     ) : (
-                                        <Input
-                                            type="text"
-                                            inputMode={
-                                                field.type === 'number' ? 'decimal' : undefined
-                                            }
-                                            autoComplete="off"
+                                        <PluginConfigTextControl
+                                            field={field}
                                             value={String(draft[field.key])}
-                                            maxLength={16384}
                                             disabled={busy || !canExecute}
-                                            onChange={(event) => {
-                                                const value = event.currentTarget.value;
+                                            onChange={(value) => {
                                                 setDraft((previous) =>
                                                     applyConfigDraftField(
                                                         previous,

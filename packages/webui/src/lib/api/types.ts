@@ -219,6 +219,7 @@ export interface PluginConfigField {
     description?: string;
     default?: PluginConfigScalar | PluginConfigOptionValue[];
     options?: PluginConfigOption[];
+    placeholder?: string;
     reactive?: false;
     hidden?: false;
 }

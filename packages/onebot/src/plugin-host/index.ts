@@ -318,7 +318,13 @@ function copyJson(
 
                 text(key);
                 add(1);
-                result[key] = visit(descriptor.value, depth + 1);
+                const copied = visit(descriptor.value, depth + 1);
+                Object.defineProperty(result, key, {
+                    value: copied,
+                    enumerable: true,
+                    writable: true,
+                    configurable: true,
+                });
             }
 
             return result;

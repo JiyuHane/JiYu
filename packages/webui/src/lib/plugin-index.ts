@@ -173,6 +173,16 @@ export function parseLocalPluginMutation(
 
 const DANGEROUS_CONFIG_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
 
+/** Create snapshot fields without invoking inherited setters. */
+function defineSnapshotField(target: Record<string, unknown>, name: string, value: unknown): void {
+    Object.defineProperty(target, name, {
+        value,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+    });
+}
+
 function isPlainConfigRecord(value: unknown): value is Record<string, unknown> {
     if (!isRecord(value)) {
         return false;
@@ -263,6 +273,7 @@ export function parseConfigFields(fields: unknown): PluginConfigField[] {
                         'reactive',
                         'hidden',
                         'options',
+                        'placeholder',
                     ].includes(key),
             ) ||
             typeof field.key !== 'string' ||
@@ -283,6 +294,8 @@ export function parseConfigFields(fields: unknown): PluginConfigField[] {
                 : Object.hasOwn(field, 'options')) ||
             (Object.hasOwn(field, 'reactive') && field.reactive !== false) ||
             (Object.hasOwn(field, 'hidden') && field.hidden !== false) ||
+            (Object.hasOwn(field, 'placeholder') &&
+                (typeof field.placeholder !== 'string' || field.placeholder.length > 1024)) ||
             (field.description !== undefined &&
                 (typeof field.description !== 'string' || field.description.length > 1024))
         ) {
@@ -431,6 +444,7 @@ function snapshotMultiSelectField(field: Record<string, unknown>): PluginConfigF
             'reactive',
             'hidden',
             'options',
+            'placeholder',
         ];
         const snapshot: Record<string, unknown> = {};
 
@@ -506,7 +520,7 @@ function snapshotMultiSelectField(field: Record<string, unknown>): PluginConfigF
                 }
 
                 Object.freeze(options);
-                snapshot.options = options;
+                defineSnapshotField(snapshot, 'options', options);
             } else if (name === 'default') {
                 const defaults = copyConfigOptionValues(descriptor.value);
 
@@ -515,9 +529,9 @@ function snapshotMultiSelectField(field: Record<string, unknown>): PluginConfigF
                 }
 
                 Object.freeze(defaults);
-                snapshot.default = defaults;
+                defineSnapshotField(snapshot, 'default', defaults);
             } else {
-                snapshot[name] = descriptor.value;
+                defineSnapshotField(snapshot, name, descriptor.value);
             }
         }
 
@@ -536,6 +550,8 @@ function snapshotMultiSelectField(field: Record<string, unknown>): PluginConfigF
             !Object.hasOwn(snapshot, 'options') ||
             (Object.hasOwn(snapshot, 'reactive') && snapshot.reactive !== false) ||
             (Object.hasOwn(snapshot, 'hidden') && snapshot.hidden !== false) ||
+            (Object.hasOwn(snapshot, 'placeholder') &&
+                (typeof snapshot.placeholder !== 'string' || snapshot.placeholder.length > 1024)) ||
             (snapshot.description !== undefined &&
                 (typeof snapshot.description !== 'string' || snapshot.description.length > 1024))
         ) {
@@ -683,6 +699,7 @@ function snapshotReadOnlyDeclaration(field: PluginConfigField): PluginConfigFiel
             'reactive',
             'hidden',
             'options',
+            'placeholder',
         ];
         const snapshot: Record<string, unknown> = {};
 
@@ -712,7 +729,7 @@ function snapshotReadOnlyDeclaration(field: PluginConfigField): PluginConfigFiel
                     return unsupportedConfig();
                 }
 
-                snapshot.options = options;
+                defineSnapshotField(snapshot, 'options', options);
             } else if (name === 'default' && Array.isArray(value)) {
                 const defaults = copyConfigOptionValues(value);
 
@@ -721,7 +738,7 @@ function snapshotReadOnlyDeclaration(field: PluginConfigField): PluginConfigFiel
                 }
 
                 Object.freeze(defaults);
-                snapshot.default = defaults;
+                defineSnapshotField(snapshot, 'default', defaults);
             } else {
                 if (
                     value !== undefined &&
@@ -732,7 +749,7 @@ function snapshotReadOnlyDeclaration(field: PluginConfigField): PluginConfigFiel
                     return unsupportedConfig();
                 }
 
-                snapshot[name] = value;
+                defineSnapshotField(snapshot, name, value);
             }
         }
 
