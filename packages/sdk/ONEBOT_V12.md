@@ -185,6 +185,115 @@ failure or timeout after a send begins can leave its outcome uncertain; neither
 the SDK nor Jiyu retries automatically. Existing v11 message behavior is
 unchanged. See the [server details](../onebot/ONEBOT_V12.md#sending-a-single-location).
 
+## Local file data subset
+
+`@harehane/sdk/v12` exports `OneBot12UploadFileDataParams`,
+`OneBot12UploadFileDataResult` and
+`OneBot12UploadFileDataResponse`, and `OneBot12GetFileDataParams`,
+`OneBot12GetFileDataResult` and `OneBot12GetFileDataResponse`. These are optional
+TypeScript annotations: they do not validate action-specific fields at runtime.
+The existing generic `request()` still returns `OneBot12ActionResponse`, not an
+automatically narrowed response. The generic parser checks the envelope and JSON,
+not Base64 canonicality, digest integrity or action-specific result fields. A
+response type assertion is not validation, and the generic v12 client does not
+automatically encode, decode or verify file bytes.
+
+For a connected `client`, this synthetic example sends the Base64 string for
+`hello` and omits the optional upload hash:
+
+```ts
+import type {
+    OneBot12GetFileDataParams,
+    OneBot12UploadFileDataParams,
+} from '@harehane/sdk/v12';
+
+const upload: OneBot12UploadFileDataParams = {
+    type: 'data',
+    name: 'hello.txt',
+    data: 'aGVsbG8=',
+};
+const uploaded = await client.request('upload_file', upload);
+if (
+    uploaded.status === 'ok' && uploaded.data !== null &&
+    typeof uploaded.data === 'object' && !Array.isArray(uploaded.data) &&
+    typeof uploaded.data.file_id === 'string'
+) {
+    const get: OneBot12GetFileDataParams = {
+        type: 'data',
+        file_id: uploaded.data.file_id,
+    };
+    const retrieved = await client.request('get_file', get);
+    if (
+        retrieved.status === 'ok' && retrieved.data !== null &&
+        typeof retrieved.data === 'object' && !Array.isArray(retrieved.data) &&
+        typeof retrieved.data.name === 'string' &&
+        typeof retrieved.data.data === 'string' &&
+        typeof retrieved.data.sha256 === 'string'
+    ) {
+        // These are shape checks only, not Base64 or SHA-256 verification.
+    }
+}
+```
+
+Jiyu's local upload accepts only `type: 'data'`. `name` is a primitive
+string of at most 4,096 UTF-16 units, including the empty string; `data` is a
+canonical RFC 4648 Base64 JSON string, padded where required, for at most 256 KiB
+(262,144) decoded bytes. The empty Base64 string represents zero bytes. Optional
+`sha256`, if supplied, must be 64 lowercase hexadecimal characters matching the
+raw bytes; omit the property when unused rather than assigning `undefined`.
+Upload success carries `{file_id}`. Jiyu data retrieval success carries
+`{name, data, sha256}`, with `data` a Base64 string rather than a byte array and
+`sha256` the lowercase digest. The generic result type permits an absent hash for
+other implementations; the Jiyu result includes it. The returned name is
+not path-sanitized.
+
+The `jiyu-upload:v1:` handle contains 32 random bytes encoded as unpadded
+base64url. It is a transferable reference within the same account and current
+listener generation, not a QQ file ID. While the data capability is available,
+a foreign, expired or forged otherwise valid ID returns local not-found in data
+mode without a v11 lookup; URL mode returns 10004 for this prefix without v11 fallback. An old v11
+alias with the prefix is shadowed by v12 URL lookup, while v11 itself and other
+image, voice and v11 URL paths remain unchanged. Common snapshot and ID checks
+can fail earlier. Upload `url`, `path` and unknown types return 10004; the
+separate `upload_file_fragmented` action returns 10002. In Jiyu's account runtime,
+`get_supported_actions` will list `upload_file` only when both data callbacks
+exist and the current listener's upload lease is valid; a standalone core without a
+readiness callback instead checks the callback pair. Listing the action does not
+promise all types.
+
+At most 32 entries and 4 MiB (4,194,304) raw bytes are retained per listener;
+capacity exhaustion returns a fixed failure without eviction. Expiry is 10
+minutes from the upload's initial valid local clock sample, including subsequent
+processing time; a sufficiently delayed upload can already be expired on success.
+Retrieval does not extend expiry. Cleanup is lazy and idle expired content can
+remain until another store access or close. A historical random ID could in
+principle be generated again because collision checks cover only active entries.
+Every close attempt, even a failed one, the current listener token's `onError`,
+token/port reload, and runtime quiesce/force-close invalidate these handles. The
+listener lease is checked around synchronous callbacks and before commit. A
+post-bind transport error attempts quiescence first; the runtime also checks
+read-only transport state at guarded points, rejecting data access while quiesced,
+including after reentrant callbacks. If close or quiesce throws while open is pending, or a
+construction-time error is followed by the existing lifecycle restoring that
+listener as active, the retired upload lease stays invalid and discovery omits
+`upload_file`. A successful close and reopen are needed to restore it. A peer
+disconnect by itself does not prove listener-generation revocation; losing a
+response after commit is neither rollback nor proof of client receipt. Local buffer clearing is
+best effort; input/output/JSON copies, garbage collection and actual process RSS
+are not guaranteed to be cleared or bounded.
+
+Before upload effects, Jiyu checks the complete UTF-8 upload success envelope,
+including `file_id` and the upload request's `echo`, against 1 MiB minus 14 bytes.
+A later data retrieval separately checks its own complete success envelope,
+including `name`, `data`, `sha256` and its own `echo`. This is only a conservative
+single-frame budget for the default empty-queue transport: smaller custom limits,
+already queued WebSocket output or a closed connection may still prevent delivery.
+A failed or missing response can leave the upload outcome unknown; do not
+automatically retry. These local actions do not contact QQ, call v11, read or write
+files or make outbound network requests. The client transport is separate, and
+this v12 data subset does not upload to QQ or send image, voice or file messages.
+See the [server details](../onebot/ONEBOT_V12.md#local-data-uploads).
+
 ## `get_file` URL subset
 
 `@harehane/sdk/v12` exports `OneBot12GetFileUrlParams`,
@@ -223,11 +332,11 @@ normal response parser checks the envelope and JSON value, not action-specific
 fields, optional headers or hash, or URL syntax. Callers must validate any fields
 they use; a type assertion is not validation.
 
-Jiyu's current v12 server supports only this URL subset, not the complete
-`get_file` action: bytes and path modes, and other file operations, are not
-implemented. Supply an already-known legacy ID from the same account's v11
-media cache, or the transient ID from a supported incoming v12 image or voice
-segment. A cache miss or another kind of ID may fail. The
+Jiyu's existing URL subset is not the complete `get_file` action. The separate
+local data capability above retrieves only locally uploaded data; path mode and
+general file operations remain unsupported. For URL mode, supply an already-known legacy ID from the
+same account's v11 media cache, or the transient ID from a supported incoming v12
+image or voice segment. A cache miss or another kind of ID may fail. The
 [OneBot URL-mode definition](https://12.onebot.dev/interface/file/actions/#get_file)
 requires the application to be able to download the file. Jiyu checks URL syntax
 on a best-effort basis, but does not establish that requirement, reachability,

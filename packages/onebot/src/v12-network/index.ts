@@ -341,6 +341,11 @@ export class V12Transport {
         this.state = 'open';
     }
 
+    /** Current listener admission state; this is an observation, not a delivery guarantee. */
+    isAcceptingActions(): boolean {
+        return this.state === 'open' && !this.quiesced;
+    }
+
     /** Caller must route requests exclusively to this method, not multiple listeners. */
     handleRequest(req: IncomingMessage, res: ServerResponse): void {
         if (this.state !== 'open' || this.quiesced) {

@@ -1,4 +1,8 @@
 import type { ApiResponse, JsonObject, JsonValue } from '../types';
+import type { V12ReadUploadResult, V12UploadResult } from './uploaded-data-store';
+
+/** Internal listener-lifetime check, not an authentication boundary. */
+export type V12FileLease = () => boolean;
 
 /** One account owned by the surrounding instance, not a global account registry. */
 export interface V12Self {
@@ -31,6 +35,17 @@ export interface V12CoreOptions {
     resolveImageFileUrl?(fileId: string): string | null;
     /** Resolve an implementation-issued voice file ID for the current account. */
     resolveVoiceFileUrl?(fileId: string): string | null;
+    /** Synchronous local data store; a listener owner may supply a commit lease. */
+    uploadDataFile?(
+        name: string,
+        data: string,
+        sha256?: string,
+        lease?: V12FileLease,
+    ): V12UploadResult;
+    /** Synchronous local read; the lease is a lifetime fence, not authentication. */
+    getUploadedDataFile?(fileId: string, lease?: V12FileLease): V12ReadUploadResult;
+    /** Optional listener readiness; absence preserves direct core callback behavior. */
+    isUploadDataSupported?(lease?: V12FileLease): boolean;
 }
 
 export type V12TextSegment = { type: 'text'; data: { text: string } };

@@ -1,8 +1,9 @@
 import { isProxy } from 'node:util/types';
 import type { ApiResponse, JsonObject, JsonValue } from '../types';
-import type { V12CoreOptions, V12Response } from './types';
+import type { V12CoreOptions, V12FileLease, V12Response } from './types';
 import { classifyFileUrl } from './file-url';
 import { isV12ImageToken, isV12VoiceToken } from './image-file-token';
+import { isV12UploadToken, V12_UPLOAD_TOKEN_PREFIX } from './uploaded-data-store';
 import {
     MAX_REQUEST_STRING_LENGTH,
     fromV11MessageId,
@@ -12,6 +13,8 @@ import {
     parseMessageId,
     snapshotRequest,
 } from './validation';
+
+const apply = Reflect.apply;
 
 type PreparedRequest = {
     input: Record<string, unknown>;
@@ -66,6 +69,91 @@ function response(
 
 function extraKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
     return Object.keys(value).some((key) => !allowed.includes(key));
+}
+
+// This bounds one local success envelope for the default transport, including
+// the maximum WebSocket framing overhead. It does not guarantee delivery or
+// account for smaller configured limits or already-queued WebSocket messages.
+const MAX_FILE_SUCCESS_JSON_BYTES = 1024 * 1024 - 14;
+const MAX_UPLOAD_BASE64_LENGTH = 349528;
+const MAX_UPLOAD_DATA_BYTES = 256 * 1024;
+
+function fileSuccessFits(data: JsonObject, echo?: string): boolean {
+    return (
+        Buffer.byteLength(JSON.stringify(response(0, '', data, echo)), 'utf8') <=
+        MAX_FILE_SUCCESS_JSON_BYTES
+    );
+}
+
+function fileLeaseCurrent(lease?: V12FileLease): boolean {
+    try {
+        // Direct, transport-independent core callers own their own lifecycle.
+        return lease === undefined || lease() === true;
+    } catch {
+        return false;
+    }
+}
+
+/** Inspect only own data properties of a non-Proxy provider result. */
+function ownData(value: object, key: string): unknown {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && 'value' in descriptor ? descriptor.value : undefined;
+}
+
+function isProviderRecord(value: unknown): value is object {
+    return typeof value === 'object' && value !== null && !isProxy(value) && !Array.isArray(value);
+}
+
+function isCanonicalUploadId(value: unknown): value is string {
+    if (
+        typeof value !== 'string' ||
+        !isV12UploadToken(value) ||
+        value.length !== V12_UPLOAD_TOKEN_PREFIX.length + 43
+    ) {
+        return false;
+    }
+
+    const encoded = value.slice(V12_UPLOAD_TOKEN_PREFIX.length);
+    // 32-byte base64url has 42 unrestricted characters and two zero pad bits.
+    return /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/.test(encoded);
+}
+
+function isCanonicalUploadData(value: unknown): value is string {
+    if (
+        typeof value !== 'string' ||
+        value.length > MAX_UPLOAD_BASE64_LENGTH ||
+        value.length % 4 !== 0
+    ) {
+        return false;
+    }
+
+    const length = value.length;
+    const padding =
+        length > 0 && value[length - 1] === '=' ? (value[length - 2] === '=' ? 2 : 1) : 0;
+
+    for (let index = 0; index < length - padding; index += 1) {
+        const code = value.charCodeAt(index);
+
+        if (!(
+            (code >= 65 && code <= 90) ||
+            (code >= 97 && code <= 122) ||
+            (code >= 48 && code <= 57) ||
+            code === 43 ||
+            code === 47
+        )) {
+            return false;
+        }
+    }
+
+    if (padding === 2 && !'AQgw'.includes(value[length - 3]!)) {
+        return false;
+    }
+
+    if (padding === 1 && !'AEIMQUYcgkosw048'.includes(value[length - 2]!)) {
+        return false;
+    }
+
+    return (length / 4) * 3 - padding <= MAX_UPLOAD_DATA_BYTES;
 }
 
 /** Only call on an already bounded snapshot, never on caller-owned objects. */
@@ -142,9 +230,12 @@ export class V12Dispatcher {
         this.version = { ...options.version };
     }
 
-    async handle(input: unknown): Promise<V12Response> {
+    /** A transport supplies its listener lease; direct core users own callback lifetime. */
+    async handle(input: unknown, fileLease?: V12FileLease): Promise<V12Response> {
         const checked = this.preflight(input);
-        return checked.kind === 'error' ? checked.response : this.runPrepared(checked.request);
+        return checked.kind === 'error'
+            ? checked.response
+            : this.runPrepared(checked.request, fileLease);
     }
 
     /** Internal future HTTP integration seam. It does not register or run a poll. */
@@ -161,7 +252,8 @@ export class V12Dispatcher {
         }
 
         this.#preparedOrdinary.delete(token);
-        return this.runPrepared(request);
+        // This future HTTP seam has no listener lease; file effects fail closed.
+        return this.runPrepared(request, () => false);
     }
 
     private classifyHttpRequest(input: unknown): HttpPreflight {
@@ -287,20 +379,57 @@ export class V12Dispatcher {
         }
     }
 
-    private async runPrepared(request: PreparedRequest): Promise<V12Response> {
+    private async runPrepared(
+        request: PreparedRequest,
+        fileLease?: V12FileLease,
+    ): Promise<V12Response> {
         try {
-            return await this.handleSnapshot(request.input);
+            return await this.handleSnapshot(request.input, fileLease);
         } catch {
             return response(10001, 'invalid action request', null, request.fallbackEcho);
         }
     }
 
-    private async handleSnapshot(input: Record<string, unknown>): Promise<V12Response> {
+    private supportsUploadData(fileLease?: V12FileLease): boolean {
+        try {
+            if (
+                typeof this.options.uploadDataFile !== 'function' ||
+                typeof this.options.getUploadedDataFile !== 'function'
+            ) {
+                return false;
+            }
+
+            const readiness = this.options.isUploadDataSupported;
+
+            if (readiness === undefined) {
+                return fileLeaseCurrent(fileLease);
+            }
+
+            return (
+                typeof readiness === 'function' &&
+                apply(readiness, this.options, [fileLease]) === true &&
+                typeof this.options.uploadDataFile === 'function' &&
+                typeof this.options.getUploadedDataFile === 'function' &&
+                fileLeaseCurrent(fileLease)
+            );
+        } catch {
+            return false;
+        }
+    }
+
+    private async handleSnapshot(
+        input: Record<string, unknown>,
+        fileLease?: V12FileLease,
+    ): Promise<V12Response> {
         const echo = typeof input.echo === 'string' ? input.echo : undefined;
         const action = input.action as string;
         const params = input.params as Record<string, unknown>;
 
-        if (!(ACTIONS as readonly string[]).includes(action)) {
+        if (action === 'upload_file') {
+            if (!this.supportsUploadData(fileLease)) {
+                return response(10002, 'unsupported action', null, echo);
+            }
+        } else if (!(ACTIONS as readonly string[]).includes(action)) {
             return response(10002, 'unsupported action', null, echo);
         }
 
@@ -318,7 +447,13 @@ export class V12Dispatcher {
             }
 
             if (action === 'get_supported_actions') {
-                return response(0, '', [...ACTIONS], echo);
+                const actions: string[] = [...ACTIONS];
+
+                if (this.supportsUploadData(fileLease)) {
+                    actions.push('upload_file');
+                }
+
+                return response(0, '', actions, echo);
             }
 
             try {
@@ -461,6 +596,10 @@ export class V12Dispatcher {
             return this.callDelete(id, echo);
         }
 
+        if (action === 'upload_file') {
+            return this.uploadFile(params, echo, fileLease);
+        }
+
         if (action === 'get_file') {
             if (extraKeys(params, ['file_id', 'type'])) {
                 return response(10004, 'unsupported parameter', null, echo);
@@ -475,7 +614,13 @@ export class V12Dispatcher {
                 return response(10003, 'invalid file parameters', null, echo);
             }
 
-            if (params.type !== 'url') {
+            if (params.type === 'data' && isV12UploadToken(params.file_id)) {
+                return this.getUploadedFile(params.file_id, echo, fileLease);
+            }
+
+            if (params.type !== 'url' || isV12UploadToken(params.file_id)) {
+                // The reserved upload prefix shadows any v11 alias only through
+                // v12 get_file; direct v11 actions and lookups are unchanged.
                 return response(10004, 'unsupported file type', null, echo);
             }
 
@@ -559,6 +704,143 @@ export class V12Dispatcher {
             );
         } catch {
             return response(20002, 'self info unavailable', null, echo);
+        }
+    }
+
+    private uploadFile(
+        params: Record<string, unknown>,
+        echo?: string,
+        fileLease?: V12FileLease,
+    ): V12Response {
+        const invalid = () => response(10003, 'invalid upload parameters', null, echo);
+        const unavailable = () => response(20002, 'upload unavailable', null, echo);
+
+        if (extraKeys(params, ['type', 'name', 'data', 'sha256'])) {
+            return response(10004, 'unsupported parameter', null, echo);
+        }
+
+        if (typeof params.type !== 'string') {
+            return invalid();
+        }
+
+        if (params.type !== 'data') {
+            return response(10004, 'unsupported file type', null, echo);
+        }
+
+        if (
+            typeof params.name !== 'string' ||
+            params.name.length > 4096 ||
+            !isCanonicalUploadData(params.data) ||
+            (Object.hasOwn(params, 'sha256') &&
+                (typeof params.sha256 !== 'string' ||
+                    params.sha256.length !== 64 ||
+                    !/^[0-9a-f]{64}$/.test(params.sha256)))
+        ) {
+            return invalid();
+        }
+
+        try {
+            // Every accepted result ID has this exact encoded length, so this
+            // preflight bounds the precise success envelope before any upload.
+            if (!fileSuccessFits({ file_id: V12_UPLOAD_TOKEN_PREFIX + 'A'.repeat(43) }, echo)) {
+                return invalid();
+            }
+
+            const upload = this.options.uploadDataFile;
+
+            if (typeof upload !== 'function' || !fileLeaseCurrent(fileLease)) {
+                return unavailable();
+            }
+
+            const args: unknown[] = [params.name, params.data, params.sha256];
+
+            if (fileLease !== undefined) {
+                args.push(fileLease);
+            }
+
+            const result: unknown = apply(upload, this.options, args);
+
+            if (!fileLeaseCurrent(fileLease) || !isProviderRecord(result)) {
+                return unavailable();
+            }
+
+            const kind = ownData(result, 'kind');
+
+            if (kind === 'invalid') {
+                return invalid();
+            }
+
+            if (kind !== 'ok') {
+                return unavailable();
+            }
+
+            const fileId = ownData(result, 'fileId');
+            return isCanonicalUploadId(fileId)
+                ? response(0, '', { file_id: fileId }, echo)
+                : unavailable();
+        } catch {
+            return unavailable();
+        }
+    }
+
+    private getUploadedFile(fileId: string, echo?: string, fileLease?: V12FileLease): V12Response {
+        const unavailable = () => response(20002, 'file unavailable', null, echo);
+
+        try {
+            const get = this.options.getUploadedDataFile;
+
+            if (typeof get !== 'function' || !fileLeaseCurrent(fileLease)) {
+                return unavailable();
+            }
+
+            const args: unknown[] = [fileId];
+
+            if (fileLease !== undefined) {
+                args.push(fileLease);
+            }
+
+            const result: unknown = apply(get, this.options, args);
+
+            if (!fileLeaseCurrent(fileLease) || !isProviderRecord(result)) {
+                return unavailable();
+            }
+
+            const kind = ownData(result, 'kind');
+
+            if (kind === 'not_found') {
+                return response(20001, 'invalid file result', null, echo);
+            }
+
+            if (kind !== 'ok') {
+                return unavailable();
+            }
+
+            const name = ownData(result, 'name');
+            const data = ownData(result, 'data');
+            const sha256 = ownData(result, 'sha256');
+
+            // This bounds provider data; it does not authenticate a custom
+            // callback or independently prove that its digest matches its bytes.
+            if (
+                typeof name !== 'string' ||
+                name.length > 4096 ||
+                !isCanonicalUploadData(data) ||
+                typeof sha256 !== 'string' ||
+                sha256.length !== 64 ||
+                !/^[0-9a-f]{64}$/.test(sha256)
+            ) {
+                return unavailable();
+            }
+
+            const payload = { name, data, sha256 };
+
+            if (!fileSuccessFits(payload, echo)) {
+                return response(10003, 'file response too large', null, echo);
+            }
+
+            return response(0, '', payload, echo);
+        } catch {
+            return unavailable();
         }
     }
 

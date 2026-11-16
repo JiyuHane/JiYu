@@ -60,8 +60,9 @@ The core currently handles `get_version`, `get_status`, `get_supported_actions`,
 `get_group_list`, `get_group_member_list`, `get_group_member_info`,
 `send_message` for private and group text, group mentions, and a single standalone
 location segment in either conversation type, `delete_message`, `set_group_name`,
-`leave_group`, and the restricted URL mode
-of `get_file`. Setting a group name
+`leave_group`, and the restricted URL mode of `get_file`. The account runtime also
+installs the local `upload_file` and `get_file` data capability described below.
+Setting a group name
 requires a canonical positive uint32 group ID encoded as a string and a string
 group name, including an empty string; it forwards one request to the existing account-local v11 handler. The
 uint32 limit prevents truncation in the downstream group-name encoding.
@@ -74,27 +75,103 @@ response is not proof that a requested deletion did or did not happen. Its
 response inspection rejects a final Proxy value after JavaScript's `await` has
 performed thenable handling, which may itself execute a `then` getter.
 
-`get_file` currently supports only `type: "url"`. Non-reserved opaque `file_id`
-values are passed once to the existing account-local v11 media lookup; supported
-hits come from that account's cached image or voice metadata. The ID must be a
-nonempty string of at most 4,096 UTF-16 code units. Supported v12 incoming image
-and voice segments can instead supply separate transient handles as described
-below; v12 uploads do not yet supply IDs. Success returns only `name` and the
-original HTTP(S) `url`. The [OneBot URL mode](https://12.onebot.dev/interface/file/actions/#get_file)
-requires the application to be able to download the file; Jiyu's best-effort URL
-syntax check does not establish that requirement, URL availability, validity
-period, required credentials, or application access. Cached names can be
-identifiers or other stored labels rather than original filenames. A label
-containing `/` or NUL, or equal to `.` or `..`, is projected as an empty unknown
-name because it is not a Linux filename; other labels are retained without proof
-they were the original filename. Consumers must validate names for their own
-platform before using them as filesystem paths. Missing URL or other retrieval
-types return 10004; a cache miss is not proof that the underlying file does not
-exist. Group/normal files, videos, uploads, local paths, inline data and
-fragmented transfer remain unsupported here. The v11 `get_file` request, result
-and action-error logs are redacted, and the image URL-refresh warning no longer
-records its exception; observers and other lower-level logging or configured
-URL-refresh services can still see data.
+For `get_file` with `type: "url"`, non-reserved opaque `file_id` values are
+passed once to the existing account-local v11 media lookup; supported hits come
+from that account's cached image or voice metadata. The ID must be a nonempty
+string of at most 4,096 UTF-16 code units. Supported v12 incoming image and voice
+segments can instead supply separate transient URL handles as described below.
+URL success returns only `name` and the original HTTP(S) `url`. The
+[OneBot URL mode](https://12.onebot.dev/interface/file/actions/#get_file) requires
+the application to be able to download the file; Jiyu's best-effort URL syntax
+check does not establish that requirement, URL availability, validity period,
+required credentials, or application access. Cached names can be identifiers or
+other stored labels rather than original filenames. A label containing `/` or NUL,
+or equal to `.` or `..`, is projected as an empty unknown name because it is not
+a Linux filename; other labels are retained without proof they were the original
+filename. Consumers must validate names for their own platform before using them as
+filesystem paths. A missing URL returns 10004; a cache miss is not proof that the
+underlying file does not exist. The v11 `get_file` request, result and action-error
+logs are redacted, and the image URL-refresh warning no longer records its
+exception; observers and other lower-level logging or configured URL-refresh
+services can still see data.
+
+### Local data uploads
+
+The account runtime installs a local data capability. Its
+`get_supported_actions` lists `upload_file` only when both local data callbacks
+exist and the current listener's upload lease is valid. The independent core
+can instead use the callback pair alone when no readiness callback is supplied.
+Listing the action does not imply support for every upload type. `upload_file` accepts only
+`type: "data"`: `name` is a primitive string of at most 4,096 UTF-16 code units
+and may be empty, while `data` is a JSON string containing canonical RFC 4648
+Base64 with padding where required. Whitespace, the base64url alphabet,
+unnecessary or missing padding, and noncanonical pad bits are rejected. The empty
+string represents zero bytes. An optional `sha256` must be a 64-character
+lowercase hexadecimal string matching the decoded bytes; omit it when unused,
+rather than supplying `undefined`. A file may contain at most 256 KiB (262,144)
+raw bytes.
+
+A successful upload stores the decoded bytes temporarily in the local process and
+returns `{file_id}`. Its ID is `jiyu-upload:v1:` followed by 32 random bytes encoded
+as unpadded base64url. It is a transferable bearer reference usable only by a
+caller of the same account and active listener generation. `get_file` with
+`type: "data"` retrieves `{name, data, sha256}`: the original name, canonical
+Base64 bytes and lowercase SHA-256. The name is preserved as data, not validated
+as a filesystem path. No local upload or data retrieval contacts QQ, invokes v11,
+reads or writes a file, or makes an outbound network request; the ordinary client
+transport remains separate. These actions do not send an image, voice message or
+file, and do not establish an end-to-end QQ media transfer.
+
+When the data capability is available and a request passes the common `file_id`
+type and length checks, a foreign, expired or forged ID in this reserved namespace
+produces a local not-found result for data mode without a v11 lookup. URL mode returns 10004 for that prefix without
+falling back to v11. Other existing image, voice and v11 URL paths remain unchanged,
+except that, once installed, this capability shadows a pre-existing v11 alias
+starting `jiyu-upload:v1:` through v12 URL lookup; v11 itself is unchanged. Malformed or oversized IDs may
+fail earlier common validation. Upload `type: "url"`, `type: "path"` and unknown
+types return 10004; the separate `upload_file_fragmented` action remains
+unimplemented and returns 10002. Other group/normal file and video operations,
+local-path modes and outbound media remain unsupported.
+
+Each listener retains at most 32 entries and 4 MiB (4,194,304) raw bytes in total;
+exhaustion returns a fixed failure without evicting an unexpired entry. Expiry is
+10 minutes from the upload's initial valid local clock sample, including subsequent
+processing time; in an extreme delay an entry can already be expired when success
+is returned. Reads do not extend the deadline. Cleanup is lazy, so idle expired
+content may remain in memory until the next store access or close. Since only the
+active map is checked for random-ID collisions, a historical ID could in principle
+coincide with a new random ID; there is no permanent tombstone guarantee.
+
+Every listener close attempt invalidates its data handles, even if closing fails;
+the current listener token's `onError`, token or port reload, and runtime quiesce
+or force-close also invalidate them. The listener lease is rechecked around
+synchronous callbacks and before commit to block a late request from an old
+generation. A post-bind transport error attempts to quiesce the transport first;
+the runtime also checks its read-only transport state at the guarded points, so
+a quiesced transport rejects data access, including after reentrant callbacks.
+
+If close or quiesce throws while an open is pending, or construction reports an
+error and the existing lifecycle later restores that listener as active, the
+retired upload lease remains invalid and `get_supported_actions` omits
+`upload_file`. A successful close and subsequent reopen are needed to restore
+the capability; restoring the listener's general active state alone is not
+enough. A peer disconnect by itself does not prove that the listener generation
+was revoked; loss of a response after commit is neither rollback nor proof of
+remote receipt.
+Retained local buffers are cleared on a best-effort basis; input/output/JSON
+copies, garbage collection and actual process RSS are not guaranteed to be erased
+or bounded by these store limits.
+
+Before an upload has an effect, its complete UTF-8 success response, including
+`file_id` and any `echo`, is checked against 1 MiB minus 14 bytes. A data retrieval
+separately checks its complete success response, including `name`, `data`,
+`sha256` and that request's `echo`, against the same limit. This conservative
+budget covers one frame for the default transport with an empty queue only; a
+smaller custom limit, existing WebSocket queued frames or a terminated connection
+can still prevent delivery. A failed or missing response can leave the upload
+outcome unknown; neither Jiyu nor the SDK automatically retries it.
+
+### Incoming messages
 
 Incoming friend/private and normal/group messages with text and v11 `at`
 segments are converted to v12 `text`, `mention` and `mention_all` segments.
@@ -296,9 +373,10 @@ rather than producing a partial event; if the internal ordered poll owner is
 active, this failure marks an ordering gap instead of silently skipping the
 event. The poll owner is not wired to a production HTTP polling action. Other
 notices and requests are not yet translated to v12. Unsupported actions,
-parameters and message segments return explicit errors. File operations beyond
-the `get_file` URL subset, HTTP event polling and HTTP Webhook are not implemented
-by this listener. Capability and error details remain authoritative at runtime.
+parameters and message segments return explicit errors. Apart from the existing
+`get_file` URL subset and the local data capability described above, file
+operations, HTTP event polling and HTTP Webhook are not implemented by this
+listener. Capability and error details remain authoritative at runtime.
 
 A WebSocket connection receives `meta.connect` first and then the current
 account status; network connection alone does not assert that the account is

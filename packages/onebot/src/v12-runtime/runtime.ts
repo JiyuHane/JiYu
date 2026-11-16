@@ -20,7 +20,8 @@ import {
     createStatusUpdateEvent,
     V12UnsupportedEventError,
 } from '../v12/events';
-import type { V12Self } from '../v12/types';
+import { V12UploadedDataStore } from '../v12/uploaded-data-store';
+import type { V12FileLease, V12Self } from '../v12/types';
 import type { JsonObject } from '../types';
 import { safeV12Error, V12_ADAPTER_NAME, type V12ManagedConfig } from './identity';
 import {
@@ -51,9 +52,18 @@ import {
     type PollGate,
 } from './poll-owner';
 
+const apply = Reflect.apply;
+
 // Local per-event admission limits, not QQ or OneBot protocol limits.
 const MAX_INBOUND_MEDIA_SEGMENTS = 128;
 const MAX_INBOUND_MEDIA_URL_BYTES = 256 * 1024;
+
+type UploadGeneration = { readonly token: object; valid: boolean };
+type UploadSlot = {
+    readonly generation: UploadGeneration;
+    readonly transport: V12Transport;
+    readonly store: V12UploadedDataStore;
+};
 
 function hasFriendRecallType(event: JsonObject): boolean {
     try {
@@ -83,6 +93,8 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     private readonly dispatcher: V12Dispatcher;
     private imageFileTokens: V12ImageFileTokens | null = null;
     #voiceFileTokens: V12VoiceFileTokens | null = null;
+    #uploadGeneration: UploadGeneration | null = null;
+    #uploadSlot: UploadSlot | null = null;
     private readonly subscribers = new Set<(event: unknown) => void>();
     private readonly subscriberGenerations = new Map<(event: unknown) => void, object>();
     private readonly heartbeatEnableReloadScopes = new Set<{
@@ -171,6 +183,58 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                     ? url
                     : null;
             },
+            isUploadDataSupported: (lease) => {
+                const generation = this.#uploadGeneration;
+                const transport = this.transport;
+
+                // A failed close can leave a listener running, but its retired
+                // file lease must never be recreated for that same generation.
+                return (
+                    generation !== null &&
+                    transport !== null &&
+                    this.isUploadLeaseCurrent(lease, generation, transport)
+                );
+            },
+            uploadDataFile: (name, data, sha256, lease) => {
+                const slot = this.acquireUploadSlot(lease);
+
+                if (!slot) {
+                    return { kind: 'unavailable' };
+                }
+
+                const current = () => this.isUploadSlotCurrent(slot, lease);
+
+                try {
+                    if (!current()) {
+                        return { kind: 'unavailable' };
+                    }
+
+                    const result = slot.store.upload(name, data, sha256, current);
+                    return current() ? result : { kind: 'unavailable' };
+                } catch {
+                    return { kind: 'unavailable' };
+                }
+            },
+            getUploadedDataFile: (fileId, lease) => {
+                const slot = this.acquireUploadSlot(lease);
+
+                if (!slot) {
+                    return { kind: 'unavailable' };
+                }
+
+                const current = () => this.isUploadSlotCurrent(slot, lease);
+
+                try {
+                    if (!current()) {
+                        return { kind: 'unavailable' };
+                    }
+
+                    const result = slot.store.get(fileId, current);
+                    return current() ? result : { kind: 'unavailable' };
+                } catch {
+                    return { kind: 'unavailable' };
+                }
+            },
         });
         registerOrderedRuntime(this, (source) => recordPreparedScopeLoss(this, source));
     }
@@ -224,11 +288,35 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
 
         const token = {};
         const sourceAttempt = {};
+        const uploadGeneration: UploadGeneration = { token, valid: true };
         this.openingOwner = token;
         this.sourceAttempt = sourceAttempt;
         this.sourceBinding = null;
         this.currentStatusTransportToken = token;
+        this.#uploadGeneration = uploadGeneration;
         let transport: V12Transport;
+
+        const fileLease = (): boolean => {
+            const owns = (): boolean =>
+                uploadGeneration.valid &&
+                this.#uploadGeneration === uploadGeneration &&
+                this.transport !== null &&
+                this.transport === transport &&
+                this.currentStatusTransportToken === token &&
+                this.isEnabled &&
+                this.accepting;
+
+            if (!this.uploadTransportReady(transport, owns)) {
+                return false;
+            }
+
+            try {
+                // This callback may synchronously close or replace the listener.
+                return this.options.canAccept() && this.uploadTransportReady(transport, owns);
+            } catch {
+                return false;
+            }
+        };
 
         try {
             transport = new V12Transport({
@@ -236,10 +324,20 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                 port: this.config.port,
                 accessToken: this.config.accessToken,
                 handle: (request) =>
-                    this.options.trackAction('v12 action', () => this.dispatcher.handle(request)),
+                    this.options.trackAction('v12 action', () =>
+                        this.dispatcher.handle(request, fileLease),
+                    ),
                 getConnectEvent: () => createConnectEvent(this.version),
                 subscribe: (listener) => this.subscribeStatus(listener),
                 onError: (error) => {
+                    // A stale error must not revoke a replacement listener's store.
+                    if (
+                        this.#uploadGeneration === uploadGeneration &&
+                        this.currentStatusTransportToken === token
+                    ) {
+                        this.retireUploadGeneration(uploadGeneration);
+                    }
+
                     // Retire only this transport's timer before any reentrant cleanup.
                     this.cancelHeartbeat(token);
 
@@ -260,6 +358,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                 },
             });
         } catch (error) {
+            this.retireUploadGeneration(uploadGeneration);
             this.cancelHeartbeat(token);
 
             if (this.sourceAttempt === sourceAttempt) {
@@ -285,6 +384,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             this.currentStatusTransportToken !== token ||
             this.transport
         ) {
+            this.retireUploadGeneration(uploadGeneration);
             this.cancelHeartbeat(token);
 
             try {
@@ -306,6 +406,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             await transport.open();
 
             if (!this.accepting || !this.options.canAccept()) {
+                this.retireUploadGeneration(uploadGeneration);
                 this.cancelHeartbeat(token);
                 await transport.close();
 
@@ -345,6 +446,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                 }
             }
         } catch (error) {
+            this.retireUploadGeneration(uploadGeneration);
             this.cancelHeartbeat(token);
 
             if (this.sourceAttempt === sourceAttempt) {
@@ -378,6 +480,20 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     async close(): Promise<void> {
         const initialTransport = this.transport;
         const initialToken = this.currentStatusTransportToken;
+        const uploadGeneration = this.#uploadGeneration;
+
+        if (uploadGeneration?.token === initialToken) {
+            this.retireUploadGeneration(uploadGeneration);
+        }
+
+        // Store cleanup and its diagnostic can reenter and install a new listener.
+        if (
+            this.transport !== initialTransport ||
+            this.currentStatusTransportToken !== initialToken
+        ) {
+            return;
+        }
+
         const heartbeatEnabled =
             this.config.heartbeat?.enabled === true ||
             [...this.heartbeatEnableReloadScopes].some(
@@ -470,13 +586,19 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     }
 
     quiesce(): void {
+        this.accepting = false;
+        const uploadGeneration = this.#uploadGeneration;
+
+        if (uploadGeneration) {
+            this.retireUploadGeneration(uploadGeneration);
+        }
+
         this.cancelHeartbeat();
         this.revokePoll();
         this.closeRevision = {};
         this.openingOwner = null;
         this.sourceAttempt = null;
         this.sourceBinding = null;
-        this.accepting = false;
 
         this.revokeMediaTokens();
         this.cancelHeartbeat();
@@ -485,13 +607,19 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     }
 
     override forceClose(): void {
+        this.accepting = false;
+        const uploadGeneration = this.#uploadGeneration;
+
+        if (uploadGeneration) {
+            this.retireUploadGeneration(uploadGeneration);
+        }
+
         this.cancelHeartbeat();
         this.revokePoll();
         this.closeRevision = {};
         this.openingOwner = null;
         this.sourceAttempt = null;
         this.sourceBinding = null;
-        this.accepting = false;
 
         this.revokeMediaTokens();
         this.cancelHeartbeat();
@@ -1220,6 +1348,141 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                 process.emitWarning('v12 status diagnostic failed');
             } catch {
                 // Both diagnostic channels failed; retain delivery semantics.
+            }
+        }
+    }
+
+    /** The transport can be quiesced before its owner receives onError. */
+    private uploadTransportReady(transport: V12Transport, owns: () => boolean): boolean {
+        if (!owns()) {
+            return false;
+        }
+
+        try {
+            const ready = transport.isAcceptingActions;
+            // A test transport's method/getter may reenter or be absent.
+            return (
+                typeof ready === 'function' &&
+                owns() &&
+                apply(ready, transport, []) === true &&
+                owns()
+            );
+        } catch {
+            return false;
+        }
+    }
+
+    /** The lease correlates one listener, not an inbound source or an identity. */
+    private isUploadLeaseCurrent(
+        lease: V12FileLease | undefined,
+        generation: UploadGeneration,
+        transport: V12Transport,
+    ): boolean {
+        const owns = (): boolean =>
+            generation.valid &&
+            this.#uploadGeneration === generation &&
+            this.currentStatusTransportToken === generation.token &&
+            this.transport === transport &&
+            this.isEnabled &&
+            this.accepting;
+
+        if (!lease || !this.uploadTransportReady(transport, owns)) {
+            return false;
+        }
+
+        try {
+            // The readiness check, canAccept and lease may all reenter lifecycle code.
+            return (
+                this.options.canAccept() &&
+                this.uploadTransportReady(transport, owns) &&
+                lease() &&
+                this.uploadTransportReady(transport, owns)
+            );
+        } catch {
+            return false;
+        }
+    }
+
+    private isUploadSlotCurrent(slot: UploadSlot, lease: V12FileLease | undefined): boolean {
+        return (
+            this.#uploadSlot === slot &&
+            this.isUploadLeaseCurrent(lease, slot.generation, slot.transport) &&
+            this.#uploadSlot === slot
+        );
+    }
+
+    /** Lazily allocate only for the exact listener generation requesting data. */
+    private acquireUploadSlot(lease: V12FileLease | undefined): UploadSlot | null {
+        const generation = this.#uploadGeneration;
+        const transport = this.transport;
+
+        if (!generation || !transport || !this.isUploadLeaseCurrent(lease, generation, transport)) {
+            return null;
+        }
+
+        let slot = this.#uploadSlot;
+
+        if (slot) {
+            return this.isUploadSlotCurrent(slot, lease) ? slot : null;
+        }
+
+        let candidate: V12UploadedDataStore;
+
+        try {
+            candidate = new V12UploadedDataStore();
+        } catch {
+            return null;
+        }
+
+        if (!this.isUploadLeaseCurrent(lease, generation, transport)) {
+            this.closeUploadStore(candidate);
+            return null;
+        }
+
+        // Construction or the lease can reenter and install another store.
+        if (this.#uploadSlot === null) {
+            this.#uploadSlot = { generation, transport, store: candidate };
+        } else {
+            this.closeUploadStore(candidate);
+        }
+
+        slot = this.#uploadSlot;
+        return slot && this.isUploadSlotCurrent(slot, lease) ? slot : null;
+    }
+
+    private retireUploadGeneration(generation: UploadGeneration): void {
+        // Invalidate before detach or any cleanup: close/diagnostics can reenter.
+        generation.valid = false;
+
+        if (this.#uploadGeneration === generation) {
+            this.#uploadGeneration = null;
+        }
+
+        const slot = this.#uploadSlot;
+
+        if (!slot || slot.generation !== generation) {
+            return;
+        }
+
+        this.#uploadSlot = null;
+        this.closeUploadStore(slot.store);
+    }
+
+    private closeUploadStore(store: V12UploadedDataStore): void {
+        try {
+            store.close();
+        } catch {
+            // Never expose provider details or allow diagnostics to block teardown.
+            const message = 'v12 upload store close failed';
+
+            try {
+                this.log.warn(message);
+            } catch {
+                try {
+                    process.emitWarning(message);
+                } catch {
+                    // Both diagnostic channels failed; continue the lifecycle.
+                }
             }
         }
     }

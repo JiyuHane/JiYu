@@ -102,13 +102,19 @@ reverse.on('connection', (bot: SnowLumaReverseWebSocketSession) => {
         path.join(consumerRoot, 'browser-types.mts'),
         `
 import { SnowLumaWebSocketClient, text } from '@harehane/sdk';
-import { OneBot12HttpClient, OneBot12WebSocketClient, type OneBot12Event, type OneBot12LatestEventsParams, type OneBot12LatestEventsResponse, type OneBot12PlatformEvent } from '@harehane/sdk/v12';
+import { OneBot12HttpClient, OneBot12WebSocketClient, type OneBot12Event, type OneBot12LatestEventsParams, type OneBot12LatestEventsResponse, type OneBot12PlatformEvent, type OneBot12UploadFileDataParams, type OneBot12GetFileDataResponse } from '@harehane/sdk/v12';
 new SnowLumaWebSocketClient().onMessage(async (_event, context) => { await context.reply(text('hello')); });
 const http = new OneBot12HttpClient({ baseUrl: 'http://127.0.0.1:3012/' });
 const ws = new OneBot12WebSocketClient({ url: 'ws://127.0.0.1:3012/' });
 const listen = (event: OneBot12Event) => event.type;
 ws.onEvent(listen);
 const pollParams: OneBot12LatestEventsParams = { limit: 3, timeout: 5 };
+const fileUpload: OneBot12UploadFileDataParams = { type: 'data', name: 'example.bin', data: 'aGVsbG8=' };
+function readDataFile(result: OneBot12GetFileDataResponse): string | null {
+    return result.status === 'ok' ? result.data.data : null;
+}
+void fileUpload;
+void readDataFile;
 const poll: Promise<OneBot12LatestEventsResponse> = http.getLatestEvents(pollParams, { timeoutMs: 10000 });
 void poll.then(result => {
     if (result.status === 'ok') {
@@ -160,7 +166,17 @@ import { isMessageEvent, type EventMiddleware } from '@harehane/sdk/events';
 import { SnowLumaApiError } from '@harehane/sdk/errors';
 import { SNOWLUMA_ACTIONS, isSnowLumaAction, type SnowLumaKnownAction } from '@harehane/sdk/actions';
 import type { ActionParams, StatusInfo } from '@harehane/sdk/types';
+import type { OneBot12UploadFileDataParams, OneBot12UploadFileDataResponse, OneBot12GetFileDataParams, OneBot12GetFileDataResponse } from '@harehane/sdk/v12';
 
+const dataUpload: OneBot12UploadFileDataParams = { type: 'data', name: 'example.bin', data: 'aGVsbG8=' };
+const dataLookup: OneBot12GetFileDataParams = { type: 'data', file_id: 'local-file' };
+function project(upload: OneBot12UploadFileDataResponse, lookup: OneBot12GetFileDataResponse): void {
+    if (upload.status === 'ok') void upload.data.file_id;
+    if (lookup.status === 'ok') void lookup.data.data;
+}
+void dataUpload;
+void dataLookup;
+void project;
 const options: SnowLumaHttpClientOptions = { baseUrl: 'http://127.0.0.1:3000/' };
 const client = new SnowLumaHttpClient(options);
 const status: Promise<StatusInfo> = client.getStatus();

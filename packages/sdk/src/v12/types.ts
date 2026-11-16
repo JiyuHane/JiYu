@@ -73,6 +73,44 @@ export interface OneBot12ActionResponse extends OneBot12JsonObject {
     echo?: string;
 }
 
+/** JSON bytes are Base64 strings; Jiyu requires canonical Base64, which this type does not validate. */
+export interface OneBot12UploadFileDataParams extends OneBot12JsonObject {
+    type: 'data';
+    name: string;
+    data: string;
+    /** Optional lowercase hexadecimal SHA-256 of the original bytes. */
+    sha256?: string;
+}
+
+/** File ID returned by a supporting OneBot 12 upload_file implementation. */
+export interface OneBot12UploadFileDataResult extends OneBot12JsonObject {
+    file_id: string;
+}
+
+/** Describes the response shape; the generic response parser does not validate file fields. */
+export type OneBot12UploadFileDataResponse =
+    | (OneBot12ActionResponse & { status: 'ok'; data: OneBot12UploadFileDataResult })
+    | (OneBot12ActionResponse & { status: 'failed'; data: OneBot12JsonValue });
+
+/** Parameters for the data subset of OneBot 12 get_file. */
+export interface OneBot12GetFileDataParams extends OneBot12JsonObject {
+    file_id: string;
+    type: 'data';
+}
+
+/** JSON bytes are Base64 strings, not byte arrays; Jiyu uses canonical Base64. */
+export interface OneBot12GetFileDataResult extends OneBot12JsonObject {
+    name: string;
+    data: string;
+    /** Optional lowercase hexadecimal SHA-256 of the original bytes. */
+    sha256?: string;
+}
+
+/** Describes the response shape; the generic response parser does not validate file fields. */
+export type OneBot12GetFileDataResponse =
+    | (OneBot12ActionResponse & { status: 'ok'; data: OneBot12GetFileDataResult })
+    | (OneBot12ActionResponse & { status: 'failed'; data: OneBot12JsonValue });
+
 /** Parameters for the URL subset of OneBot 12 get_file. */
 export interface OneBot12GetFileUrlParams extends OneBot12JsonObject {
     file_id: string;
