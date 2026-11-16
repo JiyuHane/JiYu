@@ -96,7 +96,7 @@ function record(value: unknown): Record<string, unknown> {
     for (const key of keys) {
         const descriptor = Object.getOwnPropertyDescriptor(value, key);
 
-        if (typeof key !== 'string' || !descriptor || !('value' in descriptor)) {
+        if (typeof key !== 'string' || !descriptor || !Object.hasOwn(descriptor, 'value')) {
             throw new TypeError('invalid record');
         }
 

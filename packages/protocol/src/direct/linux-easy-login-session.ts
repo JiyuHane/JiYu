@@ -1,6 +1,14 @@
 import { addAbortListener } from 'node:events';
 import { isPromise, isProxy } from 'node:util/types';
 import type { KeyExchangeFlowResult } from './key-exchange-flow';
+import {
+    assertLinuxEasyKeyTentative,
+    linuxEasyKeyState,
+    reserveLinuxEasyKeyForSession,
+    revokeLinuxEasyKey,
+    type LinuxEasyKeySessionReservation,
+    type LinuxEasyKeyToken,
+} from './linux-easy-key-capability';
 import type { LinuxNTLoginReferenceResponse } from './nt-linux-login-response-reference';
 import type { RawSessionLease } from './raw-session-broker';
 import { MAX_SERVICE_FRAME_BYTES } from './service-frame';
@@ -10,6 +18,7 @@ import {
 } from './sso-reference-key-exchange-flow';
 import {
     referenceLinuxEasyLoginOnTransport,
+    referenceLinuxEasyLoginWithReservedKeyCapability,
     type SsoReferenceLinuxEasyLoginOptions,
 } from './sso-reference-linux-easy-login-flow';
 import type { Sso12RawOptions, Sso12RawResult, Sso12RawTransport } from './sso12-packet-client';
@@ -189,7 +198,7 @@ function plainOptions(value: unknown): LinuxEasyLoginSessionOptions {
             typeof key !== 'string' ||
             !allowed.has(key) ||
             !descriptor ||
-            !('value' in descriptor)
+            !Object.hasOwn(descriptor, 'value')
         ) {
             throw new TypeError('invalid options');
         }
@@ -244,9 +253,43 @@ function disposeKey(value: KeyExchangeFlowResult | undefined): void {
  * already-running transport, guards, callbacks, crypto and runtime copies can outlive
  * settlement. It does not allocate nonces, retry, integrate production, or prove closure.
  */
-export async function runLinuxEasyLoginSession(
+export function runLinuxEasyLoginSession(
     lease: RawSessionLease,
     options: LinuxEasyLoginSessionOptions,
+): Promise<LinuxEasyLoginSessionResult> {
+    return runSession(lease, options);
+}
+
+/**
+ * Internal composition only: the token is reserved for this exact raw lease and
+ * account before any external callback. A response transfers only tentative state;
+ * registration, key comparison, commit, delivery and eventual revocation remain
+ * the owner's responsibility. whenClosed is observed asynchronously.
+ */
+export async function runLinuxEasyLoginSessionWithKeyCapability(
+    lease: RawSessionLease,
+    options: LinuxEasyLoginSessionOptions,
+    token: LinuxEasyKeyToken,
+): Promise<LinuxEasyLoginSessionResult> {
+    const cleanupState: { failure?: Failure } = Object.create(null) as { failure?: Failure };
+
+    try {
+        const result = await runSession(lease, options, { token }, cleanupState);
+        return cleanupState.failure ?? result;
+    } catch (error) {
+        if (cleanupState.failure) {
+            return cleanupState.failure;
+        }
+
+        throw error;
+    }
+}
+
+async function runSession(
+    lease: RawSessionLease,
+    options: LinuxEasyLoginSessionOptions,
+    capability?: { token: LinuxEasyKeyToken },
+    cleanupState?: { failure?: Failure },
 ): Promise<LinuxEasyLoginSessionResult> {
     const started = performance.now();
     let stage: Failure['stage'] = 'session';
@@ -268,6 +311,11 @@ export async function runLinuxEasyLoginSession(
     let signal: AbortSignal | undefined;
     let keyResult: KeyExchangeFlowResult | undefined;
     let easyResult: LinuxNTLoginReferenceResponse | undefined;
+    let reservation: LinuxEasyKeySessionReservation | undefined;
+    let capabilityOwned = false;
+    let leaseClosed = false;
+    let capabilityOutput: Extract<LinuxEasyLoginSessionResult, { kind: 'response' }> | undefined;
+    let capabilityUin: string | undefined;
     const owned = new Set<Uint8Array>();
     const controller = new AbortController();
     let resolveStop!: () => void;
@@ -289,7 +337,24 @@ export async function runLinuxEasyLoginSession(
         poison,
     });
 
+    const revokeCapability = (): void => {
+        if (capability && capabilityOwned) {
+            capabilityOwned = false;
+            revokeLinuxEasyKey(capability.token);
+        }
+    };
+
     const requestPoison = (): void => {
+        if (capability) {
+            active = false;
+
+            try {
+                revokeCapability();
+            } catch {
+                // Teardown continues if the capability implementation fails.
+            }
+        }
+
         if (!hasClaim || poison !== 'not-requested') {
             return;
         }
@@ -329,6 +394,18 @@ export async function runLinuxEasyLoginSession(
 
         if (active && performance.now() >= deadline) {
             stop('timeout');
+        }
+
+        if (active && capability && capabilityOwned) {
+            try {
+                const state = linuxEasyKeyState(capability.token);
+
+                if (state !== 'empty' && !(stage === 'easy-login' && state === 'tentative')) {
+                    stop('lease-unavailable');
+                }
+            } catch {
+                stop('lease-unavailable');
+            }
         }
 
         if (!active) {
@@ -427,15 +504,15 @@ export async function runLinuxEasyLoginSession(
 
         if (
             !transactDescriptor ||
-            !('value' in transactDescriptor) ||
+            !Object.hasOwn(transactDescriptor, 'value') ||
             typeof transactDescriptor.value !== 'function' ||
             isProxy(transactDescriptor.value) ||
             !poisonDescriptor ||
-            !('value' in poisonDescriptor) ||
+            !Object.hasOwn(poisonDescriptor, 'value') ||
             typeof poisonDescriptor.value !== 'function' ||
             isProxy(poisonDescriptor.value) ||
             !closedDescriptor ||
-            !('value' in closedDescriptor) ||
+            !Object.hasOwn(closedDescriptor, 'value') ||
             isProxy(closedDescriptor.value) ||
             !isPromise(closedDescriptor.value) ||
             claimed.has(lease)
@@ -445,12 +522,26 @@ export async function runLinuxEasyLoginSession(
 
         const transact = transactDescriptor.value as Sso12RawTransport['transactRaw'];
         poisonMethod = poisonDescriptor.value as () => void;
-        // No user code between duplicate check and claim.
+
+        // Reservation and the local lease claim are synchronous, with no external
+        // callback or await between the duplicate check and the two claims.
+        if (capability) {
+            reservation = reserveLinuxEasyKeyForSession({
+                token: capability.token,
+                lease,
+                uin: input.uin,
+            });
+            capabilityOwned = true;
+            capabilityUin = input.uin;
+        }
+
         claimed.add(lease);
         hasClaim = true;
         leaseWatch = () => stop('lease-unavailable');
 
         const leaseSettled = (): void => {
+            leaseClosed = true;
+
             try {
                 leaseWatch?.();
             } catch {
@@ -479,8 +570,43 @@ export async function runLinuxEasyLoginSession(
                     throw new Error('invalid stage');
                 }
 
+                let transaction = raw;
+
+                if (capability && stage === 'easy-login') {
+                    transaction = {
+                        ...raw,
+                        consumeCandidate: async (candidate, context, identity) => {
+                            try {
+                                check();
+                                const result = await raw.consumeCandidate(
+                                    candidate,
+                                    context,
+                                    identity,
+                                );
+                                check();
+                                return result;
+                            } catch {
+                                // Recognize a deadline or cancellation reached during a
+                                // throwing consume without mislabeling other failures.
+                                try {
+                                    check();
+                                } catch {
+                                    // check has already stopped and revoked the session.
+                                }
+
+                                // The mux must not release its hold while a failed or
+                                // expired consume still leaves a tentative key usable.
+                                requestPoison();
+                                controller.abort();
+                                resolveStop();
+                                throw new Error('session consume failed');
+                            }
+                        },
+                    };
+                }
+
                 const pending = Promise.resolve(
-                    Reflect.apply(transact, lease, [raw]) as Promise<Sso12RawResult<T>>,
+                    Reflect.apply(transact, lease, [transaction]) as Promise<Sso12RawResult<T>>,
                 );
                 // If the synchronous method reenters cancellation, check() can
                 // throw before the child receives the promise; observe rejection first.
@@ -627,7 +753,24 @@ export async function runLinuxEasyLoginSession(
                 timeoutMs: remaining(),
                 signal: controller.signal,
             };
-            easyPromise = referenceLinuxEasyLoginOnTransport(stable, easyOptions);
+
+            if (capability) {
+                if (!reservation || !capabilityOwned) {
+                    throw new Error('missing capability reservation');
+                }
+
+                easyPromise = referenceLinuxEasyLoginWithReservedKeyCapability(
+                    stable,
+                    easyOptions,
+                    {
+                        token: capability.token,
+                        lease,
+                        reservation,
+                    },
+                );
+            } else {
+                easyPromise = referenceLinuxEasyLoginOnTransport(stable, easyOptions);
+            }
         } finally {
             disposeKey(keyResult);
             keyResult = undefined;
@@ -679,7 +822,9 @@ export async function runLinuxEasyLoginSession(
             value: { status: easyOutcome.value.status, body },
         };
 
-        if (body) {
+        if (capability) {
+            capabilityOutput = output;
+        } else if (body) {
             owned.delete(body);
         }
 
@@ -706,24 +851,105 @@ export async function runLinuxEasyLoginSession(
         active = false;
         leaseWatch = undefined;
 
-        if (timer !== undefined) {
-            clearTimeout(timer);
+        if (capability) {
+            if (!capabilityOutput) {
+                requestPoison();
+            }
+
+            let cleanupSucceeded = true;
+
+            try {
+                if (timer !== undefined) {
+                    clearTimeout(timer);
+                }
+
+                listener?.[Symbol.dispose]();
+            } catch {
+                cleanupSucceeded = false;
+            }
+
+            disposeKey(keyResult);
+            wipe(easyResult?.body);
+
+            for (const value of owned) {
+                if (value !== capabilityOutput?.value.body) {
+                    wipe(value);
+                }
+            }
+
+            owned.clear();
+
+            const canTransfer = (): boolean => {
+                try {
+                    if (signal && getAborted.call(signal)) {
+                        stopCode = 'cancelled';
+                    } else if (performance.now() >= deadline) {
+                        stopCode = 'timeout';
+                    } else if (leaseClosed) {
+                        stopCode = 'lease-unavailable';
+                    }
+
+                    if (
+                        !cleanupSucceeded ||
+                        stopCode ||
+                        !capabilityOwned ||
+                        capabilityUin === undefined ||
+                        !capabilityOutput ||
+                        capabilityOutput.value.status.kind !== 'code' ||
+                        capabilityOutput.value.status.codePresent !== true ||
+                        capabilityOutput.value.status.code !== 0n ||
+                        capabilityOutput.value.body === null
+                    ) {
+                        return false;
+                    }
+
+                    assertLinuxEasyKeyTentative({
+                        token: capability.token,
+                        lease,
+                        uin: capabilityUin,
+                        sequence: capabilityOutput.easyLoginSequence,
+                    });
+                    return true;
+                } catch {
+                    return false;
+                }
+            };
+
+            if (capabilityOutput && !canTransfer()) {
+                requestPoison();
+            }
+
+            try {
+                controller.abort();
+            } catch {
+                cleanupSucceeded = false;
+            }
+
+            if (capabilityOutput && !canTransfer()) {
+                requestPoison();
+                wipe(capabilityOutput.value.body);
+                cleanupState!.failure = fail(stopCode ?? 'easy-login-failed');
+            }
+        } else {
+            if (timer !== undefined) {
+                clearTimeout(timer);
+            }
+
+            try {
+                listener?.[Symbol.dispose]();
+            } catch {
+                /* best effort */
+            }
+
+            controller.abort();
+            disposeKey(keyResult);
+            wipe(easyResult?.body);
+
+            for (const value of owned) {
+                wipe(value);
+            }
+
+            owned.clear();
         }
-
-        try {
-            listener?.[Symbol.dispose]();
-        } catch {
-            /* best effort */
-        }
-
-        controller.abort();
-        disposeKey(keyResult);
-        wipe(easyResult?.body);
-
-        for (const value of owned) {
-            wipe(value);
-        }
-
-        owned.clear();
     }
 }

@@ -2084,8 +2084,17 @@ remain to be recovered and independently verified.
   callback can retain its own copies and continue effects after local settlement.
   Its in-process observation assumes ordinary Promise internals; mutated Promise
   constructors/species, arbitrary thenables and other same-process changes remain
-  outside that contract. Actual QQ interoperability and production Bridge wiring
-  remain unverified.
+  outside that contract. The separate internal
+  `runLinuxEasyLoginSessionWithKeyCapability` path reserves a token against the
+  original lease and UIN before key exchange, then transfers its one-shot proof
+  internally to EasyLogin. The child receives a transport wrapper, while the key
+  remains bound to the original lease. It checks the parent deadline around
+  response consumption and returns only tentative state after cleanup and a final
+  account/sequence check. The owner must revoke it on subsequent failure or close;
+  the returned login body is caller-owned and can contain ticket material. A
+  same-batch, in-memory mux test exercises both transactions and the early key
+  stage. This is not peer authentication or production integration. Actual QQ
+  interoperability and production Bridge wiring remain unverified.
 - `src/direct/linux-easy-reference-register.ts` provides a separate borrowed-lease
   handoff from an EasyLogin response to reference registration. It uses the existing
   four-ticket projection and registration transaction; UID and its association with

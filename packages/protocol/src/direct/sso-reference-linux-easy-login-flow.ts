@@ -3,9 +3,11 @@ import { isProxy } from 'node:util/types';
 import { guardBorrowedTransport } from './guard-raw-transaction';
 import {
     claimLinuxEasyKeyForLogin,
+    consumeLinuxEasyKeySessionReservation,
     linuxEasyKeyState,
     revokeLinuxEasyKey,
     stageLinuxEasyKey,
+    type LinuxEasyKeySessionReservation,
     type LinuxEasyKeyToken,
 } from './linux-easy-key-capability';
 import {
@@ -153,7 +155,7 @@ function configuration(value: unknown): Record<string, unknown> {
             typeof key !== 'string' ||
             !allowed.has(key) ||
             !descriptor ||
-            !('value' in descriptor)
+            !Object.hasOwn(descriptor, 'value')
         ) {
             throw new TypeError('invalid EasyLogin configuration');
         }
@@ -223,14 +225,15 @@ export async function referenceLinuxEasyLoginWithKeyCapability(
         !keys.includes('token') ||
         !keys.includes('lease') ||
         !token ||
-        !('value' in token) ||
+        !Object.hasOwn(token, 'value') ||
         !lease ||
-        !('value' in lease)
+        !Object.hasOwn(lease, 'value')
     ) {
         throw new TypeError('invalid EasyLogin capability binding');
     }
 
-    const cleanupState: { failure?: Extract<Sso12RawResult<never>, { kind: 'failure' }> } = {};
+    const cleanupState: { failure?: Extract<Sso12RawResult<never>, { kind: 'failure' }> } =
+        Object.assign(Object.create(null) as object, { failure: undefined });
 
     try {
         const result = await referenceLinuxEasyLoginFlow(
@@ -252,10 +255,81 @@ export async function referenceLinuxEasyLoginWithKeyCapability(
     }
 }
 
+/**
+ * Internal session composition using a previously reserved one-shot proof. The
+ * owner still asserts the transport/lease relationship and handles revocation if
+ * this flow fails before consuming the reservation. The same tentative-key and
+ * asynchronous close-notification qualifications as the other deep entry apply.
+ */
+export async function referenceLinuxEasyLoginWithReservedKeyCapability(
+    transport: Sso12RawTransport,
+    options: SsoReferenceLinuxEasyLoginOptions,
+    binding: {
+        token: LinuxEasyKeyToken;
+        lease: object;
+        reservation: LinuxEasyKeySessionReservation;
+    },
+): Promise<Sso12RawResult<LinuxNTLoginReferenceResponse>> {
+    if (typeof binding !== 'object' || binding === null || isProxy(binding)) {
+        throw new TypeError('invalid EasyLogin capability binding');
+    }
+
+    const proto = Object.getPrototypeOf(binding) as object | null;
+    const keys = Reflect.ownKeys(binding);
+    const token = Object.getOwnPropertyDescriptor(binding, 'token');
+    const lease = Object.getOwnPropertyDescriptor(binding, 'lease');
+    const reservation = Object.getOwnPropertyDescriptor(binding, 'reservation');
+
+    if (
+        (proto !== Object.prototype && proto !== null) ||
+        keys.length !== 3 ||
+        !keys.includes('token') ||
+        !keys.includes('lease') ||
+        !keys.includes('reservation') ||
+        !token ||
+        !Object.hasOwn(token, 'value') ||
+        !lease ||
+        !Object.hasOwn(lease, 'value') ||
+        !reservation ||
+        !Object.hasOwn(reservation, 'value')
+    ) {
+        throw new TypeError('invalid EasyLogin capability binding');
+    }
+
+    const cleanupState: { failure?: Extract<Sso12RawResult<never>, { kind: 'failure' }> } =
+        Object.assign(Object.create(null) as object, { failure: undefined });
+
+    try {
+        const result = await referenceLinuxEasyLoginFlow(
+            transport,
+            options,
+            {
+                token: token.value as LinuxEasyKeyToken,
+                lease: lease.value as object,
+                reservation: reservation.value as LinuxEasyKeySessionReservation,
+            },
+            cleanupState,
+        );
+        return cleanupState.failure ?? result;
+    } catch (error) {
+        if (cleanupState.failure) {
+            return cleanupState.failure;
+        }
+
+        throw error;
+    }
+}
+
 async function referenceLinuxEasyLoginFlow(
     transport: Sso12RawTransport,
     options: SsoReferenceLinuxEasyLoginOptions,
-    binding?: { token: LinuxEasyKeyToken; lease: object },
+    binding?:
+        | { token: LinuxEasyKeyToken; lease: object }
+        | {
+              token: LinuxEasyKeyToken;
+              lease: object;
+              reservation: LinuxEasyKeySessionReservation;
+          },
     cleanupState?: { failure?: Extract<Sso12RawResult<never>, { kind: 'failure' }> },
 ): Promise<Sso12RawResult<LinuxNTLoginReferenceResponse>> {
     const started = performance.now();
@@ -356,7 +430,19 @@ async function referenceLinuxEasyLoginFlow(
         }
 
         if (binding) {
-            claimLinuxEasyKeyForLogin({ token: binding.token, lease: binding.lease, uin });
+            const reservation = Object.getOwnPropertyDescriptor(binding, 'reservation');
+
+            if (reservation) {
+                consumeLinuxEasyKeySessionReservation({
+                    token: binding.token,
+                    lease: binding.lease,
+                    uin,
+                    reservation: reservation.value as LinuxEasyKeySessionReservation,
+                });
+            } else {
+                claimLinuxEasyKeyForLogin({ token: binding.token, lease: binding.lease, uin });
+            }
+
             claimed = true;
         }
 

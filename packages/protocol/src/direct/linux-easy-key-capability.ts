@@ -7,7 +7,9 @@ import { decodeSsoResponse } from './sso';
 // QQ-TEA and successful parsing do not authenticate a peer or validate a payload.
 // There is deliberately no owner/flow, queue, authentication or delivery here.
 declare const tokenBrand: unique symbol;
+declare const reservationBrand: unique symbol;
 export type LinuxEasyKeyToken = { readonly [tokenBrand]: never };
+export type LinuxEasyKeySessionReservation = { readonly [reservationBrand]: never };
 export type LinuxEasyKeyState = 'empty' | 'tentative' | 'active' | 'revoked';
 
 export interface LinuxEasyKeyBinding {
@@ -21,6 +23,12 @@ export interface LinuxEasyKeyLoginClaimInput {
     token: LinuxEasyKeyToken;
     lease: object;
     uin: string;
+}
+export interface LinuxEasyKeySessionReservationInput extends LinuxEasyKeyLoginClaimInput {
+    reservation: LinuxEasyKeySessionReservation;
+}
+export interface LinuxEasyKeyTentativeInput extends LinuxEasyKeyLoginClaimInput {
+    sequence: number;
 }
 export interface LinuxEasyKeyStageInput {
     token: LinuxEasyKeyToken;
@@ -62,17 +70,23 @@ type Slot = {
     lease: object;
     uin: string;
     generation: object;
+    reservation?: object;
     sequence?: number;
     key?: Uint8Array;
 };
 const slots = new WeakMap<object, Slot>();
+const reservations = new WeakMap<object, { token: object; slot: Slot }>();
 const claimedLeases = new WeakSet<object>();
 const apply = Reflect.apply;
 const getPrototypeOf = Object.getPrototypeOf;
+const setPrototypeOf = Object.setPrototypeOf;
 const getDescriptor = Object.getOwnPropertyDescriptor;
+const defineProperty = Object.defineProperty;
+const hasOwn = Object.hasOwn;
 const freeze = Object.freeze;
 const weakGet = WeakMap.prototype.get;
 const weakSet = WeakMap.prototype.set;
+const weakDelete = WeakMap.prototype.delete;
 const weakHas = WeakSet.prototype.has;
 const weakAdd = WeakSet.prototype.add;
 const Bytes = Uint8Array;
@@ -115,11 +129,17 @@ function fields(value: unknown, names: readonly string[]): unknown[] {
     for (let index = 0; index < names.length; index++) {
         const descriptor = getDescriptor(value, names[index]);
 
-        if (!descriptor || !('value' in descriptor)) {
+        if (!descriptor || !hasOwn(descriptor, 'value')) {
             return fail();
         }
 
-        result[index] = descriptor.value;
+        // Define an own element without invoking an inherited numeric setter.
+        defineProperty(result, index, {
+            value: descriptor.value,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        });
     }
 
     return result;
@@ -217,7 +237,19 @@ export function createLinuxEasyKeyCapability(input: LinuxEasyKeyBinding): LinuxE
         }
 
         const token = freeze({}) as LinuxEasyKeyToken;
-        const value: Slot = { phase: 'empty', loginClaimed: false, lease, uin, generation };
+        // Own data fields and a null prototype prevent inherited setters from
+        // re-entering claim or reservation while the slot is being updated.
+        const value: Slot = {
+            phase: 'empty',
+            loginClaimed: false,
+            lease,
+            uin,
+            generation,
+            reservation: undefined,
+            sequence: undefined,
+            key: undefined,
+        };
+        setPrototypeOf(value, null);
         apply(weakAdd, claimedLeases, [lease]);
         apply(weakSet, slots, [token, value]);
         return token;
@@ -250,6 +282,101 @@ export function claimLinuxEasyKeyForLogin(input: LinuxEasyKeyLoginClaimInput): v
         }
 
         value.loginClaimed = true;
+    } catch {
+        return fail();
+    }
+}
+
+/**
+ * Reserve the empty capability for a session before key exchange, then transfer
+ * this internal occupancy once to its EasyLogin flow. The proof contains no key.
+ * Neither reservation nor transfer validates a transport or server; a session's
+ * stable transport wrapper need not be identical to the exact bound lease object.
+ * The session must revoke on every failure, stop or cancellation. This is not a
+ * same-process security boundary, and staging does not require the proof.
+ */
+export function reserveLinuxEasyKeyForSession(
+    input: LinuxEasyKeyLoginClaimInput,
+): LinuxEasyKeySessionReservation {
+    try {
+        const [token, lease, uin] = fields(input, ['token', 'lease', 'uin']);
+        const value = lookup(token);
+
+        if (value.phase !== 'empty' || value.loginClaimed || !bound(value, lease, uin)) {
+            return fail();
+        }
+
+        // lookup has already checked token identity; keep that exact identity.
+        if (!identity(token)) {
+            return fail();
+        }
+
+        const reservation = freeze({}) as LinuxEasyKeySessionReservation;
+        apply(weakSet, reservations, [reservation, { token, slot: value }]);
+        value.reservation = reservation;
+        value.loginClaimed = true;
+        return reservation;
+    } catch {
+        return fail();
+    }
+}
+
+/** Consume only the matching session reservation, exactly once, while still empty. */
+export function consumeLinuxEasyKeySessionReservation(
+    input: LinuxEasyKeySessionReservationInput,
+): void {
+    try {
+        const [token, lease, uin, reservation] = fields(input, [
+            'token',
+            'lease',
+            'uin',
+            'reservation',
+        ]);
+        const value = lookup(token);
+
+        if (!identity(reservation)) {
+            return fail();
+        }
+
+        const record = apply(weakGet, reservations, [reservation]) as
+            { token: object; slot: Slot } | undefined;
+
+        if (
+            value.phase !== 'empty' ||
+            !bound(value, lease, uin) ||
+            value.reservation !== reservation ||
+            !record ||
+            record.token !== token ||
+            record.slot !== value
+        ) {
+            return fail();
+        }
+
+        apply(weakDelete, reservations, [reservation]);
+        value.reservation = undefined;
+    } catch {
+        return fail();
+    }
+}
+
+/**
+ * Check staged metadata without returning key material or authenticating a peer.
+ * The caller remains responsible for session liveness and failure cleanup.
+ */
+export function assertLinuxEasyKeyTentative(input: LinuxEasyKeyTentativeInput): void {
+    try {
+        const [token, lease, uin, sequence] = fields(input, ['token', 'lease', 'uin', 'sequence']);
+        const value = lookup(token);
+
+        if (
+            value.phase !== 'tentative' ||
+            !value.key ||
+            !bound(value, lease, uin) ||
+            !uint32(sequence) ||
+            value.sequence !== sequence
+        ) {
+            return fail();
+        }
     } catch {
         return fail();
     }
@@ -373,6 +500,13 @@ export function revokeLinuxEasyKey(token: LinuxEasyKeyToken): void {
         const value = lookup(token);
         const key = value.key;
         value.phase = 'revoked';
+        const reservation = value.reservation;
+        value.reservation = undefined;
+
+        if (reservation) {
+            apply(weakDelete, reservations, [reservation]);
+        }
+
         value.key = undefined;
         value.sequence = undefined;
         wipe(key);
