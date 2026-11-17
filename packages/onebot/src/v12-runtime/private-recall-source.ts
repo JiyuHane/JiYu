@@ -25,10 +25,44 @@ export interface PrivateRecallProvenance extends PrivateRecallSnapshot {
     readonly messageId: number;
 }
 
+// Compile-time brand only: proofs have no runtime properties, including symbols.
+declare const privateRecallPollProofBrand: unique symbol;
+export type PrivateRecallPollProof = { readonly [privateRecallPollProofBrand]: never };
+
+type PrivateRecallBinding = {
+    readonly context: RecallContext;
+    readonly event: JsonObject;
+};
+
+type PrivateRecallReverseBinding = {
+    readonly context: WeakRef<RecallContext>;
+    readonly event: WeakRef<JsonObject>;
+};
+
+type PrivateRecallPollBinding = PrivateRecallBinding & {
+    readonly source: PrivateRecallProvenance;
+    readonly sourceTicket: V12Source;
+    readonly self: V12Self;
+    readonly candidate: object;
+    readonly candidateId: string;
+};
+
 // Both the instance context and the exact converted event are weak keys. Nothing
 // is attached to the public v11 event, its clones, or its serialized payload.
 const sources = new WeakMap<object, WeakMap<object, PrivateRecallProvenance>>();
 const captures = new WeakMap<PrivateRecallSnapshot, RecallContext>();
+// The reverse association is weak; a retained ticket or other object may retain its own graph.
+const sourceBindings = new WeakMap<PrivateRecallProvenance, PrivateRecallReverseBinding>();
+// This conversion association does not itself retain its source, v11 event, or self.
+const convertedBindings = new WeakMap<
+    object,
+    {
+        readonly source: WeakRef<PrivateRecallProvenance>;
+        readonly event: WeakRef<JsonObject>;
+        readonly self: WeakRef<V12Self>;
+    }
+>();
+const pollProofs = new WeakMap<PrivateRecallPollProof, PrivateRecallPollBinding>();
 
 function isV12Time(value: unknown): value is number {
     return (
@@ -256,7 +290,20 @@ export function rememberPrivateRecallSource(
         sources.set(context, byEvent);
     }
 
-    byEvent.set(event, source);
+    const previous = byEvent.get(event);
+    sourceBindings.set(source, { context: new WeakRef(context), event: new WeakRef(event) });
+
+    try {
+        byEvent.set(event, source);
+    } catch (error) {
+        sourceBindings.delete(source);
+        throw error;
+    }
+
+    if (previous) {
+        sourceBindings.delete(previous);
+    }
+
     return true;
 }
 
@@ -265,6 +312,323 @@ export function getPrivateRecallSource(
     event: JsonObject,
 ): PrivateRecallProvenance | undefined {
     return sources.get(context)?.get(event);
+}
+
+function isNonProxyObject(value: unknown): value is object {
+    return typeof value === 'object' && value !== null && !isProxy(value);
+}
+
+function isPlainNonProxyObject(value: unknown): value is object {
+    if (!isNonProxyObject(value)) {
+        return false;
+    }
+
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+}
+
+function hasPrivateRecallConversion(
+    candidate: unknown,
+    event: JsonObject,
+    source: PrivateRecallProvenance,
+    self: V12Self,
+): boolean {
+    if (!isNonProxyObject(candidate)) {
+        return false;
+    }
+
+    const converted = convertedBindings.get(candidate);
+    return (
+        converted !== undefined &&
+        converted.event.deref() === event &&
+        converted.source.deref() === source &&
+        converted.self.deref() === self
+    );
+}
+
+function hasExactOwnKeys(target: object, expected: readonly string[]): boolean {
+    const keys = Reflect.ownKeys(target);
+    return (
+        keys.length === expected.length &&
+        keys.every((key) => typeof key === 'string' && expected.includes(key))
+    );
+}
+
+function hasEnumerableDataValue(target: object, key: string, value: unknown): boolean {
+    const descriptor = ownDataDescriptor(target, key);
+    return (
+        descriptor !== undefined &&
+        descriptor.enumerable === true &&
+        Object.is(descriptor.value, value)
+    );
+}
+
+/** These checks use only module-created bindings and own data properties. */
+function isPrivateRecallBindingCurrent(binding: PrivateRecallPollBinding): boolean {
+    const { context, event, source, sourceTicket, self } = binding;
+
+    if (
+        !isNonProxyObject(context) ||
+        !isNonProxyObject(event) ||
+        !isNonProxyObject(source) ||
+        !isNonProxyObject(sourceTicket) ||
+        !isPlainNonProxyObject(self) ||
+        !hasExactOwnKeys(self, ['platform', 'user_id'])
+    ) {
+        return false;
+    }
+
+    const reverse = sourceBindings.get(source);
+
+    if (
+        !reverse ||
+        reverse.context.deref() !== context ||
+        reverse.event.deref() !== event ||
+        sources.get(context)?.get(event) !== source
+    ) {
+        return false;
+    }
+
+    const sourceSelf = ownDataDescriptor(source, 'selfUin');
+    const sourceTicketField = ownDataDescriptor(source, 'sourceTicket');
+    const accountUin = ownDataDescriptor(context, 'uin');
+    const accountSelf = ownDataDescriptor(context, 'selfId');
+    const selfPlatform = ownDataDescriptor(self, 'platform');
+    const selfUser = ownDataDescriptor(self, 'user_id');
+
+    if (
+        !sourceSelf ||
+        typeof sourceSelf.value !== 'number' ||
+        !sourceTicketField ||
+        sourceTicketField.value !== sourceTicket ||
+        !accountUin ||
+        !accountSelf ||
+        !selfPlatform ||
+        selfPlatform.enumerable !== true ||
+        !selfUser ||
+        selfUser.enumerable !== true
+    ) {
+        return false;
+    }
+
+    const selfId = fromV11AccountId(sourceSelf.value);
+    return (
+        selfId !== null &&
+        accountUin.value === selfId &&
+        fromV11AccountId(accountSelf.value) === selfId &&
+        selfPlatform.value === 'qq' &&
+        selfUser.value === selfId &&
+        matchesPrivateRecallEvent(event, source)
+    );
+}
+
+/** Return the candidate ID only for the exact supported own-data projection. */
+function privateRecallCandidateId(
+    candidate: unknown,
+    source: PrivateRecallProvenance,
+): string | undefined {
+    if (
+        !isPlainNonProxyObject(candidate) ||
+        !hasExactOwnKeys(candidate, [
+            'id',
+            'time',
+            'type',
+            'detail_type',
+            'sub_type',
+            'self',
+            'message_id',
+            'user_id',
+        ])
+    ) {
+        return undefined;
+    }
+
+    const id = ownDataDescriptor(candidate, 'id');
+    const self = ownDataDescriptor(candidate, 'self');
+    const selfId = fromV11AccountId(source.selfUin);
+    const peerId = fromV11AccountId(source.peerUin);
+    const messageId = fromV11MessageId(source.messageId);
+
+    if (
+        !id ||
+        id.enumerable !== true ||
+        typeof id.value !== 'string' ||
+        id.value.length === 0 ||
+        !self ||
+        self.enumerable !== true ||
+        !isPlainNonProxyObject(self.value) ||
+        selfId === null ||
+        peerId === null ||
+        messageId === null ||
+        typeof source.recalledBySelf !== 'boolean' ||
+        !hasExactOwnKeys(self.value, ['platform', 'user_id']) ||
+        !hasEnumerableDataValue(self.value, 'platform', 'qq') ||
+        !hasEnumerableDataValue(self.value, 'user_id', selfId) ||
+        !hasEnumerableDataValue(candidate, 'time', source.time) ||
+        !hasEnumerableDataValue(candidate, 'type', 'notice') ||
+        !hasEnumerableDataValue(candidate, 'detail_type', 'private_message_delete') ||
+        !hasEnumerableDataValue(candidate, 'sub_type', '') ||
+        !hasEnumerableDataValue(candidate, 'message_id', messageId) ||
+        !hasEnumerableDataValue(candidate, 'user_id', source.recalledBySelf ? selfId : peerId)
+    ) {
+        return undefined;
+    }
+
+    return id.value;
+}
+
+/**
+ * Create an internal local-binding proof; QQ authenticity is outside its scope.
+ * It does not verify online state, owner, or source epoch. A future owner must
+ * check those separately at the same linearization point. The proof holds exact
+ * objects strongly while retained; the owner bounds the number it queues. The
+ * reverse source association itself is weak; the ticket or other objects may
+ * retain their own graphs. An event or candidate can subsequently grow; this
+ * primitive neither manages queues nor bounds RSS/CPU. Multiple proofs or
+ * conversions can exist for one event/ticket; the future owner must deduplicate
+ * those local admissions. This primitive does not establish global QQ event
+ * idempotency.
+ */
+export function createPrivateRecallPollProof(
+    event: JsonObject,
+    source: PrivateRecallProvenance,
+    sourceTicket: V12Source,
+    self: V12Self,
+    candidate: unknown,
+): PrivateRecallPollProof | undefined {
+    try {
+        if (
+            !isNonProxyObject(event) ||
+            !isNonProxyObject(source) ||
+            !isNonProxyObject(sourceTicket) ||
+            !isPlainNonProxyObject(self) ||
+            !isNonProxyObject(candidate)
+        ) {
+            return undefined;
+        }
+
+        const reverse = sourceBindings.get(source);
+        const context = reverse?.context.deref();
+
+        if (
+            !context ||
+            reverse?.event.deref() !== event ||
+            !hasPrivateRecallConversion(candidate, event, source, self)
+        ) {
+            return undefined;
+        }
+
+        const candidateId = privateRecallCandidateId(candidate, source);
+
+        if (candidateId === undefined) {
+            return undefined;
+        }
+
+        const binding: PrivateRecallPollBinding = {
+            context,
+            event,
+            source,
+            sourceTicket,
+            self,
+            candidate,
+            candidateId,
+        };
+
+        if (!isPrivateRecallBindingCurrent(binding)) {
+            return undefined;
+        }
+
+        // A null prototype also prevents inherited serialization hooks.
+        const proof = Object.freeze(Object.create(null)) as PrivateRecallPollProof;
+        pollProofs.set(proof, binding);
+        return proof;
+    } catch {
+        return undefined;
+    }
+}
+
+/** Check the original v11 binding synchronously without calling host code. */
+export function isPrivateRecallPollProofCurrent(proof: unknown): boolean {
+    try {
+        if (!isNonProxyObject(proof)) {
+            return false;
+        }
+
+        const binding = pollProofs.get(proof as PrivateRecallPollProof);
+        return binding !== undefined && isPrivateRecallBindingCurrent(binding);
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Compare the proof's exact ticket and account to an owner's value snapshot.
+ * This does not verify online state, manager ownership, or epoch: the owner must
+ * separately check sameSourceEpoch(exactTicket, owner.source) at its live
+ * linearization point. A different ticket from the same epoch is not exact.
+ */
+export function isPrivateRecallPollProofBoundTo(
+    proof: unknown,
+    exactTicket: unknown,
+    ownerSelf: unknown,
+): boolean {
+    try {
+        if (!isNonProxyObject(proof)) {
+            return false;
+        }
+
+        const binding = pollProofs.get(proof as PrivateRecallPollProof);
+
+        if (
+            !binding ||
+            binding.sourceTicket !== exactTicket ||
+            !isPrivateRecallBindingCurrent(binding) ||
+            !isPlainNonProxyObject(ownerSelf) ||
+            !hasExactOwnKeys(ownerSelf, ['platform', 'user_id'])
+        ) {
+            return false;
+        }
+
+        const selfId = fromV11AccountId(ownDataDescriptor(binding.source, 'selfUin')?.value);
+        return (
+            selfId !== null &&
+            hasEnumerableDataValue(ownerSelf, 'platform', 'qq') &&
+            hasEnumerableDataValue(ownerSelf, 'user_id', selfId) &&
+            isPrivateRecallBindingCurrent(binding)
+        );
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Recheck the same candidate reference, its original ID, and the full projection.
+ * Before enqueueing, the caller must snapshot that same candidate and recheck
+ * after callbacks; the queue should retain independent immutable JSON, not read a
+ * mutable candidate again at commit. Owner/epoch checks remain separate.
+ */
+export function isPrivateRecallPollProofFor(proof: unknown, candidate: unknown): boolean {
+    try {
+        if (!isNonProxyObject(proof)) {
+            return false;
+        }
+
+        const binding = pollProofs.get(proof as PrivateRecallPollProof);
+
+        if (
+            !binding ||
+            binding.candidate !== candidate ||
+            !hasPrivateRecallConversion(candidate, binding.event, binding.source, binding.self) ||
+            !isPrivateRecallBindingCurrent(binding) ||
+            privateRecallCandidateId(candidate, binding.source) !== binding.candidateId
+        ) {
+            return false;
+        }
+
+        return isPrivateRecallBindingCurrent(binding);
+    } catch {
+        return false;
+    }
 }
 
 /** Internal-only conversion; callers separately verify the original live ticket. */
@@ -309,5 +673,36 @@ export function convertPrivateRecallEvent(
     };
     // Subscribers share this new event; protect later deliveries from earlier
     // subscribers without freezing or mutating the runtime's account identity.
-    return Object.freeze(converted);
+    const result = Object.freeze(converted);
+
+    try {
+        // This optional brand must never affect the existing conversion or WS path.
+        if (
+            isNonProxyObject(event) &&
+            isNonProxyObject(source) &&
+            isPlainNonProxyObject(self) &&
+            hasExactOwnKeys(self, ['platform', 'user_id']) &&
+            hasEnumerableDataValue(self, 'platform', 'qq') &&
+            hasEnumerableDataValue(self, 'user_id', selfId)
+        ) {
+            const reverse = sourceBindings.get(source);
+            const context = reverse?.context.deref();
+
+            if (
+                context &&
+                reverse?.event.deref() === event &&
+                sources.get(context)?.get(event) === source
+            ) {
+                convertedBindings.set(result, {
+                    source: new WeakRef(source),
+                    event: new WeakRef(event),
+                    self: new WeakRef(self),
+                });
+            }
+        }
+    } catch {
+        // Proof creation fails closed when optional branding is unavailable.
+    }
+
+    return result;
 }
