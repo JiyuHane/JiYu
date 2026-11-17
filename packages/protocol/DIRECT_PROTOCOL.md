@@ -726,6 +726,27 @@ an instruction boundary in that stream. These are conditional static facts;
 indirect calls, aliases, concurrent writers and runtime control flow remain
 unresolved.
 
+A further conditional continuation reads a descriptor at linked address
+`0x9035278`. Under the inspected non-null branch, `0x6c04788` reads the byte at
+`0x9035284`; when that byte is nonzero, it is saved alongside a pointer to a
+cleared 32-byte stack region. Later code reads the little-endian dword at
+`0x9035280` and, if it equals 4, calls PLT `0x8e10720` with `(1, 0x6c)` and
+stores the result in a local object. Its relocation declares `calloc`; binding,
+return value and later use remain unobserved. The inspected continuation has not
+established a read from `G + 0x28` through `G + 0x47` or a link to the eventual
+return, and it does not establish that no such link exists later.
+
+The descriptor bytes have a different file mapping from the code: the writable
+`PT_LOAD` maps linked `0x9035280` and `0x9035284` to file offsets `0x9033280`
+and `0x9033284`. The five original bytes are `04 00 00 00 20`. Independent
+bounded static parsing of this file's declared `DT_RELA` and `DT_JMPREL` tables
+found no relocation write intersecting that five-byte interval. Its dynamic
+table declares no standard REL or RELR table or the examined Android packed
+REL/RELA/RELR tags; its section table has no `SHT_REL` or `SHT_RELR`. The adjacent
+`R_X86_64_RELATIVE` write at `0x9035278` ends immediately before the interval.
+These file and relocation facts do not establish the runtime values: declared
+initializers, other loader processing or later writes remain unexamined.
+
 These code observations use the executable `PT_LOAD` mapping stated above,
 not a file mapping for `G` or the adjacent global object. Capstone and Zydis
 independently decoded the selected bounded instruction windows with matching
