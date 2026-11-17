@@ -727,8 +727,9 @@ indirect calls, aliases, concurrent writers and runtime control flow remain
 unresolved.
 
 A further conditional continuation reads a descriptor at linked address
-`0x9035278`. Under the inspected non-null branch, `0x6c04788` reads the byte at
-`0x9035284`; when that byte is nonzero, it is saved alongside a pointer to a
+`0x9035278`. Under the inspected non-null branch, with the traced pointer still
+intact, `0x6c0478f` reads the byte corresponding to linked address `0x9035284`;
+when that byte is nonzero, it is saved alongside a pointer to a
 cleared 32-byte stack region. Later code reads the little-endian dword at
 `0x9035280` and, if it equals 4, calls PLT `0x8e10720` with `(1, 0x6c)` and
 stores the result in a local object. Its relocation declares `calloc`; binding,
