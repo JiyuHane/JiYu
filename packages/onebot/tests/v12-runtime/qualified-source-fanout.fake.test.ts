@@ -9,6 +9,9 @@ const fake = vi.hoisted(() => ({
     transports: [] as Array<{ options: V12TransportOptions }>,
     trace: [] as string[],
     registerPollHost: vi.fn(),
+    activateHttpPollOwner: vi.fn(),
+    hasHttpPollOwner: vi.fn(),
+    pollOwnerStats: vi.fn(),
     failOrderedPollIngress: vi.fn(),
     hasOrderedPollOwner: vi.fn(),
     enqueuePollEvent: vi.fn(),
@@ -29,6 +32,8 @@ vi.mock('@snowluma/websocket', () => ({
         }
     },
 }));
+// This fake omits isAcceptingActions: event activation checks its source guard,
+// then remains unavailable. Poll markers below do not imply real HTTP readiness.
 vi.mock('../../src/v12-network', () => ({
     V12Transport: class {
         constructor(options: V12TransportOptions) {
@@ -42,6 +47,9 @@ vi.mock('../../src/v12-network', () => ({
 }));
 vi.mock('../../src/v12-runtime/poll-owner', () => ({
     registerPollHost: fake.registerPollHost,
+    activateHttpPollOwner: fake.activateHttpPollOwner,
+    hasHttpPollOwner: fake.hasHttpPollOwner,
+    pollOwnerStats: fake.pollOwnerStats,
     failOrderedPollIngress: fake.failOrderedPollIngress,
     hasOrderedPollOwner: fake.hasOrderedPollOwner,
     enqueuePollEvent: fake.enqueuePollEvent,
@@ -89,6 +97,10 @@ class LegacySink extends IOneBotNetworkAdapter<NetworkBase> {
                 buildHeartbeatEvent: () => ({}),
             },
         );
+    }
+
+    protected bindingSignature(): string {
+        return 'synthetic-v11';
     }
 
     open() {
@@ -165,6 +177,7 @@ async function fixture(heartbeat = false) {
             enabled: true,
             host: 'synthetic',
             port: 1,
+            accessToken: '',
             allowNonLoopback: false,
             messageFormat: 'array',
             reportSelfMessage: false,
@@ -227,6 +240,8 @@ async function fixture(heartbeat = false) {
 
 function clearDeliveryTrace() {
     fake.trace.length = 0;
+    fake.hasHttpPollOwner.mockClear();
+    fake.pollOwnerStats.mockClear();
     fake.failOrderedPollIngress.mockClear();
     fake.hasOrderedPollOwner.mockClear();
     fake.enqueuePollEvent.mockClear();
@@ -239,6 +254,9 @@ beforeEach(() => {
     fake.trace.length = 0;
     runtimes.length = 0;
     fake.registerPollHost.mockReset();
+    fake.activateHttpPollOwner.mockReset().mockReturnValue({ status: 'unavailable' });
+    fake.hasHttpPollOwner.mockReset().mockReturnValue(false);
+    fake.pollOwnerStats.mockReset().mockReturnValue(null);
     fake.failOrderedPollIngress.mockReset().mockImplementation(() => {
         fake.trace.push('poll:fail-ingress');
     });
@@ -384,7 +402,12 @@ describe('qualified ordinary event fanout (pure memory)', () => {
         const ticket = f.ticket();
         const ws = observe(f.options, (event) => {
             if (event.type === 'message') {
-                fake.trace.push('ws');
+                fake.trace.push('ws:first');
+            }
+        });
+        const second = observe(f.options, (event) => {
+            if (event.type === 'message') {
+                fake.trace.push('ws:second');
             }
         });
         clearDeliveryTrace();
@@ -392,21 +415,40 @@ describe('qualified ordinary event fanout (pure memory)', () => {
         await f.manager.emitEvent(message('private', 41), ticket);
         expect(fake.failOrderedPollIngress).toHaveBeenCalledExactlyOnceWith(f.runtime);
         expect(fake.hasOrderedPollOwner).toHaveBeenCalledExactlyOnceWith(f.runtime);
+        expect(fake.hasHttpPollOwner).toHaveBeenCalledExactlyOnceWith(f.runtime);
+        expect(fake.pollOwnerStats).not.toHaveBeenCalled();
+        expect(fake.activateHttpPollOwner).not.toHaveBeenCalled();
         expect(fake.enqueuePollEvent).toHaveBeenCalledExactlyOnceWith(
             f.runtime,
             expect.objectContaining({ type: 'message', message_id: '41' }),
             ticket,
         );
-        expect(fake.trace.slice(0, 3)).toEqual([
+        expect(fake.trace).toEqual([
+            'verify', // pre-activation source guard
             'poll:fail-ingress',
             'poll:has-owner',
             'poll:enqueue',
+            'verify', // pre-publish
+            'verify', // first subscriber
+            'ws:first',
+            'verify', // second subscriber
+            'ws:second',
+            'v11',
         ]);
-        expect(f.verify.mock.calls.length).toBeGreaterThanOrEqual(2);
-        expect(f.verify.mock.calls.every(([source]) => source === ticket)).toBe(true);
-        expect(fake.trace.indexOf('poll:enqueue')).toBeLessThan(fake.trace.indexOf('verify'));
-        expect(fake.trace.indexOf('verify')).toBeLessThan(fake.trace.indexOf('ws'));
-        expect(messages(ws.events)).toHaveLength(1);
+        expect(f.verify.mock.calls.map(([source]) => source)).toEqual([
+            ticket,
+            ticket,
+            ticket,
+            ticket,
+        ]);
+        expect(f.verify.mock.results.map((result) => result.value)).toEqual([
+            true,
+            true,
+            true,
+            true,
+        ]);
+        expect(messages(ws.events).map((event) => event.message_id)).toEqual(['41']);
+        expect(messages(second.events).map((event) => event.message_id)).toEqual(['41']);
         expect(f.legacy.received).toHaveBeenCalledOnce();
 
         // A stale input still runs the same poll admission branch before WS is fenced.
@@ -414,18 +456,23 @@ describe('qualified ordinary event fanout (pure memory)', () => {
         clearDeliveryTrace();
         f.verify.mockClear();
         await f.manager.emitEvent(message('private', 42), ticket);
-        expect(fake.trace.slice(0, 4)).toEqual([
+        expect(fake.trace).toEqual([
+            'verify', // pre-activation source guard
             'poll:fail-ingress',
             'poll:has-owner',
             'poll:enqueue',
-            'verify',
+            'verify', // pre-publish rejects the stale ticket
+            'v11',
         ]);
         expect(fake.enqueuePollEvent).toHaveBeenCalledExactlyOnceWith(
             f.runtime,
             expect.objectContaining({ message_id: '42' }),
             ticket,
         );
+        expect(f.verify.mock.calls.map(([source]) => source)).toEqual([ticket, ticket]);
+        expect(f.verify.mock.results.map((result) => result.value)).toEqual([false, false]);
         expect(messages(ws.events).map((event) => event.message_id)).toEqual(['41']);
+        expect(messages(second.events).map((event) => event.message_id)).toEqual(['41']);
         expect(f.legacy.received).toHaveBeenCalledTimes(2);
     });
 
@@ -436,14 +483,26 @@ describe('qualified ordinary event fanout (pure memory)', () => {
         f.verify.mockClear();
         await f.manager.emitEvent(message('group', 43), ticket);
         expect(fake.enqueuePollEvent).toHaveBeenCalledOnce();
-        expect(f.verify).toHaveBeenCalled();
-        expect(fake.trace.indexOf('poll:enqueue')).toBeLessThan(fake.trace.indexOf('verify'));
+        expect(fake.trace).toEqual([
+            'verify', // pre-activation source guard
+            'poll:fail-ingress',
+            'poll:has-owner',
+            'poll:enqueue',
+            'verify', // pre-publish, even without subscribers
+            'v11',
+        ]);
+        expect(f.verify.mock.calls.map(([source]) => source)).toEqual([ticket, ticket]);
+        expect(f.verify.mock.results.map((result) => result.value)).toEqual([true, true]);
         expect(f.legacy.received).toHaveBeenCalledOnce();
     });
 
     it('resolves an ordered lease first and fences WS if resolution rotates the epoch', async () => {
         const f = await fixture();
-        const ws = observe(f.options);
+        const ws = observe(f.options, (event) => {
+            if (event.type === 'message') {
+                fake.trace.push('ws');
+            }
+        });
         const ticket = f.ticket();
         let pending = true;
         const lease = {
@@ -477,14 +536,25 @@ describe('qualified ordinary event fanout (pure memory)', () => {
         expect(lease.skip).not.toHaveBeenCalled();
         expect(fake.failOrderedPollIngress).not.toHaveBeenCalled();
         expect(fake.enqueuePollEvent).not.toHaveBeenCalled();
-        expect(fake.trace.indexOf('poll:resolve')).toBeLessThan(fake.trace.indexOf('verify'));
+        expect(fake.trace).toEqual([
+            'verify', // pre-activation source guard
+            'poll:resolve',
+            'verify', // pre-publish rejects the rotated epoch
+            'v11',
+        ]);
+        expect(f.verify.mock.calls.map(([source]) => source)).toEqual([ticket, ticket]);
+        expect(f.verify.mock.results.map((result) => result.value)).toEqual([true, false]);
         expect(messages(ws.events)).toEqual([]);
         expect(f.legacy.received).toHaveBeenCalledOnce();
     });
 
     it('keeps current eligible admission and WS on the identical converted event', async () => {
         const f = await fixture();
-        const ws = observe(f.options);
+        const ws = observe(f.options, (event) => {
+            if (event.type === 'message') {
+                fake.trace.push('ws');
+            }
+        });
         const ticket = f.ticket();
         let pending = true;
         const lease = {
@@ -506,6 +576,7 @@ describe('qualified ordinary event fanout (pure memory)', () => {
         const admission: OrderedAdmission = { kind: 'eligible', target: f.runtime, lease };
         const input = message('private', 53);
         clearDeliveryTrace();
+        f.verify.mockClear();
         await withOrderedScope(f.manager, 'manager', input, admission, () =>
             f.manager.emitEvent(input, ticket),
         );
@@ -515,7 +586,16 @@ describe('qualified ordinary event fanout (pure memory)', () => {
         expect(lease.fail).not.toHaveBeenCalled();
         expect(fake.failOrderedPollIngress).not.toHaveBeenCalled();
         expect(fake.enqueuePollEvent).not.toHaveBeenCalled();
-        expect(fake.trace.indexOf('poll:resolve')).toBeLessThan(fake.trace.indexOf('verify'));
+        expect(fake.trace).toEqual([
+            'verify', // pre-activation source guard
+            'poll:resolve',
+            'verify', // pre-publish
+            'verify', // subscriber
+            'ws',
+            'v11',
+        ]);
+        expect(f.verify.mock.calls.map(([source]) => source)).toEqual([ticket, ticket, ticket]);
+        expect(f.verify.mock.results.map((result) => result.value)).toEqual([true, true, true]);
         expect(f.legacy.received).toHaveBeenCalledOnce();
     });
 
@@ -592,37 +672,74 @@ describe('qualified ordinary event fanout (pure memory)', () => {
 
     it('continues qualified WS after a synthetic poll enqueue exception', async () => {
         const f = await fixture();
-        const ws = observe(f.options);
+        const ws = observe(f.options, (event) => {
+            if (event.type === 'message') {
+                fake.trace.push('ws');
+            }
+        });
         const ticket = f.ticket();
+        clearDeliveryTrace();
+        f.verify.mockClear();
         fake.enqueuePollEvent.mockImplementationOnce(() => {
             fake.trace.push('poll:enqueue-throws');
             throw new Error('synthetic poll error');
         });
         await f.manager.emitEvent(message('private', 52), ticket);
-        expect(messages(ws.events).map((event) => event.message_id)).toEqual(['52']);
-        expect(fake.trace.indexOf('poll:enqueue-throws')).toBeLessThan(
-            fake.trace.indexOf('verify'),
+        expect(fake.enqueuePollEvent).toHaveBeenCalledExactlyOnceWith(
+            f.runtime,
+            expect.objectContaining({ type: 'message', message_id: '52' }),
+            ticket,
         );
+        expect(messages(ws.events).map((event) => event.message_id)).toEqual(['52']);
+        expect(fake.trace).toEqual([
+            'verify', // pre-activation source guard
+            'poll:fail-ingress',
+            'poll:has-owner',
+            'poll:enqueue-throws',
+            'verify', // pre-publish
+            'verify', // subscriber
+            'ws',
+            'v11',
+        ]);
+        expect(f.verify.mock.calls.map(([source]) => source)).toEqual([ticket, ticket, ticket]);
+        expect(f.verify.mock.results.map((result) => result.value)).toEqual([true, true, true]);
         expect(f.legacy.received).toHaveBeenCalledOnce();
     });
 
     it('rechecks after pre-publish when verification itself rotates before the first subscriber', async () => {
         const f = await fixture();
-        const ws = observe(f.options);
-        const ticket = f.ticket();
-        let checks = 0;
-        f.setVerifyHook(() => {
-            checks++;
-
-            if (checks === 2) {
-                f.rotate();
+        const ws = observe(f.options, (event) => {
+            if (event.type === 'message') {
+                fake.trace.push('ws');
             }
         });
+        const ticket = f.ticket();
+        let postPollChecks = 0;
         clearDeliveryTrace();
+        f.verify.mockClear();
+        f.setVerifyHook(() => {
+            if (fake.trace.includes('poll:enqueue')) {
+                postPollChecks++;
+
+                if (postPollChecks === 2) {
+                    f.rotate();
+                }
+            }
+        });
         await f.manager.emitEvent(message('private', 60), ticket);
-        expect(checks).toBeGreaterThanOrEqual(2);
+        expect(postPollChecks).toBe(2);
         expect(fake.enqueuePollEvent).toHaveBeenCalledOnce();
-        expect(fake.trace.indexOf('poll:enqueue')).toBeLessThan(fake.trace.indexOf('verify'));
+        expect(fake.trace).toEqual([
+            'verify', // pre-activation source guard
+            'poll:fail-ingress',
+            'poll:has-owner',
+            'poll:enqueue',
+            'verify', // pre-publish
+            'verify', // first subscriber rotates and is fenced
+            'v11',
+        ]);
+        expect(f.verify.mock.calls.map(([source]) => source)).toEqual([ticket, ticket, ticket]);
+        expect(f.verify.mock.results.map((result) => result.value)).toEqual([true, true, false]);
         expect(messages(ws.events)).toEqual([]);
         expect(f.legacy.received).toHaveBeenCalledOnce();
     });
