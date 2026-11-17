@@ -1034,7 +1034,9 @@ describe('synthetic video through production runtime and injected SDK transports
         const oldTicket = f.ticket()!;
         await f.emit(message(f.uin, 'private'), oldTicket);
         const id = fileId(ws.messages[0]!, 0, 'video');
-        const oldPoll = f.current().options.httpPoll!;
+        const oldTransport = f.current();
+        const oldHandle = oldTransport.options.handle;
+        const oldPoll = oldTransport.options.httpPoll!;
         vi.setSystemTime(Date.now() + 365 * 24 * 60 * 60 * 1000);
         expect((await getFile(f, id)).data).toEqual({ name: '', url: VIDEO_URL });
         ws.close();
@@ -1053,7 +1055,39 @@ describe('synthetic video through production runtime and injected SDK transports
         );
         expect(stale).toEqual({ kind: 'unavailable' });
         expect(staleSink.body).toBe('');
+        expect(oldTransport.instance.isAcceptingActions()).toBe(false);
+        expect(f.current().instance).not.toBe(oldTransport.instance);
+        expect(f.current().instance.isAcceptingActions()).toBe(true);
+        const resolver = vi.spyOn(
+            (
+                f.runtime as unknown as {
+                    dispatcher: {
+                        options: { resolveVideoFileUrl: (fileId: string) => string | null };
+                    };
+                }
+            ).dispatcher.options,
+            'resolveVideoFileUrl',
+        );
+        const redeem = vi.spyOn(tokens.V12VideoFileTokens.prototype, 'redeem');
+        const oldLeaseRevoke = vi.spyOn(tokens.V12VideoFileTokens.prototype, 'revoke');
+        const staleFile = await oldHandle({
+            action: 'get_file',
+            params: { file_id: id, type: 'url' },
+            echo: 'old-video-lease-🪶',
+        });
+        expect(staleFile).toMatchObject({
+            status: 'failed',
+            retcode: 20002,
+            data: null,
+            echo: 'old-video-lease-🪶',
+        });
+        expect(resolver).not.toHaveBeenCalled();
+        expect(redeem).not.toHaveBeenCalled();
+        expect(oldLeaseRevoke).not.toHaveBeenCalled();
+        expect(f.api.handle).not.toHaveBeenCalled();
         expect((await getFile(f, id)).data).toEqual({ name: '', url: VIDEO_URL });
+        expect(resolver).toHaveBeenCalledExactlyOnceWith(id);
+        expect(redeem).toHaveBeenCalledExactlyOnceWith(id);
         const reopenedWs = await connectSdkWs(f);
 
         try {
@@ -1069,13 +1103,24 @@ describe('synthetic video through production runtime and injected SDK transports
             expect(reopenedWs.messages).toHaveLength(1);
             expect((await getFile(f, id)).data).toEqual({ name: '', url: VIDEO_URL });
             const savedHandle = f.current().options.handle;
+            resolver.mockClear();
+            redeem.mockClear();
+            const revoke = oldLeaseRevoke;
             f.runtime.quiesce();
             const revoked = await savedHandle({
                 action: 'get_file',
                 params: { file_id: id, type: 'url' },
                 echo: 'closed',
             });
-            expect(revoked).toMatchObject({ status: 'failed', retcode: 20001, data: null });
+            expect(revoked).toMatchObject({
+                status: 'failed',
+                retcode: 20002,
+                data: null,
+                echo: 'closed',
+            });
+            expect(resolver).not.toHaveBeenCalled();
+            expect(redeem).not.toHaveBeenCalled();
+            expect(revoke).toHaveBeenCalledOnce();
             expect(f.api.handle).not.toHaveBeenCalled();
         } finally {
             reopenedWs.close();
@@ -1090,12 +1135,33 @@ describe('synthetic video through production runtime and injected SDK transports
             await f.emit(message(f.uin, 'private'), f.ticket());
             const id = fileId(ws.messages[0]!, 0, 'video');
             const savedHandle = f.current().options.handle;
+            const resolver = vi.spyOn(
+                (
+                    f.runtime as unknown as {
+                        dispatcher: {
+                            options: { resolveVideoFileUrl: (fileId: string) => string | null };
+                        };
+                    }
+                ).dispatcher.options,
+                'resolveVideoFileUrl',
+            );
+            const redeem = vi.spyOn(tokens.V12VideoFileTokens.prototype, 'redeem');
+            const revoke = vi.spyOn(tokens.V12VideoFileTokens.prototype, 'revoke');
             f.runtime.forceClose();
             const result = await savedHandle({
                 action: 'get_file',
                 params: { file_id: id, type: 'url' },
+                echo: 'video-forced',
             });
-            expect(result).toMatchObject({ status: 'failed', retcode: 20001, data: null });
+            expect(result).toMatchObject({
+                status: 'failed',
+                retcode: 20002,
+                data: null,
+                echo: 'video-forced',
+            });
+            expect(resolver).not.toHaveBeenCalled();
+            expect(redeem).not.toHaveBeenCalled();
+            expect(revoke).toHaveBeenCalledOnce();
             expect(f.api.handle).not.toHaveBeenCalled();
         } finally {
             ws.close();
@@ -1129,7 +1195,7 @@ describe('synthetic video through production runtime and injected SDK transports
             const result = await getFile(f, id);
             expect(redeem).toHaveBeenCalledExactlyOnceWith(id);
             expect(revokedAfterDecrypt).toBe(true);
-            expect(result).toMatchObject({ status: 'failed', retcode: 20001, data: null });
+            expect(result).toMatchObject({ status: 'failed', retcode: 20002, data: null });
             expect(JSON.stringify(result)).not.toContain(VIDEO_SECRET);
             expect(JSON.stringify(result)).not.toContain(VIDEO_URL);
             expect(f.api.handle).not.toHaveBeenCalled();

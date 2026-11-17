@@ -293,6 +293,14 @@ describe('synthetic uploaded-image target bounds through V12 dispatcher', () => 
                         valid,
                         { type: 'text', data: { text: 'fixture' } },
                     ]),
+                    code: 10003,
+                },
+                {
+                    input: request(scene, target, [
+                        valid,
+                        { type: 'text', data: { text: 'fixture' } },
+                        { type: 'text', data: { text: 'extra' } },
+                    ]),
                     code: 10005,
                 },
                 {

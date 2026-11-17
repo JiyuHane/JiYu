@@ -136,8 +136,9 @@ acknowledgement. See the [polling design and detailed limits](V12_HTTP_POLL_DESI
 The core currently handles `get_version`, `get_status`, `get_supported_actions`,
 `get_self_info`, `get_user_info`, `get_friend_list`, `get_group_info`,
 `get_group_list`, `get_group_member_list`, `get_group_member_info`,
-`send_message` for private and group text, group mentions, and a single standalone
-location or restricted local-upload image segment in either conversation type,
+`send_message` for private and group text, group mentions, a single standalone
+location, and a restricted local-upload image alone or with exactly one text
+segment in either conversation type,
 `delete_message`, `set_group_name`,
 `leave_group`, and the restricted URL mode of `get_file`. The account runtime also
 installs local `upload_file`, `get_file` data, and `get_file_fragmented` read
@@ -208,9 +209,10 @@ eligible current-generation handle.
 When the data capability is available and a request passes the common `file_id`
 type and length checks, a foreign, expired or forged ID in this reserved namespace
 produces a local not-found result for data mode without a v11 lookup. URL mode returns 10004 for that prefix without
-falling back to v11. Other existing image, voice and v11 URL paths remain unchanged,
-except that, once installed, this capability shadows a pre-existing v11 alias
-starting `jiyu-upload:v1:` through v12 URL lookup; v11 itself is unchanged. Malformed or oversized IDs may
+falling back to v11. Once installed, this capability shadows a pre-existing v11
+alias starting `jiyu-upload:v1:` through v12 URL lookup; direct v11 lookup is
+unchanged. Other reserved media URL handles have the listener-lease checks
+described below. Malformed or oversized IDs may
 fail earlier common validation. Upload `type: "url"`, `type: "path"` and unknown
 types return 10004; the separate `upload_file_fragmented` action remains
 unimplemented and returns 10002. Outbound video sending, other group/normal
@@ -371,6 +373,26 @@ string, not the original bytes, QQ source identity, actual file identity, format
 playability, future URL content or access. Local AES-GCM is unrelated to QQ
 signing or its encryption algorithms; image, voice and video each have a separate
 purpose, random key, AAD and nonce state.
+
+For these three reserved prefixes in URL mode, after common request validation,
+the core samples the originating listener's lease before and after reading the
+resolver, after invoking it and after URL classification. A stale, false or
+throwing lease produces core 20002; with a current lease, a bad or foreign
+handle that resolves to no valid URL produces core 20001. Neither result falls
+back to v11. A normal listener close/reopen retains the issuer, but a call through
+the old listener's handler still has its expired lease; the new active listener
+can attempt redemption of
+the same runtime's handle. Quiesce or force-close also invalidates that lease.
+
+This is a trusted internal lifetime seam: the real transport already has its own
+quiesce/open admission, and these observations do not establish an external or
+cross-account exploit. The checks are synchronous samples, not atomicity across
+resolver side effects, untrusted same-process changes, subsequent microtasks,
+writes or network delivery. A direct standalone core call without a lease leaves
+callback lifetime to its caller; an internal prepared ordinary call made without
+a lease instead uses a false sentinel and fails this reserved URL path. On the
+normal HTTP response path, the wrapper preserves the core retcode and `echo` but
+can replace the failure text; the output and connection limits below still apply.
 
 For image, voice and video handles, a core success is still subject to the
 transport's output byte limit for the entire JSON response, including the URL
@@ -815,8 +837,8 @@ event logging can still expose data. Real QQ behavior remains unverified.
 For private `send_message`, the target `user_id` must be a canonical positive
 uint32 decimal string; larger values return `10003` before the v11 handler is
 called, avoiding truncation in the downstream private routing field. Group text,
-mentions and location retain their existing target range; the standalone image
-path applies the separate uint32 constraint described below.
+mentions and location retain their existing target range; the single-image and
+image-plus-text paths apply the separate uint32 constraint described below.
 
 For group `send_message`, a v12 `mention` with `data.user_id` as a canonical
 positive decimal string in the UIN range 1 through 4294967295 maps to the
@@ -825,13 +847,15 @@ empty `data` maps to `at` with `qq: 'all'`. Leading zeroes, signs, whitespace,
 zero, numeric IDs, values above 4294967295 and `mention` user ID `'all'` are
 invalid. The mention limit prevents truncation in the downstream uint32 UIN
 encoding; it does not change the group target ID range for text or mentions.
-The standalone image path applies a separate target limit. Mixed text and
-mentions retain their order, and the complete message is validated before one
-v11 handler call. For private sends both mention types return unsupported 10005
-without calling the v11 handler; this is an implementation limit, not a claim
-that the standard forbids private mentions.
-After request checks and basic target parsing, a multi-segment message containing
-an image returns 10005 in an image-combination scan before per-segment validation.
+The single-image and image-plus-text paths apply a separate target limit. Mixed
+text and mentions retain their order, and the complete message is validated
+before one v11 handler call. For private sends both mention types return
+unsupported 10005 without calling the v11 handler; this is an implementation
+limit, not a claim that the standard forbids private mentions.
+After request checks and basic target parsing, an array containing exactly one
+text and one image enters the restricted image path described below. Any other
+multi-segment form containing an image returns 10005 in an image-combination
+scan before per-segment validation.
 For the non-image path each segment is processed in order: shape and, for known
 segment types, extra fields and required values are validated before the
 private-mention decision. Thus malformed fields return 10006 or 10007, while a
@@ -887,7 +911,8 @@ For example, non-finite in-process numbers fail the snapshot with `10001`. These
 coordinate ranges, text limit and combination rules are local support policies,
 not assertions about the OneBot standard. `get_supported_actions` lists actions,
 not supported segment combinations. Apart from the restricted single-image path
-below, other outbound media, including voice, remain unsupported by v12.
+below, optionally with one text segment, other outbound media, including voice
+and video, remain unsupported by v12.
 
 Once preflight succeeds, v12 calls the existing account-local v11 send handler
 with one `{type: 'location', data: {lat: latitude, lon: longitude, title,
@@ -916,22 +941,37 @@ outcome uncertain; no automatic retry is attempted.
 
 ### Sending a single local-upload image
 
-For private or group `send_message`, Jiyu supports exactly one standalone
+For private or group `send_message`, Jiyu supports one
 `{type: 'image', data: {file_id}}` segment, supplied directly or as a
-single-element array. The only accepted `file_id` is a canonical
+single-element array, or an array of exactly that image and one
+`{type: 'text', data: {text: <string>}}` segment in either order. No extra
+segment or data fields are accepted. The only accepted `file_id` is a canonical
 `jiyu-upload:v1:` handle from this account's current listener generation,
 previously returned by `upload_file` with `type: 'data'`. The suffix is the
 canonical unpadded base64url encoding of 32 bytes. Incoming `jiyu-image:v1:`,
 `jiyu-voice:v1:` or `jiyu-video:v1:` handles, legacy IDs, URLs, local paths,
-multiple image segments and image mixed with any other segment are unsupported.
-This path does not
-fetch a URL or read an arbitrary file.
+multiple images and other mixed segment combinations are unsupported. This path
+does not fetch a URL or read an arbitrary file.
 
-After request and basic target checks, the multi-segment image scan returns
-10005 before per-segment validation. For one image, missing or non-object `data`
-returns 10006; extra segment or data fields are then checked and return 10007
-before `file_id` validation. A missing or wrong-type `file_id` returns 10006,
-and a noncanonical upload ID returns 10005. After these checks, both private
+For the two-segment form, both segments are validated in input order before the
+image store is read or the sensitive action is invoked. Its text must be a
+string with well-formed UTF-16: an unpaired surrogate returns 10006 before the
+store read, avoiding downstream replacement with U+FFFD. This extra UTF-16 check
+is specific to image-plus-text, not a new rule for existing text-only sends.
+The empty string, spaces, NUL and valid surrogate pairs pass this check. The
+v11 parser later skips an exactly empty text placeholder; it does not apply that
+empty-placeholder rule to spaces or NUL. There is no additional 64 KiB limit for
+this text, although the usual request snapshot and transport limits apply. These
+are local policies, not a QQ message-length or delivery guarantee.
+
+After request and basic target checks, other multi-segment forms containing an
+image return 10005 in the image-combination scan before per-segment validation.
+For a recognized single image or image-plus-text form, missing or non-object
+`data` returns 10006; extra segment or data fields are then checked and return
+10007 before required values are checked. In the two-segment form those checks
+are applied in input order, so an earlier invalid segment determines the result.
+A missing or wrong-type `file_id` returns 10006, and a noncanonical upload ID
+returns 10005. After these checks, both private
 and group image target IDs must be at most `4294967295`; larger canonical IDs
 return 10003 before the image store is read or a send is attempted. The bound
 prevents truncation of the group target in the downstream uint32 image-upload
@@ -945,7 +985,8 @@ retrieval, but zero-byte content is
 not accepted for image sending. The dispatcher reads
 the handle once, checks canonical Base64, requires 1–262,144 decoded bytes and
 recomputes SHA-256 against the returned lowercase digest. An otherwise valid
-one-byte upload passes these local content checks. They do not parse image
+one-byte upload passes these local content checks. These size and target bounds
+are local policies, not QQ or OneBot maximums. These checks do not parse image
 formats, establish file provenance, prove that the bytes are actually decodable
 as an image, or establish QQ acceptance. An image send does not consume its
 handle or extend its existing upload TTL; the store's 32-entry, 4 MiB and
@@ -970,8 +1011,9 @@ concurrency cap nor an RSS bound.
 
 After the original lease, readiness and pinned identities are checked, the
 dispatcher calls the sensitive entry at most once with one v11 image segment
-whose `file` is `base64://` followed by the canonical Base64 data. After the
-entry's synchronous input and debug logging calls return, and immediately before
+whose `file` is `base64://` followed by the canonical Base64 data, optionally
+alongside the one v11 text segment in the requested order. After the entry's
+synchronous input and debug logging calls return, and immediately before
 the registered handler starts, the built-in `ApiHandler` consumes a one-shot start
 guard and rechecks quiescence. A failed guard or quiesced handler prevents that
 start in the built-in `ApiHandler`; its registered v11 handler otherwise starts
@@ -983,7 +1025,9 @@ guard or contract. Once the handler has started, closing or replacing the listen
 cannot retract its effects. A timeout, lost response,
 handler failure or unavailable sent-time can leave the outcome unknown; do not
 automatically retry the whole send. Existing lower-level Highway chunk handling
-may have its own bounded retries.
+may have its own bounded retries. A self-sent v12 event containing an image is
+rejected as a whole; in an image-plus-text echo the text is not emitted
+separately. Neither a self echo nor a later `get_message` lookup is guaranteed.
 
 Redaction here is limited to this `ApiHandler` sensitive action's own diagnostics
 and action-observer records. Each observer receives `redacted: true`, empty
@@ -997,7 +1041,10 @@ not run. The supplied
 request `echo` is still returned under the usual rules and is not sanitized.
 
 The registered handler, Bridge, media sinks, other logs and arbitrary
-same-process callbacks can still see the original content. Temporary buffer
+same-process callbacks can still see the original content. For image-plus-text,
+the downstream successful-send INFO log can include the first 50 UTF-16 code
+units of the text, and local message history may store it. `ApiHandler`
+redaction is not end-to-end text redaction. Temporary buffer
 clearing is best effort and cannot guarantee erasure of JavaScript Base64 strings
 or copies. Synchronous logging and observer callback exceptions are caught at
 this boundary. Rejection handling for observer-returned native Promises is best

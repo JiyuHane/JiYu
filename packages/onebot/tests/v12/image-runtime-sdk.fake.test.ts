@@ -1,6 +1,8 @@
 import net from 'node:net';
 import http from 'node:http';
 import https from 'node:https';
+import http2 from 'node:http2';
+import childProcess from 'node:child_process';
 import tls from 'node:tls';
 import dgram from 'node:dgram';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -9,19 +11,34 @@ import type { V12TransportOptions } from '../../src/v12-network';
 // No listener, outgoing socket, native addon, account, Core or plugin is started.
 // The real runtime calls this in-memory transport's saved callbacks.
 const fixture = vi.hoisted(() => ({
-    transports: [] as Array<{ options: V12TransportOptions }>,
+    transports: [] as Array<{
+        options: V12TransportOptions;
+        instance: { isAcceptingActions(): boolean };
+    }>,
     forbiddenModules: [] as string[],
 }));
 
 vi.mock('../../src/v12-network', () => ({
     V12Transport: class {
+        private accepting = false;
         constructor(options: V12TransportOptions) {
-            fixture.transports.push({ options });
+            fixture.transports.push({ options, instance: this });
         }
-        async open() {}
-        async close() {}
-        quiesce() {}
-        forceClose() {}
+        async open() {
+            this.accepting = true;
+        }
+        async close() {
+            this.accepting = false;
+        }
+        isAcceptingActions() {
+            return this.accepting;
+        }
+        quiesce() {
+            this.accepting = false;
+        }
+        forceClose() {
+            this.accepting = false;
+        }
     },
 }));
 
@@ -71,6 +88,7 @@ import {
 import { IOneBotNetworkAdapter } from '../../src/network/adapter';
 import { OneBotNetworkManager } from '../../src/network/network-manager';
 import { attachMessageMedia } from '../../src/message-media';
+import { V12ImageFileTokens } from '../../src/v12/image-file-token';
 import type { DispatchPayload } from '../../src/event-filter';
 import type { JsonObject, NetworkBase } from '../../src/types';
 
@@ -115,12 +133,22 @@ beforeEach(() => {
         vi.spyOn(https, 'createServer').mockImplementation(blocked),
         vi.spyOn(https, 'request').mockImplementation(blocked),
         vi.spyOn(https, 'get').mockImplementation(blocked),
+        vi.spyOn(http2, 'createServer').mockImplementation(blocked),
+        vi.spyOn(http2, 'createSecureServer').mockImplementation(blocked),
+        vi.spyOn(http2, 'connect').mockImplementation(blocked),
         vi.spyOn(tls, 'createServer').mockImplementation(blocked),
         vi.spyOn(tls, 'connect').mockImplementation(blocked),
         vi.spyOn(dgram, 'createSocket').mockImplementation(blocked),
         vi.spyOn(dgram.Socket.prototype, 'bind').mockImplementation(blocked),
         vi.spyOn(dgram.Socket.prototype, 'connect').mockImplementation(blocked),
         vi.spyOn(dgram.Socket.prototype, 'send').mockImplementation(blocked),
+        vi.spyOn(childProcess, 'spawn').mockImplementation(blocked),
+        vi.spyOn(childProcess, 'spawnSync').mockImplementation(blocked),
+        vi.spyOn(childProcess, 'exec').mockImplementation(blocked),
+        vi.spyOn(childProcess, 'execSync').mockImplementation(blocked),
+        vi.spyOn(childProcess, 'execFile').mockImplementation(blocked),
+        vi.spyOn(childProcess, 'execFileSync').mockImplementation(blocked),
+        vi.spyOn(childProcess, 'fork').mockImplementation(blocked),
     ];
     nativeGuard = vi.spyOn(process, 'dlopen').mockImplementation(blocked);
 });
@@ -185,7 +213,10 @@ class V11Capture extends IOneBotNetworkAdapter<NetworkBase> {
     }
 }
 
-async function account(uin: string, options: { verifier?: boolean } = {}) {
+async function account(
+    uin: string,
+    options: { verifier?: boolean; orderedFixture?: boolean } = {},
+) {
     const generation = new SourceGeneration();
     const manager = new OneBotNetworkManager();
     const api = {
@@ -239,16 +270,22 @@ async function account(uin: string, options: { verifier?: boolean } = {}) {
     const v11 = new V11Capture(uin);
     v11.open();
     manager.register(v11);
-    generation.setOnline(true);
-    let transport: { options: V12TransportOptions } | undefined;
+
+    // Ordered-only fixtures start without a source so production completion-order
+    // poll activation does not claim their gate; their fake transport is still ready.
+    if (!options.orderedFixture) {
+        generation.setOnline(true);
+    }
+
+    let transport: (typeof fixture.transports)[number] | undefined;
     const wire: string[] = [];
 
     const open = async () => {
         await runtime.open();
         transport = fixture.transports.at(-1);
 
-        if (!transport) {
-            throw new Error('fake transport was not created');
+        if (!transport || !transport.instance.isAcceptingActions()) {
+            throw new Error('ready fake transport was not created');
         }
 
         // This is the fake WebSocket boundary: the production runtime supplies
@@ -258,6 +295,19 @@ async function account(uin: string, options: { verifier?: boolean } = {}) {
     };
 
     await open();
+
+    if (options.orderedFixture) {
+        generation.setOnline(true);
+    }
+
+    const current = () => {
+        if (!transport) {
+            throw new Error('fake transport unavailable');
+        }
+
+        return transport;
+    };
+
     const fakeFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         expect(input).toBe(ENDPOINT);
         expect(init?.method).toBe('POST');
@@ -297,6 +347,7 @@ async function account(uin: string, options: { verifier?: boolean } = {}) {
         client,
         fakeFetch,
         open,
+        current,
         ticket,
         emit,
         messages,
@@ -461,8 +512,43 @@ describe('inbound image through the real v12 runtime with fake transports', () =
         const oldTicket = f.ticket()!;
         await f.emit(message(f.uin, 'private'), oldTicket);
         const id = fileId(f.messages()[0]!);
+        const oldTransport = f.current();
+        const oldHandle = oldTransport.options.handle;
         await f.runtime.close();
         await f.open();
+        expect(oldTransport.instance.isAcceptingActions()).toBe(false);
+        expect(f.current().instance).not.toBe(oldTransport.instance);
+        expect(f.current().instance.isAcceptingActions()).toBe(true);
+        const resolver = vi.spyOn(
+            (
+                f.runtime as unknown as {
+                    dispatcher: {
+                        options: { resolveImageFileUrl: (fileId: string) => string | null };
+                    };
+                }
+            ).dispatcher.options,
+            'resolveImageFileUrl',
+        );
+        const redeem = vi.spyOn(V12ImageFileTokens.prototype, 'redeem');
+        const revoke = vi.spyOn(V12ImageFileTokens.prototype, 'revoke');
+        const stale = await oldHandle({
+            action: 'get_file',
+            params: { file_id: id, type: 'url' },
+            echo: 'old-image-lease-🪶',
+        });
+        expect(stale).toMatchObject({
+            status: 'failed',
+            retcode: 20002,
+            data: null,
+            echo: 'old-image-lease-🪶',
+        });
+        expect(resolver).not.toHaveBeenCalled();
+        expect(redeem).not.toHaveBeenCalled();
+        expect(revoke).not.toHaveBeenCalled();
+        expect(f.api.handle).not.toHaveBeenCalled();
+        expect((await getFile(f, id)).data).toEqual({ name: '', url: IMAGE_URL });
+        expect(resolver).toHaveBeenCalledExactlyOnceWith(id);
+        expect(redeem).toHaveBeenCalledExactlyOnceWith(id);
         f.wire.length = 0;
         const nextTicket = f.ticket()!;
         expect(nextTicket).toBeDefined();
@@ -476,6 +562,37 @@ describe('inbound image through the real v12 runtime with fake transports', () =
             name: '',
             url: OTHER_URL,
         });
+        expect(f.api.handle).not.toHaveBeenCalled();
+    });
+
+    it('discards an image URL if redemption synchronously retires its listener', async () => {
+        const f = await account('10001');
+        await f.emit(message(f.uin, 'private'), f.ticket());
+        const id = fileId(f.messages()[0]!);
+        const original = V12ImageFileTokens.prototype.redeem;
+        let decrypted = false;
+        const redeem = vi
+            .spyOn(V12ImageFileTokens.prototype, 'redeem')
+            .mockImplementation(function (this: V12ImageFileTokens, input: string) {
+                const url = original.call(this, input);
+
+                if (input === id && url === IMAGE_URL) {
+                    decrypted = true;
+                    f.runtime.quiesce();
+                }
+
+                return url;
+            });
+        const result = await getFile(f, id, 'image-reentrant');
+        expect(decrypted).toBe(true);
+        expect(redeem).toHaveBeenCalledExactlyOnceWith(id);
+        expect(result).toMatchObject({
+            status: 'failed',
+            retcode: 20002,
+            data: null,
+            echo: 'image-reentrant',
+        });
+        expect(JSON.stringify(result)).not.toContain(URL_MARKER);
         expect(f.api.handle).not.toHaveBeenCalled();
     });
 
@@ -646,22 +763,44 @@ describe('inbound image through the real v12 runtime with fake transports', () =
             const source = f.ticket()!;
             await f.emit(message(f.uin, 'private'), source);
             const id = fileId(f.messages()[0]!);
+            const handle = f.current().options.handle;
+            const resolver = vi.spyOn(
+                (
+                    f.runtime as unknown as {
+                        dispatcher: {
+                            options: { resolveImageFileUrl: (fileId: string) => string | null };
+                        };
+                    }
+                ).dispatcher.options,
+                'resolveImageFileUrl',
+            );
+            const redeem = vi.spyOn(V12ImageFileTokens.prototype, 'redeem');
+            const revoke = vi.spyOn(V12ImageFileTokens.prototype, 'revoke');
             f.runtime[method]();
             await f.emit(message(f.uin, 'private'), source);
             expect(f.messages()).toHaveLength(1);
-            // The fake HTTP callback deliberately bypasses transport admission;
-            // this assertion concerns key revocation, not a live endpoint.
-            expect(await getFile(f, id)).toMatchObject({
+            // A saved callback models a stale in-process listener, not a socket.
+            expect(
+                await handle({
+                    action: 'get_file',
+                    params: { file_id: id, type: 'url' },
+                    echo: 'image-retired',
+                }),
+            ).toMatchObject({
                 status: 'failed',
-                retcode: 20001,
+                retcode: 20002,
                 data: null,
+                echo: 'image-retired',
             });
+            expect(resolver).not.toHaveBeenCalled();
+            expect(redeem).not.toHaveBeenCalled();
+            expect(revoke).toHaveBeenCalledOnce();
             expect(f.api.handle).not.toHaveBeenCalled();
         },
     );
 
     it('admits a source-verified image into the explicitly activated in-process ordered poll fixture', async () => {
-        const f = await account('10001');
+        const f = await account('10001', { orderedFixture: true });
         const activation = activateOrderedPollOwner(f.runtime);
         expect(activation.status).toBe('ready');
 
@@ -703,7 +842,7 @@ describe('inbound image through the real v12 runtime with fake transports', () =
     });
 
     it('does not enqueue or fan out an image whose ticket expires after poll admission', async () => {
-        const f = await account('10001');
+        const f = await account('10001', { orderedFixture: true });
         const activation = activateOrderedPollOwner(f.runtime);
         expect(activation.status).toBe('ready');
 

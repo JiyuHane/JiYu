@@ -225,6 +225,27 @@ function isLowerSha256(value: unknown): value is string {
     return true;
 }
 
+/** Reject isolated UTF-16 surrogates without rewriting valid text. */
+function isWellFormedUtf16(value: string): boolean {
+    for (let index = 0; index < value.length; index += 1) {
+        const code = stringCharCodeAt(value, index);
+
+        if (code >= 0xd800 && code <= 0xdbff) {
+            const next = stringCharCodeAt(value, index + 1);
+
+            if (!(next >= 0xdc00 && next <= 0xdfff)) {
+                return false;
+            }
+
+            index += 1;
+        } else if (code >= 0xdc00 && code <= 0xdfff) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 /** Only call on an already bounded snapshot, never on caller-owned objects. */
 function freezeSnapshot(value: unknown): void {
     if (typeof value !== 'object' || value === null) {
@@ -966,7 +987,7 @@ export class V12Dispatcher {
                 return response(10004, 'unsupported file type', null, echo);
             }
 
-            return this.getFile(params.file_id, echo);
+            return this.getFile(params.file_id, echo, fileLease);
         }
 
         return this.send(params, echo, fileLease);
@@ -1388,7 +1409,56 @@ export class V12Dispatcher {
         }
     }
 
-    private async getFile(fileId: string, echo?: string): Promise<V12Response> {
+    private getReservedFileUrl(
+        fileId: string,
+        echo: string | undefined,
+        fileLease: V12FileLease | undefined,
+        resolverKey: 'resolveImageFileUrl' | 'resolveVoiceFileUrl' | 'resolveVideoFileUrl',
+    ): V12Response {
+        const invalid = () => response(20001, 'invalid file result', null, echo);
+        const unavailable = () => response(20002, 'file unavailable', null, echo);
+
+        try {
+            if (!fileLeaseCurrent(fileLease)) {
+                return unavailable();
+            }
+
+            // An option getter may retire the listener before the resolver starts.
+            const options = this.options;
+            const resolver = options[resolverKey];
+
+            if (!fileLeaseCurrent(fileLease)) {
+                return unavailable();
+            }
+
+            const url =
+                resolver === undefined || resolver === null
+                    ? undefined
+                    : apply(resolver, options, [fileId]);
+
+            if (!fileLeaseCurrent(fileLease)) {
+                return unavailable();
+            }
+
+            const checked = classifyFileUrl(url);
+
+            if (!fileLeaseCurrent(fileLease)) {
+                return unavailable();
+            }
+
+            return checked.kind === 'valid'
+                ? response(0, '', { name: '', url: checked.url }, echo)
+                : invalid();
+        } catch {
+            return unavailable();
+        }
+    }
+
+    private async getFile(
+        fileId: string,
+        echo?: string,
+        fileLease?: V12FileLease,
+    ): Promise<V12Response> {
         const invalid = () => response(20001, 'invalid file result', null, echo);
         const unavailable = () => response(20002, 'file unavailable', null, echo);
         const unsupported = () => response(10004, 'file URL unavailable', null, echo);
@@ -1396,43 +1466,19 @@ export class V12Dispatcher {
         if (isV12ImageToken(fileId)) {
             // The reserved namespace is never retried as a legacy alias: doing
             // so could turn a damaged or foreign handle into a different file.
-            try {
-                const url = this.options.resolveImageFileUrl?.(fileId);
-                const checked = classifyFileUrl(url);
-                return checked.kind === 'valid'
-                    ? response(0, '', { name: '', url: checked.url }, echo)
-                    : invalid();
-            } catch {
-                return unavailable();
-            }
+            return this.getReservedFileUrl(fileId, echo, fileLease, 'resolveImageFileUrl');
         }
 
         if (isV12VoiceToken(fileId)) {
             // Reserved voice handles have an independent issuer and must not
             // fall back to a v11 alias, even when malformed or unredeemable.
-            try {
-                const url = this.options.resolveVoiceFileUrl?.(fileId);
-                const checked = classifyFileUrl(url);
-                return checked.kind === 'valid'
-                    ? response(0, '', { name: '', url: checked.url }, echo)
-                    : invalid();
-            } catch {
-                return unavailable();
-            }
+            return this.getReservedFileUrl(fileId, echo, fileLease, 'resolveVoiceFileUrl');
         }
 
         if (isV12VideoToken(fileId)) {
             // The new reserved prefix shadows matching legacy aliases through
             // v12 get_file, even for malformed or unredeemable video handles.
-            try {
-                const url = this.options.resolveVideoFileUrl?.(fileId);
-                const checked = classifyFileUrl(url);
-                return checked.kind === 'valid'
-                    ? response(0, '', { name: '', url: checked.url }, echo)
-                    : invalid();
-            } catch {
-                return unavailable();
-            }
+            return this.getReservedFileUrl(fileId, echo, fileLease, 'resolveVideoFileUrl');
         }
 
         try {
@@ -2241,6 +2287,7 @@ export class V12Dispatcher {
         fileId: string,
         echo: string | undefined,
         fileLease: V12FileLease | undefined,
+        accompanyingText?: { text: string; beforeImage: boolean },
     ): Promise<V12Response> {
         const unavailable = () => response(20002, 'image unavailable', null, echo);
 
@@ -2320,9 +2367,16 @@ export class V12Dispatcher {
             }
 
             const action = targetKey === 'user_id' ? 'send_private_msg' : 'send_group_msg';
+            const image: JsonObject = { type: 'image', data: { file: `base64://${data}` } };
+            const message: JsonObject[] =
+                accompanyingText === undefined
+                    ? [image]
+                    : accompanyingText.beforeImage
+                      ? [{ type: 'text', data: { text: accompanyingText.text } }, image]
+                      : [image, { type: 'text', data: { text: accompanyingText.text } }];
             const params: JsonObject = {
                 [targetKey]: target,
-                message: [{ type: 'image', data: { file: `base64://${data}` } }],
+                message,
                 auto_escape: false,
             };
             const originalLease: V12FileLease = fileLease;
@@ -2488,7 +2542,72 @@ export class V12Dispatcher {
             return response(10003, 'invalid target or message', null, echo);
         }
 
-        // Images are an exclusive local-upload subset, never a partial mixed send.
+        // The only mixed image form is one text and one local-upload image.
+        // Validate both in request order before invoking any provider or handler.
+        const firstSegment = segments.length === 2 ? segments[0] : undefined;
+        const secondSegment = segments.length === 2 ? segments[1] : undefined;
+
+        if (
+            segments.length === 2 &&
+            isObject(firstSegment) &&
+            isObject(secondSegment) &&
+            ((firstSegment.type === 'image' && secondSegment.type === 'text') ||
+                (firstSegment.type === 'text' && secondSegment.type === 'image'))
+        ) {
+            let fileId: string | undefined;
+            let text: string | undefined;
+
+            for (let index = 0; index < 2; index += 1) {
+                const segment = index === 0 ? firstSegment : secondSegment;
+
+                if (!isObject(segment.data)) {
+                    return response(10006, 'invalid message segment', null, echo);
+                }
+
+                const allowedData = segment.type === 'image' ? ['file_id'] : ['text'];
+
+                if (extraKeys(segment, ['type', 'data']) || extraKeys(segment.data, allowedData)) {
+                    return response(10007, 'unsupported message segment field', null, echo);
+                }
+
+                if (segment.type === 'image') {
+                    if (typeof segment.data.file_id !== 'string') {
+                        return response(10006, 'invalid image segment', null, echo);
+                    }
+
+                    if (!isCanonicalUploadId(segment.data.file_id)) {
+                        return response(10005, 'unsupported message segment', null, echo);
+                    }
+
+                    fileId = segment.data.file_id;
+                } else {
+                    if (
+                        typeof segment.data.text !== 'string' ||
+                        !isWellFormedUtf16(segment.data.text)
+                    ) {
+                        return response(10006, 'invalid text segment', null, echo);
+                    }
+
+                    text = segment.data.text;
+                }
+            }
+
+            if (fileId === undefined || text === undefined) {
+                return response(10006, 'invalid message segment', null, echo);
+            }
+
+            // Both private routing and group image upload scenes encode uint32 IDs.
+            if (target > 0xffffffff) {
+                return response(10003, 'invalid target or message', null, echo);
+            }
+
+            return this.#sendImage(targetKey, target, fileId, echo, fileLease, {
+                text,
+                beforeImage: firstSegment.type === 'text',
+            });
+        }
+
+        // Other image combinations remain unsupported; never partially send them.
         if (segments.length > 1) {
             for (let index = 0; index < segments.length; index += 1) {
                 const segment = segments[index];

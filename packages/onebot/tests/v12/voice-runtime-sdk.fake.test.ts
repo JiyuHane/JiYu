@@ -2,6 +2,7 @@ import net from 'node:net';
 import http from 'node:http';
 import https from 'node:https';
 import http2 from 'node:http2';
+import childProcess from 'node:child_process';
 import tls from 'node:tls';
 import dgram from 'node:dgram';
 import { EventEmitter } from 'node:events';
@@ -19,19 +20,34 @@ import type { V12ImageFileTokens } from '../../src/v12/image-file-token';
 // Only fake transport callbacks are used. The imports below happen after the
 // network/native guards are installed; no QQ, Core, account or service starts.
 const fixture = vi.hoisted(() => ({
-    transports: [] as Array<{ options: V12TransportOptions }>,
+    transports: [] as Array<{
+        options: V12TransportOptions;
+        instance: { isAcceptingActions(): boolean };
+    }>,
     forbiddenModules: [] as string[],
 }));
 
 vi.mock('../../src/v12-network', () => ({
     V12Transport: class {
+        private accepting = false;
         constructor(options: V12TransportOptions) {
-            fixture.transports.push({ options });
+            fixture.transports.push({ options, instance: this });
         }
-        async open() {}
-        async close() {}
-        quiesce() {}
-        forceClose() {}
+        async open() {
+            this.accepting = true;
+        }
+        async close() {
+            this.accepting = false;
+        }
+        isAcceptingActions() {
+            return this.accepting;
+        }
+        quiesce() {
+            this.accepting = false;
+        }
+        forceClose() {
+            this.accepting = false;
+        }
     },
 }));
 vi.mock('../../src/network', async () => ({
@@ -134,6 +150,13 @@ beforeEach(async () => {
         vi.spyOn(dgram.Socket.prototype, 'bind').mockImplementation(blocked),
         vi.spyOn(dgram.Socket.prototype, 'connect').mockImplementation(blocked),
         vi.spyOn(dgram.Socket.prototype, 'send').mockImplementation(blocked),
+        vi.spyOn(childProcess, 'spawn').mockImplementation(blocked),
+        vi.spyOn(childProcess, 'spawnSync').mockImplementation(blocked),
+        vi.spyOn(childProcess, 'exec').mockImplementation(blocked),
+        vi.spyOn(childProcess, 'execSync').mockImplementation(blocked),
+        vi.spyOn(childProcess, 'execFile').mockImplementation(blocked),
+        vi.spyOn(childProcess, 'execFileSync').mockImplementation(blocked),
+        vi.spyOn(childProcess, 'fork').mockImplementation(blocked),
     ];
     nativeGuard = vi.spyOn(process, 'dlopen').mockImplementation(blocked);
 
@@ -197,7 +220,11 @@ afterEach(async () => {
 
 async function account(
     uin: string,
-    options: { verifier?: boolean; firstSubscriber?: (event: unknown) => void } = {},
+    options: {
+        verifier?: boolean;
+        orderedFixture?: boolean;
+        firstSubscriber?: (event: unknown) => void;
+    } = {},
 ) {
     const generation = new sourceApi.SourceGeneration();
     const manager = new managerApi.OneBotNetworkManager();
@@ -302,16 +329,22 @@ async function account(
     const v11 = new V11Capture();
     v11.open();
     manager.register(v11);
-    generation.setOnline(true);
-    let transport: { options: V12TransportOptions } | undefined;
+
+    // Ordered-only fixtures start without a source so production completion-order
+    // poll activation does not claim their gate; their fake transport is still ready.
+    if (!options.orderedFixture) {
+        generation.setOnline(true);
+    }
+
+    let transport: (typeof fixture.transports)[number] | undefined;
     const wire: string[] = [];
 
     const open = async () => {
         await runtime.open();
         transport = fixture.transports.at(-1);
 
-        if (!transport) {
-            throw new Error('fake transport was not created');
+        if (!transport || !transport.instance.isAcceptingActions()) {
+            throw new Error('ready fake transport was not created');
         }
 
         if (options.firstSubscriber) {
@@ -323,6 +356,19 @@ async function account(
     };
 
     await open();
+
+    if (options.orderedFixture) {
+        generation.setOnline(true);
+    }
+
+    const current = () => {
+        if (!transport) {
+            throw new Error('fake transport unavailable');
+        }
+
+        return transport;
+    };
+
     const fakeFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         expect(input).toBe(ENDPOINT);
         expect(init?.method).toBe('POST');
@@ -385,6 +431,7 @@ async function account(
         client,
         fakeFetch,
         open,
+        current,
         ticket,
         emit,
         messages,
@@ -624,8 +671,43 @@ describe('inbound voice through the real v12 runtime and SDK with fake transport
         const oldTicket = f.ticket()!;
         await f.emit(message(f.uin, 'private'), oldTicket);
         const id = fileId(f.messages()[0]!, 2, 'voice');
+        const oldTransport = f.current();
+        const oldHandle = oldTransport.options.handle;
         await f.runtime.close();
         await f.open();
+        expect(oldTransport.instance.isAcceptingActions()).toBe(false);
+        expect(f.current().instance).not.toBe(oldTransport.instance);
+        expect(f.current().instance.isAcceptingActions()).toBe(true);
+        const resolver = vi.spyOn(
+            (
+                f.runtime as unknown as {
+                    dispatcher: {
+                        options: { resolveVoiceFileUrl: (fileId: string) => string | null };
+                    };
+                }
+            ).dispatcher.options,
+            'resolveVoiceFileUrl',
+        );
+        const redeem = vi.spyOn(tokenApi.V12VoiceFileTokens.prototype, 'redeem');
+        const revoke = vi.spyOn(tokenApi.V12VoiceFileTokens.prototype, 'revoke');
+        const stale = await oldHandle({
+            action: 'get_file',
+            params: { file_id: id, type: 'url' },
+            echo: 'old-voice-lease-🪶',
+        });
+        expect(stale).toMatchObject({
+            status: 'failed',
+            retcode: 20002,
+            data: null,
+            echo: 'old-voice-lease-🪶',
+        });
+        expect(resolver).not.toHaveBeenCalled();
+        expect(redeem).not.toHaveBeenCalled();
+        expect(revoke).not.toHaveBeenCalled();
+        expect(f.api.handle).not.toHaveBeenCalled();
+        expect((await getFile(f, id)).data).toEqual({ name: '', url: VOICE_URL });
+        expect(resolver).toHaveBeenCalledExactlyOnceWith(id);
+        expect(redeem).toHaveBeenCalledExactlyOnceWith(id);
         const reopened = f.ticket()!;
         await f.emit(message(f.uin, 'private'), oldTicket);
         expect(f.messages()).toEqual([]);
@@ -654,18 +736,75 @@ describe('inbound voice through the real v12 runtime and SDK with fake transport
             const source = f.ticket()!;
             await f.emit(message(f.uin, 'private'), source);
             const id = fileId(f.messages()[0]!, 2, 'voice');
+            const handle = f.current().options.handle;
+            const resolver = vi.spyOn(
+                (
+                    f.runtime as unknown as {
+                        dispatcher: {
+                            options: { resolveVoiceFileUrl: (fileId: string) => string | null };
+                        };
+                    }
+                ).dispatcher.options,
+                'resolveVoiceFileUrl',
+            );
+            const redeem = vi.spyOn(tokenApi.V12VoiceFileTokens.prototype, 'redeem');
+            const revoke = vi.spyOn(tokenApi.V12VoiceFileTokens.prototype, 'revoke');
             f.runtime[method]();
             await f.emit(message(f.uin, 'private'), source);
             expect(f.messages()).toHaveLength(1);
-            // This callback bypasses transport admission; it tests revocation only.
-            expect(await getFile(f, id)).toMatchObject({
+            // A saved callback models a stale in-process listener, not a socket.
+            expect(
+                await handle({
+                    action: 'get_file',
+                    params: { file_id: id, type: 'url' },
+                    echo: 'voice-retired',
+                }),
+            ).toMatchObject({
                 status: 'failed',
-                retcode: 20001,
+                retcode: 20002,
                 data: null,
+                echo: 'voice-retired',
             });
+            expect(resolver).not.toHaveBeenCalled();
+            expect(redeem).not.toHaveBeenCalled();
+            expect(revoke).toHaveBeenCalledOnce();
             expect(f.api.handle).not.toHaveBeenCalled();
         },
     );
+
+    it('discards a voice URL if redemption synchronously retires its listener', async () => {
+        const f = await account('10001');
+        await f.emit(message(f.uin, 'private'), f.ticket());
+        const id = fileId(f.messages()[0]!, 2, 'voice');
+        const original = tokenApi.V12VoiceFileTokens.prototype.redeem;
+        let decrypted = false;
+        const redeem = vi
+            .spyOn(tokenApi.V12VoiceFileTokens.prototype, 'redeem')
+            .mockImplementation(function (
+                this: InstanceType<typeof tokenApi.V12VoiceFileTokens>,
+                input: string,
+            ) {
+                const url = original.call(this, input);
+
+                if (input === id && url === VOICE_URL) {
+                    decrypted = true;
+                    f.runtime.quiesce();
+                }
+
+                return url;
+            });
+        const result = await getFile(f, id, 'voice-reentrant');
+        expect(decrypted).toBe(true);
+        expect(redeem).toHaveBeenCalledExactlyOnceWith(id);
+        expect(result).toMatchObject({
+            status: 'failed',
+            retcode: 20002,
+            data: null,
+            echo: 'voice-reentrant',
+        });
+        expect(JSON.stringify(result)).not.toContain(VOICE_SECRET);
+        expect(f.api.handle).not.toHaveBeenCalled();
+    });
 
     it('isolates accounts and new runtimes, tampering and swapped image/voice prefixes without fallback', async () => {
         const a = await account('10001');
@@ -827,7 +966,7 @@ describe('inbound voice through the real v12 runtime and SDK with fake transport
     it.each([262144, 262145])(
         'enforces the aggregate media URL UTF-8 budget at %i bytes, separately from poll',
         async (totalBytes) => {
-            const f = await account('10001');
+            const f = await account('10001', { orderedFixture: true });
             const { context, owner } = setupOrdered(f);
             const imageIssue = vi.spyOn(tokenApi.V12ImageFileTokens.prototype, 'issue');
             const voiceIssue = vi.spyOn(tokenApi.V12VoiceFileTokens.prototype, 'issue');
@@ -1151,7 +1290,7 @@ describe('inbound voice through the real v12 runtime and SDK with fake transport
     });
 
     it('admits the converted mixed event to the explicitly activated in-process ordered poll fixture', async () => {
-        const f = await account('10001');
+        const f = await account('10001', { orderedFixture: true });
         const { context, owner } = setupOrdered(f);
         const enqueue = vi.spyOn(pollBufferApi.EventPollBuffer.prototype, 'enqueue');
 
@@ -1201,7 +1340,7 @@ describe('inbound voice through the real v12 runtime and SDK with fake transport
     });
 
     it('leaves a poll gap if the source expires after voice issuance but before poll resolution', async () => {
-        const f = await account('10001');
+        const f = await account('10001', { orderedFixture: true });
         const { context, owner } = setupOrdered(f);
         const enqueue = vi.spyOn(pollBufferApi.EventPollBuffer.prototype, 'enqueue');
         const original = tokenApi.V12VoiceFileTokens.prototype.issue;
@@ -1254,7 +1393,7 @@ describe('inbound voice through the real v12 runtime and SDK with fake transport
     });
 
     it('releases a queued voice on source loss at the final poll precommit fence and records the gap', async () => {
-        const f = await account('10001');
+        const f = await account('10001', { orderedFixture: true });
         const { context, owner } = setupOrdered(f);
 
         try {

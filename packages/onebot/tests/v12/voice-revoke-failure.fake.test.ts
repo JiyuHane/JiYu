@@ -18,10 +18,11 @@ type FakeToken = {
 };
 type FakeTransport = {
     options: V12TransportOptions;
-    open: ReturnType<typeof vi.fn>;
-    close: ReturnType<typeof vi.fn>;
-    quiesce: ReturnType<typeof vi.fn>;
-    forceClose: ReturnType<typeof vi.fn>;
+    open: Mock<() => Promise<void>>;
+    close: Mock<() => Promise<void>>;
+    quiesce: Mock<() => void>;
+    forceClose: Mock<() => void>;
+    isAcceptingActions: Mock<() => boolean>;
 };
 
 // These are in-memory fakes; no transport or token provider performs I/O.
@@ -36,10 +37,20 @@ const fixture = vi.hoisted(() => ({
 
 vi.mock('../../src/v12-network', () => ({
     V12Transport: class {
-        readonly open = vi.fn(async () => {});
-        readonly close = vi.fn(async () => {});
-        readonly quiesce = vi.fn();
-        readonly forceClose = vi.fn();
+        private accepting = false;
+        readonly open = vi.fn(async () => {
+            this.accepting = true;
+        });
+        readonly close = vi.fn(async () => {
+            this.accepting = false;
+        });
+        readonly quiesce = vi.fn(() => {
+            this.accepting = false;
+        });
+        readonly forceClose = vi.fn(() => {
+            this.accepting = false;
+        });
+        readonly isAcceptingActions = vi.fn(() => this.accepting);
 
         constructor(readonly options: V12TransportOptions) {
             fixture.transports.push(this);
@@ -275,22 +286,25 @@ async function createRuntimeFixture(includeVideo = false) {
             getSentMessageTime: async () => null,
             trackAction: <T>(_label: string, start: () => Promise<T>) => start(),
             canAccept: () => true,
+            // The media lifecycle fixture has no HTTP poll consumer or queue.
+            pollGate: null,
             captureCurrentSource: () => generation.capture(runtime[sourceApi.captureBinding]()),
             isSourceCurrent: (source, binding) => generation.isCurrent(source, binding),
         },
     );
     activeRuntimes.push(runtime);
     await runtime.open();
-    // This in-memory transport deliberately exposes no listener-readiness method,
-    // so the optional production HTTP poll owner is unavailable. Keep that fixed
-    // setup diagnostic separate from the media-revocation diagnostics under test.
-    expect(fixture.warn.mock.calls).toEqual([['v12 http poll unavailable']]);
-    fixture.warn.mockClear();
     const transport = fixture.transports.at(-1);
 
     if (!transport) {
         throw new Error('fake transport was not constructed');
     }
+
+    expect(transport.isAcceptingActions()).toBe(true);
+    // Explicit pollGate:null leaves the optional HTTP poll owner unavailable;
+    // isolate its fixed diagnostic from the media-revocation checks below.
+    expect(fixture.warn.mock.calls).toEqual([['v12 http poll unavailable']]);
+    fixture.warn.mockClear();
 
     const wire: unknown[] = [];
     transport.options.subscribe((event) => wire.push(event));
@@ -386,6 +400,22 @@ async function createRuntimeFixture(includeVideo = false) {
         expect(video.issue).toHaveBeenCalledExactlyOnceWith(VIDEO_URL);
     }
 
+    // Observe the actual dispatcher callbacks as well as the issuer methods:
+    // after lease revocation, even a resolver that would return null is skipped.
+    const dispatcher = runtime as unknown as {
+        dispatcher: {
+            options: {
+                resolveImageFileUrl: (id: string) => string | null;
+                resolveVoiceFileUrl: (id: string) => string | null;
+                resolveVideoFileUrl: (id: string) => string | null;
+            };
+        };
+    };
+    const resolvers = {
+        image: vi.spyOn(dispatcher.dispatcher.options, 'resolveImageFileUrl'),
+        voice: vi.spyOn(dispatcher.dispatcher.options, 'resolveVoiceFileUrl'),
+        video: vi.spyOn(dispatcher.dispatcher.options, 'resolveVideoFileUrl'),
+    };
     const getFile = (fileId: string) =>
         transport.options.handle({
             action: 'get_file',
@@ -404,6 +434,8 @@ async function createRuntimeFixture(includeVideo = false) {
     });
     expect(image.redeem).toHaveBeenCalledExactlyOnceWith(IMAGE_ID);
     expect(voice.redeem).toHaveBeenCalledExactlyOnceWith(VOICE_ID);
+    expect(resolvers.image).toHaveBeenCalledExactlyOnceWith(IMAGE_ID);
+    expect(resolvers.voice).toHaveBeenCalledExactlyOnceWith(VOICE_ID);
 
     if (video) {
         expect(await getFile(VIDEO_ID)).toMatchObject({
@@ -412,24 +444,50 @@ async function createRuntimeFixture(includeVideo = false) {
             data: { name: '', url: VIDEO_URL },
         });
         expect(video.redeem).toHaveBeenCalledExactlyOnceWith(VIDEO_ID);
+        expect(resolvers.video).toHaveBeenCalledExactlyOnceWith(VIDEO_ID);
+    } else {
+        expect(resolvers.video).not.toHaveBeenCalled();
     }
 
-    return { runtime, transport, image, voice, video, wire, emit, getFile, legacyHandle };
+    return {
+        runtime,
+        transport,
+        image,
+        voice,
+        video,
+        wire,
+        emit,
+        getFile,
+        legacyHandle,
+        resolvers,
+    };
 }
 
 type RuntimeFixture = Awaited<ReturnType<typeof createRuntimeFixture>>;
 
 async function expectRetired(f: RuntimeFixture) {
     // Deliberately invoke saved callbacks rather than relying on transport admission.
+    expect(f.transport.isAcceptingActions()).toBe(false);
+
     for (const id of [IMAGE_ID, VOICE_ID, ...(f.video ? [VIDEO_ID] : [])]) {
-        expect(await f.getFile(id)).toMatchObject({ status: 'failed', retcode: 20001, data: null });
+        expect(await f.getFile(id)).toMatchObject({
+            status: 'failed',
+            retcode: 20002,
+            data: null,
+            message: 'file unavailable',
+        });
     }
 
     expect(f.image.redeem).toHaveBeenCalledTimes(1);
     expect(f.voice.redeem).toHaveBeenCalledTimes(1);
+    expect(f.resolvers.image).toHaveBeenCalledTimes(1);
+    expect(f.resolvers.voice).toHaveBeenCalledTimes(1);
 
     if (f.video) {
         expect(f.video.redeem).toHaveBeenCalledTimes(1);
+        expect(f.resolvers.video).toHaveBeenCalledTimes(1);
+    } else {
+        expect(f.resolvers.video).not.toHaveBeenCalled();
     }
 
     expect(f.legacyHandle).not.toHaveBeenCalled();
@@ -522,10 +580,19 @@ describe('v12 media revocation failures through fake lifecycle boundaries', () =
                     throw sensitiveError();
                 }
             });
+            const quiesceTransport = f.transport.quiesce.getMockImplementation();
+            const forceCloseTransport = f.transport.forceClose.getMockImplementation();
+
+            if (!quiesceTransport || !forceCloseTransport) {
+                throw new Error('missing synthetic transport lifecycle');
+            }
+
             f.transport.quiesce.mockImplementation(() => {
+                quiesceTransport();
                 order.push('quiesce');
             });
             f.transport.forceClose.mockImplementation(() => {
+                forceCloseTransport();
                 order.push('forceClose');
             });
             fixture.warn.mockImplementation(() => {
@@ -579,10 +646,19 @@ describe('v12 media revocation failures through fake lifecycle boundaries', () =
                 order.push('voice');
                 throw new Error(`voice ${FAILURE_SECRET} ${FAILURE_URL}`);
             });
+            const quiesceTransport = f.transport.quiesce.getMockImplementation();
+            const forceCloseTransport = f.transport.forceClose.getMockImplementation();
+
+            if (!quiesceTransport || !forceCloseTransport) {
+                throw new Error('missing synthetic transport lifecycle');
+            }
+
             f.transport.quiesce.mockImplementation(() => {
+                quiesceTransport();
                 order.push('quiesce');
             });
             f.transport.forceClose.mockImplementation(() => {
+                forceCloseTransport();
                 order.push('forceClose');
             });
 

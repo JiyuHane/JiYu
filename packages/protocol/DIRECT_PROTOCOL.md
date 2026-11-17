@@ -783,6 +783,16 @@ read their contents or use `G` as the base, and do not establish a reference to
 of `K` and the exit of this path remain unresolved. Neither `n3` nor either `+8`
 check is an observation of runtime values, and the repeated reads need not match.
 
+Under the further conditions that `n3` is nonzero and the saved slots and pointer
+remain stable, the selected handler reads the first dword of `P` as `c`, saves
+`64 - (c & 63)`, then writes `(c + n3) mod 2^32` back to that dword and records
+the unsigned carry for subsequent dispatch. If the earlier initialization of
+that dword to zero is still intact, this particular update has `c=0` and no carry;
+that remains conditional rather than a runtime observation. These reads and
+writes concern `P`; they do not establish that the separately saved `K` or its
+contents are consumed, nor do they establish the identity of the eventual hash,
+return value or SSO signing callback.
+
 The original file bytes `+0xc = 0x20` and `+0xd = 0x40` suggest `L=32` and
 64-byte halves only if they and the relevant reads remain unchanged at runtime.
 A distinct `L > r` branch performs conditional writes to the first allocation,

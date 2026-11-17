@@ -218,9 +218,10 @@ invalid values, out-of-range coordinates and this text limit return `10006`;
 extra segment or data fields return `10007`. An otherwise valid location mixed
 with text or mentions, or with a second location, returns `10005` without a v11
 send. On the non-image path segment checks run in order, so an earlier invalid
-segment or other preflight failure can take precedence. A multi-segment message
-containing an image is rejected by an earlier combination scan with `10005`,
-after request checks and basic target parsing. Non-finite in-process inputs can fail snapshot
+segment or other preflight failure can take precedence. After request checks and
+basic target parsing, exactly one text plus one image enters the restricted
+image path below; other multi-segment forms containing an image are rejected by
+an earlier combination scan with `10005`. Non-finite in-process inputs can fail snapshot
 validation with `10001`. Separate request and transport limits also
 apply. These ranges, length and combination restrictions are Jiyu policies, not
 claims about requirements of the OneBot standard. `get_supported_actions` reports
@@ -250,17 +251,30 @@ unchanged. See the [server details](../onebot/ONEBOT_V12.md#sending-a-single-loc
 
 `OneBot12ImageSegment` is an optional TypeScript description of the image
 segment's `file_id` shape, not action-specific runtime validation or a guarantee
-that a server accepts that ID. With Jiyu, `send_message` accepts exactly one
+that a server accepts that ID. With Jiyu, `send_message` accepts one
 `{type: 'image', data: {file_id}}` object, either directly or in a one-element
-array, for a private or group target. The ID must be a canonical
+array, or exactly two segments containing that image and one
+`{type: 'text', data: {text: <string>}}` in either order, for a private or group
+target. Both segments require their supported fields only. They are validated in
+input order before any store read or sensitive call. The ID must be a canonical
 `jiyu-upload:v1:` handle from `upload_file` data mode for the same account and
 current listener generation. Incoming media handles, legacy IDs, URLs, local
-paths, multiple images and mixed segments are unsupported.
+paths, multiple images and other mixed combinations are unsupported.
 
-The upload must contain 1–262,144 bytes; Jiyu checks canonical Base64 and the
-returned SHA-256 before submitting. An otherwise valid one-byte upload passes
-these local content checks, which do not establish image decodability or QQ
-acceptance. Zero-byte uploads are valid for data retrieval but not this send.
+In the two-segment form, text with an unpaired UTF-16 surrogate returns `10006`
+before the store read to avoid downstream U+FFFD replacement; this is not a new
+restriction on text-only sends. Empty text, spaces, NUL and valid surrogate pairs
+pass this check, but the v11 parser later skips an exactly empty text placeholder.
+There is no additional 64 KiB mixed-text cap, though normal snapshot and transport
+limits apply. Jiyu uses at most one sensitive v11 action and preserves the segment
+order in its input; this does not guarantee QQ rendering or delivery.
+
+The upload must contain 1–262,144 bytes and the private or group target must be a
+canonical positive uint32 ID; Jiyu checks canonical Base64 and the returned
+SHA-256 before submitting. These size and target bounds are local policies, not
+QQ or OneBot maximums. An otherwise valid one-byte upload passes these local
+content checks, which do not establish image decodability or QQ acceptance.
+Zero-byte uploads are valid for data retrieval but not this send.
 Sending neither consumes the handle nor extends its TTL; the existing upload
 store limits remain in effect.
 
@@ -278,12 +292,19 @@ cap or an RSS bound. Once the registered handler starts, closing cannot retract
 its effects and a timeout or failed response may leave the outcome unknown. Neither client nor server automatically retries the whole send;
 existing lower-level Highway chunk handling may retry individual chunks.
 
+A self-sent v12 event containing an image is rejected as a whole, so mixed text
+is not emitted separately; neither a self echo nor later `get_message` lookup is
+guaranteed.
+
 The sensitive `ApiHandler` action diagnostics and observer records are locally
 redacted; observer retcodes are only 0/100 classifications, and a reported
 handler status is not proof of delivery. Other logs, media/Bridge sinks and
-same-process callbacks can still see content, and a supplied `echo` follows
-normal response rules. JavaScript Base64 copies cannot be guaranteed erased;
-observer Promise rejection handling is best effort, not a guarantee against
+same-process callbacks can still see content. For image-plus-text, the downstream
+successful-send INFO log can include the first 50 UTF-16 code units of the text,
+and local history may store it; the `ApiHandler` redaction is not end-to-end
+text redaction. A supplied `echo` follows normal response rules. JavaScript Base64
+copies cannot be guaranteed erased; observer Promise rejection handling is best
+effort, not a guarantee against
 malicious constructors/species, arbitrary thenables or asynchronous logger
 subscriber failures. See the [server's image-send contract](../onebot/ONEBOT_V12.md#sending-a-single-local-upload-image)
 for guards, status details and limitations. Live QQ acceptance remains unverified.
@@ -356,8 +377,9 @@ base64url. It is a transferable reference within the same account and current
 listener generation, not a QQ file ID. While the data capability is available,
 a foreign, expired or forged otherwise valid ID returns local not-found in data
 mode without a v11 lookup; URL mode returns 10004 for this prefix without v11 fallback. An old v11
-alias with the prefix is shadowed by v12 URL lookup, while v11 itself and other
-image, voice and v11 URL paths remain unchanged. Common snapshot and ID checks
+alias with the prefix is shadowed by v12 URL lookup, while direct v11 lookup is
+unchanged. Other reserved media URL handles have the listener-lease checks
+described below. Common snapshot and ID checks
 can fail earlier. Upload `url`, `path` and unknown types return 10004; the
 separate `upload_file_fragmented` action returns 10002. In Jiyu's account runtime,
 `get_supported_actions` will list `upload_file` only when both data callbacks
@@ -566,6 +588,27 @@ still apply. Incoming video handles do not support `get_file` data or path mode
 or `get_file_fragmented`. Each media kind has a separate purpose, random key,
 AAD and nonce state; a URL is limited to 3,000 UTF-8 bytes, an ID to 4,096
 UTF-16 code units and each key to 2²⁴ issuances.
+
+For these three reserved prefixes in URL mode, after common request validation
+Jiyu samples the originating listener's lease before and after reading the
+resolver, after invoking it and after URL classification. A stale, false or
+throwing lease produces core 20002; with a current lease, a bad or foreign
+handle that resolves to no valid URL produces core 20001. Neither falls back to
+v11. A normal listener close/reopen retains the issuer, but an old listener handler
+still carries its
+expired lease; the new active listener can attempt redemption of the same
+runtime's handle. Quiesce or force-close also invalidates that lease. Non-reserved
+v11 fallback IDs keep their existing path.
+
+These checks concern a trusted internal lifetime seam; the real transport already
+has quiesce/open admission. Local reentry observations do not establish an
+external or cross-account exploit, and the synchronous samples do not make
+resolver side effects, untrusted same-process changes, later microtasks, writes
+or network delivery atomic. A standalone direct core call without a lease leaves
+callback lifetime to its caller; an internal ordinary request prepared without a
+lease instead uses a false sentinel for this reserved URL path. On the normal
+HTTP response path, the wrapper preserves the core retcode and `echo` but can
+replace its text; transport output and connection limits still apply.
 
 For image, voice and video handles, a core success is still subject to the
 transport output byte limit for the complete JSON envelope, including the URL

@@ -556,8 +556,7 @@ describe('uploaded single-image sends through real V12 dispatcher and store', ()
             request('group', [{ type: 'file', data: { file_id: id } }]),
             request('group', [{ type: 'voice', data: { file_id: id } }]),
             request('group', [{ type: 'video', data: { file_id: id } }]),
-            request('group', [valid, text]),
-            request('group', [text, valid]),
+            request('group', [valid, text, text]),
             request('group', [valid, valid]),
             request('group', [valid, { type: 'mention_all', data: {} }]),
         ];
