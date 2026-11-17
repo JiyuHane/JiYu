@@ -4,7 +4,8 @@
 is separate from the existing OneBot 11 clients and does not change their
 behaviour. The implementation follows selected parts of the
 [OneBot 12 candidate standard](https://12.onebot.dev/); consult the connected
-implementation's `get_supported_actions` result for its capabilities.
+implementation's `get_supported_actions` result and documentation for its capabilities;
+some supported HTTP-only actions may be omitted from discovery.
 
 ## HTTP
 
@@ -57,10 +58,37 @@ decompression.
 
 `client.getLatestEvents({ limit, timeout }, options)` sends the OneBot 12
 `get_latest_events` action through HTTP. The connected implementation must
-support it; **Jiyu's current v12 HTTP server does not yet implement event
-polling**. The standard requires this action for HTTP, but implementations may
-omit it from `get_supported_actions`. WebSocket clients retain their generic
-`request` interface; the standard does not require this action over WebSocket.
+support it. Jiyu's enabled account-local v12 listener provides a **partial
+HTTP-only** implementation when the listener and online source are current;
+its ordinary dispatcher and WebSocket action path still return 10002. Jiyu does
+not currently list the action in `get_supported_actions`, so that result alone
+is not a complete discovery mechanism for this endpoint. The standard requires
+the action for HTTP; WebSocket clients retain their generic `request` interface.
+
+For Jiyu, `timeout` is capped at 10 seconds and a poll `echo` above 4,096
+UTF-16 code units returns 10001 after earlier checks if a response remains
+writable. The in-memory queue is limited to 128 events and 256 KiB of encoded
+array data, with a 64 KiB single-event budget;
+`limit: 0` does not remove these or response-size limits. Each response selects
+a completion-order FIFO prefix, then sorts that prefix stably by event `time`;
+`limit: 1` does not necessarily return the globally oldest event. Separate
+batches, late arrivals and QQ occurrence order have no global ordering guarantee.
+A successful empty array means this poll obtained no reservation, not that the
+upstream pipeline is empty or another poll holds no events.
+
+The account and listener must be current and online. Pending prior-owner cleanup
+can temporarily prevent activation, and events may be missed while later
+status, event or poll activity retries. Queue overflow drops new events;
+unsupported conversions and private recalls are omitted from polling. A
+source-qualified private recall may still reach WebSocket subscribers through
+its separate guarded path. Queue state is in memory and may be discarded at
+close or generation changes. A lost response after the server commits a batch
+can leave delivery unknown; neither server nor SDK automatically replays it.
+Jiyu attempts a fixed, category-deduplicated warning for known uncertain
+delivery, not a client-visible gap notification or receipt guarantee.
+The default manager's non-evicting 1,024-UIN gate is per manager; custom
+factories and separate managers or processes do not automatically share it.
+See the [server polling limits](../onebot/V12_HTTP_POLL_DESIGN.md#current-http-polling-behavior).
 
 `limit` and `timeout` are optional nonnegative safe integers. They default to
 server-side zero when omitted: `limit: 0` places no protocol count limit and
@@ -429,8 +457,10 @@ Before issuing any handle for an incoming v12 event containing images or voice,
 the Jiyu runtime limits the combined number of image/voice segments to 128 and
 their combined UTF-8 URL lengths to 256 KiB (262,144 bytes). Exceeding either
 limit fails the whole conversion without truncation; an already-prepared
-internal ordered poll admission records a gap under its existing rules. Text-only
-events and v11 behavior are unaffected by these media limits.
+internal ordered-prototype admission records a gap under its existing rules.
+Production HTTP polling uses a separate completion-order owner and can omit the
+failed event. Text-only events and v11 behavior are unaffected by these media
+limits.
 These are local workload policies, not QQ or OneBot protocol limits, and they do
 not bound total CPU use or process RSS. A nonce already reserved by an issuer is
 not rolled back if that issuer or its provider subsequently fails.
@@ -456,8 +486,9 @@ constructing the event; the resolver may access the network or change the source
 element, and upstream conversion may lose format, duration or other semantics.
 Existing v11 file-ID logic is unchanged. A redacted warning replaces exception
 details only in the media URL population catch; other logs have separate
-behavior. Production HTTP event polling remains unavailable, and local fixtures
-do not establish live QQ interoperability. See the [server details](../onebot/ONEBOT_V12.md).
+behavior. Jiyu's partial HTTP event polling has separate source, queue and
+delivery limits; local fixtures do not establish live QQ interoperability. See
+the [server details](../onebot/ONEBOT_V12.md#http-event-polling-partial).
 
 ## Data and compatibility limits
 

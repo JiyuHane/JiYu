@@ -60,6 +60,7 @@ import {
     createPollGate,
     failOrderedPollIngress,
     invalidatePollOwner,
+    type PollGate,
 } from './v12-runtime/poll-owner';
 import { V12_ADAPTER_NAME } from './v12-runtime/identity';
 import {
@@ -124,7 +125,7 @@ export class OneBotInstance {
     // V12 reports the explicit account-session edge, not listener connectivity.
     private v12Online = false;
     private readonly sourceGeneration = new SourceGeneration();
-    private readonly v12PollGate = createPollGate();
+    private readonly v12PollGate: PollGate | null;
     private v12Adapter: V12Runtime | null = null;
     private heartbeatTimer: NodeJS.Timeout | null = null;
     private static readonly HEARTBEAT_INTERVAL = 30000;
@@ -200,9 +201,7 @@ export class OneBotInstance {
     }
 
     /** Configuration is available only to explicitly enabled plugins. */
-    getPluginConfigSchema(
-        id: string,
-    ): Promise<{
+    getPluginConfigSchema(id: string): Promise<{
         fields: JsonValue[] | null;
         source: 'schema' | 'ui' | 'none';
         displaySidecar?: PluginDisplaySidecar;
@@ -311,9 +310,12 @@ export class OneBotInstance {
         bridge: BridgeInterface,
         config: OneBotConfig,
         globalSettings: GlobalSettings,
+        pollGate?: PollGate | null,
     ) {
         this.uin = uin;
         this.bridge = bridge;
+        // Undefined preserves standalone-instance behavior; null disables poll registration.
+        this.v12PollGate = pollGate === undefined ? createPollGate() : pollGate;
         this.historySyncEnabledAtStartup = config.historySync.enabled;
         const uinNum = Number.parseInt(uin, 10);
         this.log =

@@ -42,13 +42,17 @@ import {
 } from './source-generation';
 import type { DispatchPayload } from '../event-filter';
 import {
+    activateHttpPollOwner,
     enqueuePollEvent,
     failOrderedPollIngress,
+    hasHttpPollOwner,
     hasOrderedPollOwner,
     invalidatePollOwner,
     invalidateStalePollOwner,
+    pollOwnerStats,
     recordPreparedScopeLoss,
     registerPollHost,
+    type PollActivation,
     type PollGate,
 } from './poll-owner';
 
@@ -57,6 +61,18 @@ const apply = Reflect.apply;
 // Local per-event admission limits, not QQ or OneBot protocol limits.
 const MAX_INBOUND_MEDIA_SEGMENTS = 128;
 const MAX_INBOUND_MEDIA_URL_BYTES = 256 * 1024;
+
+type HttpPollDiagnostic =
+    | 'unavailable'
+    | 'cleanup_pending'
+    | 'degraded'
+    | 'full'
+    | 'too_large'
+    | 'invalid'
+    | 'private_recall'
+    | 'transport_error'
+    | 'delivery_uncertain'
+    | 'closing_discard';
 
 type UploadGeneration = { readonly token: object; valid: boolean };
 type UploadSlot = {
@@ -126,6 +142,9 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     private sourceAttempt: object | null = null;
     private sourceBinding: object | null = null;
     private accepting = true;
+    private pollActivationChecking = false;
+    // Fixed diagnostic categories bound logging work even under repeated loss.
+    private readonly pollDiagnostics = new Set<HttpPollDiagnostic>();
 
     constructor(
         config: V12ManagedConfig,
@@ -138,21 +157,28 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             isSourceCurrent?: (source: V12Source | undefined, binding: object | null) => boolean;
             captureCurrentSource?: () => V12Source | undefined;
             getPrivateRecallSource?: (event: JsonObject) => PrivateRecallProvenance | undefined;
-            pollGate?: PollGate;
+            pollGate?: PollGate | null;
         },
     ) {
         super(V12_ADAPTER_NAME, config, ctx);
         this.self = Object.freeze({ platform: 'qq', user_id: ctx.uin });
-        registerPollHost(
-            this,
-            {
-                self: this.self,
-                captureBinding: () => this[captureBinding](),
-                captureSource: () => this.options.captureCurrentSource?.(),
-                verify: (source) => this[verifySource](source),
-            },
-            options.pollGate,
-        );
+
+        // Explicit null means the manager could not allocate a shared gate.
+        // Do not fall back to a new per-instance gate in that case.
+        if (options.pollGate !== null) {
+            registerPollHost(
+                this,
+                {
+                    self: this.self,
+                    captureBinding: () => this[captureBinding](),
+                    captureSource: () => this.options.captureCurrentSource?.(),
+                    verify: (source) => this[verifySource](source),
+                    onClosingDiscard: () => this.warnHttpPoll('closing_discard'),
+                },
+                options.pollGate,
+            );
+        }
+
         this.dispatcher = new V12Dispatcher({
             self: this.self,
             version: this.version,
@@ -326,6 +352,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             throw new Error('v12 listener has not been released');
         }
 
+        this.pollDiagnostics.clear();
         const token = {};
         const sourceAttempt = {};
         const uploadGeneration: UploadGeneration = { token, valid: true };
@@ -369,8 +396,105 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                     this.options.trackAction('v12 action', () =>
                         this.dispatcher.handle(request, fileLease),
                     ),
+                // HTTP only. supported_actions discovery does not yet advertise polling.
+                httpPoll: {
+                    run: (input, context) => {
+                        if (!fileLease()) {
+                            return { kind: 'unavailable' };
+                        }
+
+                        try {
+                            const checked = this.dispatcher
+                                .createInternalHttpPreflight(fileLease)
+                                .classify(input);
+
+                            // Preflight can invoke callbacks that retire this listener.
+                            if (!fileLease()) {
+                                return { kind: 'unavailable' };
+                            }
+
+                            if (checked.kind === 'error') {
+                                switch (checked.response.message) {
+                                    case 'invalid action request':
+                                        return { kind: 'preflight', error: 'invalid_request' };
+                                    case 'unknown self':
+                                        return { kind: 'preflight', error: 'unknown_self' };
+                                    case 'invalid poll parameters':
+                                        return { kind: 'preflight', error: 'invalid_params' };
+                                    case 'unsupported request field':
+                                        return { kind: 'preflight', error: 'unsupported_field' };
+                                    case 'unsupported parameter':
+                                        return {
+                                            kind: 'preflight',
+                                            error: 'unsupported_parameter',
+                                        };
+                                    default:
+                                        return { kind: 'unavailable' };
+                                }
+                            }
+
+                            if (checked.kind !== 'poll') {
+                                return { kind: 'unavailable' };
+                            }
+
+                            // The owner uses a tighter local echo limit than general actions.
+                            if (checked.echo !== undefined && checked.echo.length > 4096) {
+                                return { kind: 'preflight', error: 'invalid_request' };
+                            }
+
+                            const activation = this.activateHttpPoll(fileLease);
+
+                            if (activation.status !== 'ready') {
+                                return { kind: 'unavailable' };
+                            }
+
+                            // Track the actual transaction through settlement, including
+                            // cleanup; no timeout race may release its accounting early.
+                            return this.options.trackAction('v12 http poll', async () => {
+                                const current = this.activateHttpPoll(fileLease);
+
+                                if (
+                                    current.status !== 'ready' ||
+                                    current.owner !== activation.owner ||
+                                    !fileLease()
+                                ) {
+                                    return { kind: 'unavailable' } as const;
+                                }
+
+                                const outcome = await current.owner.start(
+                                    {
+                                        limit: checked.limit,
+                                        timeoutMs: checked.timeoutSeconds * 1000,
+                                        echo: checked.echo,
+                                        maxOutputBytes: context.maxOutputBytes,
+                                        responseDeadline: context.responseDeadline,
+                                        externalAbortSignal: context.signal,
+                                    },
+                                    context.sink,
+                                ).result;
+
+                                // A committed prefix is not requeued after an ambiguous
+                                // write. Keep this observable without logging event data.
+                                if (
+                                    outcome.kind === 'commit_unknown' ||
+                                    outcome.kind === 'committed_unsent' ||
+                                    (outcome.kind === 'unknown' && outcome.committed) ||
+                                    (outcome.kind === 'cleanup_uncertain' &&
+                                        outcome.committed !== false)
+                                ) {
+                                    this.warnHttpPoll('delivery_uncertain');
+                                }
+
+                                return { kind: 'outcome', outcome } as const;
+                            });
+                        } catch {
+                            return { kind: 'unavailable' };
+                        }
+                    },
+                },
                 getConnectEvent: () => createConnectEvent(this.version),
                 subscribe: (listener) => this.subscribeStatus(listener),
+                onPollError: () => this.warnHttpPoll('transport_error'),
                 onError: (error) => {
                     // A stale error must not revoke a replacement listener's store.
                     if (
@@ -485,6 +609,21 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                     this.sourceBinding === sourceAttempt
                 ) {
                     this.startHeartbeat(transport, token, sourceAttempt);
+                    // Source and listener must both be current. If retirement is
+                    // still pending, later events or polls retry without a new gate.
+                    this.activateHttpPoll(fileLease);
+
+                    // Poll activation invokes host callbacks. If one closes or replaces
+                    // this listener, opening must not report a successful stale binding.
+                    if (
+                        !ownsOpening() ||
+                        !this.accepting ||
+                        !this.isEnabled ||
+                        this.sourceAttempt !== sourceAttempt ||
+                        this.sourceBinding !== sourceAttempt
+                    ) {
+                        throw new Error('v12 listener opening superseded');
+                    }
                 }
             }
         } catch (error) {
@@ -669,6 +808,72 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
         this.transport?.forceClose();
     }
 
+    /** Activate only through this runtime's registered gate and current listener. */
+    private activateHttpPoll(guard: () => boolean): PollActivation {
+        if (this.pollActivationChecking) {
+            return { status: 'unavailable' };
+        }
+
+        this.pollActivationChecking = true;
+
+        try {
+            const transport = this.transport;
+            const token = this.currentStatusTransportToken;
+            const attempt = this.sourceAttempt;
+
+            const unavailable = (): PollActivation => {
+                this.warnHttpPoll('unavailable');
+                return { status: 'unavailable' };
+            };
+
+            if (!transport || !token || !attempt) {
+                return unavailable();
+            }
+
+            const owns = (): boolean =>
+                this.transport === transport &&
+                this.currentStatusTransportToken === token &&
+                this.openingOwner === token &&
+                this.sourceAttempt === attempt &&
+                this.sourceBinding === attempt &&
+                this.isEnabled &&
+                this.accepting;
+            const usable = (): boolean =>
+                owns() &&
+                guard() &&
+                owns() &&
+                this.uploadTransportReady(transport, owns) &&
+                this.options.canAccept() === true &&
+                owns() &&
+                guard() &&
+                owns();
+
+            if (!usable()) {
+                return unavailable();
+            }
+
+            // The registered host captures and verifies the source; the production
+            // verifier requires it to be online for this exact binding.
+            const activation = activateHttpPollOwner(this);
+
+            // Host callbacks during activation may retire or replace this binding.
+            if (!usable()) {
+                return unavailable();
+            }
+
+            if (activation.status !== 'ready') {
+                this.warnHttpPoll(activation.status);
+            }
+
+            return activation;
+        } catch {
+            this.warnHttpPoll('unavailable');
+            return { status: 'unavailable' };
+        } finally {
+            this.pollActivationChecking = false;
+        }
+    }
+
     [captureBinding](): object | null {
         return this.isEnabled && this.accepting && this.options.canAccept()
             ? this.sourceBinding
@@ -775,6 +980,25 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
         if (friendRecall && scope) {
             privateRecallOwner = {};
             scope.privateRecallOwner = privateRecallOwner;
+        }
+
+        if (!friendRecall && scope) {
+            const eventSource = scope.source;
+            const ownsSourceScope = (): boolean =>
+                this.#sourceScopes.at(-1) === scope &&
+                scope.event === event &&
+                scope.payload === payload &&
+                scope.source === eventSource &&
+                this.isEnabled &&
+                this.accepting;
+
+            // Capture and verify this event's source before activation. The first
+            // event can activate its owner and be enqueued; while an old owner is
+            // cleanup_pending this event can instead be lost. Only a later event
+            // or poll retries, so no continuity across that wait is implied.
+            this.activateHttpPoll(
+                () => ownsSourceScope() && this.isSourceCurrent(eventSource) && ownsSourceScope(),
+            );
         }
 
         const admission = claimOrderedScope(this, 'runtime', event);
@@ -1040,6 +1264,10 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                         // subscriber or guard callback can reenter.
                         this.#privateRecallPublished.set(event, source);
 
+                        // The legacy HTTP owner does not enqueue this projection.
+                        // Capture the diagnostic before, but log only after WS fanout.
+                        const pollMissesRecall = hasHttpPollOwner(this);
+
                         // Poll delivery has no final guard on the original v11 object.
                         // A genuinely admitted projection must not disappear silently.
                         if (admission?.kind === 'eligible' && admission.target === this) {
@@ -1054,10 +1282,16 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                                 recallScopeCurrent() &&
                                 matchesPrivateRecallEvent(event, verifiedSource),
                         );
+
+                        if (pollMissesRecall) {
+                            this.warnHttpPoll('private_recall');
+                        }
                     } else if (admission) {
                         skipOrderedAdmission(admission);
                     }
                 } else {
+                    let pollLosses: HttpPollDiagnostic[] = [];
+
                     try {
                         if (admission?.kind === 'eligible' && admission.target === this) {
                             admission.lease.resolve(converted);
@@ -1067,7 +1301,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                         ) {
                             // Only an unprepared legacy input may use completion-order FIFO.
                             // A proven pre-ready input never enters a later consumer group.
-                            enqueuePollEvent(this, converted, source);
+                            pollLosses = this.enqueuePollWithDiagnostics(converted, source);
                         }
                     } catch {
                         failOrderedAdmission(admission);
@@ -1085,6 +1319,11 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                         }
                     } else {
                         this.publish(converted);
+                    }
+
+                    // Logger callbacks must not precede the established WS fanout.
+                    for (const loss of pollLosses) {
+                        this.warnHttpPoll(loss);
                     }
                 }
             } else if (admission) {
@@ -1110,6 +1349,14 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
         } catch {
             // Poll cleanup is independent of the established status path.
         }
+
+        if (!this.isEnabled || !this.accepting) {
+            return;
+        }
+
+        // A source may become online after the listener opened. Pending cleanup
+        // is retried only on a later status, event or poll; it is not bypassed.
+        this.activateHttpPoll(() => true);
 
         if (!this.isEnabled || !this.accepting) {
             return;
@@ -1379,6 +1626,70 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             clearImmediate(this.statusImmediate);
             this.statusImmediate = null;
         }
+    }
+
+    /** Preserve legacy admission while collecting bounded HTTP queue loss diagnostics. */
+    private enqueuePollWithDiagnostics(
+        event: unknown,
+        source: V12Source | undefined,
+    ): HttpPollDiagnostic[] {
+        let before: ReturnType<typeof pollOwnerStats> = null;
+        const losses: HttpPollDiagnostic[] = [];
+
+        try {
+            if (hasHttpPollOwner(this)) {
+                before = pollOwnerStats(this);
+            }
+        } catch {
+            // An optional diagnostic must not prevent admission or WS fanout.
+        }
+
+        enqueuePollEvent(this, event, source);
+
+        if (!before) {
+            return losses;
+        }
+
+        try {
+            const after = pollOwnerStats(this);
+
+            if (after && after.full > before.full) {
+                losses.push('full');
+            }
+
+            if (after && after.too_large > before.too_large) {
+                losses.push('too_large');
+            }
+
+            if (after && after.invalid > before.invalid) {
+                losses.push('invalid');
+            }
+        } catch {
+            // Admission has already completed; diagnostics remain best-effort.
+        }
+
+        return losses;
+    }
+
+    private warnHttpPoll(kind: HttpPollDiagnostic): void {
+        if (this.pollDiagnostics.has(kind)) {
+            return;
+        }
+
+        this.pollDiagnostics.add(kind);
+        const messages: Record<HttpPollDiagnostic, string> = {
+            unavailable: 'v12 http poll unavailable',
+            cleanup_pending: 'v12 http poll cleanup pending; events may be missed',
+            degraded: 'v12 http poll source degraded',
+            full: 'v12 http poll queue full; new event dropped',
+            too_large: 'v12 http poll event too large; event dropped',
+            invalid: 'v12 http poll event invalid; event dropped',
+            private_recall: 'v12 http poll omits private recall events',
+            transport_error: 'v12 http poll response failed',
+            delivery_uncertain: 'v12 http poll delivery outcome unknown; events may be missed',
+            closing_discard: 'v12 http poll retired with undelivered buffered events',
+        };
+        this.warnStatus(messages[kind]);
     }
 
     private warnStatus(message: string): void {

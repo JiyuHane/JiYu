@@ -55,8 +55,10 @@ export interface V12TransportOptions {
     httpPoll?: V12HttpPollCapability;
     getConnectEvent: () => unknown;
     subscribe: (listener: (event: unknown) => void) => () => void;
-    /** Called on asynchronous listener failure with a sanitized diagnostic. */
+    /** Called on listener failure and, if onPollError is absent, poll response errors. */
     onError?: (error: Error) => void;
+    /** Called on poll response errors with a sanitized diagnostic; falls back to onError. */
+    onPollError?: (error: Error) => void;
     maxBodyBytes?: number;
     maxOutputBytes?: number;
     maxConcurrent?: number;
@@ -750,9 +752,10 @@ export class V12Transport {
                 reported = true;
 
                 try {
-                    const result: unknown = this.options.onError?.(
-                        new Error('poll response error'),
-                    );
+                    const report = this.options.onPollError ?? this.options.onError;
+                    const result: unknown = report
+                        ? Reflect.apply(report, this.options, [new Error('poll response error')])
+                        : undefined;
                     void Promise.resolve(result).catch(() => undefined);
                 } catch {
                     /* reporting is best effort */
@@ -884,9 +887,10 @@ export class V12Transport {
                 reported = true;
 
                 try {
-                    const reportedResult: unknown = this.options.onError?.(
-                        new Error('poll response error'),
-                    );
+                    const report = this.options.onPollError ?? this.options.onError;
+                    const reportedResult: unknown = report
+                        ? Reflect.apply(report, this.options, [new Error('poll response error')])
+                        : undefined;
                     void Promise.resolve(reportedResult).catch(() => undefined);
                 } catch {
                     /* reporting is best effort */

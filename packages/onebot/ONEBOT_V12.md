@@ -47,11 +47,71 @@ enabled interval or toggling the feature reopens the v12 listener and disconnect
 existing v12 WebSocket clients; it does not change v11 listeners. A locally
 scheduled heartbeat is a nominal transport-level pulse, not evidence that QQ or an account is online, a remote
 client received it, or the timer ran with real-time precision. It is a meta
-event and is not placed in the experimental HTTP polling queue. If releasing a
+event and is not placed in the HTTP polling queue. If releasing a
 heartbeat-enabled listener, or switching a listener to enable heartbeats, fails
 during quiescence, the v12 runtime stops the timer and retains the transport for
 cleanup rather than reporting a successful restoration; retry requires releasing
 the previous transport before reopening.
+
+## HTTP event polling (partial)
+
+The enabled account-local v12 listener accepts `get_latest_events` as a JSON
+`POST` to its existing `/` endpoint. This uses the listener's existing HTTP
+access checks. Polling is HTTP-only: the ordinary v12 dispatcher and WebSocket
+action path return 10002, and `get_supported_actions` does not currently list
+it. The v11 adapters and WebUI are separate from this capability. For example:
+
+```json
+{"action":"get_latest_events","params":{"limit":0,"timeout":5},"echo":"poll-1"}
+```
+
+`params` must be an object; `limit` and `timeout` default to zero and accept
+nonnegative safe integers. `timeout` is measured in seconds and is capped at
+10; `limit: 0` removes the count limit but not the byte and capacity limits.
+A poll `echo` may contain at most 4,096 UTF-16 code units; a longer one returns
+10001 after earlier request checks when a response remains writable.
+The poll owner admits at most 128 events, with a 256 KiB encoded-array queue
+budget and a 64 KiB single-event budget. It allows at most eight waiters and
+eight tracked transactions; the transport can impose a lower concurrency limit.
+These are not limits on total process memory or upstream activity.
+
+The account must be online and its listener/source binding current. An adapter
+reported as active does not prove poll source or owner readiness; a revoked
+opening source attempt can leave polling unavailable without proving that this
+timing occurs on a live network. Activation is attempted on listener open,
+status change, eligible event or poll. Once ready, the owner can buffer eligible
+events before the first poll. If old owner cleanup is pending, later activity
+retries activation; events can be lost in the interval. The default manager retains a non-evicting gate for each
+canonical UIN, up to 1,024 entries per manager lifetime. Its custom instance
+factory does not automatically share that gate, nor do separate managers or
+processes. Source tickets identify a local binding and online generation, not
+QQ occurrence time or a complete poll-readiness cut; upstream work can still
+be in flight when a poll returns.
+
+Responses select an admission-completion FIFO prefix and then sort that batch
+by `time`, stably for equal timestamps. `limit: 1` selects the FIFO head, not
+necessarily the globally oldest event. Cross-batch order, later arrivals and
+QQ occurrence order are not guaranteed. A short or timed poll can return
+`data: []` when it did not reserve events; this is not proof that upstream is
+empty or no other reservation holds data. Contention or a head that does not
+fit the response can instead produce a failure.
+
+Queue overflow drops new events; its fixed warning is best effort and
+category-deduplicated, not a complete loss report. Unsupported conversions and
+private recall are omitted from HTTP polling. A source-qualified private recall
+can still be published independently over WebSocket when its existing guard
+succeeds; unsupported conversions are not necessarily available there either.
+Closing or rotating a listener/account/source generation can discard queued
+memory. When retirement cleanup observes discarded buffered events, it attempts
+the fixed warning `v12 http poll retired with undelivered buffered events`;
+this best-effort, category-deduplicated diagnostic is not a persistent count
+or client-visible gap. A selected batch is committed before response writing:
+a lost or partial response can leave delivery unknown, and committed events are not
+requeued or automatically replayed. For observed uncertain outcomes the runtime
+attempts the fixed, category-deduplicated warning
+`v12 http poll delivery outcome unknown; events may be missed`; this best-effort
+warning is not a client-visible gap notification. Local `finish` is not a remote
+acknowledgement. See the [polling design and detailed limits](V12_HTTP_POLL_DESIGN.md#current-http-polling-behavior).
 
 ## Supported behavior and limits
 
@@ -232,8 +292,9 @@ Before issuing any handle for an incoming v12 event containing images or voice,
 the runtime also enforces a combined maximum of 128 image/voice segments and
 256 KiB (262,144 bytes) across their UTF-8 URLs. Exceeding either limit fails
 the whole conversion without truncation; an already-prepared internal ordered
-poll admission records an ordering gap under its existing rules. Text-only
-events and v11 behavior are unaffected by these media limits.
+prototype admission records an ordering gap under its existing rules. Production
+HTTP polling uses a separate completion-order owner and can omit the failed
+event. Text-only events and v11 behavior are unaffected by these media limits.
 These are local workload policies, not QQ or OneBot protocol limits, and they
 do not bound total CPU use or process RSS. If a subsequent issuer or provider
 fails after reserving a nonce, that nonce is not rolled back.
@@ -256,8 +317,9 @@ property `auto_reply: true` is preserved as the optional own JSON field
 without invoking an `auto_reply` getter. This is a Jiyu QQ-specific extension,
 not a OneBot 12 standard field or confirmation of a successful send. Other values
 are ignored, and the field is omitted when absent; group messages never acquire
-it. This is partial event conversion support: production HTTP event polling is
-not implemented, and local fixtures do not prove QQ interoperability.
+it. This is partial event conversion support. HTTP polling has the separate
+admission, ordering and loss limits described above; local fixtures do not prove
+QQ interoperability.
 
 Each supported image or voice segment carries a transient `jiyu-image:v1:` or
 `jiyu-voice:v1:` file ID that seals the exact HTTP(S) URL observed in its v11
@@ -291,9 +353,9 @@ provided ticket is not published to v12 subscribers; v11 dispatch is unchanged.
 Events with no ticket retain the legacy unguarded fanout. A synchronous reentry
 with the exact same event and payload can inherit the surrounding ticket scope.
 For image and voice projections the source and current issuer references are also
-rechecked before poll resolution and WebSocket delivery; other admission and
-settlement behavior is unchanged. A poll result already committed before a later
-WebSocket check is not rolled back, and the internal poll seam is not a
+rechecked before poll admission and WebSocket delivery. Production HTTP poll
+admission and batch ordering follow the limits above. A poll result already
+committed before a later WebSocket check is not rolled back, and the internal poll seam is not a
 same-process authentication boundary. These checks depend on the instance's
 synchronous source verifier and observed issuer identity; they do not establish
 upstream QQ identity, prevent arbitrary same-process mutation, suppress same-epoch
@@ -348,13 +410,14 @@ keeps its first reason; an earlier deadline, clock or other ordering failure can
 therefore take precedence over `child_failed`. An absent or stale source, invalid
 ticket, same-object/same-ticket replay or pre-ready input does not by itself
 create this recall-specific gap; other ordering failures still follow their own
-policies. The legacy buffer
-does not enqueue private recall and has separate unresolved empty-result and
-bounded-overflow concerns.
-`pollOwnerStats` exposes the gap internally, not as a public gap API. The poll
-owner's structural validator remains available to direct trusted fixtures;
-that does not establish runtime poll admission. Production HTTP event polling
-and an end-to-end completeness guarantee remain unimplemented.
+policies. This sticky-gap behavior belongs to the ordered prototype, not the
+production HTTP owner. Production HTTP also omits private recall and attempts a
+fixed, category-deduplicated warning; its empty-result and bounded-overflow
+limitations are described in [HTTP event polling](#http-event-polling-partial).
+`pollOwnerStats` exposes ordering state internally, not as a public gap API. The
+poll owner's structural validator remains available to direct trusted fixtures;
+that does not establish runtime poll admission or an end-to-end completeness
+guarantee.
 
 A valid v11 `group_recall` maps to `notice.group_message_delete` after account,
 time, field and identifier validation. It uses `recall` when sender and operator match;
@@ -405,12 +468,13 @@ rather than guessed. Private temporary-chat echoes
 remain unsupported. A self echo with an unsupported segment fails conversion
 rather than producing a partial event; if the internal ordered poll owner is
 active, this failure marks an ordering gap instead of silently skipping the
-event. The poll owner is not wired to a production HTTP polling action. Other
-notices and requests are not yet translated to v12. Unsupported actions,
-parameters and message segments return explicit errors. Apart from the existing
-`get_file` URL subset and the local data capability described above, file
-operations, HTTP event polling and HTTP Webhook are not implemented by this
-listener. Capability and error details remain authoritative at runtime.
+event. That ordered owner is a separate prototype; production HTTP polling
+uses the completion-order policy described above. Other notices and requests
+are not yet translated to v12. Unsupported actions, parameters and message
+segments return explicit errors. Apart from the existing `get_file` URL subset
+and the local data capability described above, other file operations remain
+unsupported. HTTP Webhook is not implemented by this listener. Capability and
+error details remain authoritative at runtime.
 
 A WebSocket connection receives `meta.connect` first and then the current
 account status; network connection alone does not assert that the account is

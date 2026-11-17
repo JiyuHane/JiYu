@@ -259,6 +259,8 @@ type Host = {
     captureBinding(): object | null;
     captureSource(): V12Source | undefined;
     verify(source: V12Source | undefined): boolean;
+    /** Best-effort diagnostic; never receives event data. */
+    onClosingDiscard?(): void;
 };
 export interface PollGate {
     claim: object | null;
@@ -413,15 +415,25 @@ export function registerPollHost(runtime: object, host: Host, gate = createPollG
     });
 }
 
-/** Trusted-host-only explicit activation; there is no implicit production buffer. */
+/** Trusted-host-only explicit activation of the legacy FIFO mode. */
 export function activatePollOwner(runtime: object): PollActivation {
-    const result = activate(runtime, false);
+    const result = activate(runtime, false, 'fifo');
+    return result.status === 'ready' ? { status: 'ready', owner: result.owner.facade } : result;
+}
+
+/**
+ * HTTP uses the existing completion-order admission and bounded queue. Only the
+ * selected FIFO prefix is stably ordered by event time within each response;
+ * overflow drops new events and is counted, so this is not full protocol coverage.
+ */
+export function activateHttpPollOwner(runtime: object): PollActivation {
+    const result = activate(runtime, false, 'event-time');
     return result.status === 'ready' ? { status: 'ready', owner: result.owner.facade } : result;
 }
 
 /** Explicit in-process prototype; empty polls do not produce an HTTP response. */
 export function activateOrderedPollOwner(runtime: object): OrderedPollActivation {
-    const result = activate(runtime, true);
+    const result = activate(runtime, true, 'fifo');
     return result.status === 'ready'
         ? { status: 'ready', owner: result.owner.orderedFacade }
         : result;
@@ -487,9 +499,12 @@ export function isCurrentOrderedFacade(runtime: object, supplied: unknown): bool
     }
 }
 
+type PollBatchOrder = 'fifo' | 'event-time';
+
 function activate(
     runtime: object,
     ordered: boolean,
+    batchOrder: PollBatchOrder,
 ): { status: 'ready'; owner: Owner } | { status: 'unavailable' | 'cleanup_pending' | 'degraded' } {
     const slot = slots.get(runtime);
 
@@ -515,7 +530,7 @@ function activate(
     const current = slot.owner;
 
     if (current) {
-        if (current.ordered !== ordered) {
+        if (current.ordered !== ordered || current.batchOrder !== batchOrder) {
             return { status: 'unavailable' };
         }
 
@@ -591,7 +606,7 @@ function activate(
         }
 
         if (
-            (ordered || gap) &&
+            (ordered || batchOrder === 'event-time' || gap) &&
             (sameSourceEpoch(source, source) !== 'same' || !sourceHasBinding(source, binding))
         ) {
             return { status: 'unavailable' };
@@ -622,7 +637,7 @@ function activate(
             return { status: 'unavailable' };
         }
 
-        const owner = new Owner(slot, binding, source, claim, ordered, self);
+        const owner = new Owner(slot, binding, source, claim, ordered, self, batchOrder);
         slot.owner = owner;
         attached = true;
 
@@ -697,6 +712,12 @@ export function invalidateStalePollOwner(runtime: object): void {
             owner.invalidate();
         }
     }
+}
+
+/** Diagnostic-only mode check; does not claim a gate or validate an epoch. */
+export function hasHttpPollOwner(runtime: object): boolean {
+    const owner = slots.get(runtime)?.owner;
+    return owner?.ordered === false && owner.batchOrder === 'event-time';
 }
 
 /** Internal ordered scope guard; never selected from an action request. */
@@ -840,7 +861,14 @@ export function enqueuePollEvent(
     }
 
     try {
-        if (!slot.host.verify(source) || !owner.valid()) {
+        // HTTP must never admit an old source into a replacement generation,
+        // even if a host verifier is permissive or reenters during verification.
+        if (
+            (owner.batchOrder === 'event-time' && !owner.matchesScopeSource(source)) ||
+            !slot.host.verify(source) ||
+            !owner.valid() ||
+            (owner.batchOrder === 'event-time' && !owner.matchesScopeSource(source))
+        ) {
             return;
         }
 
@@ -861,7 +889,9 @@ export function enqueuePollEvent(
     }
 }
 
-/** Per-instance gate only: it does not coordinate replacement instances after forceRelease. */
+/** The supplied gate protects one owner. The default manager shares it by account
+ * across replacement instances; standalone/custom instances and other managers or
+ * processes need their own coordination. */
 class Owner implements PollOwner {
     private readonly queue = new EventPollBuffer(limits);
     private readonly sequencer: IngressSequencer | null;
@@ -891,6 +921,7 @@ class Owner implements PollOwner {
         private readonly claim: object,
         readonly ordered: boolean,
         private readonly self: OrderedSelf | null,
+        readonly batchOrder: PollBatchOrder,
     ) {
         this.ownerRevision = slot.revision;
         this.sequencer = ordered
@@ -945,13 +976,17 @@ class Owner implements PollOwner {
                   },
               )
             : null;
-        this.coordinator = new PollCoordinator(
+        const coordinatorArgs = [
             this.queue,
             limits.maxQueueBytes,
             () => performance.now(),
             () => this.valid(),
             ordered ? 'unavailable' : 'legacy',
-        );
+        ] as const;
+        this.coordinator =
+            batchOrder === 'event-time'
+                ? new PollCoordinator(...coordinatorArgs, 'event-time')
+                : new PollCoordinator(...coordinatorArgs);
     }
 
     private attached(): boolean {
@@ -1526,6 +1561,14 @@ class Owner implements PollOwner {
                     if (!this.slot.gate.uncertain && this.ownsGate()) {
                         this.slot.gate.claim = null;
                         this.slot.retiring = false;
+                    }
+
+                    if (count > 0 && this.batchOrder === 'event-time') {
+                        try {
+                            this.slot.host.onClosingDiscard?.();
+                        } catch {
+                            // Diagnostics must not change gate or cleanup state.
+                        }
                     }
                 } catch {
                     this.markUncertain();

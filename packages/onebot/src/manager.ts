@@ -11,8 +11,13 @@ import {
 } from './message-store-migration-task';
 import type { AdapterStatus, NetworkApplyError, NetworkShutdownResult } from './network';
 import type { OneBotConfig } from './types';
+import { createPollGateRegistry } from './v12-runtime/poll-owner';
 
 const log = createLogger('OneBot');
+
+// Retain gates for this manager's lifetime without eviction: retiring instances
+// may still use them. Different managers and processes remain independent.
+const POLL_GATE_REGISTRY_CAPACITY = 1024;
 
 class InstanceLifecycleError extends Error {
     constructor(
@@ -124,6 +129,7 @@ export interface ConfigApplyResult {
 }
 
 export class OneBotManager {
+    private readonly pollGateRegistry = createPollGateRegistry(POLL_GATE_REGISTRY_CAPACITY);
     private readonly instances = new Map<string, OneBotInstance>();
     // Keep the factory argument, rather than reading mutable instance properties,
     // as the authority for the active generation.
@@ -187,8 +193,25 @@ export class OneBotManager {
             options.createDatabaseMigrationTask ?? createMessageStoreMigrationTask;
         this.createInstance =
             options.createInstance ??
-            ((uin, bridge, config, globalSettings) =>
-                new OneBotInstance(uin, bridge, config, globalSettings));
+            ((uin, bridge, config, globalSettings) => {
+                const result = this.pollGateRegistry.getOrCreate(uin);
+
+                if (result.kind !== 'ready') {
+                    try {
+                        log.warn('OneBot v12 HTTP poll gate unavailable: %s', result.kind);
+                    } catch {
+                        // Diagnostics must not block the ordinary instance lifecycle.
+                    }
+                }
+
+                return new OneBotInstance(
+                    uin,
+                    bridge,
+                    config,
+                    globalSettings,
+                    result.kind === 'ready' ? result.gate : null,
+                );
+            });
     }
 
     bind(bridgeManager: BridgeSessionSource): void {

@@ -1,8 +1,8 @@
 import { addAbortListener } from 'node:events';
 import type { PollOptions, PollResult } from './event-poll-buffer';
 
-/** Internal transaction seam: an explicitly activated runtime owner and an injected
- * HTTP capability can use it, but the production runtime does not wire them together.
+/** Internal transaction seam used by the bounded production HTTP poll owner.
+ * The ordered-ingress owner remains a separate experimental mode.
  * The trusted host owns one coordinator per account and binding epoch, validates
  * event origin, creates the buffer and supplies its exact maxQueueBytes. Neither
  * request input nor an arbitrary same-process object is an authority for these.
@@ -23,6 +23,14 @@ import type { PollOptions, PollResult } from './event-poll-buffer';
  * Timeout says only this consumer did not reserve events before its wait expired;
  * other waiters or reservations may exist. This mapping still needs transport and
  * fairness review; it does not establish delivery, global emptiness or event order.
+ *
+ * The trusted owner may opt into event-time order for each selected FIFO prefix.
+ * Selection still uses the original FIFO count and byte limits, and equal times keep
+ * their selected indices; in particular, limit=1 still selects the FIFO head. OneBot
+ * v12's oldest-to-newest expectation additionally assumes event.time represents age
+ * and earlier events are already available in the right order across requests. This
+ * policy does not select the globally earliest queued event or order late arrivals
+ * or separate responses. Runtime producers remain responsible for non-meta events.
  */
 export interface PollQueue {
     reserve(options: PollOptions): Promise<PollResult>;
@@ -92,6 +100,41 @@ function nonnegativeInteger(value: unknown): value is number {
     return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
+/** Reorder only a private parsed copy of the already selected FIFO prefix. */
+function orderEventsByTime(events: unknown[]): string | undefined {
+    const indexed: { event: object; time: number; index: number }[] = [];
+
+    for (let index = 0; index < events.length; index++) {
+        const event: unknown = events[index];
+
+        if (
+            typeof event !== 'object' ||
+            event === null ||
+            Array.isArray(event) ||
+            Object.getPrototypeOf(event) !== Object.prototype
+        ) {
+            return undefined;
+        }
+
+        // JSON.parse creates own data properties; inherited time is not an event time.
+        const time: unknown = Object.getOwnPropertyDescriptor(event, 'time')?.value;
+
+        if (
+            typeof time !== 'number' ||
+            !Number.isFinite(time) ||
+            time < 0 ||
+            time > Number.MAX_SAFE_INTEGER
+        ) {
+            return undefined;
+        }
+
+        indexed.push({ event, time, index });
+    }
+
+    indexed.sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : a.index - b.index));
+    return JSON.stringify(indexed.map(({ event }) => event));
+}
+
 /** The functions and queue are trusted owner dependencies, not request-selected callbacks. */
 export class PollCoordinator {
     private closed = false;
@@ -103,6 +146,7 @@ export class PollCoordinator {
         private readonly now: () => number,
         private readonly isEpochValid: () => boolean,
         private readonly emptyPolicy: 'legacy' | 'unavailable' = 'legacy',
+        private readonly batchOrder: 'fifo' | 'event-time' = 'fifo',
     ) {
         if (!nonnegativeInteger(maxQueueBytes) || maxQueueBytes < 2) {
             throw new RangeError('invalid queue budget');
@@ -110,6 +154,10 @@ export class PollCoordinator {
 
         if (emptyPolicy !== 'legacy' && emptyPolicy !== 'unavailable') {
             throw new RangeError('invalid empty policy');
+        }
+
+        if (batchOrder !== 'fifo' && batchOrder !== 'event-time') {
+            throw new RangeError('invalid batch order');
         }
     }
 
@@ -131,6 +179,7 @@ export class PollCoordinator {
             },
             () => this.transactions.delete(transaction),
             this.emptyPolicy,
+            this.batchOrder,
         );
 
         return transaction;
@@ -177,9 +226,14 @@ export class PollTransaction {
         private readonly onStart: () => boolean,
         private readonly onDone: () => void,
         private readonly emptyPolicy: 'legacy' | 'unavailable' = 'legacy',
+        private readonly batchOrder: 'fifo' | 'event-time' = 'fifo',
     ) {
         if (emptyPolicy !== 'legacy' && emptyPolicy !== 'unavailable') {
             throw new RangeError('invalid empty policy');
+        }
+
+        if (batchOrder !== 'fifo' && batchOrder !== 'event-time') {
+            throw new RangeError('invalid batch order');
         }
 
         this.request = {
@@ -588,10 +642,26 @@ export class PollTransaction {
                     const parsed: unknown = JSON.parse(result.eventsJson);
 
                     if (Array.isArray(parsed) && parsed.length === result.count) {
-                        const candidate = prefix + result.eventsJson + suffix;
+                        if (this.batchOrder === 'fifo') {
+                            const candidate = prefix + result.eventsJson + suffix;
 
-                        if (Buffer.byteLength(candidate, 'utf8') <= maxOutputBytes) {
-                            body = candidate;
+                            if (Buffer.byteLength(candidate, 'utf8') <= maxOutputBytes) {
+                                body = candidate;
+                            }
+                        } else {
+                            const ordered = orderEventsByTime(parsed);
+
+                            // budget covers both maxQueueBytes and the response envelope.
+                            if (
+                                ordered !== undefined &&
+                                Buffer.byteLength(ordered, 'utf8') <= budget
+                            ) {
+                                const candidate = prefix + ordered + suffix;
+
+                                if (Buffer.byteLength(candidate, 'utf8') <= maxOutputBytes) {
+                                    body = candidate;
+                                }
+                            }
                         }
                     }
                 }
