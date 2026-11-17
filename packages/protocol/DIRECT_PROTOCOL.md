@@ -743,6 +743,15 @@ nor subsequent object use is established. The inspected continuation has not
 established a read from `G + 0x28` through `G + 0x47` or a link to the eventual
 return, and it does not establish that no such link exists later.
 
+Under the further assumptions that both calls return nonzero and the traced local
+slots remain stable, the inspected dispatcher states set a local flag to zero,
+carry the address of `[rbp-0x1420]` into another local slot, and reach the
+conditional jump at `0x6bf9bb0` to `0x6bf9e8f`. The latter target has not been
+inspected in this slice. Nearby instructions compare a pointer associated with
+the second return and a different state contains XOR instructions, but their
+reachability from this conditional continuation has not been established. The
+inspected windows do not connect either to the final output or to an SSO signer.
+
 The descriptor bytes have a different file mapping from the code: the writable
 `PT_LOAD` maps linked `0x9035280` through `0x9035285` to file offsets
 `0x9033280` through `0x9033285`. The six original bytes are `04 00 00 00 20 40`.
