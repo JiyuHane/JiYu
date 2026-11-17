@@ -182,6 +182,51 @@ function snapshotGroupNameEvent(input: unknown): Readonly<Record<string, unknown
     return Object.freeze(fields);
 }
 
+/** Capture initially recognizable group-admin notices before event getters or self spread. */
+function snapshotGroupAdminEvent(input: unknown): Readonly<Record<string, unknown>> | null {
+    if (isProxy(input) || !isObject(input)) {
+        return null;
+    }
+
+    const postType = Object.getOwnPropertyDescriptor(input, 'post_type');
+
+    if (!postType?.enumerable || !('value' in postType) || postType.value !== 'notice') {
+        return null;
+    }
+
+    const noticeType = Object.getOwnPropertyDescriptor(input, 'notice_type');
+
+    if (!noticeType?.enumerable || !('value' in noticeType) || noticeType.value !== 'group_admin') {
+        return null;
+    }
+
+    const subType = Object.getOwnPropertyDescriptor(input, 'sub_type');
+
+    if (
+        !subType?.enumerable ||
+        !('value' in subType) ||
+        (subType.value !== 'set' && subType.value !== 'unset')
+    ) {
+        return null;
+    }
+
+    const fields = visibleOwnData(input, [
+        'time',
+        'self_id',
+        'post_type',
+        'notice_type',
+        'sub_type',
+        'group_id',
+        'user_id',
+    ]);
+
+    if (!fields) {
+        throw new Error('invalid or unsupported V11 group admin event');
+    }
+
+    return Object.freeze(fields);
+}
+
 /** A known but unsupported V11 event returns null; malformed input throws. */
 export function convertV11Event(
     input: unknown,
@@ -197,12 +242,13 @@ export function convertV11Event(
         throw new Error('invalid V11 event or V12 account identity');
     }
 
-    // This recognized extension must be snapshotted before self getters can
+    // These recognized extensions must be snapshotted before self getters can
     // mutate the source event. Other event paths retain their legacy reads.
     const groupNameFields = snapshotGroupNameEvent(input);
+    const groupAdminFields = snapshotGroupAdminEvent(input);
 
-    // Legacy paths capture identity before reading event properties; the group-name
-    // candidate above has already been copied using data descriptors only.
+    // Legacy paths capture identity before reading event properties; recognized
+    // candidates above have already been copied using data descriptors only.
     const eventSelf = { ...self };
 
     if (!isSelf(eventSelf)) {
@@ -239,6 +285,44 @@ export function convertV11Event(
             group_name: groupNameFields.name_new,
             // Zero denotes an unresolved operator, not proof of no operator.
             ...(operatorId === null ? {} : { operator_id: operatorId }),
+        };
+    }
+
+    if (groupAdminFields !== null) {
+        const sourceSelf = fromV11AccountId(groupAdminFields.self_id);
+
+        if (sourceSelf === null || sourceSelf !== eventSelf.user_id) {
+            throw new Error('V11 event account does not match V12 account');
+        }
+
+        if (eventSelf.platform !== 'qq') {
+            return null;
+        }
+
+        const groupId = fromV11AccountId(groupAdminFields.group_id);
+        const userId = fromV11AccountId(groupAdminFields.user_id);
+
+        if (
+            groupAdminFields.post_type !== 'notice' ||
+            groupAdminFields.notice_type !== 'group_admin' ||
+            (groupAdminFields.sub_type !== 'set' && groupAdminFields.sub_type !== 'unset') ||
+            groupId === null ||
+            userId === null ||
+            !isV12Time(groupAdminFields.time)
+        ) {
+            throw new Error('invalid or unsupported V11 group admin event');
+        }
+
+        return {
+            id: randomUUID(),
+            time: groupAdminFields.time,
+            type: 'notice',
+            detail_type: 'qq.group_admin_change',
+            sub_type: '',
+            self: { ...eventSelf, platform: 'qq' },
+            group_id: groupId,
+            user_id: userId,
+            is_admin: groupAdminFields.sub_type === 'set',
         };
     }
 

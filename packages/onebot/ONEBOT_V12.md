@@ -590,7 +590,38 @@ when the packet timestamp is missing, so it is not proof of the event's time.
 This is an [extension](https://12.onebot.dev/interface/rules/), not a standard
 group notice, and does not establish QQ-side authenticity or client delivery. The
 SDK's dedicated type describes the shape; its generic event parser validates only
-common fields. A valid v11 `friend_add` maps to `notice.friend_increase` with an
+common fields.
+
+The Jiyu-specific, nonstandard `notice.qq.group_admin_change` projects an
+observable v11 `group_admin` notice with subtype `set` or `unset`. Its v12
+`sub_type` is empty; `is_admin` is `true` for `set` and `false` for `unset`.
+`group_id` and the affected `user_id` are canonical positive decimal strings
+within JavaScript's safe-integer range. The v12 `self.platform` is `qq`, and the
+v11 `self_id` must match that account. The notice does not supply or infer an
+`operator_id`. Its reported change does not establish current or effective
+permissions, QQ-side origin, actual delivery or real QQ interoperability.
+
+For an initially recognized `set`/`unset` candidate, the converter snapshots
+the expected visible v11 data fields before spreading `self`; extra enumerable
+own fields or symbols, including an `operator_id`, and string-key accessors are
+rejected. Non-enumerable data and hidden symbols can remain as internal metadata.
+Earlier discrimination, v11 serialization and `self` reads have their own behavior; this
+is not a blanket guarantee that getters or proxy traps never run. Unsupported
+or future subtypes follow the existing unsupported path and its account-identity
+check. A non-QQ account does not produce this extension. Time uses the existing
+nonnegative finite range through JavaScript's safe-integer maximum, including
+fractions.
+
+This notice uses ordinary event admission: a current source ticket and owner can
+allow the bounded completion-order HTTP queue, with admission attempted before
+WebSocket fanout. Source-qualified WebSocket publication is checked separately;
+an independent unticketed dispatch can still use the legacy WebSocket path but
+is not admitted to production HTTP polling. Both paths retain the lifecycle,
+overflow, ordering and delivery limitations described above. A ticket correlates
+local state; it does not authenticate a QQ event or create a same-process security
+boundary.
+
+A valid v11 `friend_add` maps to `notice.friend_increase` with an
 empty subtype and the same user ID as a string. The upstream new-friend decoder resolves the peer UIN
 with a routing fallback and may fall back to the packet header time; this mapping
 preserves the v11 fields without independently verifying QQ identity, event, or

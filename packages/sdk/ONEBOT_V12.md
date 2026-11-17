@@ -195,6 +195,37 @@ The generic event and polling parsers check common event fields, not these
 notice-specific fields or QQ provenance. A type annotation is not runtime
 validation or authentication of the event's origin.
 
+### Jiyu group-administrator change extension
+
+Jiyu's nonstandard `notice.qq.group_admin_change` projects v11 `group_admin`
+`set` and `unset` as `is_admin: true` and `is_admin: false`, respectively. Its
+`sub_type` is empty, `self.platform` is `'qq'`, and `group_id` and the affected
+`user_id` are canonical positive safe-integer decimal strings. Jiyu does not
+emit or infer an `operator_id` for this notice. The reported change is not proof
+of current or effective permissions, QQ origin, client delivery or real QQ
+interoperability. Subject to the ordinary source, queue and lifecycle limits
+above, the event can reach WebSocket subscribers or HTTP polling; an unticketed
+independent dispatch can use the legacy WebSocket path but is not admitted to
+production polling.
+
+`@harehane/sdk/v12` exports `OneBot12QQGroupAdminChangeEvent` as an optional
+TypeScript description of Jiyu's current shape:
+
+```ts
+import type { OneBot12QQGroupAdminChangeEvent } from '@harehane/sdk/v12';
+
+// Apply your own source and detail-field checks before calling this function.
+function reportedAdminChange(event: OneBot12QQGroupAdminChangeEvent): boolean {
+    return event.is_admin;
+}
+```
+
+The generic event and polling parsers validate common event fields, not this
+extension's fields or QQ provenance; they can preserve unknown fields and
+subtypes. A TypeScript annotation does not validate the payload at runtime or
+authenticate its origin, and this type does not define every implementation's
+behavior.
+
 ### Jiyu group-name extension
 
 `@harehane/sdk/v12` exports the `OneBot12QQGroupNameChangeEvent` TypeScript

@@ -245,6 +245,23 @@ export interface OneBot12PlatformEvent extends OneBot12EventBase {
 }
 
 /**
+ * Jiyu QQ administrator-change notice; this is not a standard OneBot 12 event.
+ * `is_admin` describes the reported change, not proof of current or effective
+ * permissions. Jiyu does not synthesize an operator for this notice. The generic
+ * event and polling parsers do not validate these detail-specific fields or
+ * authenticate that an event originated from QQ.
+ */
+export interface OneBot12QQGroupAdminChangeEvent extends OneBot12PlatformEvent {
+    type: 'notice';
+    detail_type: 'qq.group_admin_change';
+    sub_type: '';
+    self: OneBot12Self & { platform: 'qq' };
+    group_id: string;
+    user_id: string;
+    is_admin: boolean;
+}
+
+/**
  * Jiyu-specific notice, not a standard OneBot 12 event. The generic event
  * parser does not validate its detail-specific fields; this shape does not
  * authenticate that an event originated from QQ.

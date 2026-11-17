@@ -176,6 +176,19 @@ export interface V12GroupNameChangeEvent {
     operator_id?: string;
 }
 
+export interface V12GroupAdminChangeEvent {
+    id: string;
+    time: number;
+    type: 'notice';
+    /** QQ-specific extension reflecting a V11 notice, not a standard OneBot 12 event. */
+    detail_type: 'qq.group_admin_change';
+    sub_type: '';
+    self: V12Self & { platform: 'qq' };
+    group_id: string;
+    user_id: string;
+    is_admin: boolean;
+}
+
 export type V12ConvertedEvent =
     | V12MessageEvent
     | V12FriendIncreaseEvent
@@ -183,4 +196,5 @@ export type V12ConvertedEvent =
     | V12GroupMessageDeleteEvent
     | V12GroupMemberDecreaseEvent
     | V12GroupMemberIncreaseEvent
-    | V12GroupNameChangeEvent;
+    | V12GroupNameChangeEvent
+    | V12GroupAdminChangeEvent;

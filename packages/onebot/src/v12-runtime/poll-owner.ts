@@ -253,6 +253,17 @@ function validOrderedEvent(event: unknown, self: OrderedSelf): boolean {
         );
     }
 
+    if (event.type === 'notice' && event.detail_type === 'qq.group_admin_change') {
+        return (
+            event.sub_type === '' &&
+            event.time <= Number.MAX_SAFE_INTEGER &&
+            parseAccountId(event.group_id) !== null &&
+            parseAccountId(event.user_id) !== null &&
+            typeof event.is_admin === 'boolean' &&
+            exact(event, [...common, 'group_id', 'user_id', 'is_admin'])
+        );
+    }
+
     if (
         event.type !== 'notice' ||
         parseAccountId(event.group_id) === null ||

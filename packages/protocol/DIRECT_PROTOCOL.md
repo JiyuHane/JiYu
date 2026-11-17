@@ -843,6 +843,47 @@ constants match the corresponding SHA-256 compression term and round constants;
 this local match does not prove the complete algorithm, final output, or a
 connection to the current QQ SSO signing callback.
 
+On the further selected `k >= 16` branch, `0x6bff5c8` initializes a batch index
+`b` to 16. At `0x6c00b43`, an unsigned comparison selects the expansion path
+while `b < 64`; `0x6c00b09–0x6c00b1a` advances it by eight. Under stable index
+and pointer slots, valid readable and writable storage, no exceptions and no
+destructive aliasing, the examined batches start at 16, 24, 32, 40, 48 and 56.
+They produce `W[16]` through `W[63]`; the next comparison at 64 exits instead of
+accessing `W[64]`. The primary static trace inspected all eight unrolled items;
+an independent decoder confirmed the first and last items and the loop boundary.
+For each resulting index `x`, the inspected operations correspond to:
+
+```text
+s1(v) = ROL32(v, 15) XOR ROL32(v, 13) XOR (v >>> 10)
+s0(v) = ROL32(v, 25) XOR ROL32(v, 14) XOR (v >>> 3)
+W[x]  = s1(W[x-2]) + W[x-7] + s0(W[x-15]) + W[x-16]  mod 2^32
+```
+
+The recurrence matches the SHA-256 message schedule after converting the rotate
+directions. Its reads must observe the intended initial or previously generated
+words; the code also interleaves table reads and working-data writes, so this
+relationship depends on those writes not destructively aliasing `W` or its
+pointer slots. The offline [`targetSha256ScheduleCandidate`](src/direct/target-sha256-schedule-candidate.ts)
+models this recurrence for one caller-supplied 64-byte block and returns fresh
+numeric schedule words, not digest bytes; the returned typed array's backing-byte
+order is platform-native. It rejects shared, resizable and invalid backing views; callers
+must exclude external native writes or backing invalidation during the snapshot.
+Its fixed errors distinguish invalid input, unavailable prerequisites and
+operation failure. It is not wired into the signer and has not been compared with
+a runtime execution of the target.
+
+After the `b=64` branch, the selected dispatcher initializes a new index to
+zero and loops while it is below eight. `0x6c006cf` reads a 32-bit word through
+`r15`, and `0x6c006ff` adds it modulo 2^32 to the corresponding word through
+`Q = [rbp-0x1b28]`, writing the sum back through `Q`. The traced setup makes
+`Q = *[rbp-0x1c10] + 8`, with `[rbp-0x1c10] = &[rbp-0x1558]`; it is `P+8` only
+if the previously established `P` slot and intervening pointer values remain
+unchanged. The eight source words and destination words must be readable and
+the destination writable; `r15`, `Q`, the index and intermediate pointer slots
+must stay stable across the loop, without concurrent interference or destructive
+aliasing. The original identity of the `r15` value at writeback, the complete
+preceding round sequence, final output and any SSO connection remain unestablished.
+
 The original file bytes `+0xc = 0x20` and `+0xd = 0x40` suggest `L=32` and
 64-byte halves only if they and the relevant reads remain unchanged at runtime.
 A distinct `L > r` branch performs conditional writes to the first allocation,

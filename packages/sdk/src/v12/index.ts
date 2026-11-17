@@ -33,6 +33,7 @@ export type {
     OneBot12MessageSegment,
     OneBot12OutgoingMessage,
     OneBot12PlatformEvent,
+    OneBot12QQGroupAdminChangeEvent,
     OneBot12QQGroupNameChangeEvent,
     OneBot12QQPrivateMessageDeleteEvent,
     OneBot12Self,
