@@ -13,8 +13,12 @@ import { sameSourceEpoch, sourceHasBinding, type V12Source } from './source-gene
 import {
     createPrivateRecallPollEpochAccountScope,
     isPrivateRecallPollEpochAccountScopeActive,
+    isPrivateRecallPollProofBoundTo,
+    isPrivateRecallPollProofFor,
+    isPrivateRecallPollProofInEpochAccountScope,
     retirePrivateRecallPollEpochAccountScope,
     type PrivateRecallPollEpochAccountScope,
+    type PrivateRecallPollProof,
 } from './private-recall-source';
 import {
     IngressSequencer,
@@ -1068,6 +1072,258 @@ export function enqueuePollEvent(
     }
 }
 
+export type PrivateRecallPollAdmission =
+    'accepted' | 'unavailable' | 'full' | 'oversize' | 'invalid' | 'uncertain';
+
+/**
+ * Trusted internal admission seam, not a same-process authentication boundary.
+ * The caller owns deduplication of the original event and exact source ticket;
+ * distinct candidates or proofs do not establish distinct source events. A
+ * possibly published admission must never be retried automatically. The guard
+ * is sampled synchronously and is not retained by the queue or event payload.
+ */
+export function enqueuePrivateRecallPollEvent(
+    runtime: object,
+    expectedOwner: PollOwner,
+    candidate: unknown,
+    proof: PrivateRecallPollProof,
+    source: V12Source,
+    guard: () => boolean,
+): PrivateRecallPollAdmission {
+    const slot = slots.get(runtime);
+    const owner = slot?.owner;
+
+    if (
+        !slot ||
+        !owner ||
+        owner.facade !== expectedOwner ||
+        owner.ordered ||
+        owner.batchOrder !== 'event-time' ||
+        !owner.hasScopedQueue() ||
+        typeof guard !== 'function'
+    ) {
+        return 'unavailable';
+    }
+
+    const gate = slot.gate;
+    const state = gateState(gate);
+    const claim = gate.claim;
+    const revision = slot.revision;
+    const transition = state.transition;
+    let attempted = false;
+
+    const sameOwner = (): boolean =>
+        slots.get(runtime) === slot &&
+        slot.owner === owner &&
+        slot.gate === gate &&
+        gate.claim === claim &&
+        claim !== null;
+    const stable = (): boolean =>
+        sameOwner() &&
+        owner.facade === expectedOwner &&
+        slot.revision === revision &&
+        state.transition === transition &&
+        state.scopeCheck === null &&
+        state.gap === null &&
+        !slot.retiring &&
+        !slot.activating &&
+        !gate.uncertain &&
+        owner.hasRecallAuthority();
+
+    const unavailable = (): 'unavailable' => {
+        try {
+            if (sameOwner() && !owner.scopedActive() && sameOwner()) {
+                owner.invalidate();
+            }
+        } catch {
+            try {
+                if (sameOwner()) {
+                    owner.failScopedAdmission();
+                }
+            } catch {
+                // The original owner must never affect a replacement.
+            }
+        }
+
+        return 'unavailable';
+    };
+
+    const validate = (): 'unavailable' | 'invalid' | null => {
+        if (!stable() || !owner.matchesScopeSource(source)) {
+            return unavailable();
+        }
+
+        if (!owner.matchesRecallProof(candidate, proof, source)) {
+            if (!stable() || !owner.matchesScopeSource(source)) {
+                return unavailable();
+            }
+
+            increment(slot, 'invalid');
+            return 'invalid';
+        }
+
+        return stable() && owner.matchesScopeSource(source) ? null : unavailable();
+    };
+
+    try {
+        let validation = validate();
+
+        if (validation !== null) {
+            return validation;
+        }
+
+        // This probe can reenter; all authority and proof checks are repeated after it.
+        let queueOpen: boolean;
+
+        try {
+            queueOpen = owner.scopedQueueOpen();
+        } catch {
+            if (sameOwner()) {
+                owner.failScopedAdmission();
+            }
+
+            return unavailable();
+        }
+
+        if (queueOpen !== true) {
+            try {
+                if (sameOwner()) {
+                    const scopeActive = owner.scopedActive();
+
+                    if (sameOwner()) {
+                        if (scopeActive === false) {
+                            owner.invalidate();
+                        } else {
+                            // A non-open queue contradicts a live owner scope.
+                            owner.failScopedAdmission();
+                        }
+                    }
+                }
+            } catch {
+                try {
+                    if (sameOwner()) {
+                        owner.failScopedAdmission();
+                    }
+                } catch {
+                    // Never change a replacement owner after a reentrant probe.
+                }
+            }
+
+            return unavailable();
+        }
+
+        validation = validate();
+
+        if (validation !== null) {
+            return validation;
+        }
+
+        if (owner.valid() !== true) {
+            return unavailable();
+        }
+
+        validation = validate();
+
+        if (validation !== null) {
+            return validation;
+        }
+
+        if (slot.host.verify(source) !== true) {
+            return unavailable();
+        }
+
+        validation = validate();
+
+        if (validation !== null) {
+            return validation;
+        }
+
+        if (guard() !== true) {
+            return unavailable();
+        }
+
+        validation = validate();
+
+        if (validation !== null) {
+            return validation;
+        }
+
+        if (owner.valid() !== true) {
+            return unavailable();
+        }
+
+        validation = validate();
+
+        if (validation !== null) {
+            return validation;
+        }
+
+        if (slot.host.verify(source) !== true) {
+            return unavailable();
+        }
+
+        validation = validate();
+
+        if (validation !== null) {
+            return validation;
+        }
+
+        // Sample the trusted guard last; the following checks use only retained
+        // identities and fixed scope/proof verifiers, without a host callback.
+        if (guard() !== true) {
+            return unavailable();
+        }
+
+        validation = validate();
+
+        if (validation !== null) {
+            return validation;
+        }
+
+        attempted = true;
+        const result = owner.enqueueScopedRecall(candidate, proof, source);
+
+        if (result === 'accepted') {
+            increment(slot, 'accepted');
+            return 'accepted';
+        }
+
+        if (result === 'full') {
+            increment(slot, 'full');
+            return 'full';
+        }
+
+        if (result === 'oversize') {
+            increment(slot, 'too_large');
+            return 'oversize';
+        }
+
+        if (result === 'invalid' || result === 'meta') {
+            increment(slot, 'invalid');
+            return 'invalid';
+        }
+
+        if (result === 'uncertain') {
+            increment(slot, 'admission_uncertain');
+            return 'uncertain';
+        }
+
+        return unavailable();
+    } catch {
+        if (attempted) {
+            increment(slot, 'admission_uncertain');
+
+            if (sameOwner()) {
+                owner.failScopedAdmission();
+            }
+
+            return 'uncertain';
+        }
+
+        return unavailable();
+    }
+}
+
 /** The supplied gate protects one owner. The default manager shares it by account
  * across replacement instances; standalone/custom instances and other managers or
  * processes need their own coordination. */
@@ -1259,6 +1515,36 @@ class Owner implements PollOwner {
         return (
             this.#scopedScope !== null &&
             isPrivateRecallPollEpochAccountScopeActive(this.#scopedScope)
+        );
+    }
+
+    /** Local identity and scope checks only; live source validation is separate. */
+    hasRecallAuthority(): boolean {
+        return (
+            !this.ordered &&
+            this.batchOrder === 'event-time' &&
+            this.self !== null &&
+            this.#scopedScope !== null &&
+            this.attached() &&
+            isPrivateRecallPollEpochAccountScopeActive(this.#scopedScope)
+        );
+    }
+
+    /** The proof must bind this exact event ticket and this owner's captured self. */
+    matchesRecallProof(
+        candidate: unknown,
+        proof: PrivateRecallPollProof,
+        source: V12Source,
+    ): boolean {
+        const scope = this.#scopedScope;
+        const self = this.self;
+
+        return (
+            scope !== null &&
+            self !== null &&
+            isPrivateRecallPollProofFor(proof, candidate) &&
+            isPrivateRecallPollProofBoundTo(proof, source, self) &&
+            isPrivateRecallPollProofInEpochAccountScope(proof, source, scope)
         );
     }
 
@@ -1753,11 +2039,27 @@ class Owner implements PollOwner {
             }
         }
 
+        return this.enqueueScoped(() => this.queue.enqueue(event));
+    }
+
+    enqueueScopedRecall(candidate: unknown, proof: PrivateRecallPollProof, source: V12Source) {
+        if (!this.#scopedScope) {
+            return 'closed' as const;
+        }
+
+        return this.enqueueScoped(
+            () => this.queue.enqueueScopedRecall(candidate, proof, source),
+            true,
+        );
+    }
+
+    /** Execute a fixed queue operation synchronously without retaining the caller's guard. */
+    private enqueueScoped(operation: () => ReturnType<EventPollBuffer['enqueue']>, recall = false) {
         let result: ReturnType<EventPollBuffer['enqueue']> | undefined;
         let uncertain = false;
 
         try {
-            result = this.queue.enqueue(event);
+            result = operation();
         } catch {
             // Publication and eviction may already have happened; never retry.
             uncertain = true;
@@ -1769,16 +2071,47 @@ class Owner implements PollOwner {
             }
         }
 
+        let recallScopeActive: boolean | undefined;
+
+        if (recall) {
+            try {
+                recallScopeActive = this.scopedActive();
+
+                if (recallScopeActive !== true && recallScopeActive !== false) {
+                    uncertain = true;
+                }
+            } catch {
+                uncertain = true;
+            }
+        }
+
+        const cleanRevocation =
+            recall &&
+            (result === 'scope_revoked' || result === 'closed') &&
+            recallScopeActive === false;
+
         try {
             const cleanup: unknown = this.queue.guardedCleanupState();
 
             if (
                 (cleanup !== 'open' && cleanup !== 'closing' && cleanup !== 'closed') ||
-                ((cleanup === 'closing' || cleanup === 'closed') && !this.retired)
+                ((cleanup === 'closing' || cleanup === 'closed') &&
+                    !this.retired &&
+                    !cleanRevocation)
             ) {
                 uncertain = true;
             }
         } catch {
+            uncertain = true;
+        }
+
+        if (
+            recall &&
+            (result === 'scope_revoked' || result === 'closed') &&
+            recallScopeActive === true &&
+            !this.retired
+        ) {
+            // An open owner scope cannot explain a closed/revoked scoped queue.
             uncertain = true;
         }
 
@@ -1796,7 +2129,10 @@ class Owner implements PollOwner {
         }
 
         if (uncertain) {
-            this.failScopedAdmission();
+            if (!recall || (this.ownsGate() && (this.slot.owner === this || !this.slot.owner))) {
+                this.failScopedAdmission();
+            }
+
             return 'uncertain' as const;
         }
 

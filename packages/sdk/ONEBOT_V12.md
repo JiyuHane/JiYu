@@ -79,11 +79,12 @@ batches, late arrivals and QQ occurrence order have no global ordering guarantee
 A successful empty array means this poll obtained no reservation, not that the
 upstream pipeline is empty or another poll holds no events.
 
-For ordinary eligible events, Jiyu's production completion-order HTTP owner
-uses a scoped guarded queue. The account/epoch scope is local lifecycle
-correlation, not proof of QQ origin, online state or owner authority; trusted
-owner checks remain separate. This is not the separate ordered-producer
-prototype, and it does not admit private recalls to HTTP.
+For eligible ordinary events and qualified private recalls, Jiyu's production
+completion-order HTTP owner uses a scoped guarded queue. The account/epoch scope
+is local lifecycle correlation, not proof of QQ origin, online state or owner
+authority; trusted owner checks remain separate. This is not the separate
+ordered-producer prototype, and the scoped queue alone is not sufficient proof
+for private-recall admission.
 
 Before settling a selected prefix, the scoped transaction samples the request's
 original listener, listener token and source attempt (`sourceAttempt`) alongside
@@ -109,11 +110,13 @@ warning after WebSocket fanout; that warning does not establish whether an event
 was lost. Internal counters and cleanup indicators are not a durable loss ledger. The transaction distinguishes
 selection, commit, release, prune, scope revocation and uncertainty; when it
 continues after no-drain settlement, it attempts to resume the queue barrier
-using that settlement's exact receipt. A prune outcome does not
-establish private-recall admission. Unsupported conversions and private recalls
-are omitted from polling. A
-source-qualified private recall may still reach WebSocket subscribers through
-its separate guarded path. Queue state is in memory and may be discarded at
+using that settlement's exact receipt. If an admitted recall proof is stale at
+settlement, the queue can prune that recall without committing other valid
+selected entries on that attempt; those entries remain subject to later
+lifecycle and overflow limits. A prune can yield an unavailable failure when a
+response is writable, not a successful empty batch. Unsupported conversions and
+recalls without the required evidence can be omitted. Queue state is in memory
+and may be discarded at
 close or generation changes. A lost response after the server commits a batch
 can leave delivery unknown; neither server nor SDK automatically replays it.
 Jiyu attempts a fixed, category-deduplicated warning for known uncertain
@@ -121,6 +124,26 @@ delivery, not a client-visible gap notification or receipt guarantee.
 The default manager's non-evicting 1,024-UIN gate is per manager; custom
 factories and separate managers or processes do not automatically share it.
 See the [server polling limits](../onebot/V12_HTTP_POLL_DESIGN.md#current-http-polling-behavior).
+
+Jiyu can poll a source-qualified `notice.private_message_delete` projected from
+`friend_recall` after attempting its independent WebSocket fanout. The proof
+binds the original v11 event, provenance, exact event ticket, conversion identity
+and candidate; the owner separately checks account, source epoch and current
+lifecycle. The owner's ticket may be another object from the same epoch; the
+proof still requires the exact original event ticket. A first qualified recall
+can activate the HTTP owner after fanout. Missing or stale evidence and changes
+made during a subscriber callback can prevent HTTP admission.
+
+The runtime records at most one local HTTP attempt per exact original
+event/ticket pair before its admission guards, including when a prepared or
+ordered context excludes the attempt. That does not deduplicate different objects
+or tickets, other runtimes or restarts. Fixed poll warnings omit the proof, ticket,
+account-self and event contents; the standard event still has its ordinary
+`self`, and existing lower-level logs may expose recall identifiers and
+direction. The SDK checks common event fields, not recall-specific payload
+fields or provenance. These local checks do not establish QQ authenticity,
+global exactly-once processing, durable event history, security isolation,
+remote delivery or live QQ interoperability.
 
 `limit` and `timeout` are optional nonnegative safe integers. They default to
 server-side zero when omitted: `limit: 0` places no protocol count limit and
@@ -147,6 +170,30 @@ size, structure and safe-number policies still apply, including when `limit` is
 zero. Parameter snapshots avoid invoking ordinary getters, but JavaScript proxy
 reflection traps may execute; do not treat the codec as isolation from hostile
 same-process code.
+
+### Jiyu private-message deletion type
+
+`@harehane/sdk/v12` exports the optional TypeScript shape
+`OneBot12QQPrivateMessageDeleteEvent` for the private-message deletion notice
+currently emitted by Jiyu's QQ adapter. It describes `type: 'notice'`,
+`detail_type: 'private_message_delete'`, an empty `sub_type`, a `self` whose
+`platform` is `'qq'`, and string `message_id` and `user_id` fields. The message
+ID can represent a negative signed 32-bit value; `user_id` identifies the
+recalling party, either the account or its peer. This describes Jiyu's current
+projection, not every implementation of the notice.
+
+```ts
+import type { OneBot12QQPrivateMessageDeleteEvent } from '@harehane/sdk/v12';
+
+// Apply your own source and detail-field checks before calling this function.
+function messageIdOfValidatedRecall(event: OneBot12QQPrivateMessageDeleteEvent): string {
+    return event.message_id;
+}
+```
+
+The generic event and polling parsers check common event fields, not these
+notice-specific fields or QQ provenance. A type annotation is not runtime
+validation or authentication of the event's origin.
 
 ### Jiyu group-name extension
 

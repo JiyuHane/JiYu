@@ -154,14 +154,19 @@ function instrumentCoordinator(module: typeof import('../../src/v12-runtime/poll
 function instrumentQueue(module: typeof import('../../src/v12-runtime/event-poll-buffer')) {
     const cls = module.EventPollBuffer;
     const realEnqueue = cls.prototype.enqueue;
+    const realEnqueueScopedRecall = cls.prototype.enqueueScopedRecall;
+    const realGuardedCleanup = cls.prototype.guardedCleanupState;
     const realReserveGuarded = cls.prototype.reserveGuarded;
     const realCommitGuarded = cls.prototype.commitGuardedNoDrain;
     return {
         realEnqueue,
+        realEnqueueScopedRecall,
+        realGuardedCleanup,
         realReserveGuarded,
         realCommitGuarded,
         scoped: vi.spyOn(cls, 'scoped'),
         enqueue: vi.spyOn(cls.prototype, 'enqueue'),
+        enqueueScopedRecall: vi.spyOn(cls.prototype, 'enqueueScopedRecall'),
         cleanup: vi.spyOn(cls.prototype, 'guardedCleanupState'),
         reserveGuarded: vi.spyOn(cls.prototype, 'reserveGuarded'),
         commitGuarded: vi.spyOn(cls.prototype, 'commitGuardedNoDrain'),
@@ -758,7 +763,7 @@ describe('real production scoped HTTP owner (in-memory transport and sinks)', ()
         }
     });
 
-    it('keeps a proven friend recall WS-only while normal HTTP queue remains scoped', async () => {
+    it('admits a proven friend recall to the scoped HTTP queue after WS fanout', async () => {
         const f = await account();
         const peer = connect(f.transport.instance);
         const ticket = f.ticket();
@@ -790,10 +795,225 @@ describe('real production scoped HTTP owner (in-memory transport and sinks)', ()
             detail_type: 'private_message_delete',
             message_id: '-7',
         });
-        expect(realScopedQueue().stats()).toMatchObject({ count: 0, reserved: 0 });
+        const scoped = realScopedQueue();
+        expect(scoped.stats()).toMatchObject({ count: 1, reserved: 0 });
+        expect(ownerApi.pollOwnerStats(f.runtime)).toMatchObject({ active: true, accepted: 1 });
         expect(queue.enqueue).not.toHaveBeenCalled();
+        expect(queue.enqueueScopedRecall).toHaveBeenCalledOnce();
+        expect(queue.enqueueScopedRecall.mock.contexts[0]).toBe(scoped);
+        expect(queue.enqueueScopedRecall.mock.results[0]!.value).toBe('accepted');
+        const [candidate, proof, eventTicket] = queue.enqueueScopedRecall.mock.calls[0]!;
+        const scope = queue.scoped.mock.calls[0]![2]; // The real runtime-created scope.
+        expect(eventTicket).toBe(ticket);
+        expect(recallApi.isPrivateRecallPollProofFor(proof, candidate)).toBe(true);
+        expect(recallApi.isPrivateRecallPollProofInEpochAccountScope(proof, ticket, scope)).toBe(
+            true,
+        );
+        expect(candidate).toEqual(notices[0]);
+        const response = await poll(f.transport.instance);
+        expect(response.echo).toBe(ECHO);
+        expect(events(response)).toEqual(notices);
         expect(events(await poll(f.transport.instance))).toEqual([]);
-        expect(fake.warnings).toContain('v12 http poll omits private recall events');
+        expect(queue.enqueueScopedRecall).toHaveBeenCalledOnce();
+        expect(fake.warnings).not.toContain('v12 http poll private recall event not admitted');
+        assertNoLegacyTransaction();
+        noPrivateDiagnostics();
+    });
+
+    it('reports uncertain recall admission after a real guarded eviction and publication', async () => {
+        const gate = ownerApi.createPollGate();
+        const f = await account(gate);
+        const peer = connect(f.transport.instance);
+        const scoped = realScopedQueue();
+        const ticket = f.ticket();
+
+        for (let id = 1; id <= 128; id += 1) {
+            await f.manager.emitEvent(message(id, id), ticket);
+        }
+
+        expect(scoped.stats()).toMatchObject({ count: 128, reserved: 0, closed: false });
+        expect(scoped.oldestDropCount()).toBe(0n);
+        expect(queue.enqueue).toHaveBeenCalledTimes(128);
+        expect(queue.enqueueScopedRecall).not.toHaveBeenCalled();
+        expect(ownerApi.pollOwnerStats(f.runtime)).toMatchObject({
+            active: true,
+            accepted: 128,
+            admission_uncertain: 0,
+            dropped_oldest: '0',
+        });
+
+        const raw = {
+            kind: 'friend_recall' as const,
+            time: 200,
+            selfUin: 12345,
+            userUin: 23456,
+            msgSeq: 7,
+            clientSeq: 7,
+            recalledBySelf: false,
+        };
+        const event: JsonObject = {
+            time: 200,
+            self_id: 12345,
+            post_type: 'notice',
+            notice_type: 'friend_recall',
+            user_id: 23456,
+            message_id: -7,
+        };
+        const snapshot = recallApi.capturePrivateRecallSource(f.context, raw, ticket);
+        expect(snapshot).toBeDefined();
+        expect(recallApi.rememberPrivateRecallSource(f.context, event, snapshot, -7)).toBe(true);
+        const scope = queue.scoped.mock.calls[0]![2];
+        const dropWarning = 'v12 http poll queue full; oldest unreserved events dropped';
+        const privateRecallWarning = 'v12 http poll private recall event not admitted';
+        expect(fake.warnings).not.toContain(dropWarning);
+        expect(fake.warnings).not.toContain(ADMISSION_WARNING);
+
+        const logger = (
+            f.runtime as unknown as {
+                log: { warn: (...args: unknown[]) => void };
+            }
+        ).log;
+        const originalWarn = logger.warn;
+        const warningsAfterWs: Array<{ message: string; notices: number }> = [];
+        const warn = vi.spyOn(logger, 'warn').mockImplementation((...args) => {
+            const first = args[0];
+
+            if (first === dropWarning || first === ADMISSION_WARNING) {
+                warningsAfterWs.push({
+                    message: first,
+                    notices: (peer.frames as WireEvent[]).filter(
+                        (frame) =>
+                            frame.type === 'notice' &&
+                            frame.detail_type === 'private_message_delete',
+                    ).length,
+                });
+            }
+
+            Reflect.apply(originalWarn, logger, args);
+        });
+        const admit = vi.spyOn(ownerApi, 'enqueuePrivateRecallPollEvent');
+        const close = vi.spyOn(scoped, 'close');
+        const published: Array<{
+            result: string;
+            count: number;
+            reserved: number;
+            drops: bigint;
+            cleanup: string;
+            candidate: unknown;
+            proof: unknown;
+            eventTicket: unknown;
+            proofValid: boolean;
+            proofInScope: boolean;
+        }> = [];
+        let uncertainReports = 0;
+        let cleanupContext: InstanceType<typeof bufferApi.EventPollBuffer> | undefined;
+        const recall = queue.enqueueScopedRecall.mockImplementation(function (
+            this: InstanceType<typeof bufferApi.EventPollBuffer>,
+            candidate,
+            proof,
+            eventTicket,
+        ) {
+            const result = Reflect.apply(queue.realEnqueueScopedRecall, this, [
+                candidate,
+                proof,
+                eventTicket,
+            ]);
+
+            if (result === 'accepted') {
+                const state = this.stats();
+                published.push({
+                    result,
+                    count: state.count,
+                    reserved: state.reserved,
+                    drops: this.oldestDropCount(),
+                    cleanup: Reflect.apply(queue.realGuardedCleanup, this, []),
+                    candidate,
+                    proof,
+                    eventTicket,
+                    proofValid: recallApi.isPrivateRecallPollProofFor(proof, candidate),
+                    proofInScope: recallApi.isPrivateRecallPollProofInEpochAccountScope(
+                        proof,
+                        eventTicket,
+                        scope,
+                    ),
+                });
+                // The real enqueue already published. Fault-inject only the
+                // following cleanup observation and record its queue instance.
+                queue.cleanup.mockImplementationOnce(function (
+                    this: InstanceType<typeof bufferApi.EventPollBuffer>,
+                ) {
+                    cleanupContext = this;
+                    uncertainReports += 1;
+                    return 'uncertain';
+                });
+            }
+
+            return result;
+        });
+
+        await f.manager.emitEvent(event, ticket);
+        await settle();
+
+        expect(recall).toHaveBeenCalledOnce();
+        expect(queue.enqueueScopedRecall).toHaveBeenCalledOnce();
+        expect(queue.enqueueScopedRecall.mock.contexts[0]).toBe(scoped);
+        expect(queue.enqueueScopedRecall.mock.results[0]!.value).toBe('accepted');
+        expect(published).toHaveLength(1);
+        expect(published[0]).toMatchObject({
+            result: 'accepted',
+            count: 128,
+            reserved: 0,
+            drops: 1n,
+            cleanup: 'open',
+            proofValid: true,
+            proofInScope: true,
+        });
+        const [candidate, proof, eventTicket] = queue.enqueueScopedRecall.mock.calls[0]!;
+        expect(candidate).toBe(published[0]!.candidate);
+        expect(proof).toBe(published[0]!.proof);
+        expect(eventTicket).toBe(ticket);
+        expect(published[0]!.eventTicket).toBe(ticket);
+        expect(uncertainReports).toBe(1);
+        expect(cleanupContext).toBe(scoped);
+        expect(admit).toHaveBeenCalledOnce();
+        expect(admit.mock.results[0]).toMatchObject({ type: 'return', value: 'uncertain' });
+        expect(ownerApi.pollOwnerStats(f.runtime)).toMatchObject({
+            active: false,
+            accepted: 128,
+            admission_uncertain: 1,
+            dropped_oldest: '1',
+            cleanup_pending: true,
+            cleanup_uncertain: true,
+        });
+        expect(gate.uncertain).toBe(true);
+        expect(close).toHaveBeenCalledOnce();
+        expect(scoped.guardedCleanupState()).toBe('closed');
+        expect(scoped.stats()).toMatchObject({ count: 0, reserved: 0, closed: true });
+        expect(scoped.oldestDropCount()).toBe(1n);
+        expect(queue.enqueueScopedRecall).toHaveBeenCalledOnce();
+
+        expect(f.legacy.received).toHaveLength(129);
+        expect(f.legacy.received.filter((entry) => entry === event)).toEqual([event]);
+        const notices = (peer.frames as WireEvent[]).filter(
+            (frame) => frame.type === 'notice' && frame.detail_type === 'private_message_delete',
+        );
+        expect(notices).toHaveLength(1);
+        expect(notices[0]).toMatchObject({ message_id: '-7' });
+        expect(published[0]!.candidate).toEqual(notices[0]);
+        expect(warningsAfterWs).toEqual([
+            { message: dropWarning, notices: 1 },
+            { message: ADMISSION_WARNING, notices: 1 },
+        ]);
+        expect(
+            warn.mock.calls.filter(
+                ([message]) => message === dropWarning || message === ADMISSION_WARNING,
+            ),
+        ).toEqual([[dropWarning], [ADMISSION_WARNING]]);
+        expect(fake.warnings).not.toContain(privateRecallWarning);
+        expect(JSON.stringify(fake.warnings)).not.toContain('23456');
+        expect(JSON.stringify(fake.warnings)).not.toContain('"message_id"');
+        assertNoLegacyTransaction();
+        noPrivateDiagnostics();
     });
 
     it.each(['before-enqueue', 'during-host-verify'] as const)(

@@ -491,7 +491,7 @@ function friendAdd(): JsonObject {
 }
 
 describe('private recall proof/brand compatibility with the real V12 runtime', () => {
-    it('keeps both directions and signed IDs on the subscriber path while HTTP polling omits recall', async () => {
+    it('delivers both directions and signed IDs once to subscribers and scoped HTTP', async () => {
         const f = await fixture();
         expect(fake.noServerConstructed).toBe(1);
         expect(pollApi.pollOwnerStats(f.runtime)).toMatchObject({ active: true, accepted: 0 });
@@ -546,8 +546,11 @@ describe('private recall proof/brand compatibility with the real V12 runtime', (
         }
 
         expect(f.first.published).toHaveLength(2);
-        expect(pollApi.pollOwnerStats(f.runtime)).toMatchObject({ active: true, accepted: 0 });
-        expect(await poll(f.first.instance, 'recalls-omitted')).toEqual(ok([], 'recalls-omitted'));
+        expect(pollApi.pollOwnerStats(f.runtime)).toMatchObject({ active: true, accepted: 2 });
+        expect(await poll(f.first.instance, 'recalls')).toEqual(
+            ok([f.first.published[0], f.first.published[1]], 'recalls'),
+        );
+        expect(await poll(f.first.instance, 'recalls-drained')).toEqual(ok([], 'recalls-drained'));
         const ordinary = friendAdd();
         deliver(f, ordinary, f.ticket());
         expect(f.first.published).toHaveLength(3);
@@ -584,7 +587,12 @@ describe('private recall proof/brand compatibility with the real V12 runtime', (
         expect(f.first.published[0]).toEqual({ ...input.converted, id: expect.any(String) });
         await f.runtime[sourceApi.receiveSourceEvent](input.event, payload, input.ticket);
         expect(f.first.published).toHaveLength(1);
-        expect(await poll(f.first.instance, 'duplicate')).toEqual(ok([], 'duplicate'));
+        expect(await poll(f.first.instance, 'duplicate')).toEqual(
+            ok([f.first.published[0]], 'duplicate'),
+        );
+        expect(await poll(f.first.instance, 'duplicate-drained')).toEqual(
+            ok([], 'duplicate-drained'),
+        );
         expect(Object.isFrozen(input.event)).toBe(false);
         expect(Object.getOwnPropertyDescriptors(input.event)).toEqual(input.descriptors);
     });
@@ -646,10 +654,14 @@ describe('private recall proof/brand compatibility with the real V12 runtime', (
         deliver(f, input.event, sameEpochTicket);
         await f.runtime.onEvent(input.event, filterApi.buildDispatchPayload(input.event));
         expect(f.first.published).toEqual([]);
+        expect(await poll(f.first.instance, 'invalid-clones')).toEqual(ok([], 'invalid-clones'));
         deliver(f, input.event, input.ticket);
         expect(f.first.published).toHaveLength(1);
         expect(f.first.published[0]).toEqual({ ...input.converted, id: expect.any(String) });
-        expect(await poll(f.first.instance, 'clones')).toEqual(ok([], 'clones'));
+        expect(await poll(f.first.instance, 'clones')).toEqual(
+            ok([f.first.published[0]], 'clones'),
+        );
+        expect(await poll(f.first.instance, 'clones-drained')).toEqual(ok([], 'clones-drained'));
     });
 
     it('rejects undispatched stale tickets on close, reopen and online-epoch change', async () => {
@@ -674,6 +686,7 @@ describe('private recall proof/brand compatibility with the real V12 runtime', (
         deliver(f, stale.event, stale.ticket);
         deliver(f, stale.event, nextTicket);
         expect(next.published).toEqual([]);
+        expect(await poll(next.instance, 'stale-reopened')).toEqual(ok([], 'stale-reopened'));
 
         // Proof is a local object binding, not an epoch verifier; runtime must
         // independently reject the expired source even while the proof is current.
@@ -685,9 +698,12 @@ describe('private recall proof/brand compatibility with the real V12 runtime', (
         deliver(f, fresh.event, fresh.ticket);
         expect(next.published).toHaveLength(1);
         expect(next.published[0]).toEqual({ ...fresh.converted, id: expect.any(String) });
-        expect(await poll(next.instance, 'reopened')).toEqual(ok([], 'reopened'));
+        expect(await poll(next.instance, 'reopened')).toEqual(ok([next.published[0]], 'reopened'));
+        expect(await poll(next.instance, 'reopened-drained')).toEqual(ok([], 'reopened-drained'));
 
         const offlineStale = recalled(f, false, -53);
+        const acceptedBeforeOffline = pollApi.pollOwnerStats(f.runtime)?.accepted;
+        expect(acceptedBeforeOffline).toBeDefined();
         f.generation.setOnline(false);
         f.generation.setOnline(true);
         expect(
@@ -695,6 +711,9 @@ describe('private recall proof/brand compatibility with the real V12 runtime', (
         ).toBe(false);
         deliver(f, offlineStale.event, offlineStale.ticket);
         expect(next.published).toHaveLength(1);
+        // Scope churn can make the next HTTP request temporarily unavailable;
+        // the admission counter still proves the stale event did not enter.
+        expect(pollApi.pollOwnerStats(f.runtime)?.accepted).toBe(acceptedBeforeOffline);
         expect(recallApi.isPrivateRecallPollProofCurrent(offlineStale.proof)).toBe(true);
         expect(Object.getOwnPropertyDescriptors(stale.event)).toEqual(stale.descriptors);
         expect(Object.getOwnPropertyDescriptors(offlineStale.event)).toEqual(

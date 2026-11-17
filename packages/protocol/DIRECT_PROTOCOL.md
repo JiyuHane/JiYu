@@ -779,9 +779,10 @@ saves both `K` and `n3` in local slots. A subsequent handler independently
 rereads descriptor `+8`; if this later read also equals 4, the selected branch
 calculates the addresses `P+0x28` and `P+8`. Those address calculations do not
 read their contents or use `G` as the base, and do not establish a reference to
-`G+0x28`; aliasing between `P` and `G` remains unobserved. The later consumer
-of `K` and the exit of this path remain unresolved. Neither `n3` nor either `+8`
-check is an observation of runtime values, and the repeated reads need not match.
+`G+0x28`; aliasing between `P` and `G` remains unobserved. These observations
+alone do not establish what consumes `K` or the exit of this path; a further
+conditional path is examined below. Neither `n3` nor either `+8` check is an
+observation of runtime values, and the repeated reads need not match.
 
 Under the further conditions that `n3` is nonzero and the saved slots and pointer
 remain stable, the selected handler reads the first dword of `P` as `c`, saves
@@ -796,13 +797,51 @@ return value or SSO signing callback.
 On the selected no-carry branch, the code tests `t = c & 63` and copies `t`,
 `K` and `n3` into further local slots. When `t` is zero, it subsequently compares
 `n3` as an unsigned length against 64. Under the additional condition `n3 >= 64`,
-the inspected handlers copy `K` and `n3` again, initialize a local index to zero,
-and dispatch to `0x6c0072e`; that target has not yet been inspected. A zero `t`
-does not by itself imply `c` is zero. The inspected post-XOR dispatch path does
-not establish a subsequent read of `K`'s contents or a call to a consumer, and
-the `n3 >= 64` condition is not a runtime observation. The current `n3` is a
-separate descriptor read and need not match the earlier lengths or the original
-file byte.
+the inspected handlers copy `K` and `n3` again and dispatch to `0x6c0072e`.
+A zero `t` does not by itself imply `c` is zero, and `n3 >= 64` is not a runtime
+observation. The current `n3` is a separate descriptor read and need not match
+the earlier lengths or the original file byte.
+
+On that further selected path, `0x6c0072e` first controls a loop that copies eight
+32-bit values through a separately obtained base pointer into stack storage; its
+alias relationship with `K` is unobserved. Only after that loop finishes does the
+code initialize an index `j` to zero and, while `j < 16`, read four bytes per
+iteration from the pointer saved at `[rbp-0x1b18]`. The previously traced
+pointer-copy chain identifies that pointer as `K` under the same slot-stability
+and non-destructive-alias assumptions. The byte loads at `0x6c0058c`,
+`0x6c00593`, `0x6c0059d` and `0x6bff4d1` are combined and written to the stack
+array at `[rbp-0x13b0 + 4*j]`. If the corresponding `K` bytes remain unchanged
+throughout their reads, the resulting 32-bit value is
+`W[j] = BE32(K[4*j .. 4*j+3])`; otherwise, its four bytes are the values at
+their respective load times. Reaching and completing these reads additionally
+requires the eight preceding source words to be readable, their destinations to
+be writable, and all 64 bytes of `K` to be readable; the length comparison alone
+does not establish allocation capacity or valid addresses.
+
+After the 16-word load, a separate index `k` begins at zero. In the selected
+first iteration, `0x6c004bc–0x6c004dd` reads `W[0]` and the first 32-bit table
+entry at linked address `0x00fe6a00`. Assuming `W[0]` remains intact between
+its creation and this use, these values and the `r15` fields are readable and
+stable across their uses, and the intermediate stack slots are writable without
+destructive aliasing, write `E`, `F`, `G` and `H` for
+the loaded 32-bit fields at offsets `+0x10`, `+0x14`, `+0x18` and `+0x1c` of
+`r15`. The inspected instructions compute, modulo 2^32:
+
+```text
+mix = G ^ ((F ^ G) & E)
+rot = ROL32(E, 26) ^ ROL32(E, 21) ^ ROL32(E, 7)
+T   = H + rot + table[0] + mix + W[0]
+```
+
+The result is stored in a temporary stack slot at `0x6c004f5`. The table's first
+16 original file bytes are `98 2f 8a 42 91 44 37 71 cf fb c0 b5 a5 db b5 e9`;
+interpreted as little-endian 32-bit words they are `428a2f98`, `71374491`,
+`b5c0fbcf` and `e9b5dba5`. Treating those as runtime table values additionally
+requires the loading, any relocations and subsequent writes to preserve the
+corresponding file bytes. The first-round expression and these first four
+constants match the corresponding SHA-256 compression term and round constants;
+this local match does not prove the complete algorithm, final output, or a
+connection to the current QQ SSO signing callback.
 
 The original file bytes `+0xc = 0x20` and `+0xd = 0x40` suggest `L=32` and
 64-byte halves only if they and the relevant reads remain unchanged at runtime.

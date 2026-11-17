@@ -27,6 +27,7 @@ import type { JsonObject } from '../types';
 import { safeV12Error, V12_ADAPTER_NAME, type V12ManagedConfig } from './identity';
 import {
     convertPrivateRecallEvent,
+    createPrivateRecallPollProof,
     matchesPrivateRecallEvent,
     type PrivateRecallProvenance,
 } from './private-recall-source';
@@ -45,6 +46,7 @@ import type { DispatchPayload } from '../event-filter';
 import {
     activateHttpPollOwner,
     enqueuePollEvent,
+    enqueuePrivateRecallPollEvent,
     failOrderedPollIngress,
     hasHttpPollOwner,
     hasOrderedPollOwner,
@@ -129,6 +131,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     }> = [];
     readonly #privateRecallInFlight = new WeakSet<object>();
     readonly #privateRecallPublished = new WeakMap<object, V12Source>();
+    readonly #privateRecallPollAttempts = new WeakMap<JsonObject, WeakSet<V12Source>>();
     private statusEmitting = false;
     private statusPending = false;
     private statusImmediate: ReturnType<typeof setImmediate> | null = null;
@@ -1140,6 +1143,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             };
 
             let converted: ReturnType<typeof convertV11Event>;
+            let conversionSelf: V12Self | undefined;
             let issuedImageIssuer: V12ImageFileTokens | null = null;
             let issuedVoiceIssuer: V12VoiceFileTokens | null = null;
             let issuedVideoIssuer: V12VideoFileTokens | null = null;
@@ -1162,10 +1166,14 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             };
 
             if (privateRecall) {
-                converted =
-                    recallSource && recallScopeCurrent()
-                        ? convertPrivateRecallEvent(event, this.self, recallSource)
-                        : null;
+                if (recallSource && recallScopeCurrent()) {
+                    // Preserve the original read order: the scope verifier runs
+                    // before capturing the exact identity used by conversion.
+                    conversionSelf = this.self;
+                    converted = convertPrivateRecallEvent(event, conversionSelf, recallSource);
+                } else {
+                    converted = null;
+                }
 
                 // Verification may synchronously reenter. Check the same live scope,
                 // epoch and original event again after it returns.
@@ -1372,11 +1380,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                         // subscriber or guard callback can reenter.
                         this.#privateRecallPublished.set(event, source);
 
-                        // The production HTTP owner does not enqueue this projection.
-                        // Capture the diagnostic before, but log only after WS fanout.
-                        const pollMissesRecall = hasHttpPollOwner(this);
-
-                        // Poll delivery has no final guard on the original v11 object.
+                        // The ordered prototype has no final guard on the original v11 object.
                         // A genuinely admitted projection must not disappear silently.
                         if (admission?.kind === 'eligible' && admission.target === this) {
                             failOrderedAdmission(admission);
@@ -1384,16 +1388,49 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                             skipOrderedAdmission(admission);
                         }
 
-                        this.publish(
-                            converted,
-                            () =>
-                                recallScopeCurrent() &&
-                                matchesPrivateRecallEvent(event, verifiedSource),
-                        );
+                        // Capture the same completion-order eligibility used by
+                        // ordinary events before invoking WS subscribers.
+                        let allowCompletionOrder = false;
 
-                        if (pollMissesRecall) {
-                            this.warnHttpPoll('private_recall');
+                        try {
+                            allowCompletionOrder =
+                                (!admission || admission.kind === 'disabled') &&
+                                !hasOrderedPollOwner(this);
+                        } catch {
+                            // An unconfirmed poll mode must not affect WS fanout.
                         }
+
+                        const recallCurrent = (): boolean =>
+                            recallScopeCurrent() &&
+                            matchesPrivateRecallEvent(event, verifiedSource);
+                        this.publish(converted, recallCurrent);
+
+                        const ownsRecallScope = (): boolean =>
+                            scope !== undefined &&
+                            privateRecallOwner !== undefined &&
+                            scope.privateRecallOwner === privateRecallOwner &&
+                            this.#sourceScopes.at(-1) === scope &&
+                            scope.event === event &&
+                            scope.payload === payload &&
+                            scope.source === source &&
+                            verifiedSource.sourceTicket === source &&
+                            this.isEnabled &&
+                            this.accepting &&
+                            matchesPrivateRecallEvent(event, verifiedSource);
+
+                        // HTTP admission is independent of established WS fanout.
+                        // Its local attempt marker is installed before any guard,
+                        // activation, proof, statistics or provider callback.
+                        this.enqueuePrivateRecallAfterFanout(
+                            event,
+                            source,
+                            verifiedSource,
+                            conversionSelf,
+                            converted,
+                            recallCurrent,
+                            ownsRecallScope,
+                            allowCompletionOrder,
+                        );
                     } else if (admission) {
                         skipOrderedAdmission(admission);
                     }
@@ -1745,6 +1782,233 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
         }
     }
 
+    /** One local HTTP attempt for an exact event/ticket pair, after WS fanout. */
+    private enqueuePrivateRecallAfterFanout(
+        event: JsonObject,
+        source: V12Source,
+        provenance: PrivateRecallProvenance,
+        conversionSelf: V12Self | undefined,
+        candidate: unknown,
+        guard: () => boolean,
+        ownsScope: () => boolean,
+        allowCompletionOrder: boolean,
+    ): void {
+        const warn = (kind: HttpPollDiagnostic): void => {
+            try {
+                this.warnHttpPoll(kind);
+            } catch {
+                // Diagnostics are independent of WS and v11 delivery.
+            }
+        };
+
+        let enteredAdmission = false;
+        let observedAdmission = false;
+
+        try {
+            let attempts = this.#privateRecallPollAttempts.get(event);
+
+            if (!attempts) {
+                attempts = new WeakSet<V12Source>();
+                this.#privateRecallPollAttempts.set(event, attempts);
+            }
+
+            if (attempts.has(source)) {
+                return;
+            }
+
+            // Weak keys avoid retaining either the original event or its ticket.
+            // This is local object-identity deduplication, not QQ-wide idempotency.
+            attempts.add(source);
+
+            // Even an excluded ordered attempt stays marked for this exact pair.
+            if (!allowCompletionOrder) {
+                return;
+            }
+
+            // Bind this attempt to the exact listener observed after WS fanout;
+            // an activation callback must not retarget it to a replacement.
+            const transport = this.transport;
+            const token = this.currentStatusTransportToken;
+            const uploadGeneration = this.#uploadGeneration;
+            const openingOwner = this.openingOwner;
+            const attempt = this.sourceAttempt;
+            const binding = this.sourceBinding;
+            const owns = (): boolean =>
+                transport !== null &&
+                token !== null &&
+                uploadGeneration !== null &&
+                uploadGeneration.valid === true &&
+                uploadGeneration.token === token &&
+                this.#uploadGeneration === uploadGeneration &&
+                openingOwner === token &&
+                attempt !== null &&
+                binding === attempt &&
+                this.transport === transport &&
+                this.currentStatusTransportToken === token &&
+                this.openingOwner === openingOwner &&
+                this.sourceAttempt === attempt &&
+                this.sourceBinding === binding &&
+                this.isEnabled &&
+                this.accepting &&
+                ownsScope();
+
+            const current = (): boolean => {
+                try {
+                    if (transport === null || !owns() || guard() !== true || !owns()) {
+                        return false;
+                    }
+
+                    if (!this.uploadTransportReady(transport, owns) || !owns()) {
+                        return false;
+                    }
+
+                    if (this.options.canAccept() !== true || !owns()) {
+                        return false;
+                    }
+
+                    if (guard() !== true || !owns()) {
+                        return false;
+                    }
+
+                    // Readiness may invalidate the source without changing the
+                    // listener references, so sample the same source guard again.
+                    if (!this.uploadTransportReady(transport, owns) || !owns()) {
+                        return false;
+                    }
+
+                    // These callback observations are not an atomic snapshot: the
+                    // final guard itself can change independent listener readiness.
+                    return guard() === true && owns();
+                } catch {
+                    return false;
+                }
+            };
+
+            if (!conversionSelf || !current()) {
+                warn('private_recall');
+                return;
+            }
+
+            // A first recall can activate the production HTTP owner. Activation
+            // may synchronously reenter or replace the listener/source.
+            const activation = this.activateHttpPoll(current);
+
+            if (activation.status !== 'ready' || !current()) {
+                warn('private_recall');
+                return;
+            }
+
+            const proof = createPrivateRecallPollProof(
+                event,
+                provenance,
+                source,
+                conversionSelf,
+                candidate,
+            );
+
+            if (!proof || !current()) {
+                warn('private_recall');
+                return;
+            }
+
+            let before: ReturnType<typeof pollOwnerStats> = null;
+            let after: ReturnType<typeof pollOwnerStats> = null;
+
+            try {
+                before = pollOwnerStats(this);
+            } catch {
+                warn('cleanup_pending');
+            }
+
+            if (!current()) {
+                warn('private_recall');
+                return;
+            }
+
+            // No retry after entry: an exception can follow a real queue effect.
+            enteredAdmission = true;
+            const outcome: unknown = enqueuePrivateRecallPollEvent(
+                this,
+                activation.owner,
+                candidate,
+                proof,
+                source,
+                current,
+            );
+            observedAdmission = true;
+
+            try {
+                after = pollOwnerStats(this);
+            } catch {
+                warn('cleanup_pending');
+            }
+
+            // An uncertain admission can still have evicted older events. The
+            // watermark is independent of the new recall's unknown outcome.
+            if (before && after && after.dropped_oldest !== before.dropped_oldest) {
+                warn('dropped_oldest');
+            }
+
+            if (outcome === 'uncertain') {
+                warn('admission_uncertain');
+                return;
+            }
+
+            if (
+                outcome !== 'accepted' &&
+                outcome !== 'unavailable' &&
+                outcome !== 'full' &&
+                outcome !== 'oversize' &&
+                outcome !== 'invalid'
+            ) {
+                warn('admission_uncertain');
+                return;
+            }
+
+            if (before && after) {
+                if (after.full > before.full) {
+                    warn('full');
+                }
+
+                if (after.too_large > before.too_large) {
+                    warn('too_large');
+                }
+
+                if (after.invalid > before.invalid) {
+                    warn('invalid');
+                }
+
+                if (after.admission_uncertain > before.admission_uncertain) {
+                    warn('admission_uncertain');
+                }
+            }
+
+            if (outcome === 'full') {
+                warn('full');
+            } else if (outcome === 'oversize') {
+                warn('too_large');
+            } else if (outcome === 'invalid') {
+                warn('invalid');
+            }
+
+            if (outcome !== 'accepted') {
+                warn('private_recall');
+            }
+        } catch {
+            if (!allowCompletionOrder) {
+                return;
+            }
+
+            if (enteredAdmission && !observedAdmission) {
+                warn('admission_uncertain');
+            } else if (!enteredAdmission) {
+                warn('private_recall');
+            } else {
+                warn('cleanup_pending');
+            }
+        }
+    }
+
     /** Preserve legacy admission while collecting bounded HTTP queue loss diagnostics. */
     private enqueuePollWithDiagnostics(
         event: unknown,
@@ -1823,7 +2087,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             invalid: 'v12 http poll event invalid; event dropped',
             admission_uncertain:
                 'v12 http poll admission outcome unknown; event may have been queued',
-            private_recall: 'v12 http poll omits private recall events',
+            private_recall: 'v12 http poll private recall event not admitted',
             transport_error: 'v12 http poll response failed',
             delivery_uncertain: 'v12 http poll delivery outcome unknown; events may be missed',
             closing_discard: 'v12 http poll retired with undelivered buffered events',

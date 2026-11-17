@@ -259,6 +259,22 @@ export interface OneBot12QQGroupNameChangeEvent extends OneBot12PlatformEvent {
     operator_id?: string;
 }
 
+/**
+ * Private-message deletion notice currently emitted by Jiyu's QQ adapter.
+ * `user_id` identifies the recalling party, which may be the bot or its peer;
+ * `message_id` is a string and may represent a negative signed 32-bit ID.
+ * This type describes that shape only: the generic event and polling parsers
+ * do not validate these detail-specific fields or authenticate a QQ origin.
+ */
+export interface OneBot12QQPrivateMessageDeleteEvent extends OneBot12PlatformEvent {
+    type: 'notice';
+    detail_type: 'private_message_delete';
+    sub_type: '';
+    self: OneBot12Self & { platform: 'qq' };
+    message_id: string;
+    user_id: string;
+}
+
 export type OneBot12Event = OneBot12MetaEvent | OneBot12PlatformEvent;
 
 /** Both fields use the safe integer subset of the protocol's int64. */
