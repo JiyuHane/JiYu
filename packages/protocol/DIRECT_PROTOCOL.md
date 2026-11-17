@@ -643,9 +643,47 @@ Two other observed calls request 32 bytes from PLT `0x8e10800`: at
 `0x6d00c68–0x6d00c72` it is saved in the `Q` slot. Its `.rela.plt` entry at file
 offset `0x850fd0` declares `malloc`; the actual binding, allocation success,
 intervening slot updates, buffer contents and possible aliasing are unknown.
-The relation of this XOR chain to the word-writing loop and later return is also
-unproved. Consequently, neither the candidate random-word block nor these local
-operations establish the bytes returned by the helper or a complete signature.
+
+On an inspected conditional path, the `P` buffer is filled before the
+random-word writes above; afterwards the `Q` buffer is filled, and the XOR
+loop runs. The `P` path calls the PLT at `0x6d009a4`; the `Q` path calls it
+again at `0x6d00c9c`. PLT `0x8e124c0` uses GOT `0x91609b0`; its
+`.rela.plt[0x24b]` entry at file offset `0x853af0` declares the external symbol
+`std::chrono::_V2::system_clock::now`. Each path saves the return and uses
+`mov ecx, eax` to initialize the first state slot, thus retaining its low 32-bit
+pattern. The two call results are separate observations: their actual values,
+clock units and equality are not established.
+
+Each path initializes 624 eight-byte slots, followed by an index value of 624,
+using the 32-bit recurrence multiplier `0x6c078965`. The engine call targets PLT
+`0x8e12120` and GOT `0x91607e0`; `.rela.plt[0x211]` at file offset `0x853580`
+references a weak defined `std::mersenne_twister_engine` operator with the
+32-bit MT19937 parameters and ELF symbol value `0x6d06e00`. Its candidate
+`_M_gen_rand` at `0x6d06e66` follows PLT `0x8e12150` and a separate relocation.
+Under the seeded-state invariant that the upper 32 bits of every eight-byte slot
+remain zero, the inspected initialization, in-place 624-word twist and temper
+operations agree with the standard 32-bit recurrence. The two byte loops use
+x86's masked 32-bit shift count and store only `AL`; each successive four-byte
+group is therefore emitted low byte first. On this path eight words fill each
+buffer, while a ninth call is made after the final byte; its later effect remains
+unknown. Initial GOT contents are lazy-binding stubs, not observed resolved
+function addresses. Interposition, dynamic binding, actual calls and the values
+stored remain unverified.
+
+The separate [seeded slice-mix candidate](src/direct/target-seeded-mt-slice-mix-candidate.ts)
+is a pure local model: callers supply two uint32 seeds and the 32-byte slice
+**after** the candidate random-word writes but **before** the XOR. It creates
+two standard MT19937 streams and returns the XOR of their first eight words,
+expanded low byte first, with that caller-supplied slice. Its input restrictions
+and memory bounds are local policy, and it has no connection to a signer or the
+existing return candidate. Its finite output matches independent synthetic C++
+`std::mt19937` and NumPy `RandomState` vectors; those vectors do not establish
+native execution. The model assumes the inspected dispatcher states and calls
+occur in order, the target functions bind as above, memory remains valid and
+stable, and no intervening write or destructive alias changes the values. The
+path after the XOR and its connection to the helper's eventual return are still
+unproved; neither this model nor the earlier random-word observations establish
+a complete signature or QQ acceptance.
 
 These code observations use the executable `PT_LOAD` mapping stated above,
 not a file mapping for `G` or the adjacent global object. Capstone and Zydis
