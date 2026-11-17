@@ -812,16 +812,24 @@ describe('candidate reserve transaction with synthetic in-memory transport', () 
         expect(output).toEqual(originalOutput);
     });
 
-    it('fails without a frame when the callback replaces DataView with a sequence-zeroing subclass', async () => {
+    it('fails without a frame when the callback replaces DataView with a sequence-zeroing constructor', async () => {
         const input = options();
         const fixture = normalFake();
         const output = candidateOutput();
         const OriginalDataView = globalThis.DataView;
-        class SequenceZeroDataView extends OriginalDataView {
-            override setUint32(byteOffset: number, value: number, littleEndian?: boolean): void {
-                super.setUint32(byteOffset, byteOffset === 4 ? 0 : value, littleEndian);
-            }
-        }
+        const SequenceZeroDataView = function (
+            buffer: ArrayBufferLike,
+            byteOffset?: number,
+            byteLength?: number,
+        ) {
+            const view = new OriginalDataView(buffer, byteOffset, byteLength);
+            const originalSet = view.setUint32;
+            Object.defineProperty(view, 'setUint32', {
+                value: (offset: number, value: number, littleEndian?: boolean) =>
+                    originalSet.call(view, offset, offset === 4 ? 0 : value, littleEndian),
+            });
+            return view;
+        } as unknown as DataViewConstructor;
         const build = vi.fn(() => {
             globalThis.DataView = SequenceZeroDataView;
             return { status: 0, output };
