@@ -626,15 +626,26 @@ initialization path, not proof that it runs or that either import binds to the
 named implementation. The actual object state, call results, reachability, lock
 coverage, and stability of stack slots and global contents remain unknown.
 
-Another bounded candidate can change the same slice: `0x6d011df–0x6d011f4`
-forms `G + 0x28 + [rbp-0x1a58]` and saves the pointer at `[rbp-0x1a50]`;
-`0x6d00f10–0x6d00f1d` loads another value and writes its low byte through the
-saved pointer. A separate window at `0x6d011fb–0x6d01218` reads through that
-pointer and XORs a byte from another pointer. Their reachability, input bytes,
-intervening slot changes, ordering relative to the word-writing loop, and any
-connection between the XOR result and that indirect write are not established.
-Consequently, the observed candidate random-word block does not establish the
-bytes later returned by the helper or a complete signature.
+A separate chain of inspected dispatcher states can change the same slice. Let
+`i` be `[rbp-0x1a58]`, `P` be `[rbp-0x1a88]`, and `Q` be `[rbp-0x1a60]`.
+The handler at `0x6d011df–0x6d0123b` saves `d = G + 0x28 + i`, computes
+`*d XOR P[i]`, reads `Q[i]`, and selects state `0xd26f9f82`. The matching
+handler at `0x6d00f49–0x6d00f6b` XORs those saved values and selects
+`0x70cfd142`; its handler at `0x6d00f05–0x6d00f1d` writes the low byte through
+`d`. The subsequent state increments the index and returns to a local unsigned
+`index < 32` check. Under the inspected transitions, valid pointers, stable slots
+and no interfering writes, one iteration is `G[0x28+i] ^= P[i] ^ Q[i]`.
+A bounded initialization window sets the loop index to zero, but the complete
+path to that window and its runtime execution remain unproved.
+
+Two other observed calls request 32 bytes from PLT `0x8e10800`: at
+`0x6d00970–0x6d0097a` the result is saved in the `P` slot, and at
+`0x6d00c68–0x6d00c72` it is saved in the `Q` slot. Its `.rela.plt` entry at file
+offset `0x850fd0` declares `malloc`; the actual binding, allocation success,
+intervening slot updates, buffer contents and possible aliasing are unknown.
+The relation of this XOR chain to the word-writing loop and later return is also
+unproved. Consequently, neither the candidate random-word block nor these local
+operations establish the bytes returned by the helper or a complete signature.
 
 These code observations use the executable `PT_LOAD` mapping stated above,
 not a file mapping for `G` or the adjacent global object. Capstone and Zydis
