@@ -681,9 +681,50 @@ existing return candidate. Its finite output matches independent synthetic C++
 native execution. The model assumes the inspected dispatcher states and calls
 occur in order, the target functions bind as above, memory remains valid and
 stable, and no intervening write or destructive alias changes the values. The
-path after the XOR and its connection to the helper's eventual return are still
+connection from the subsequent XOR path to the helper's eventual return remains
 unproved; neither this model nor the earlier random-word observations establish
 a complete signature or QQ acceptance.
+
+Additional bounded Capstone x86 and Zydis windows extend the conditional path
+past the XOR loop without establishing its eventual return. When the saved
+index is 32, the unsigned comparison at `0x6d0118b` selects state
+`0xff0e352a`; the inspected dispatch tree reaches its matching handler at
+`0x6d0128d`. That handler reads a byte from global `0x917e398`, saves it in a
+local slot, and selects `0x1d3f1d43`. The corresponding handler selects one of
+two states according to that byte. If it is zero, a path calls `0x299eeac` with
+that global's address and branches on the return; its initialization paths are
+not fully reconstructed. If it is nonzero, the selected path tests a second
+byte at `0x917f728`, with a similar conditional call when that byte is zero.
+Both globals are in a writable, zero-filled portion of a load segment; their
+runtime values and intervening writes are unknown.
+
+On the conditional fast path where both bytes are nonzero, `0x6d0169b` passes
+`0x917e3a0` to PLT `0x8e12120`, then initializes an index to zero. Its
+`0x6d014d8` handler bounds the index below eight. For each index,
+`0x6d012e3–0x6d01302` shifts the saved low 32-bit result right by eight times
+`index % 4` and writes the low byte to `G + 0x50 + index`. After indices 3 and
+7, `0x6d015c1` makes another call to the same PLT with the same global object;
+the result after index 7 has no corresponding write in this eight-byte loop,
+and its later use is unknown. Subject to normal returns and stable state, the
+first two returned words therefore supply bytes 0–3 and 4–7 in low-byte-first
+order. This does not establish whether that global object's state is related to
+those used for `P` or `Q`. The referenced dynamic symbol is weak and
+public/default visibility, so it may be preempted; the file's initial lazy GOT
+entry is not the resolved runtime binding.
+
+After that loop exits, `0x6d016dd` writes the all-ones qword to `G + 0x20`, and
+the preceding instructions clear a separate 32-byte local stack region. These
+writes to `G + 0x20` and `G + 0x50` through `G + 0x57` lie outside the
+`G + 0x28` through `G + 0x47` slice, but inside the 160-byte block. The
+inspected continuation selects state `0x327ad760` and reaches the dispatcher
+handler at `0x6be748d`; subsequent inspected windows use additional local
+states and a byte read. A connection from this path to the slice read at
+`0x6d017fd`, a helper return, or the caller's output remains unproved. In the
+sequential stream reached from the direct branch target `0x6d01392`,
+`0x6d013c4` is the final byte of the instruction starting at `0x6d013c2`, not
+an instruction boundary in that stream. These are conditional static facts;
+indirect calls, aliases, concurrent writers and runtime control flow remain
+unresolved.
 
 These code observations use the executable `PT_LOAD` mapping stated above,
 not a file mapping for `G` or the adjacent global object. Capstone and Zydis
