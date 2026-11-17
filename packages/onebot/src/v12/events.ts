@@ -139,6 +139,48 @@ function ordinaryVoiceUrl(segment: object): string | null {
     return data.url;
 }
 
+/** Capture only initially recognizable group-name notices before any event getter or self spread. */
+function snapshotGroupNameEvent(input: unknown): Readonly<Record<string, unknown>> | null {
+    if (isProxy(input) || !isObject(input)) {
+        return null;
+    }
+
+    const postType = Object.getOwnPropertyDescriptor(input, 'post_type');
+
+    if (!postType || !('value' in postType) || postType.value !== 'notice') {
+        return null;
+    }
+
+    const noticeType = Object.getOwnPropertyDescriptor(input, 'notice_type');
+
+    if (!noticeType || !('value' in noticeType) || noticeType.value !== 'notify') {
+        return null;
+    }
+
+    const subType = Object.getOwnPropertyDescriptor(input, 'sub_type');
+
+    if (!subType?.enumerable || !('value' in subType) || subType.value !== 'group_name') {
+        return null;
+    }
+
+    const fields = visibleOwnData(input, [
+        'time',
+        'self_id',
+        'post_type',
+        'notice_type',
+        'sub_type',
+        'group_id',
+        'user_id',
+        'name_new',
+    ]);
+
+    if (!fields) {
+        throw new Error('invalid or unsupported V11 group name event');
+    }
+
+    return Object.freeze(fields);
+}
+
 /** A known but unsupported V11 event returns null; malformed input throws. */
 export function convertV11Event(
     input: unknown,
@@ -153,11 +195,52 @@ export function convertV11Event(
         throw new Error('invalid V11 event or V12 account identity');
     }
 
-    // Capture identity before inspecting the event: event getters can reenter
-    // caller code, but cannot change the identity used for this projection.
+    // This recognized extension must be snapshotted before self getters can
+    // mutate the source event. Other event paths retain their legacy reads.
+    const groupNameFields = snapshotGroupNameEvent(input);
+
+    // Legacy paths capture identity before reading event properties; the group-name
+    // candidate above has already been copied using data descriptors only.
     const eventSelf = { ...self };
 
-    if (!isSelf(eventSelf) || !isObject(input)) {
+    if (!isSelf(eventSelf)) {
+        throw new Error('invalid V11 event or V12 account identity');
+    }
+
+    if (groupNameFields !== null) {
+        const groupId = fromV11AccountId(groupNameFields.group_id);
+        const operatorId = fromV11AccountId(groupNameFields.user_id);
+
+        if (
+            groupNameFields.post_type !== 'notice' ||
+            groupNameFields.notice_type !== 'notify' ||
+            groupNameFields.sub_type !== 'group_name' ||
+            fromV11AccountId(groupNameFields.self_id) !== eventSelf.user_id ||
+            groupId === null ||
+            (operatorId === null && !Object.is(groupNameFields.user_id, 0)) ||
+            typeof groupNameFields.name_new !== 'string' ||
+            groupNameFields.name_new.length === 0 ||
+            groupNameFields.name_new.length > 1024 ||
+            !isV12Time(groupNameFields.time)
+        ) {
+            throw new Error('invalid or unsupported V11 group name event');
+        }
+
+        return {
+            id: randomUUID(),
+            time: groupNameFields.time,
+            type: 'notice',
+            detail_type: 'qq.group_name_change',
+            sub_type: '',
+            self: { ...eventSelf },
+            group_id: groupId,
+            group_name: groupNameFields.name_new,
+            // Zero denotes an unresolved operator, not proof of no operator.
+            ...(operatorId === null ? {} : { operator_id: operatorId }),
+        };
+    }
+
+    if (!isObject(input)) {
         throw new Error('invalid V11 event or V12 account identity');
     }
 

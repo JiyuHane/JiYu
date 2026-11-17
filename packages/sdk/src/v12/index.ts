@@ -33,6 +33,7 @@ export type {
     OneBot12MessageSegment,
     OneBot12OutgoingMessage,
     OneBot12PlatformEvent,
+    OneBot12QQGroupNameChangeEvent,
     OneBot12Self,
     OneBot12TextSegment,
     OneBot12UploadFileDataParams,

@@ -238,6 +238,21 @@ export interface OneBot12PlatformEvent extends OneBot12EventBase {
     self: OneBot12Self;
 }
 
+/**
+ * Jiyu-specific notice, not a standard OneBot 12 event. The generic event
+ * parser does not validate its detail-specific fields; this shape does not
+ * authenticate that an event originated from QQ.
+ */
+export interface OneBot12QQGroupNameChangeEvent extends OneBot12PlatformEvent {
+    type: 'notice';
+    detail_type: 'qq.group_name_change';
+    sub_type: '';
+    group_id: string;
+    group_name: string;
+    /** Jiyu omits this for an unresolved operator; omission does not prove there was no operator. */
+    operator_id?: string;
+}
+
 export type OneBot12Event = OneBot12MetaEvent | OneBot12PlatformEvent;
 
 /** Both fields use the safe integer subset of the protocol's int64. */

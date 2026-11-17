@@ -81,6 +81,10 @@ beforeAll(() => {
         path.join(sdkRoot, 'tests', 'fixtures', 'v12-fragmented-types.mts'),
         path.join(consumerRoot, 'v12-fragmented-types.mts'),
     );
+    copyFileSync(
+        path.join(sdkRoot, 'tests', 'fixtures', 'v12-group-name-types.mts'),
+        path.join(consumerRoot, 'v12-group-name-types.mts'),
+    );
 
     writeFileSync(
         path.join(consumerRoot, 'reverse-types.mts'),
@@ -148,7 +152,7 @@ process.cwd();
                 moduleResolution: 'Bundler',
                 types: [],
             },
-            files: ['browser-types.mts', 'v12-fragmented-types.mts'],
+            files: ['browser-types.mts', 'v12-fragmented-types.mts', 'v12-group-name-types.mts'],
         }),
     );
 
@@ -287,6 +291,7 @@ assert.equal(actions.isSnowLumaAction('consumer_extension'), false);
                 path.join(consumerRoot, 'action-types.mts'),
                 path.join(consumerRoot, 'messaging-types.mts'),
                 path.join(consumerRoot, 'v12-fragmented-types.mts'),
+                path.join(consumerRoot, 'v12-group-name-types.mts'),
             ]);
             node([
                 compiler,

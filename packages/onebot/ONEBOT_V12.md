@@ -316,6 +316,10 @@ This projection is not lossless or an end-to-end no-network guarantee. A real
 PTT URL resolution before constructing the event. That resolver may access the
 network or change the source element; an upstream decoder or v11 conversion
 may already have omitted a segment or semantics such as format and duration.
+In particular, a reply that v11 cannot resolve may be dropped before v12 sees the
+message; the remaining text can then appear without a reply segment. A reply still
+visible at the v12 boundary is unsupported and rejects the whole v12 event. Neither
+case identifies the original quoted sender or proves the quoted message's content.
 Existing v11 file-ID logic remains unchanged. If the v11 media URL population
 step throws, that particular resolver catch logs a fixed redacted warning
 instead of the original exception; it is not a guarantee about other logs.
@@ -462,9 +466,21 @@ inviter, the event preserves it in the optional string extension
 unresolved, not that no inviter existed. The subtype stays empty because
 upstream reasons can be defaults or inferred from actor equality. The extension
 preserves v11 data, not independent proof of QQ identity. Self-join user
-identity may come from account context. A valid
-v11 `friend_add` maps to `notice.friend_increase` with an empty subtype and the
-same user ID as a string. The upstream new-friend decoder resolves the peer UIN
+identity may come from account context. The Jiyu-specific extension
+`notice.qq.group_name_change` projects a supported v11 `notify/group_name` as
+`{group_id, group_name, operator_id?}`: the group ID and a resolved operator ID
+are canonical decimal strings, and numeric positive zero (`+0`) for the unresolved
+v11 operator omits `operator_id` rather than asserting that no operator existed.
+Negative zero and the string `"0"` are rejected. The name is preserved without
+trimming and must contain 1–1,024 UTF-16 units; this is a local
+limit, not a QQ or OneBot limit. Time follows the existing nonnegative safe-number
+rule, including fractional values and zero. The upstream decoder can use zero
+when the packet timestamp is missing, so it is not proof of the event's time.
+This is an [extension](https://12.onebot.dev/interface/rules/), not a standard
+group notice, and does not establish QQ-side authenticity or client delivery. The
+SDK's dedicated type describes the shape; its generic event parser validates only
+common fields. A valid v11 `friend_add` maps to `notice.friend_increase` with an
+empty subtype and the same user ID as a string. The upstream new-friend decoder resolves the peer UIN
 with a routing fallback and may fall back to the packet header time; this mapping
 preserves the v11 fields without independently verifying QQ identity, event, or
 time. Canonical positive safe-integer IDs are required, including for string
@@ -751,8 +767,9 @@ event logging can still expose data. Real QQ behavior remains unverified.
 
 For private `send_message`, the target `user_id` must be a canonical positive
 uint32 decimal string; larger values return `10003` before the v11 handler is
-called, avoiding truncation in the downstream private routing field. This does
-not narrow the group target ID range.
+called, avoiding truncation in the downstream private routing field. Group text,
+mentions and location retain their existing target range; the standalone image
+path applies the separate uint32 constraint described below.
 
 For group `send_message`, a v12 `mention` with `data.user_id` as a canonical
 positive decimal string in the UIN range 1 through 4294967295 maps to the
@@ -760,7 +777,8 @@ account-local v11 `at` segment with `data.qq` as that string; `mention_all` with
 empty `data` maps to `at` with `qq: 'all'`. Leading zeroes, signs, whitespace,
 zero, numeric IDs, values above 4294967295 and `mention` user ID `'all'` are
 invalid. The mention limit prevents truncation in the downstream uint32 UIN
-encoding; it does not change the group target ID range. Mixed text and
+encoding; it does not change the group target ID range for text or mentions.
+The standalone image path applies a separate target limit. Mixed text and
 mentions retain their order, and the complete message is validated before one
 v11 handler call. For private sends both mention types return unsupported 10005
 without calling the v11 handler; this is an implementation limit, not a claim
@@ -865,11 +883,17 @@ After request and basic target checks, the multi-segment image scan returns
 10005 before per-segment validation. For one image, missing or non-object `data`
 returns 10006; extra segment or data fields are then checked and return 10007
 before `file_id` validation. A missing or wrong-type `file_id` returns 10006,
-and a noncanonical upload ID returns 10005. A syntactically valid ID with no
-current store entry, invalid stored data or digest, an unavailable image
-capability, or a saturated image slot returns 20002 (`image unavailable`)
-before submission; earlier request checks can take precedence. A successful
-empty `upload_file` is still valid for local retrieval, but zero-byte content is
+and a noncanonical upload ID returns 10005. After these checks, both private
+and group image target IDs must be at most `4294967295`; larger canonical IDs
+return 10003 before the image store is read or a send is attempted. The bound
+prevents truncation of the group target in the downstream uint32 image-upload
+pre-application field; it does not establish where a message would otherwise be
+delivered. Direct v11 behavior is unchanged and can still narrow that field for
+larger group IDs. A syntactically valid ID with no current store entry, invalid
+stored data or digest, an unavailable image capability, or a saturated image slot
+returns 20002 (`image unavailable`) before submission; earlier request checks
+can take precedence. A successful empty `upload_file` is still valid for local
+retrieval, but zero-byte content is
 not accepted for image sending. The dispatcher reads
 the handle once, checks canonical Base64, requires 1–262,144 decoded bytes and
 recomputes SHA-256 against the returned lowercase digest. An otherwise valid

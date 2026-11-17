@@ -123,6 +123,21 @@ zero. Parameter snapshots avoid invoking ordinary getters, but JavaScript proxy
 reflection traps may execute; do not treat the codec as isolation from hostile
 same-process code.
 
+### Jiyu group-name extension
+
+`@harehane/sdk/v12` exports the `OneBot12QQGroupNameChangeEvent` TypeScript
+shape for Jiyu's `notice.qq.group_name_change` extension. It contains string
+`group_id` and `group_name` fields and an optional string `operator_id`. Jiyu
+omits the operator when its v11 source reports numeric positive zero as
+unresolved; omission does not establish that no operator existed. This is an
+implementation-specific extension, not a standard OneBot notice.
+
+The generic SDK event parser validates only common notice fields and preserves
+other JSON fields: it does **not** check the extension's field types or Jiyu's
+name and ID limits. A TypeScript annotation is not runtime validation. See the
+[server event details](../onebot/ONEBOT_V12.md) for its source and delivery
+limitations.
+
 ## Forward WebSocket
 
 ```ts

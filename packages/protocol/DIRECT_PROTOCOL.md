@@ -734,7 +734,8 @@ cleared 32-byte stack region. Later code reads the little-endian dword at
 `0x9035280` and, if it equals 4, calls PLT `0x8e10720` with `(1, 0x6c)` and
 stores the result in a local object. Its relocation declares `calloc`; the actual
 binding and return value remain unobserved. On the further conditional path where
-that return is nonzero and the traced pointer is intact, seven 16-byte stores at
+that return is nonzero, its `[0, 0x6c)` range is writable, the traced pointer is
+intact and the stores complete, seven 16-byte stores at
 `0x6be7d66` through `0x6be7d84` write zeros over `[0, 0x6c)` relative to the
 returned pointer, with overlapping stores. Instruction `0x6be7d99` then reads
 the descriptor byte at `+0xd`; the inspected continuation passes `(2, byte)` to
@@ -746,15 +747,37 @@ return, and it does not establish that no such link exists later.
 Under the further assumptions that both calls return nonzero and the traced local
 slots remain stable, the inspected dispatcher states set a local flag to zero,
 carry the address of `[rbp-0x1420]` into another local slot, and reach the
-conditional jump at `0x6bf9bb0` to `0x6bf9e8f`. That handler reads the local
-object's descriptor pointer and, if nonzero, selects state `0xb8fe90a5`. The
-handler at `0x6bf9a20` then checks the local object's `+16` pointer slot for zero;
+comparison at `0x6bf9bb0` and conditional jump at `0x6bf9bb5` to `0x6bf9e8f`.
+That handler reads the local object's descriptor pointer and, if nonzero, selects
+state `0xb8fe90a5`. The handler at `0x6bf9a20` then checks the local object's
+`+16` pointer slot for zero;
 this checks the pointer itself, not bytes in the allocation it points to. On the
 nonzero branch, `0x6bf9c68` reads descriptor `+0xd` again and compares it as an
 unsigned value with a previously saved value derived from descriptor `+0xc`.
 The second read is not necessarily equal to the byte used in the earlier call.
-The following states and their relation to a final return or an SSO signer remain
-unknown; an XOR instruction in a neighboring state is not established as reached.
+
+For the conditional `L <= r` branch, write `L` for the saved value derived from
+`+0xc`, `r` for that later `+0xd` read, `K` for the second allocation, and `S`
+for the previously saved stack-region pointer. Code then reads `+0xd` twice more,
+calling PLT `0x8e10040` as `(K, 0x36, n1)` and `(K+n1, 0x5c, n2)` respectively.
+Its relocation declares `memset`, but its actual runtime binding remains unknown.
+If those calls have normal `memset` semantics, their addresses are writable and
+`n1+n2` fits the allocation, they fill the two corresponding ranges. The three
+`+0xd` readings used for allocation and filling are separate reads, as is the
+comparison value `r`; equality requires an additional stability assumption.
+The condition `L <= r` alone does not bound `L` by either later fill length.
+
+The selected state initializes index `i` to zero and, when `i < L`, reads `K[i]`
+and `S[i]`, XORs them and writes the low byte back to `K[i]`. It then reads
+`K[n1+i]` and `S[i]`, writes their XOR to `K[n1+i]`, increments `i`, and returns
+to the unsigned `i < L` test. This describes the inspected loop control under
+valid-address, stable-pointer and non-destructive-alias assumptions; it does not
+establish what happens at the exit state. The original file bytes `+0xc = 0x20`
+and `+0xd = 0x40` suggest `L=32` and 64-byte halves only if they and the relevant
+reads remain unchanged at runtime. A distinct `L > r` branch performs conditional
+writes to the first allocation, but its subsequent behavior is not yet traced.
+Neither branch is connected here to `G + 0x28..0x47`, the final output, or an
+SSO signer; the observed padding and XOR steps alone do not establish that link.
 
 The descriptor bytes have a different file mapping from the code: the writable
 `PT_LOAD` maps linked `0x9035280` through `0x9035285` to file offsets

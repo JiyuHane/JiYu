@@ -158,10 +158,25 @@ export interface V12GroupMemberIncreaseEvent {
     'qq.invitor_id'?: string;
 }
 
+export interface V12GroupNameChangeEvent {
+    id: string;
+    time: number;
+    type: 'notice';
+    /** QQ-specific extension, not a standard OneBot 12 group event. */
+    detail_type: 'qq.group_name_change';
+    sub_type: '';
+    self: V12Self;
+    group_id: string;
+    group_name: string;
+    /** Absent when the V11 operator could not be resolved. */
+    operator_id?: string;
+}
+
 export type V12ConvertedEvent =
     | V12MessageEvent
     | V12FriendIncreaseEvent
     | V12PrivateMessageDeleteEvent
     | V12GroupMessageDeleteEvent
     | V12GroupMemberDecreaseEvent
-    | V12GroupMemberIncreaseEvent;
+    | V12GroupMemberIncreaseEvent
+    | V12GroupNameChangeEvent;

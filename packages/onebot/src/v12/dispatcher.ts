@@ -2507,7 +2507,8 @@ export class V12Dispatcher {
                 return response(10005, 'unsupported message segment', null, echo);
             }
 
-            if (params.detail_type === 'private' && target > 0xffffffff) {
+            // Private routing and the group image upload scene both encode uint32 IDs.
+            if (target > 0xffffffff) {
                 return response(10003, 'invalid target or message', null, echo);
             }
 

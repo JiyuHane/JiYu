@@ -210,6 +210,28 @@ function validOrderedEvent(event: unknown, self: OrderedSelf): boolean {
         );
     }
 
+    if (event.type === 'notice' && event.detail_type === 'qq.group_name_change') {
+        const fields = [...common, 'group_id', 'group_name'];
+
+        if (Object.hasOwn(event, 'operator_id')) {
+            if (parseAccountId(event.operator_id) === null) {
+                return false;
+            }
+
+            fields.push('operator_id');
+        }
+
+        return (
+            event.sub_type === '' &&
+            event.time <= Number.MAX_SAFE_INTEGER &&
+            parseAccountId(event.group_id) !== null &&
+            typeof event.group_name === 'string' &&
+            event.group_name.length > 0 &&
+            event.group_name.length <= 1024 &&
+            exact(event, fields)
+        );
+    }
+
     if (
         event.type !== 'notice' ||
         parseAccountId(event.group_id) === null ||
