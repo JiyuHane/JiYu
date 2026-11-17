@@ -578,6 +578,74 @@ pointers and contents, and no destructive aliasing or interfering writes. In
 particular, the observations do not prove that the conditional lock runs or
 that every writer uses it.
 
+Additional bounded windows identify a conditional candidate writer for the
+same output slice. At `0x6d01240`, `488d3d39aa4702` loads `0x917bc80` into
+`RDI`, and `0x6d01247` calls PLT entry `0x8e126f0`. The address `0x917bc80` is
+`G + 0xa0`, immediately after the defined 160-byte block; the object's runtime
+state is unknown. After a normal return, `0x6d01253` (`8985e8e4ffff`) saves
+`EAX` at `[rbp-0x1b18]`, and the following instructions set `r13d` to zero and
+select state `0x1302ca3d`. In its inspected handler, `0x6d011a1` and
+`0x6d011a7` copy that 32-bit word into `[rbp-0x1a78]`, while `r13d` is saved
+and sign-extended as the index. The unsigned comparison at `0x6d011c9` selects
+state `0xe60b69d9` when that index is below 32. This is an index bound, not an
+observed string length.
+
+For the nonnegative indices reached from that zero initialization, the window
+`0x6d01062–0x6d01080` computes `index % 4`. The state `0x36eb1cd3` handler at
+`0x6d0114e–0x6d01165` multiplies that remainder by eight, shifts the word in
+`[rbp-0x1a78]` right by the resulting count, and saves the result in
+`[rbp-0x1ab8]`. State `0x943baf34` selects the write window:
+`0x6d0110f` (`8b8548e5ffff`) loads that result into `EAX`, `0x6d01115`
+(`488b8d70e5ffff`) loads the saved index into `RCX`, `0x6d0111c`
+(`488d15bdaa4702`) loads `G` into `RDX`, and `0x6d01123` (`88441128`) writes
+`AL` to `G + 0x28 + RCX`. Thus, under the inspected state transitions and stable
+slot and memory conditions, output byte `i` is the low byte of `word >>
+(8 * (i % 4))`: each 32-bit word is emitted low byte first.
+
+After each write, the window `0x6d01127–0x6d01149` selects a further call
+when `index % 4 == 3`; the `0x9d468c30` handler calls the same PLT entry at
+`0x6d01030` and saves its returned `EAX` for the next iteration. The
+`0xf761b101` handler increments the index and carries that word to the next
+`0x1302ca3d` iteration. If all these dispatches are reached in the indicated
+order and the calls return normally, indices 0 through 31 use eight words.
+The call after index 31 is a ninth call on that path; its result has no
+corresponding byte in the inspected 0–31 loop, and its later use is unknown.
+
+The PLT entry at `0x8e126f0` begins with `ff25d2e33400`, jumping through
+`0x9160ac8`, followed by `686e020000`, which pushes relocation index `0x26e`.
+The corresponding `.rela.plt` record at file offset `0x853e38` is
+`c80a16090000000007000000ec0100000000000000000000`: its `R_X86_64_JUMP_SLOT`
+references `_ZNSt13random_device9_M_getvalEv`. This is an import declaration,
+not a runtime-binding or entropy observation. A separate bounded state handler
+at `0x6d00f86–0x6d0100e` constructs a local string from the seven bytes
+`default` at `0x992a56`, then calls PLT `0x8e12700` with `0x917bc80` and the
+string; the PLT relocation names `std::random_device::_M_init`. After normal
+returns from subsequent calls, that handler selects the `0xe0750608` state that
+locally dispatches to the first `_M_getval` call above. This suggests a possible
+initialization path, not proof that it runs or that either import binds to the
+named implementation. The actual object state, call results, reachability, lock
+coverage, and stability of stack slots and global contents remain unknown.
+
+Another bounded candidate can change the same slice: `0x6d011df–0x6d011f4`
+forms `G + 0x28 + [rbp-0x1a58]` and saves the pointer at `[rbp-0x1a50]`;
+`0x6d00f10–0x6d00f1d` loads another value and writes its low byte through the
+saved pointer. A separate window at `0x6d011fb–0x6d01218` reads through that
+pointer and XORs a byte from another pointer. Their reachability, input bytes,
+intervening slot changes, ordering relative to the word-writing loop, and any
+connection between the XOR result and that indirect write are not established.
+Consequently, the observed candidate random-word block does not establish the
+bytes later returned by the helper or a complete signature.
+
+These code observations use the executable `PT_LOAD` mapping stated above,
+not a file mapping for `G` or the adjacent global object. Capstone and Zydis
+independently decoded the selected bounded instruction windows with matching
+addresses and bytes. REA target-free ELF-note inspection bound the artifact
+identity to SHA-256
+`dc5209e20002735e31a20c9cded0a807d1db4779277dec66c9221ea28a870328`
+(Evidence `ev_271c0c5147b796ee579565881d7092aee4e02a7201c1955a4baf0261355b143d`).
+This is static evidence rather than observed execution or a complete search for
+writers.
+
 The separately supplied file-signature research archive contains a report that
 also refers to constructor `0x351fb20`, vtable address point `0x8e80f38` and
 two command-literal leads. These are report assertions; the archive did not
@@ -1403,8 +1471,8 @@ remain to be recovered and independently verified.
   raw transaction and empty-reserve lookup candidate; its fixture verification
   and local sequence assignment do not establish server authentication or
   target request/response binding.
-- `src/direct/target-raw-transaction.ts` offers one experimental transaction
-  on a caller-supplied connected raw transport. `createSso12RawClient` constructs
+- `src/direct/target-raw-transaction.ts` offers two experimental transaction
+  entry points on a caller-supplied connected raw transport. `createSso12RawClient` constructs
   the shared raw engine without reference profile, key, signer or classifier
   options; its UIN is a caller-supplied 1–20-digit local identity label, not a
   verified account binding. The existing reference-mode `Sso12PacketClient`
@@ -1437,15 +1505,39 @@ remain to be recovered and independently verified.
   After the adapter observes transport settlement, late callbacks fail closed;
   promise settlement itself and its continuation are not an atomic boundary.
   Synchronous preparation
-  counts against the required timeout but cannot be preempted. The head's input
-  sequence is a placeholder replaced by the raw client's local sequence, while
-  reserved/signing bytes are prepared beforehand; this adapter cannot itself
-  construct a signature that depends on the newly assigned sequence. The raw
+  counts against the required timeout but cannot be preempted. For the original
+  `transactTargetRawOnce` entry, the head's input sequence is a placeholder
+  replaced by the raw client's local sequence, while reserve bytes are prepared
+  beforehand; that entry cannot construct a candidate from the newly assigned
+  sequence. The raw
   client's inclusive-length framing remains a local constraint, not a proven
   target rule, and the adapter does not establish real QQ authentication,
   response binding, login or online state. Its encoder dependencies assume
   untampered JavaScript built-ins; cleanup is best effort and cannot erase engine
   or callback-owned copies.
+- The separate opt-in `transactTargetRawCandidateReserveOnce` entry constructs a
+  **caller-supplied candidate**, not a QQ signature. After its raw transport
+  supplies a local uint32 sequence, it invokes `buildCandidate` with that value,
+  the two distinct UIN labels and independent snapshots of the head command bytes
+  and unprefixed raw body. The callback returns a status and 0x300-byte candidate
+  output; the existing conditional output decoder and native-slot reserve encoder
+  construct field 24 before the same local sequence is encoded in the head. It
+  snapshots the head, body and reserve base, including inactive fields 12 and 23,
+  before awaiting the callback, and rechecks the completed head and frame size.
+  The 16 MiB aggregate input budget includes the 0x300-byte output; it is not a
+  peak-memory bound. A supplied abort signal is propagated through a private
+  `AbortSignal.any` dependent, while the original is checked at local boundaries.
+  The caller must not modify the returned output until the transaction settles:
+  even a synchronous return is observed after Promise/thenable assimilation, not
+  as an atomic snapshot at the return statement. Caller-owned output remains
+  untouched unless it aliases the callback's borrowed input, which is wiped best
+  effort; retained copies and callback side effects remain outside that cleanup.
+  Selected built-in changes are rejected, but this is not same-process isolation:
+  built-ins and imported codecs are trusted throughout. Structural transports
+  remain responsible for their writes, cancellation and settlement. Local fake
+  tests exercise this data path without a target process or socket; they establish
+  neither that the target's controller K equals the sequence nor the actual
+  signing input, output, request/response binding or QQ acceptance.
 - `src/direct/target-service-business.ts` frames a nonempty raw request body as
   `BE32(body length + 4) || body` for the observed main-request path. The
   standalone helper's empty-body behavior differs from the main entry; this
