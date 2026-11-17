@@ -4,8 +4,8 @@ import type { QQEventVariant } from '@snowluma/protocol/events';
 import type { OneBotInstanceContext } from '../instance-context';
 import type { JsonObject } from '../types';
 import type { V12PrivateMessageDeleteEvent, V12Self } from '../v12/types';
-import { fromV11AccountId, fromV11MessageId } from '../v12/validation';
-import type { V12Source } from './source-generation';
+import { fromV11AccountId, fromV11MessageId, parseAccountId } from '../v12/validation';
+import { sameSourceEpoch, type V12Source } from './source-ticket';
 
 type FriendRecall = Extract<QQEventVariant, { kind: 'friend_recall' }>;
 type RecallContext = Pick<OneBotInstanceContext, 'uin' | 'selfId'>;
@@ -25,9 +25,13 @@ export interface PrivateRecallProvenance extends PrivateRecallSnapshot {
     readonly messageId: number;
 }
 
-// Compile-time brand only: proofs have no runtime properties, including symbols.
+// Compile-time brands only: these tokens have no runtime properties, including symbols.
 declare const privateRecallPollProofBrand: unique symbol;
 export type PrivateRecallPollProof = { readonly [privateRecallPollProofBrand]: never };
+declare const privateRecallPollEpochAccountScopeBrand: unique symbol;
+export type PrivateRecallPollEpochAccountScope = {
+    readonly [privateRecallPollEpochAccountScopeBrand]: never;
+};
 
 type PrivateRecallBinding = {
     readonly context: RecallContext;
@@ -63,6 +67,14 @@ const convertedBindings = new WeakMap<
     }
 >();
 const pollProofs = new WeakMap<PrivateRecallPollProof, PrivateRecallPollBinding>();
+type PrivateRecallPollEpochAccountBinding = {
+    readonly ownerSource: unknown;
+    readonly self: Readonly<{ platform: 'qq'; user_id: string }>;
+};
+const pollEpochAccountScopes = new WeakMap<
+    PrivateRecallPollEpochAccountScope,
+    PrivateRecallPollEpochAccountBinding
+>();
 
 function isV12Time(value: unknown): value is number {
     return (
@@ -595,6 +607,121 @@ export function isPrivateRecallPollProofBoundTo(
             hasEnumerableDataValue(ownerSelf, 'platform', 'qq') &&
             hasEnumerableDataValue(ownerSelf, 'user_id', selfId) &&
             isPrivateRecallBindingCurrent(binding)
+        );
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Capture an internal epoch/account comparison scope, not an owner authority.
+ * The caller must obtain source and self together from the trusted owner lifecycle
+ * and separately verify the live source, manager, binding, gate and source scope.
+ * A genuine ticket can be supplied with a different account value; this factory
+ * does not prove which context or manager issued it. Old tickets can still compare
+ * as the same epoch after going offline. This is not a same-process security boundary.
+ *
+ * The independent frozen self is retained with the original source while the scope
+ * remains live. Keep scopes, proofs and tickets out of v12 event JSON and logs;
+ * retirement releases this map's references, not references retained elsewhere.
+ * These checks assume untampered built-ins and do not bound RSS or CPU.
+ */
+export function createPrivateRecallPollEpochAccountScope(
+    ownerSource: unknown,
+    ownerSelf: unknown,
+): PrivateRecallPollEpochAccountScope | undefined {
+    try {
+        if (
+            !isNonProxyObject(ownerSource) ||
+            sameSourceEpoch(ownerSource, ownerSource) !== 'same' ||
+            !isPlainNonProxyObject(ownerSelf) ||
+            !hasExactOwnKeys(ownerSelf, ['platform', 'user_id'])
+        ) {
+            return undefined;
+        }
+
+        const platform = ownDataDescriptor(ownerSelf, 'platform');
+        const user = ownDataDescriptor(ownerSelf, 'user_id');
+
+        if (
+            !platform ||
+            platform.enumerable !== true ||
+            platform.value !== 'qq' ||
+            !user ||
+            user.enumerable !== true ||
+            typeof user.value !== 'string' ||
+            parseAccountId(user.value) === null
+        ) {
+            return undefined;
+        }
+
+        const self = Object.freeze({
+            __proto__: null,
+            platform: 'qq' as const,
+            user_id: user.value,
+        });
+        const scope = Object.freeze(Object.create(null)) as PrivateRecallPollEpochAccountScope;
+        pollEpochAccountScopes.set(scope, Object.freeze({ ownerSource, self }));
+        return scope;
+    } catch {
+        return undefined;
+    }
+}
+
+/**
+ * Check only whether the exact issued scope remains unretired. This does not
+ * establish current online, owner or gate state. A false result is not evidence
+ * that an individual proof is stale and must not by itself trigger its pruning.
+ */
+export function isPrivateRecallPollEpochAccountScopeActive(scope: unknown): boolean {
+    try {
+        return (
+            isNonProxyObject(scope) &&
+            pollEpochAccountScopes.has(scope as PrivateRecallPollEpochAccountScope)
+        );
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Check the exact original event ticket against the proof and the separately
+ * captured owner epoch/account scope without invoking caller callbacks. A distinct
+ * owner ticket from the same epoch is valid; a substituted event ticket is not.
+ * Matching account values and epoch still do not establish that the ticket was
+ * issued for that account or owner. Distinct scopes with equal inputs can both pass;
+ * a future queue must bind the exact owner's scope and do separate live checks.
+ */
+export function isPrivateRecallPollProofInEpochAccountScope(
+    proof: unknown,
+    exactEventTicket: unknown,
+    scope: unknown,
+): boolean {
+    try {
+        if (!isNonProxyObject(proof) || !isNonProxyObject(scope)) {
+            return false;
+        }
+
+        const binding = pollEpochAccountScopes.get(scope as PrivateRecallPollEpochAccountScope);
+
+        return (
+            binding !== undefined &&
+            isPrivateRecallPollProofBoundTo(proof, exactEventTicket, binding.self) &&
+            sameSourceEpoch(exactEventTicket, binding.ownerSource) === 'same' &&
+            isPrivateRecallPollProofBoundTo(proof, exactEventTicket, binding.self) &&
+            pollEpochAccountScopes.get(scope as PrivateRecallPollEpochAccountScope) === binding
+        );
+    } catch {
+        return false;
+    }
+}
+
+/** Retire only the exact issued scope; repeated or foreign retirements do nothing. */
+export function retirePrivateRecallPollEpochAccountScope(scope: unknown): boolean {
+    try {
+        return (
+            isNonProxyObject(scope) &&
+            pollEpochAccountScopes.delete(scope as PrivateRecallPollEpochAccountScope)
         );
     } catch {
         return false;
