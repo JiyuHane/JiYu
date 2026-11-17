@@ -431,8 +431,8 @@ poll owner's structural validator remains available to direct trusted fixtures;
 that does not establish runtime poll admission or an end-to-end completeness
 guarantee.
 
-An internal [source-proof primitive and proposed queue design](V12_PRIVATE_RECALL_POLL_DESIGN.md)
-are under development. The proof is not connected to HTTP polling: it rechecks
+Internal [source-proof and guarded-queue primitives](V12_PRIVATE_RECALL_POLL_DESIGN.md)
+are under development. Neither is connected to HTTP polling: the proof rechecks
 local object and ticket bindings, but does not establish that an owner or online
 epoch is current, that QQ issued the event, or that a client received it. HTTP
 continues to omit private recalls until the remaining guarded-commit and runtime

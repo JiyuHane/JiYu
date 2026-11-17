@@ -1,5 +1,9 @@
 import { addAbortListener } from 'node:events';
 import { isProxy } from 'node:util/types';
+import {
+    isPrivateRecallPollProofCurrent,
+    isPrivateRecallPollProofFor,
+} from './private-recall-source';
 
 /** In-memory, single-process queue primitive; this is not itself an HTTP action.
  * The owner binds a separate instance to each account and validates event conversion,
@@ -42,7 +46,8 @@ export interface PollBufferConfig {
     maxTimeoutMs: number;
 }
 
-export type EnqueueResult = 'accepted' | 'full' | 'oversize' | 'invalid' | 'meta' | 'closed';
+export type EnqueueResult =
+    'accepted' | 'full' | 'oversize' | 'invalid' | 'meta' | 'closed' | 'uncertain';
 export type PollResult =
     | { status: 'reserved'; token: object; eventsJson: string; count: number; bytes: number }
     | { status: 'blocked'; requiredBytes: number }
@@ -54,16 +59,45 @@ export interface PollOptions {
     signal?: AbortSignal;
 }
 
+export type GuardedSelection =
+    | Readonly<{
+          status: 'reserved';
+          token: object;
+          eventsJson: string;
+          count: number;
+          bytes: number;
+      }>
+    | Readonly<{ status: 'blocked_guarded'; token: object; requiredBytes: number }>;
+export type GuardedPollResult =
+    GuardedSelection | Exclude<PollResult, { status: 'reserved' }> | { status: 'uncertain' };
+export type GuardedCommitResult =
+    | { status: 'committed' }
+    | { status: 'pruned'; count: number }
+    | { status: 'stale' | 'uncertain' };
+export type GuardedBlockedResult =
+    | { status: 'blocked'; requiredBytes: number }
+    | { status: 'pruned'; count: number }
+    | { status: 'stale' | 'uncertain' };
+export type GuardedReleaseResult = { status: 'released' | 'stale' | 'uncertain' };
+export type GuardedDrainResult = { status: 'resumed' | 'stale' | 'uncertain' };
+export type GuardedCleanupState = 'open' | 'closing' | 'closed' | 'uncertain' | 'unavailable';
+
 type Entry = { json: string; bytes: number };
+type Snapshot = { entry: Entry; privateRecall: boolean };
+type GuardedMetadata =
+    Readonly<{ kind: 'ordinary' }> | Readonly<{ kind: 'recall'; proof: unknown }>;
+type GuardedSlot = { entry: Entry; json: string; bytes: number; metadata: GuardedMetadata };
+type GuardedActive = { selection: GuardedSelection; slots: GuardedSlot[]; count: number };
 type Waiter = {
     limit: number;
     budget: number;
     deadline: number;
     signal?: AbortSignal;
-    resolve: (value: PollResult) => void;
+    resolve: (value: GuardedPollResult) => void;
     timer?: ReturnType<typeof setTimeout>;
     listener?: Disposable;
 };
+type GuardedWaiter = Waiter & { timerGeneration?: object };
 
 const caps: PollBufferConfig = {
     capacity: 10000,
@@ -76,7 +110,10 @@ const signalAborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'ab
 const tooLarge = Symbol('oversize');
 
 /** Data descriptors only; never calls a caller's getter or toJSON. */
-function snapshotEvent(input: unknown, maxBytes: number): Entry | 'invalid' | 'oversize' | 'meta' {
+function snapshotEvent(
+    input: unknown,
+    maxBytes: number,
+): Snapshot | 'invalid' | 'oversize' | 'meta' {
     let nodes = 0;
     let textBytes = 0;
     const ancestors = new WeakSet<object>();
@@ -202,7 +239,13 @@ function snapshotEvent(input: unknown, maxBytes: number): Entry | 'invalid' | 'o
 
         const json = JSON.stringify(value);
         const bytes = Buffer.byteLength(json, 'utf8');
-        return bytes + 2 > maxBytes ? 'oversize' : { json, bytes };
+        return bytes + 2 > maxBytes
+            ? 'oversize'
+            : {
+                  entry: { json, bytes },
+                  privateRecall:
+                      value.type === 'notice' && value.detail_type === 'private_message_delete',
+              };
     } catch (error) {
         return error === tooLarge ? 'oversize' : 'invalid';
     }
@@ -280,9 +323,26 @@ export class EventPollBuffer {
     private active: { token: object; count: number } | null = null;
     private closed = false;
 
+    // Keep guarded backing storage, attestation and token ownership out of the
+    // ordinary object graph. The legacy queue remains untouched for its callers.
+    readonly #mode: 'legacy' | 'guarded-recall';
+    #guardedQueue: Entry[] = [];
+    #guardedBytes = 0;
+    #guardedMetadata = new WeakMap<Entry, GuardedMetadata>();
+    #guardedWaiters: GuardedWaiter[] = [];
+    #guardedActive: GuardedActive | null = null;
+    #guardedBarrier: object | null = null;
+    #guardedResuming = false;
+    #guardedDraining = false;
+    #guardedUncertain = false;
+    #guardedClosed = false;
+    #guardedCleanup: GuardedCleanupState = 'open';
+    #guardedResourceScopes = 0;
+
     constructor(
         config: PollBufferConfig,
         overflowPolicy: 'reject-new' | 'drop-oldest' = 'reject-new',
+        mode: 'legacy' | 'guarded-recall' = 'legacy',
     ) {
         const input = dataOptions(config, Object.keys(caps));
 
@@ -309,7 +369,12 @@ export class EventPollBuffer {
             throw new RangeError('invalid poll buffer overflow policy');
         }
 
+        if (mode !== 'legacy' && mode !== 'guarded-recall') {
+            throw new RangeError('invalid poll buffer mode');
+        }
+
         this.overflowPolicy = overflowPolicy;
+        this.#mode = mode;
     }
 
     /** queueBytes includes array brackets and separators, including reserved entries. */
@@ -320,6 +385,16 @@ export class EventPollBuffer {
         reserved: number;
         closed: boolean;
     } {
+        if (this.#mode === 'guarded-recall') {
+            return {
+                count: this.#guardedQueue.length,
+                queueBytes: this.#guardedBytes + Math.max(0, this.#guardedQueue.length - 1) + 2,
+                waiters: this.#guardedWaiters.length,
+                reserved: this.#guardedActive?.count ?? 0,
+                closed: this.#guardedClosed,
+            };
+        }
+
         return {
             count: this.queue.length,
             queueBytes: this.sumBytes + Math.max(0, this.queue.length - 1) + 2,
@@ -329,21 +404,57 @@ export class EventPollBuffer {
         };
     }
 
+    /**
+     * Guarded cleanup state is local to this queue. `closing` means close was
+     * requested while a guarded synchronous operation or timer/abort callback
+     * remains in flight, including its timer/listener creation or cleanup.
+     * Pending Promise lifetimes, transport work and external owner callbacks are
+     * not counted. `uncertain` is sticky and takes precedence over `closing`;
+     * `stats().closed` and the close boolean alone do not prove cleanup finished.
+     * A future owner must retain sticky uncertainty in its gate: waiters already
+     * pending during quarantine can still settle as timeout or abort. A new poll
+     * on a closed queue reports `closed`, so also consult this cleanup state.
+     */
+    guardedCleanupState(): GuardedCleanupState {
+        if (this.#mode !== 'guarded-recall') {
+            return 'unavailable';
+        }
+
+        if (this.#guardedUncertain) {
+            return 'uncertain';
+        }
+
+        return this.#guardedClosed && this.#guardedResourceScopes > 0
+            ? 'closing'
+            : this.#guardedCleanup;
+    }
+
     /** Exact process-local eviction watermark; close and reads do not reset it. */
     oldestDropCount(): bigint {
         return this.#droppedOldest;
     }
 
+    /**
+     * Guarded admission copies the queue (O(n), O(capacity²) over a fill).
+     * A subsequent drain can throw after publication or eviction: the effect is
+     * unknown to the caller, quarantine is sticky, and automatic retry is unsafe.
+     */
     enqueue(input: unknown): EnqueueResult {
+        if (this.#mode === 'guarded-recall') {
+            return this.#runGuarded(() => this.#enqueueGuarded(input, undefined, false));
+        }
+
         if (this.closed) {
             return 'closed';
         }
 
-        const event = snapshotEvent(input, this.config.maxEventBytes);
+        const snapshot = snapshotEvent(input, this.config.maxEventBytes);
 
-        if (typeof event === 'string') {
-            return event;
+        if (typeof snapshot === 'string') {
+            return snapshot;
         }
+
+        const event = snapshot.entry;
 
         // A reservation owns the fixed physical prefix [0, protectedCount).
         // Trial removals from its unreserved tail change no state until the new
@@ -394,7 +505,263 @@ export class EventPollBuffer {
         return 'accepted';
     }
 
+    /**
+     * Only a factory-issued proof for this exact candidate admits a recall.
+     * The guarded admission cost and post-publication throw contract match enqueue.
+     */
+    enqueueGuarded(candidate: unknown, proof: unknown): EnqueueResult {
+        if (this.#mode !== 'guarded-recall') {
+            return 'invalid';
+        }
+
+        return this.#runGuarded(() => this.#enqueueGuarded(candidate, proof, true));
+    }
+
+    #enqueueGuarded(input: unknown, proof: unknown, recall: boolean): EnqueueResult {
+        if (this.#guardedClosed) {
+            return 'closed';
+        }
+
+        if (this.#guardedUncertain) {
+            return 'uncertain';
+        }
+
+        if (recall && !isPrivateRecallPollProofFor(proof, input)) {
+            return 'invalid';
+        }
+
+        const snapshot = snapshotEvent(input, this.config.maxEventBytes);
+
+        if (typeof snapshot === 'string') {
+            return snapshot;
+        }
+
+        if (snapshot.privateRecall !== recall) {
+            return 'invalid';
+        }
+
+        const capacity = this.config.capacity;
+        const maxBytes = this.config.maxQueueBytes;
+        const policy = this.overflowPolicy;
+        const oldQueue = this.#guardedQueue;
+        const oldActive = this.#guardedActive;
+        const protectedCount = oldActive?.count ?? 0;
+        const event = Object.freeze(snapshot.entry);
+        let dropCount = 0;
+        let dropBytes = 0;
+
+        while (
+            oldQueue.length - dropCount >= capacity ||
+            this.#guardedBytes - dropBytes + event.bytes + oldQueue.length - dropCount + 2 >
+                maxBytes
+        ) {
+            if (policy === 'reject-new' || protectedCount + dropCount >= oldQueue.length) {
+                return 'full';
+            }
+
+            dropBytes += oldQueue[protectedCount + dropCount].bytes;
+            dropCount++;
+        }
+
+        // Never call methods on a replaceable backing array during guarded
+        // preparation. Allocate everything before the last candidate check.
+        const nextQueue = new Array<Entry>(oldQueue.length - dropCount + 1);
+        let destination = 0;
+
+        for (let i = 0; i < oldQueue.length; i++) {
+            if (i < protectedCount || i >= protectedCount + dropCount) {
+                nextQueue[destination++] = oldQueue[i];
+            }
+        }
+
+        nextQueue[destination] = event;
+        const nextBytes = this.#guardedBytes + event.bytes - dropBytes;
+        const nextDropped = dropCount
+            ? this.#droppedOldest + BigInt(dropCount)
+            : this.#droppedOldest;
+        const metadata: GuardedMetadata = recall
+            ? Object.freeze({ kind: 'recall', proof })
+            : Object.freeze({ kind: 'ordinary' });
+        this.#guardedMetadata.set(event, metadata);
+
+        if (
+            this.#guardedClosed ||
+            this.#guardedUncertain ||
+            this.#guardedQueue !== oldQueue ||
+            this.#guardedActive !== oldActive
+        ) {
+            this.#guardedMetadata.delete(event);
+            return this.#guardedClosed
+                ? 'closed'
+                : this.#guardedUncertain
+                  ? 'uncertain'
+                  : 'invalid';
+        }
+
+        if (recall && !isPrivateRecallPollProofFor(proof, input)) {
+            this.#guardedMetadata.delete(event);
+            return 'invalid';
+        }
+
+        // No host callback, getter, queue method or clock between the last
+        // proof check and publication of this complete replacement.
+        this.#guardedQueue = nextQueue;
+        this.#guardedBytes = nextBytes;
+        this.#droppedOldest = nextDropped;
+
+        for (let i = 0; i < dropCount; i++) {
+            this.#guardedMetadata.delete(oldQueue[protectedCount + i]);
+        }
+
+        if (!this.#guardedBarrier) {
+            this.#requestGuardedDrain();
+        }
+
+        return 'accepted';
+    }
+
     reserve(options: PollOptions = {}): Promise<PollResult> {
+        if (this.#mode !== 'legacy') {
+            return Promise.resolve({ status: 'invalid' });
+        }
+
+        return this.reserveInternal(options) as Promise<PollResult>;
+    }
+
+    /** In guarded mode, existing close/quarantine wins over option validation and abort. */
+    reserveGuarded(options: PollOptions = {}): Promise<GuardedPollResult> {
+        if (this.#mode !== 'guarded-recall') {
+            return Promise.resolve({ status: 'invalid' });
+        }
+
+        return this.#runGuarded(() => this.#reserveGuarded(options));
+    }
+
+    #reserveGuarded(options: PollOptions): Promise<GuardedPollResult> {
+        if (this.#guardedClosed) {
+            return Promise.resolve({ status: 'closed' });
+        }
+
+        if (this.#guardedUncertain) {
+            return Promise.resolve({ status: 'uncertain' });
+        }
+
+        let start: number;
+
+        try {
+            start = performance.now();
+        } catch {
+            this.#quarantineGuarded();
+            return Promise.resolve({ status: 'uncertain' });
+        }
+
+        if (this.#guardedClosed) {
+            return Promise.resolve({ status: 'closed' });
+        }
+
+        if (this.#guardedUncertain) {
+            return Promise.resolve({ status: 'uncertain' });
+        }
+
+        const input = dataOptions(options, ['limit', 'timeoutMs', 'maxBatchBytes', 'signal']);
+
+        if (!input) {
+            return Promise.resolve({ status: 'invalid' });
+        }
+
+        const limit = input.limit === undefined ? 0 : input.limit;
+        const timeout = input.timeoutMs === undefined ? 0 : input.timeoutMs;
+        const budget =
+            input.maxBatchBytes === undefined ? this.config.maxQueueBytes : input.maxBatchBytes;
+        const signal = input.signal;
+
+        if (
+            !integer(limit, 0, Number.MAX_SAFE_INTEGER) ||
+            !integer(timeout, 0, this.config.maxTimeoutMs) ||
+            !integer(budget, 2, this.config.maxQueueBytes) ||
+            (signal !== undefined && !validSignal(signal))
+        ) {
+            return Promise.resolve({ status: 'invalid' });
+        }
+
+        if (signal && signalAborted.call(signal)) {
+            return Promise.resolve({ status: 'aborted' });
+        }
+
+        if (this.#guardedClosed) {
+            return Promise.resolve({ status: 'closed' });
+        }
+
+        if (this.#guardedUncertain) {
+            return Promise.resolve({ status: 'uncertain' });
+        }
+
+        if (timeout === 0) {
+            if (this.#guardedActive || this.#guardedBarrier || this.#guardedWaiters.length) {
+                return Promise.resolve({ status: 'contended' });
+            }
+
+            if (!this.#guardedQueue.length) {
+                return Promise.resolve({ status: 'empty' });
+            }
+
+            return Promise.resolve(this.#selectGuarded(limit, budget));
+        }
+
+        if (this.#guardedWaiters.length >= this.config.maxWaiters) {
+            return Promise.resolve({ status: 'busy' });
+        }
+
+        return new Promise((resolve) => {
+            const waiter: GuardedWaiter = {
+                limit,
+                budget,
+                deadline: start + timeout,
+                signal: signal as AbortSignal | undefined,
+                resolve,
+            };
+            this.#guardedWaiters[this.#guardedWaiters.length] = waiter;
+
+            try {
+                if (waiter.signal) {
+                    const listener = addAbortListener(waiter.signal, () =>
+                        this.#runGuarded(() => this.#abortGuarded(waiter)),
+                    );
+
+                    if (!this.#hasGuardedWaiter(waiter)) {
+                        listener[Symbol.dispose]();
+                        return;
+                    }
+
+                    waiter.listener = listener;
+                }
+
+                const now = performance.now();
+
+                if (!this.#hasGuardedWaiter(waiter)) {
+                    return;
+                }
+
+                this.#scheduleGuarded(waiter, Math.max(0, Math.ceil(waiter.deadline - now)));
+
+                if (!this.#hasGuardedWaiter(waiter)) {
+                    return;
+                }
+
+                if (waiter.signal && signalAborted.call(waiter.signal)) {
+                    this.#abortGuarded(waiter);
+                }
+
+                if (this.#hasGuardedWaiter(waiter)) {
+                    this.#requestGuardedDrain();
+                }
+            } catch {
+                this.#failGuardedWaiter(waiter);
+            }
+        });
+    }
+
+    private reserveInternal(options: PollOptions): Promise<GuardedPollResult> {
         const start = performance.now();
         const input = dataOptions(options, ['limit', 'timeoutMs', 'maxBatchBytes', 'signal']);
 
@@ -523,7 +890,79 @@ export class EventPollBuffer {
         return { status: 'reserved', token, count, bytes, eventsJson: `[${parts.join(',')}]` };
     }
 
-    private finish(waiter: Waiter, result: PollResult): void {
+    #selectGuarded(limit: number, budget: number): GuardedPollResult {
+        const first = this.#guardedQueue[0];
+        const firstMetadata = this.#guardedMetadata.get(first);
+
+        if (!firstMetadata) {
+            this.#quarantineGuarded();
+            return { status: 'uncertain' };
+        }
+
+        if (first.bytes + 2 > budget) {
+            if (firstMetadata.kind === 'ordinary') {
+                return { status: 'blocked', requiredBytes: first.bytes + 2 };
+            }
+
+            const token = Object.freeze(Object.create(null)) as object;
+            const selection: GuardedSelection = Object.freeze({
+                status: 'blocked_guarded',
+                token,
+                requiredBytes: first.bytes + 2,
+            });
+            this.#guardedActive = {
+                selection,
+                slots: [
+                    { entry: first, json: first.json, bytes: first.bytes, metadata: firstMetadata },
+                ],
+                count: 1,
+            };
+            return selection;
+        }
+
+        let bytes = 2;
+        let count = 0;
+        const parts: string[] = [];
+        const slots: GuardedSlot[] = [];
+
+        for (let i = 0; i < this.#guardedQueue.length; i++) {
+            if (limit && count >= limit) {
+                break;
+            }
+
+            const entry = this.#guardedQueue[i];
+            const next = bytes + entry.bytes + (count ? 1 : 0);
+
+            if (next > budget) {
+                break;
+            }
+
+            const metadata = this.#guardedMetadata.get(entry);
+
+            if (!metadata) {
+                this.#quarantineGuarded();
+                return { status: 'uncertain' };
+            }
+
+            bytes = next;
+            parts[count] = entry.json;
+            slots[count] = { entry, json: entry.json, bytes: entry.bytes, metadata };
+            count++;
+        }
+
+        const token = Object.freeze(Object.create(null)) as object;
+        const selection: GuardedSelection = Object.freeze({
+            status: 'reserved',
+            token,
+            count,
+            bytes,
+            eventsJson: `[${parts.join(',')}]`,
+        });
+        this.#guardedActive = { selection, slots, count };
+        return selection;
+    }
+
+    private finish(waiter: Waiter, result: GuardedPollResult): void {
         const index = this.waiters.indexOf(waiter);
 
         if (index < 0) {
@@ -539,6 +978,252 @@ export class EventPollBuffer {
         waiter.listener?.[Symbol.dispose]();
 
         waiter.resolve(result);
+    }
+
+    // Count only synchronous guarded operation/callback stacks. A returned
+    // pending Promise does not itself hold a scope open.
+    #runGuarded<T>(operation: () => T): T {
+        this.#guardedResourceScopes++;
+
+        try {
+            return operation();
+        } catch (error) {
+            this.#quarantineGuarded();
+            throw error;
+        } finally {
+            this.#guardedResourceScopes--;
+
+            if (
+                this.#guardedClosed &&
+                this.#guardedResourceScopes === 0 &&
+                !this.#guardedUncertain
+            ) {
+                this.#guardedCleanup = 'closed';
+            }
+        }
+    }
+
+    #quarantineGuarded(): void {
+        this.#guardedUncertain = true;
+        this.#guardedCleanup = 'uncertain';
+
+        if (!this.#guardedClosed && !this.#guardedBarrier) {
+            this.#guardedBarrier = Object.freeze({});
+        }
+    }
+
+    #hasGuardedWaiter(waiter: GuardedWaiter): boolean {
+        for (let i = 0; i < this.#guardedWaiters.length; i++) {
+            if (this.#guardedWaiters[i] === waiter) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    #finishGuarded(waiter: GuardedWaiter, result: GuardedPollResult): boolean {
+        let index = -1;
+
+        for (let i = 0; i < this.#guardedWaiters.length; i++) {
+            if (this.#guardedWaiters[i] === waiter) {
+                index = i;
+                break;
+            }
+        }
+
+        if (index < 0) {
+            return false;
+        }
+
+        // Detach without replaceable instance-array methods before resolving the
+        // selected token or calling timer/listener cleanup, which can reenter.
+        for (let i = index + 1; i < this.#guardedWaiters.length; i++) {
+            this.#guardedWaiters[i - 1] = this.#guardedWaiters[i];
+        }
+
+        this.#guardedWaiters.length--;
+        const timer = waiter.timer;
+        const listener = waiter.listener;
+        waiter.timer = undefined;
+        waiter.timerGeneration = undefined;
+        waiter.listener = undefined;
+        waiter.resolve(result);
+        let failed = false;
+
+        try {
+            if (timer !== undefined) {
+                clearTimeout(timer);
+            }
+        } catch {
+            failed = true;
+        }
+
+        try {
+            listener?.[Symbol.dispose]();
+        } catch {
+            failed = true;
+        }
+
+        if (failed) {
+            this.#quarantineGuarded();
+            throw new Error('guarded waiter cleanup uncertain');
+        }
+
+        return true;
+    }
+
+    #failGuardedWaiter(waiter: GuardedWaiter): void {
+        this.#quarantineGuarded();
+
+        try {
+            this.#finishGuarded(waiter, { status: 'uncertain' });
+        } catch {
+            // The promise was already settled; cleanup uncertainty is retained.
+            this.#quarantineGuarded();
+        }
+    }
+
+    #scheduleGuarded(waiter: GuardedWaiter, delay: number): void {
+        if (this.#guardedClosed || !this.#hasGuardedWaiter(waiter)) {
+            return;
+        }
+
+        const generation = {};
+        waiter.timerGeneration = generation;
+        const timer = setTimeout(
+            () => this.#runGuarded(() => this.#expireGuarded(waiter, generation)),
+            delay,
+        );
+
+        // A clock/timer fixture may have closed or settled the waiter before
+        // setTimeout returns. Never install its now-orphaned timer.
+        if (
+            this.#guardedClosed ||
+            !this.#hasGuardedWaiter(waiter) ||
+            waiter.timerGeneration !== generation
+        ) {
+            clearTimeout(timer);
+            return;
+        }
+
+        waiter.timer = timer;
+    }
+
+    #expireGuarded(waiter: GuardedWaiter, generation: object): void {
+        if (waiter.timerGeneration !== generation || !this.#hasGuardedWaiter(waiter)) {
+            return;
+        }
+
+        waiter.timerGeneration = undefined;
+        waiter.timer = undefined;
+
+        try {
+            const now = performance.now();
+
+            if (!this.#hasGuardedWaiter(waiter)) {
+                return;
+            }
+
+            const remaining = waiter.deadline - now;
+
+            if (remaining > 0) {
+                this.#scheduleGuarded(waiter, Math.ceil(remaining));
+            } else {
+                this.#finishGuarded(waiter, { status: 'timeout' });
+                this.#requestGuardedDrain();
+            }
+        } catch {
+            this.#failGuardedWaiter(waiter);
+        }
+    }
+
+    #abortGuarded(waiter: GuardedWaiter): void {
+        if (!this.#hasGuardedWaiter(waiter)) {
+            return;
+        }
+
+        try {
+            const now = performance.now();
+
+            if (!this.#hasGuardedWaiter(waiter)) {
+                return;
+            }
+
+            this.#finishGuarded(waiter, {
+                status: now >= waiter.deadline ? 'timeout' : 'aborted',
+            });
+            this.#requestGuardedDrain();
+        } catch {
+            this.#failGuardedWaiter(waiter);
+        }
+    }
+
+    #requestGuardedDrain(): void {
+        if (this.#guardedDraining) {
+            return;
+        }
+
+        this.#guardedDraining = true;
+
+        try {
+            this.#drainGuarded();
+        } catch (error) {
+            this.#quarantineGuarded();
+            throw error;
+        } finally {
+            this.#guardedDraining = false;
+        }
+    }
+
+    #drainGuarded(allowedBarrier?: object): void {
+        while (!this.#guardedClosed && !this.#guardedActive && this.#guardedWaiters.length) {
+            const waiter = this.#guardedWaiters[0];
+            let selected: GuardedPollResult | undefined;
+
+            try {
+                const now = performance.now();
+
+                if (
+                    this.#guardedClosed ||
+                    this.#guardedActive ||
+                    this.#guardedWaiters[0] !== waiter
+                ) {
+                    continue;
+                }
+
+                if (now >= waiter.deadline) {
+                    this.#finishGuarded(waiter, { status: 'timeout' });
+                } else if (waiter.signal && signalAborted.call(waiter.signal)) {
+                    this.#finishGuarded(waiter, { status: 'aborted' });
+                } else if (
+                    this.#guardedUncertain ||
+                    (this.#guardedBarrier && this.#guardedBarrier !== allowedBarrier)
+                ) {
+                    break;
+                } else if (this.#guardedQueue.length) {
+                    selected = this.#selectGuarded(waiter.limit, waiter.budget);
+
+                    if (!this.#finishGuarded(waiter, selected)) {
+                        this.#quarantineGuarded();
+                    }
+                } else {
+                    break;
+                }
+            } catch (error) {
+                this.#quarantineGuarded();
+
+                if (this.#hasGuardedWaiter(waiter)) {
+                    try {
+                        this.#finishGuarded(waiter, selected ?? { status: 'uncertain' });
+                    } catch {
+                        this.#quarantineGuarded();
+                    }
+                }
+
+                throw error;
+            }
+        }
     }
 
     private drain(): void {
@@ -557,8 +1242,261 @@ export class EventPollBuffer {
         }
     }
 
+    /** Verify only queue-owned identities and immutable snapshots, never a DTO. */
+    #guardedPrefixCurrent(active: GuardedActive): boolean {
+        if (
+            active.count < 1 ||
+            active.slots.length !== active.count ||
+            this.#guardedQueue.length < active.count
+        ) {
+            return false;
+        }
+
+        let json = '[';
+        let bytes = 2;
+
+        for (let i = 0; i < active.count; i++) {
+            const slot = active.slots[i];
+            const entry = this.#guardedQueue[i];
+
+            if (
+                !slot ||
+                entry !== slot.entry ||
+                entry.json !== slot.json ||
+                entry.bytes !== slot.bytes ||
+                this.#guardedMetadata.get(entry) !== slot.metadata ||
+                (slot.metadata.kind !== 'ordinary' && slot.metadata.kind !== 'recall')
+            ) {
+                return false;
+            }
+
+            json += (i ? ',' : '') + slot.json;
+            bytes += slot.bytes + (i ? 1 : 0);
+        }
+
+        json += ']';
+        const selection = active.selection;
+        return selection.status === 'reserved'
+            ? selection.count === active.count &&
+                  selection.bytes === bytes &&
+                  selection.eventsJson === json
+            : active.count === 1 &&
+                  active.slots[0].metadata.kind === 'recall' &&
+                  selection.requiredBytes === bytes;
+    }
+
+    /**
+     * These receipts describe only this queue's local effect. The future owner
+     * must separately verify BoundTo, source epoch, account and owner currency at
+     * the same linearization point after all callbacks, before calling this API.
+     */
+    commitGuardedNoDrain(token: object, expectedSelection: unknown): GuardedCommitResult {
+        return this.#runGuarded(
+            () => this.#settleGuarded(token, expectedSelection, 'reserved') as GuardedCommitResult,
+        );
+    }
+
+    settleBlockedGuardedNoDrain(token: object, expectedSelection: unknown): GuardedBlockedResult {
+        return this.#runGuarded(
+            () =>
+                this.#settleGuarded(
+                    token,
+                    expectedSelection,
+                    'blocked_guarded',
+                ) as GuardedBlockedResult,
+        );
+    }
+
+    #settleGuarded(
+        token: object,
+        expectedSelection: unknown,
+        kind: 'reserved' | 'blocked_guarded',
+    ): GuardedCommitResult | GuardedBlockedResult {
+        const active = this.#guardedActive;
+
+        // Compare the returned object by reference before reading anything from it.
+        if (
+            this.#mode !== 'guarded-recall' ||
+            !active ||
+            active.selection.token !== token ||
+            active.selection !== expectedSelection ||
+            active.selection.status !== kind
+        ) {
+            return { status: 'stale' };
+        }
+
+        if (this.#guardedUncertain) {
+            return { status: 'uncertain' };
+        }
+
+        const oldQueue = this.#guardedQueue;
+        let nextQueue: Entry[];
+        let nextBytes: number;
+        let removed: boolean[];
+        let receipt: GuardedCommitResult | GuardedBlockedResult;
+
+        try {
+            if (!this.#guardedPrefixCurrent(active)) {
+                this.#quarantineGuarded();
+                return { status: 'uncertain' };
+            }
+
+            removed = new Array<boolean>(active.count);
+            let badCount = 0;
+            let badBytes = 0;
+
+            // Every verifier is a fixed module function, not a caller callback.
+            // Once this scan starts, only local data and trusted built-ins are
+            // used until the queue replacement and barrier are published.
+            for (let i = 0; i < active.count; i++) {
+                const slot = active.slots[i];
+                const bad =
+                    slot.metadata.kind === 'recall' &&
+                    !isPrivateRecallPollProofCurrent(slot.metadata.proof);
+                removed[i] = bad;
+
+                if (bad) {
+                    badCount++;
+                    badBytes += slot.bytes;
+                }
+            }
+
+            const removeAll = kind === 'reserved' && badCount === 0;
+            const removeCount = removeAll ? active.count : badCount;
+            let removedBytes = badBytes;
+
+            if (removeAll) {
+                removedBytes = 0;
+
+                for (let i = 0; i < active.count; i++) {
+                    removed[i] = true;
+                    removedBytes += active.slots[i].bytes;
+                }
+            }
+
+            nextQueue =
+                removeCount === 0 ? oldQueue : new Array<Entry>(oldQueue.length - removeCount);
+
+            if (removeCount) {
+                let destination = 0;
+
+                for (let i = 0; i < oldQueue.length; i++) {
+                    if (i >= active.count || !removed[i]) {
+                        nextQueue[destination++] = oldQueue[i];
+                    }
+                }
+            }
+
+            nextBytes = this.#guardedBytes - removedBytes;
+            receipt = badCount
+                ? Object.freeze({ status: 'pruned', count: badCount })
+                : kind === 'blocked_guarded'
+                  ? Object.freeze({ status: 'blocked', requiredBytes: active.slots[0].bytes + 2 })
+                  : Object.freeze({ status: 'committed' });
+        } catch {
+            this.#quarantineGuarded();
+            return { status: 'uncertain' };
+        }
+
+        this.#guardedQueue = nextQueue;
+        this.#guardedBytes = nextBytes;
+        this.#guardedActive = null;
+        this.#guardedBarrier = receipt;
+
+        for (let i = 0; i < active.count; i++) {
+            if (removed[i]) {
+                this.#guardedMetadata.delete(active.slots[i].entry);
+            }
+        }
+
+        return receipt;
+    }
+
+    /** Cancellation, epoch retirement and deadlines release without pruning. */
+    releaseGuardedNoDrain(token: object): GuardedReleaseResult {
+        return this.#runGuarded(() => this.#releaseGuardedNoDrain(token));
+    }
+
+    #releaseGuardedNoDrain(token: object): GuardedReleaseResult {
+        const active = this.#guardedActive;
+
+        if (this.#mode !== 'guarded-recall' || !active || active.selection.token !== token) {
+            return { status: 'stale' };
+        }
+
+        if (this.#guardedUncertain) {
+            return { status: 'uncertain' };
+        }
+
+        try {
+            if (!this.#guardedPrefixCurrent(active)) {
+                this.#quarantineGuarded();
+                return { status: 'uncertain' };
+            }
+
+            const receipt = Object.freeze({ status: 'released' as const });
+            this.#guardedActive = null;
+            this.#guardedBarrier = receipt;
+            return receipt;
+        } catch {
+            this.#quarantineGuarded();
+            return { status: 'uncertain' };
+        }
+    }
+
+    /**
+     * Only the exact, recorded no-drain receipt may resume its barrier. An old
+     * or replaced receipt is stale and does not drain. A drain failure is
+     * uncertain and quarantines the queue; it does not undo an earlier known
+     * committed/pruned/released receipt or permit retrying that prior effect.
+     */
+    resumeGuardedDrain(receipt: unknown): GuardedDrainResult {
+        return this.#runGuarded(() => this.#resumeGuardedDrain(receipt));
+    }
+
+    #resumeGuardedDrain(receipt: unknown): GuardedDrainResult {
+        const barrier = this.#guardedBarrier;
+
+        if (this.#mode !== 'guarded-recall' || !barrier || barrier !== receipt) {
+            return { status: 'stale' };
+        }
+
+        if (this.#guardedUncertain || this.#guardedResuming || this.#guardedDraining) {
+            return { status: 'uncertain' };
+        }
+
+        this.#guardedResuming = true;
+        this.#guardedDraining = true;
+
+        try {
+            // The same barrier remains visible to every reentrant short poll.
+            this.#drainGuarded(barrier);
+
+            if (this.#guardedClosed) {
+                return { status: 'stale' };
+            }
+
+            if (this.#guardedUncertain || this.#guardedBarrier !== barrier) {
+                this.#quarantineGuarded();
+                return { status: 'uncertain' };
+            }
+
+            this.#guardedBarrier = null;
+            return { status: 'resumed' };
+        } catch {
+            if (!this.#guardedClosed) {
+                this.#quarantineGuarded();
+            }
+
+            return { status: 'uncertain' };
+        } finally {
+            this.#guardedDraining = false;
+            this.#guardedResuming = false;
+        }
+    }
+
     commit(token: object): boolean {
-        if (!this.active || this.active.token !== token) {
+        if (this.#mode !== 'legacy' || !this.active || this.active.token !== token) {
             return false;
         }
 
@@ -572,7 +1510,7 @@ export class EventPollBuffer {
     }
 
     release(token: object): boolean {
-        if (!this.active || this.active.token !== token) {
+        if (this.#mode !== 'legacy' || !this.active || this.active.token !== token) {
             return false;
         }
 
@@ -581,8 +1519,14 @@ export class EventPollBuffer {
         return true;
     }
 
-    /** Discards all entries, revokes the active token, resolves all waiters. */
+    /** Discards all entries, revokes the active token, resolves all waiters.
+     * In guarded mode the boolean reports the close request, not cleanup certainty.
+     */
     close(): boolean {
+        if (this.#mode === 'guarded-recall') {
+            return this.#runGuarded(() => this.#closeGuarded());
+        }
+
         if (this.closed) {
             return false;
         }
@@ -594,6 +1538,49 @@ export class EventPollBuffer {
 
         for (const waiter of [...this.waiters]) {
             this.finish(waiter, { status: 'closed' });
+        }
+
+        return true;
+    }
+
+    #closeGuarded(): boolean {
+        if (this.#guardedClosed) {
+            return false;
+        }
+
+        this.#guardedClosed = true;
+        this.#guardedCleanup = 'closing';
+        const oldQueue = this.#guardedQueue;
+        this.#guardedActive = null;
+        this.#guardedQueue = [];
+        this.#guardedBytes = 0;
+        this.#guardedBarrier = null;
+        let failed = false;
+
+        for (let i = 0; i < oldQueue.length; i++) {
+            try {
+                this.#guardedMetadata.delete(oldQueue[i]);
+            } catch {
+                failed = true;
+            }
+        }
+
+        while (this.#guardedWaiters.length) {
+            const waiter = this.#guardedWaiters[0];
+
+            try {
+                this.#finishGuarded(waiter, { status: 'closed' });
+            } catch {
+                failed = true;
+            }
+        }
+
+        if (failed || this.#guardedUncertain) {
+            this.#quarantineGuarded();
+
+            if (failed) {
+                throw new Error('guarded poll buffer cleanup uncertain');
+            }
         }
 
         return true;
