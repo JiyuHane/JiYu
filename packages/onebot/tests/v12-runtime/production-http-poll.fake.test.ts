@@ -880,7 +880,7 @@ describe('production V12 HTTP polling (real runtime, in-memory transport)', () =
         ).toEqual(['71']);
     });
 
-    it('counts the finite queue overflow without claiming the omitted event was delivered', async () => {
+    it('drops the oldest unreserved HTTP event on overflow without affecting WS or v11', async () => {
         const f = await account();
         const peer = connect(f.current().instance);
         const source = f.ticket();
@@ -889,10 +889,16 @@ describe('production V12 HTTP polling (real runtime, in-memory transport)', () =
             await f.manager.emitEvent(message(f.uin, id, id), source);
         }
 
-        expect(ownerApi.pollOwnerStats(f.runtime)).toMatchObject({ accepted: 128, full: 1 });
+        expect(ownerApi.pollOwnerStats(f.runtime)).toMatchObject({
+            accepted: 129,
+            full: 0,
+            dropped_oldest: '1',
+        });
         const batch = events(await response(f.current().instance, action()));
         expect(batch).toHaveLength(128);
-        expect(batch.map((event) => event.message_id)).not.toContain('129');
+        expect(batch.map((event) => event.message_id)).toEqual(
+            Array.from({ length: 128 }, (_, index) => String(index + 2)),
+        );
         expect(peerMessages(peer)).toHaveLength(129);
         expect(f.legacy.received).toHaveLength(129);
     });

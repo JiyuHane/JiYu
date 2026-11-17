@@ -67,6 +67,7 @@ type HttpPollDiagnostic =
     | 'cleanup_pending'
     | 'degraded'
     | 'full'
+    | 'dropped_oldest'
     | 'too_large'
     | 'invalid'
     | 'private_recall'
@@ -1657,6 +1658,10 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                 losses.push('full');
             }
 
+            if (after && after.dropped_oldest !== before.dropped_oldest) {
+                losses.push('dropped_oldest');
+            }
+
             if (after && after.too_large > before.too_large) {
                 losses.push('too_large');
             }
@@ -1682,6 +1687,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             cleanup_pending: 'v12 http poll cleanup pending; events may be missed',
             degraded: 'v12 http poll source degraded',
             full: 'v12 http poll queue full; new event dropped',
+            dropped_oldest: 'v12 http poll queue full; oldest unreserved events dropped',
             too_large: 'v12 http poll event too large; event dropped',
             invalid: 'v12 http poll event invalid; event dropped',
             private_recall: 'v12 http poll omits private recall events',

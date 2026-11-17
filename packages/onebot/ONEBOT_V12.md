@@ -59,7 +59,9 @@ The enabled account-local v12 listener accepts `get_latest_events` as a JSON
 `POST` to its existing `/` endpoint. This uses the listener's existing HTTP
 access checks. Polling is HTTP-only: the ordinary v12 dispatcher and WebSocket
 action path return 10002, and `get_supported_actions` does not currently list
-it. The v11 adapters and WebUI are separate from this capability. For example:
+it. The [candidate meta-action specification](https://12.onebot.dev/interface/meta/actions/)
+permits that omission, so it does not by itself show whether HTTP polling is
+supported. The v11 adapters and WebUI are separate from this capability. For example:
 
 ```json
 {"action":"get_latest_events","params":{"limit":0,"timeout":5},"echo":"poll-1"}
@@ -70,8 +72,9 @@ nonnegative safe integers. `timeout` is measured in seconds and is capped at
 10; `limit: 0` removes the count limit but not the byte and capacity limits.
 A poll `echo` may contain at most 4,096 UTF-16 code units; a longer one returns
 10001 after earlier request checks when a response remains writable.
-The poll owner admits at most 128 events, with a 256 KiB encoded-array queue
-budget and a 64 KiB single-event budget. It allows at most eight waiters and
+The poll owner retains at most 128 buffered events, including reserved entries,
+with a 256 KiB encoded-array queue budget and a 64 KiB single-event budget. It
+allows at most eight waiters and
 eight tracked transactions; the transport can impose a lower concurrency limit.
 These are not limits on total process memory or upstream activity.
 
@@ -81,25 +84,31 @@ opening source attempt can leave polling unavailable without proving that this
 timing occurs on a live network. Activation is attempted on listener open,
 status change, eligible event or poll. Once ready, the owner can buffer eligible
 events before the first poll. If old owner cleanup is pending, later activity
-retries activation; events can be lost in the interval. The default manager retains a non-evicting gate for each
-canonical UIN, up to 1,024 entries per manager lifetime. Its custom instance
+retries activation; events can be lost in the interval. The default manager
+retains a non-evicting gate for each canonical UIN, up to 1,024 entries per
+manager lifetime. Its custom instance
 factory does not automatically share that gate, nor do separate managers or
 processes. Source tickets identify a local binding and online generation, not
 QQ occurrence time or a complete poll-readiness cut; upstream work can still
 be in flight when a poll returns.
 
-Responses select an admission-completion FIFO prefix and then sort that batch
-by `time`, stably for equal timestamps. `limit: 1` selects the FIFO head, not
-necessarily the globally oldest event. Cross-batch order, later arrivals and
+Responses select an admission-completion FIFO prefix of the surviving queue and
+then sort that batch by `time`, stably for equal timestamps. `limit: 1` selects
+the FIFO head, not necessarily the globally oldest event. Cross-batch order, later arrivals and
 QQ occurrence order are not guaranteed. A short or timed poll can return
 `data: []` when it did not reserve events; this is not proof that upstream is
 empty or no other reservation holds data. Contention or a head that does not
 fit the response can instead produce a failure.
 
-Queue overflow drops new events; its fixed warning is best effort and
-category-deduplicated, not a complete loss report. Unsupported conversions and
-private recall are omitted from HTTP polling. A source-qualified private recall
-can still be published independently over WebSocket when its existing guard
+Under count or byte pressure, the HTTP owner first determines whether removing
+the oldest unreserved events would make room. An active reservation protects its
+physical prefix. If enough room can be made, those oldest unreserved events are
+evicted and the new event is admitted; otherwise the queue remains intact and
+the new event is dropped. Fixed, content-free warnings are best effort and
+category-deduplicated, not a complete loss report or client-visible gap.
+Unsupported conversions and private recall are omitted from HTTP polling. A
+source-qualified private recall can still be published independently over
+WebSocket when its existing guard
 succeeds; unsupported conversions are not necessarily available there either.
 Closing or rotating a listener/account/source generation can discard queued
 memory. When retirement cleanup observes discarded buffered events, it attempts

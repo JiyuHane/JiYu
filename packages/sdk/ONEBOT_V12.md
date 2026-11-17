@@ -62,24 +62,31 @@ support it. Jiyu's enabled account-local v12 listener provides a **partial
 HTTP-only** implementation when the listener and online source are current;
 its ordinary dispatcher and WebSocket action path still return 10002. Jiyu does
 not currently list the action in `get_supported_actions`, so that result alone
-is not a complete discovery mechanism for this endpoint. The standard requires
-the action for HTTP; WebSocket clients retain their generic `request` interface.
+is not a complete discovery mechanism for this endpoint. The [candidate
+meta-action specification](https://12.onebot.dev/interface/meta/actions/)
+permits this omission even though it requires the action for HTTP. WebSocket
+clients retain their generic `request` interface.
 
 For Jiyu, `timeout` is capped at 10 seconds and a poll `echo` above 4,096
 UTF-16 code units returns 10001 after earlier checks if a response remains
 writable. The in-memory queue is limited to 128 events and 256 KiB of encoded
 array data, with a 64 KiB single-event budget;
 `limit: 0` does not remove these or response-size limits. Each response selects
-a completion-order FIFO prefix, then sorts that prefix stably by event `time`;
-`limit: 1` does not necessarily return the globally oldest event. Separate
+a completion-order FIFO prefix of the surviving queue, then sorts that prefix
+stably by event `time`; `limit: 1` does not necessarily return the globally
+oldest event. Separate
 batches, late arrivals and QQ occurrence order have no global ordering guarantee.
 A successful empty array means this poll obtained no reservation, not that the
 upstream pipeline is empty or another poll holds no events.
 
 The account and listener must be current and online. Pending prior-owner cleanup
 can temporarily prevent activation, and events may be missed while later
-status, event or poll activity retries. Queue overflow drops new events;
-unsupported conversions and private recalls are omitted from polling. A
+status, event or poll activity retries. Under queue pressure the server may
+evict the oldest unreserved events to admit a new event. An active reservation's
+physical prefix stays protected; if removing all unreserved events would still
+not make enough room, the queue remains intact and the new event is dropped.
+Loss warnings are best effort, not client-visible gap notifications. Unsupported
+conversions and private recalls are omitted from polling. A
 source-qualified private recall may still reach WebSocket subscribers through
 its separate guarded path. Queue state is in memory and may be discarded at
 close or generation changes. A lost response after the server commits a batch

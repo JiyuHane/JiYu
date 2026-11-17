@@ -353,6 +353,8 @@ type Slot = {
     revision: object;
     cleanupUncertain: boolean;
     counters: Counters;
+    // Exact for this in-memory slot; bigint growth is not an RSS bound.
+    droppedOldest: bigint;
 };
 const slots = new WeakMap<object, Slot>();
 
@@ -386,6 +388,7 @@ export type OrderedPollActivation =
     | { status: 'ready'; owner: OrderedPollOwner }
     | { status: 'unavailable' | 'cleanup_pending' | 'degraded' };
 
+// Existing numeric counters saturate; the exact oldest-drop counter is tracked separately.
 function increment(slot: Slot, key: Counter, amount = 1): void {
     slot.counters[key] = Math.min(Number.MAX_SAFE_INTEGER, slot.counters[key] + amount);
 }
@@ -412,6 +415,7 @@ export function registerPollHost(runtime: object, host: Host, gate = createPollG
             closing_discard: 0,
             postcommit_unknown: 0,
         },
+        droppedOldest: 0n,
     });
 }
 
@@ -422,9 +426,10 @@ export function activatePollOwner(runtime: object): PollActivation {
 }
 
 /**
- * HTTP uses the existing completion-order admission and bounded queue. Only the
- * selected FIFO prefix is stably ordered by event time within each response;
- * overflow drops new events and is counted, so this is not full protocol coverage.
+ * HTTP uses completion-order admission and a bounded queue. Only the selected FIFO
+ * prefix is stably ordered by event time within each response. Overflow evicts the
+ * oldest unreserved events when possible; a protected prefix or byte budget can
+ * instead drop the new event. Local loss counts do not guarantee a remote gap signal.
  */
 export function activateHttpPollOwner(runtime: object): PollActivation {
     const result = activate(runtime, false, 'event-time');
@@ -659,6 +664,7 @@ function activate(
 
 export function pollOwnerStats(runtime: object): Readonly<
     Counters & {
+        dropped_oldest: string;
         active: boolean;
         cleanup_pending: boolean;
         cleanup_uncertain: boolean;
@@ -669,9 +675,11 @@ export function pollOwnerStats(runtime: object): Readonly<
 > | null {
     const slot = slots.get(runtime);
     slot?.owner?.touchOrdered();
+    slot?.owner?.syncOldestDrops();
     return slot
         ? {
               ...slot.counters,
+              dropped_oldest: slot.droppedOldest.toString(),
               active: slot.owner !== null,
               cleanup_pending:
                   slot.retiring ||
@@ -893,7 +901,8 @@ export function enqueuePollEvent(
  * across replacement instances; standalone/custom instances and other managers or
  * processes need their own coordination. */
 class Owner implements PollOwner {
-    private readonly queue = new EventPollBuffer(limits);
+    private readonly queue: EventPollBuffer;
+    private oldestDropWatermark = 0n;
     private readonly sequencer: IngressSequencer | null;
     private readonly ownerRevision: object;
     private readonly coordinator: PollCoordinator;
@@ -923,6 +932,10 @@ class Owner implements PollOwner {
         private readonly self: OrderedSelf | null,
         readonly batchOrder: PollBatchOrder,
     ) {
+        this.queue =
+            !ordered && batchOrder === 'event-time'
+                ? new EventPollBuffer(limits, 'drop-oldest')
+                : new EventPollBuffer(limits);
         this.ownerRevision = slot.revision;
         this.sequencer = ordered
             ? new IngressSequencer(
@@ -1358,8 +1371,30 @@ class Owner implements PollOwner {
         }
     }
 
+    /** Reconcile committed evictions without invoking a host callback. */
+    syncOldestDrops(): void {
+        if (this.ordered || this.batchOrder !== 'event-time') {
+            return;
+        }
+
+        const count = this.queue.oldestDropCount();
+
+        if (count > this.oldestDropWatermark) {
+            const delta = count - this.oldestDropWatermark;
+            // Publish the watermark first so nested observations cannot double-count.
+            this.oldestDropWatermark = count;
+            this.slot.droppedOldest += delta;
+        }
+    }
+
     enqueue(event: unknown) {
-        return this.queue.enqueue(event);
+        try {
+            return this.queue.enqueue(event);
+        } finally {
+            // A drain failure can follow a committed eviction. The existing accepted
+            // counter counts returned admissions, not necessarily physical enqueues.
+            this.syncOldestDrops();
+        }
     }
 
     start(request: PollRequest, sink: PollSink): { result: Promise<PollOutcome>; cancel(): void } {
@@ -1509,6 +1544,8 @@ class Owner implements PollOwner {
             return;
         }
 
+        // Preserve committed evictions before this owner can detach from the slot.
+        this.syncOldestDrops();
         this.invalidating = true;
 
         // Freeze admission first; expiry or abandoning pending work leaves a sticky gap.

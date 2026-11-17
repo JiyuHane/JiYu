@@ -1,7 +1,7 @@
 import { addAbortListener } from 'node:events';
 import { isProxy } from 'node:util/types';
 
-/** Offline, in-memory, single-process prototype; this is not an HTTP action.
+/** In-memory, single-process queue primitive; this is not itself an HTTP action.
  * The owner binds a separate instance to each account and validates event conversion,
  * account/self, authorization and source epoch. This only requires a nonempty type
  * and excludes meta; it does not validate a OneBot schema or account ownership.
@@ -12,6 +12,11 @@ import { isProxy } from 'node:util/types';
  * Once reserved, signal abort does not release the token: its owner must do so.
  * Returned strings remain with their caller after release or close and cannot be
  * revoked or prevented from being sent by that caller. close discards queued data.
+ * Only the trusted owner selects the construction-time overflow policy. The default
+ * rejects new events; drop-oldest protects the reserved physical prefix, and rejects
+ * the new event without eviction if removing the entire unreserved tail is insufficient.
+ * Its exact bigint drop watermark is in-memory, never reset, and is not part of JSON
+ * output. Its dynamically growing representation is not covered by an RSS hard limit.
  *
  * maxEventBytes includes the encoded event plus two enclosing array brackets;
  * maxQueueBytes and maxBatchBytes cover JSON arrays including commas and brackets;
@@ -267,13 +272,18 @@ function validSignal(value: unknown): value is AbortSignal {
 
 export class EventPollBuffer {
     private readonly config: PollBufferConfig;
+    private readonly overflowPolicy: 'reject-new' | 'drop-oldest';
     private queue: Entry[] = [];
     private sumBytes = 0;
+    #droppedOldest = 0n;
     private waiters: Waiter[] = [];
     private active: { token: object; count: number } | null = null;
     private closed = false;
 
-    constructor(config: PollBufferConfig) {
+    constructor(
+        config: PollBufferConfig,
+        overflowPolicy: 'reject-new' | 'drop-oldest' = 'reject-new',
+    ) {
         const input = dataOptions(config, Object.keys(caps));
 
         if (
@@ -294,6 +304,12 @@ export class EventPollBuffer {
         ) {
             throw new RangeError('inconsistent byte budgets');
         }
+
+        if (overflowPolicy !== 'reject-new' && overflowPolicy !== 'drop-oldest') {
+            throw new RangeError('invalid poll buffer overflow policy');
+        }
+
+        this.overflowPolicy = overflowPolicy;
     }
 
     /** queueBytes includes array brackets and separators, including reserved entries. */
@@ -313,6 +329,11 @@ export class EventPollBuffer {
         };
     }
 
+    /** Exact process-local eviction watermark; close and reads do not reset it. */
+    oldestDropCount(): bigint {
+        return this.#droppedOldest;
+    }
+
     enqueue(input: unknown): EnqueueResult {
         if (this.closed) {
             return 'closed';
@@ -324,15 +345,51 @@ export class EventPollBuffer {
             return event;
         }
 
-        if (
-            this.queue.length >= this.config.capacity ||
-            this.sumBytes + event.bytes + this.queue.length + 2 > this.config.maxQueueBytes
+        // A reservation owns the fixed physical prefix [0, protectedCount).
+        // Trial removals from its unreserved tail change no state until the new
+        // event fits both limits; otherwise even the entire tail remains intact.
+        const protectedCount = this.active?.count ?? 0;
+        let dropCount = 0;
+        let dropBytes = 0;
+
+        while (
+            this.queue.length - dropCount >= this.config.capacity ||
+            this.sumBytes - dropBytes + event.bytes + this.queue.length - dropCount + 2 >
+                this.config.maxQueueBytes
         ) {
-            return 'full';
+            if (
+                this.overflowPolicy === 'reject-new' ||
+                protectedCount + dropCount >= this.queue.length
+            ) {
+                return 'full';
+            }
+
+            dropBytes += this.queue[protectedCount + dropCount].bytes;
+            dropCount++;
         }
 
-        this.queue.push(event);
-        this.sumBytes += event.bytes;
+        // Prepare the non-saturating watermark before changing the queue. Under the
+        // trusted-builtins assumption, eviction, insertion and the watermark
+        // update form one synchronous commit before drain can notify waiters.
+        const nextOldestDropCount = dropCount
+            ? this.#droppedOldest + BigInt(dropCount)
+            : this.#droppedOldest;
+
+        if (dropCount) {
+            // Build the replacement before publishing it: a failed allocation must
+            // not leave old entries evicted without admitting the new event.
+            const nextQueue = this.queue.slice();
+            nextQueue.splice(protectedCount, dropCount);
+            nextQueue.push(event);
+            const nextSumBytes = this.sumBytes + event.bytes - dropBytes;
+            this.queue = nextQueue;
+            this.sumBytes = nextSumBytes;
+            this.#droppedOldest = nextOldestDropCount;
+        } else {
+            this.queue.push(event);
+            this.sumBytes += event.bytes;
+        }
+
         this.drain();
         return 'accepted';
     }
