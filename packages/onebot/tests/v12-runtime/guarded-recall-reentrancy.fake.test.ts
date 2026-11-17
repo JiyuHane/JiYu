@@ -18,6 +18,8 @@ import type {
 vi.mock('../../src/v12-runtime/private-recall-source', () => ({
     isPrivateRecallPollProofCurrent: () => false,
     isPrivateRecallPollProofFor: () => false,
+    isPrivateRecallPollEpochAccountScopeActive: () => false,
+    isPrivateRecallPollProofInEpochAccountScope: () => false,
 }));
 
 let EventPollBuffer: typeof import('../../src/v12-runtime/event-poll-buffer').EventPollBuffer;

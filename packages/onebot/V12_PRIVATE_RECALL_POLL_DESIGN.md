@@ -6,29 +6,31 @@
 
 The proposed guarantee is deliberately local: **at the linearization point of a successful poll queue commit, every private-recall entry in that committed prefix must still have valid, matching original v11 event and provenance evidence for the current owner and source epoch.** The response contains the corresponding immutable v12 snapshots prepared for that prefix. An original object may change after commit; that does not retroactively revoke the committed snapshot. The guarantee does not extend through HTTP header or body writing, local `finish`, socket delivery, client processing, or acknowledgement. A post-commit mutation alone does not require suppressing a previously committed response. A change that is later restored before the final check is likewise not detectable by a final-state comparison; this is not a claim that the object was unchanged throughout its lifetime.
 
-The queue is volatile and bounded, and the current HTTP owner chooses completion-order FIFO prefixes before sorting each selected batch by event `time`. The opt-in guarded mode extends the internal `EnqueueResult` type with `uncertain`; the default legacy mode does not produce that value at runtime. A closed or rotated epoch can discard buffered data; output loss or an unknown outcome after commit is not retried or requeued. No exactly-once delivery, eventual delivery, complete event history, client-visible gap report, global chronological order, or real QQ interoperability follows from this proposal.
+The queue is volatile and bounded, and the current HTTP owner chooses completion-order FIFO prefixes before sorting each selected batch by event `time`. The opt-in guarded modes extend the internal `EnqueueResult` type with `uncertain` and `scope_revoked`; the default legacy mode does not produce those values at runtime. A closed or rotated epoch can discard buffered data; output loss or an unknown outcome after commit is not retried or requeued. No exactly-once delivery, eventual delivery, complete event history, client-visible gap report, global chronological order, or real QQ interoperability follows from this proposal.
 
 ## Opt-in primitive status
 
 `EventPollBuffer` has an internal `guarded-recall` mode alongside its unchanged
-legacy default. It binds a qualified candidate and proof to one immutable queue
-entry, reserves physical prefixes, and exposes no-drain commit, selective prune,
-release and blocked-head results. Each successful no-drain effect returns a unique
-frozen receipt; only that same receipt can resume its barrier. The mode also
-reports cleanup uncertainty separately. These primitives have in-memory tests,
-but do not themselves bind selected proofs to the HTTP owner's account, current
-source epoch or transport. No production caller enables the mode.
+legacy default. An additional opt-in scoped construction fixes one exact active
+epoch/account scope to the queue and binds each admitted recall entry to its exact
+event ticket and proof. It reserves physical prefixes and exposes no-drain commit,
+selective prune, release and blocked-head results. Each successful no-drain effect
+returns a unique frozen receipt; only that same receipt can resume its barrier.
+The mode also reports cleanup uncertainty separately. Guarded queues use a
+separate private frozen configuration and overflow policy, so later changes to
+replaceable instance properties cannot reenter queue limit checks. These primitives
+have in-memory tests but are not connected to a production owner or transport.
 
-The next scoped variant is also not implemented. It needs to fix one exact active
-scope to the queue and bind each recall entry to its exact event ticket. A retired
-scope must prevent new selections and commits without treating all its entries as
-stale recalls; the original reservation must remain releasable, and retirement
-must be paired with queue shutdown or notification because the scope itself does
-not wake waiters. At commit, validate the exact token, frozen selection and physical
-prefix first, then the active scope and the entire batch before any mutation. A
-mismatch that cannot be explained as a stale original proof is an uncertainty for
-the whole batch, not authority to delete ordinary events. An already committed
-receipt remains committed if the scope is retired afterwards; do not requeue it.
+A retired scope prevents new selections and commits without treating all entries
+as stale recalls; the original reservation remains releasable. Retirement must be
+paired with queue shutdown or notification because the scope itself does not wake
+waiters. Commit validates the exact token, frozen selection and physical prefix,
+then the active scope and the entire batch before mutation. A mismatch that cannot
+be explained as a stale original proof makes the whole batch uncertain instead of
+authorizing deletion of ordinary entries. An already committed receipt remains
+committed if the scope is retired afterwards; it is not requeued. The caller must
+still validate ordinary non-recall events independently: scoped mode does not by
+itself validate their account, source or schema.
 
 ## Existing evidence and admission boundary
 
@@ -45,7 +47,7 @@ The current internal five-input proof factory binds the exact original v11 objec
 
 The internal proof-module check `BoundTo(proof, exactEventTicket, ownerSelf)` synchronously and without callbacks verifies the opaque proof's account binding and the **exact original event-ticket reference**. This check alone does not establish that the account is online, that the owner belongs to the current manager, or that its gate and listener are current. Separately require `sameSourceEpoch(exactEventTicket, owner.source) === 'same'` and the owner's existing current-source, binding and gate checks. `owner.source` can be a different Ticket object captured in the same binding/online epoch; requiring `owner.source === exactEventTicket` would incorrectly reject it. Reject `different` and `invalid` epoch comparisons. Recheck these bindings at the commit linearization point after all potentially reentrant callbacks.
 
-The internal epoch/account scope primitive snapshots a validated account value and a genuine owner ticket, then compares each proof against its exact event ticket and that owner's epoch. The low-level ticket implementation is shared by direct and re-exported imports within one module graph; old tickets from a separately reloaded module instance or process are not promised to remain valid. Proof creation must still receive the exact `self` object originally supplied to conversion; the independent owner-self snapshot is for the later scope check and cannot replace that conversion identity. Scope activity means only that the exact opaque handle has not been retired. It does not prove that the ticket was issued for the stated account or context: even a genuine ticket can be paired with an unrelated synthetic account by an untrusted caller. After an offline transition, two old tickets can still compare as the same historical epoch. Distinct scopes made from the same inputs can both pass; retiring one does not revoke the others or prevent another from being created. Scope, proof and ticket are internal sidecars, not v12 event JSON or diagnostic data. Existing v11 serialization and TRACE behavior are unchanged.
+The internal epoch/account scope primitive snapshots a validated account value and a genuine owner ticket, then compares each proof against its exact event ticket and that owner's epoch. The low-level ticket implementation is shared by direct and re-exported imports within one module graph; old tickets from a separately reloaded module instance or process are not promised to remain valid. Proof creation must still receive the exact `self` object originally supplied to conversion; the independent owner-self snapshot is for the later scope check and cannot replace that conversion identity. Scope activity means only that the exact opaque handle has not been retired. It does not prove that the ticket was issued for the stated account or context: even a genuine ticket can be paired with an unrelated synthetic account by an untrusted caller. After an offline transition, two old tickets can still compare as the same historical epoch. Distinct scopes made from the same inputs can both pass; retiring one does not revoke the others or prevent another from being created. The queue must not automatically add scope, proof or ticket sidecars to v12 event JSON or diagnostics. This does not stop a caller from putting its own data or references into an ordinary event or `echo`; existing v11 serialization and TRACE behavior are unchanged.
 
 The current HTTP owner does not yet retain the validated self used by this proposed check: activation currently constructs that self only for the ordered mode. Before production wiring, the HTTP owner must capture and fix an independent, valid account `self` for its lifetime, fail closed when it cannot do so, and retain the existing separate owner, listener, manager and online-source verification. The proposed selection exposes no proof or ticket, so the owner also needs a reviewed, selection-bound way to validate each entry; equal JSON or event IDs cannot identify it. The source provenance context and network adapter context are distinct objects: the trusted instance lifecycle must connect them, rather than assuming they are the same reference or joining on account text. Merely passing an account object to `BoundTo`, or maintaining an unverified parallel FIFO, is not a substitute for those checks.
 
@@ -55,7 +57,7 @@ The source verifier remains a trusted synchronous callback under the existing co
 
 ## Queue representation and ownership
 
-The production legacy [buffer](src/v12-runtime/event-poll-buffer.ts) retains encoded JSON and byte length, while its selection and commit use one opaque reservation token and a protected physical FIFO prefix. The opt-in guarded mode also retains its internal proof sidecars, but not yet an epoch/account scope or exact event ticket per entry. The production time-sorting transaction later parses and reorders a private copy. JSON content, public event IDs, message IDs, and positions after sorting do not identify the original queue entry: distinct entries can have identical values or IDs.
+The production legacy [buffer](src/v12-runtime/event-poll-buffer.ts) retains encoded JSON and byte length, while its selection and commit use one opaque reservation token and a protected physical FIFO prefix. The opt-in scoped guarded variant retains internal proof and exact event-ticket sidecars under one fixed epoch/account scope. The production time-sorting transaction still uses the legacy path and parses and reorders a private copy. JSON content, public event IDs, message IDs, and positions after sorting do not identify the original queue entry: distinct entries can have identical values or IDs.
 
 A proposed implementation must associate each admitted recall's attestation with its **specific internal queue Entry** before publishing that entry to waiters. An Entry object already has natural per-enqueue object identity; a public numeric ID or UUID is unnecessary if all validation and selective removal remain within that trusted queue. A queue-external side table or an exported sorted selection would instead need to carry the exact Entry reference or an opaque per-enqueue identity. A runtime type tag must distinguish proven recall entries from ordinary entries; missing or corrupt metadata must never cause an ordinary entry to be treated as a recall and deleted.
 

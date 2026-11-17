@@ -1,8 +1,10 @@
 import { addAbortListener } from 'node:events';
 import { isProxy } from 'node:util/types';
 import {
+    isPrivateRecallPollEpochAccountScopeActive,
     isPrivateRecallPollProofCurrent,
     isPrivateRecallPollProofFor,
+    isPrivateRecallPollProofInEpochAccountScope,
 } from './private-recall-source';
 
 /** In-memory, single-process queue primitive; this is not itself an HTTP action.
@@ -21,6 +23,15 @@ import {
  * the new event without eviction if removing the entire unreserved tail is insufficient.
  * Its exact bigint drop watermark is in-memory, never reset, and is not part of JSON
  * output. Its dynamically growing representation is not covered by an RSS hard limit.
+ *
+ * The optional fourth constructor argument enables an exact epoch/account scope on
+ * a guarded queue; it does not connect this primitive to production HTTP. The scope
+ * proves registration and proof/ticket/account/epoch correlation, not online state,
+ * ticket issuance for an account, or manager/gate ownership. The trusted owner must
+ * verify current lifecycle state separately after all potentially reentrant checks.
+ * Retiring a scope does not notify waiting polls: they may wait for timeout, abort,
+ * or owner close. Close drops this queue's scope reference; it does not retire a scope
+ * potentially shared with another owner. No scope, proof or ticket is serialized.
  *
  * maxEventBytes includes the encoded event plus two enclosing array brackets;
  * maxQueueBytes and maxBatchBytes cover JSON arrays including commas and brackets;
@@ -47,7 +58,14 @@ export interface PollBufferConfig {
 }
 
 export type EnqueueResult =
-    'accepted' | 'full' | 'oversize' | 'invalid' | 'meta' | 'closed' | 'uncertain';
+    | 'accepted'
+    | 'full'
+    | 'oversize'
+    | 'invalid'
+    | 'meta'
+    | 'closed'
+    | 'uncertain'
+    | 'scope_revoked';
 export type PollResult =
     | { status: 'reserved'; token: object; eventsJson: string; count: number; bytes: number }
     | { status: 'blocked'; requiredBytes: number }
@@ -69,23 +87,26 @@ export type GuardedSelection =
       }>
     | Readonly<{ status: 'blocked_guarded'; token: object; requiredBytes: number }>;
 export type GuardedPollResult =
-    GuardedSelection | Exclude<PollResult, { status: 'reserved' }> | { status: 'uncertain' };
+    | GuardedSelection
+    | Exclude<PollResult, { status: 'reserved' }>
+    | { status: 'uncertain' | 'scope_revoked' };
 export type GuardedCommitResult =
     | { status: 'committed' }
     | { status: 'pruned'; count: number }
-    | { status: 'stale' | 'uncertain' };
+    | { status: 'stale' | 'uncertain' | 'scope_revoked' };
 export type GuardedBlockedResult =
     | { status: 'blocked'; requiredBytes: number }
     | { status: 'pruned'; count: number }
-    | { status: 'stale' | 'uncertain' };
+    | { status: 'stale' | 'uncertain' | 'scope_revoked' };
 export type GuardedReleaseResult = { status: 'released' | 'stale' | 'uncertain' };
-export type GuardedDrainResult = { status: 'resumed' | 'stale' | 'uncertain' };
+export type GuardedDrainResult = { status: 'resumed' | 'stale' | 'uncertain' | 'scope_revoked' };
 export type GuardedCleanupState = 'open' | 'closing' | 'closed' | 'uncertain' | 'unavailable';
 
 type Entry = { json: string; bytes: number };
 type Snapshot = { entry: Entry; privateRecall: boolean };
 type GuardedMetadata =
-    Readonly<{ kind: 'ordinary' }> | Readonly<{ kind: 'recall'; proof: unknown }>;
+    | Readonly<{ kind: 'ordinary' }>
+    | Readonly<{ kind: 'recall'; proof: unknown; eventTicket?: unknown }>;
 type GuardedSlot = { entry: Entry; json: string; bytes: number; metadata: GuardedMetadata };
 type GuardedActive = { selection: GuardedSelection; slots: GuardedSlot[]; count: number };
 type Waiter = {
@@ -326,6 +347,10 @@ export class EventPollBuffer {
     // Keep guarded backing storage, attestation and token ownership out of the
     // ordinary object graph. The legacy queue remains untouched for its callers.
     readonly #mode: 'legacy' | 'guarded-recall';
+    readonly #guardedConfig: Readonly<PollBufferConfig> | null;
+    readonly #guardedOverflowPolicy: 'reject-new' | 'drop-oldest';
+    readonly #guardedScoped: boolean;
+    #guardedScope: unknown;
     #guardedQueue: Entry[] = [];
     #guardedBytes = 0;
     #guardedMetadata = new WeakMap<Entry, GuardedMetadata>();
@@ -343,7 +368,17 @@ export class EventPollBuffer {
         config: PollBufferConfig,
         overflowPolicy: 'reject-new' | 'drop-oldest' = 'reject-new',
         mode: 'legacy' | 'guarded-recall' = 'legacy',
+        scope?: unknown,
     ) {
+        const scoped = arguments.length >= 4;
+
+        if (
+            scoped &&
+            (mode !== 'guarded-recall' || !isPrivateRecallPollEpochAccountScopeActive(scope))
+        ) {
+            throw new RangeError('invalid or retired poll scope');
+        }
+
         const input = dataOptions(config, Object.keys(caps));
 
         if (
@@ -373,8 +408,34 @@ export class EventPollBuffer {
             throw new RangeError('invalid poll buffer mode');
         }
 
+        if (scoped && !isPrivateRecallPollEpochAccountScopeActive(scope)) {
+            throw new RangeError('invalid or retired poll scope');
+        }
+
         this.overflowPolicy = overflowPolicy;
         this.#mode = mode;
+        this.#guardedConfig =
+            mode === 'guarded-recall'
+                ? Object.freeze({
+                      capacity: this.config.capacity,
+                      maxQueueBytes: this.config.maxQueueBytes,
+                      maxEventBytes: this.config.maxEventBytes,
+                      maxWaiters: this.config.maxWaiters,
+                      maxTimeoutMs: this.config.maxTimeoutMs,
+                  })
+                : null;
+        this.#guardedOverflowPolicy = overflowPolicy;
+        this.#guardedScoped = scoped;
+        this.#guardedScope = scoped ? scope : undefined;
+    }
+
+    /** Construct an opt-in queue bound to this exact active scope; no implicit fallback. */
+    static scoped(
+        config: PollBufferConfig,
+        overflowPolicy: 'reject-new' | 'drop-oldest',
+        scope: unknown,
+    ): EventPollBuffer {
+        return new EventPollBuffer(config, overflowPolicy, 'guarded-recall', scope);
     }
 
     /** queueBytes includes array brackets and separators, including reserved entries. */
@@ -432,6 +493,12 @@ export class EventPollBuffer {
     /** Exact process-local eviction watermark; close and reads do not reset it. */
     oldestDropCount(): bigint {
         return this.#droppedOldest;
+    }
+
+    #guardedScopeActive(): boolean {
+        return (
+            !this.#guardedScoped || isPrivateRecallPollEpochAccountScopeActive(this.#guardedScope)
+        );
     }
 
     /**
@@ -510,14 +577,38 @@ export class EventPollBuffer {
      * The guarded admission cost and post-publication throw contract match enqueue.
      */
     enqueueGuarded(candidate: unknown, proof: unknown): EnqueueResult {
-        if (this.#mode !== 'guarded-recall') {
+        if (this.#mode !== 'guarded-recall' || this.#guardedScoped) {
             return 'invalid';
         }
 
         return this.#runGuarded(() => this.#enqueueGuarded(candidate, proof, true));
     }
 
-    #enqueueGuarded(input: unknown, proof: unknown, recall: boolean): EnqueueResult {
+    /**
+     * Scoped admission binds the exact candidate, proof and original event ticket
+     * to this queue's fixed scope. Retirement rejects all subsequent admissions
+     * without eviction; the two-argument guarded recall path is disabled here.
+     */
+    enqueueScopedRecall(
+        candidate: unknown,
+        proof: unknown,
+        exactEventTicket: unknown,
+    ): EnqueueResult {
+        if (this.#mode !== 'guarded-recall' || !this.#guardedScoped) {
+            return 'invalid';
+        }
+
+        return this.#runGuarded(() =>
+            this.#enqueueGuarded(candidate, proof, true, exactEventTicket),
+        );
+    }
+
+    #enqueueGuarded(
+        input: unknown,
+        proof: unknown,
+        recall: boolean,
+        eventTicket?: unknown,
+    ): EnqueueResult {
         if (this.#guardedClosed) {
             return 'closed';
         }
@@ -526,11 +617,37 @@ export class EventPollBuffer {
             return 'uncertain';
         }
 
+        if (!this.#guardedScopeActive()) {
+            return 'scope_revoked';
+        }
+
         if (recall && !isPrivateRecallPollProofFor(proof, input)) {
             return 'invalid';
         }
 
-        const snapshot = snapshotEvent(input, this.config.maxEventBytes);
+        if (
+            recall &&
+            this.#guardedScoped &&
+            !isPrivateRecallPollProofInEpochAccountScope(proof, eventTicket, this.#guardedScope)
+        ) {
+            return this.#guardedScopeActive() ? 'invalid' : 'scope_revoked';
+        }
+
+        const snapshot = snapshotEvent(input, this.#guardedConfig!.maxEventBytes);
+
+        if (this.#guardedScoped) {
+            if (this.#guardedClosed) {
+                return 'closed';
+            }
+
+            if (this.#guardedUncertain) {
+                return 'uncertain';
+            }
+
+            if (!this.#guardedScopeActive()) {
+                return 'scope_revoked';
+            }
+        }
 
         if (typeof snapshot === 'string') {
             return snapshot;
@@ -540,9 +657,25 @@ export class EventPollBuffer {
             return 'invalid';
         }
 
-        const capacity = this.config.capacity;
-        const maxBytes = this.config.maxQueueBytes;
-        const policy = this.overflowPolicy;
+        if (recall && this.#guardedScoped && !isPrivateRecallPollProofFor(proof, input)) {
+            return this.#guardedScopeActive() ? 'invalid' : 'scope_revoked';
+        }
+
+        if (
+            recall &&
+            this.#guardedScoped &&
+            !isPrivateRecallPollProofInEpochAccountScope(proof, eventTicket, this.#guardedScope)
+        ) {
+            return this.#guardedScopeActive() ? 'invalid' : 'scope_revoked';
+        }
+
+        if (!this.#guardedScopeActive()) {
+            return 'scope_revoked';
+        }
+
+        const capacity = this.#guardedConfig!.capacity;
+        const maxBytes = this.#guardedConfig!.maxQueueBytes;
+        const policy = this.#guardedOverflowPolicy;
         const oldQueue = this.#guardedQueue;
         const oldActive = this.#guardedActive;
         const protectedCount = oldActive?.count ?? 0;
@@ -556,6 +689,18 @@ export class EventPollBuffer {
                 maxBytes
         ) {
             if (policy === 'reject-new' || protectedCount + dropCount >= oldQueue.length) {
+                if (this.#guardedClosed) {
+                    return 'closed';
+                }
+
+                if (this.#guardedUncertain) {
+                    return 'uncertain';
+                }
+
+                if (this.#guardedScoped && !this.#guardedScopeActive()) {
+                    return 'scope_revoked';
+                }
+
                 return 'full';
             }
 
@@ -580,31 +725,69 @@ export class EventPollBuffer {
             ? this.#droppedOldest + BigInt(dropCount)
             : this.#droppedOldest;
         const metadata: GuardedMetadata = recall
-            ? Object.freeze({ kind: 'recall', proof })
+            ? this.#guardedScoped
+                ? Object.freeze({ kind: 'recall', proof, eventTicket })
+                : Object.freeze({ kind: 'recall', proof })
             : Object.freeze({ kind: 'ordinary' });
-        this.#guardedMetadata.set(event, metadata);
 
-        if (
-            this.#guardedClosed ||
-            this.#guardedUncertain ||
-            this.#guardedQueue !== oldQueue ||
-            this.#guardedActive !== oldActive
-        ) {
-            this.#guardedMetadata.delete(event);
-            return this.#guardedClosed
-                ? 'closed'
-                : this.#guardedUncertain
-                  ? 'uncertain'
-                  : 'invalid';
+        if (!this.#guardedScoped) {
+            this.#guardedMetadata.set(event, metadata);
+        }
+
+        if (this.#guardedClosed) {
+            if (!this.#guardedScoped) {
+                this.#guardedMetadata.delete(event);
+            }
+
+            return 'closed';
+        }
+
+        if (this.#guardedUncertain) {
+            if (!this.#guardedScoped) {
+                this.#guardedMetadata.delete(event);
+            }
+
+            return 'uncertain';
+        }
+
+        if (!this.#guardedScopeActive()) {
+            return 'scope_revoked';
+        }
+
+        if (this.#guardedQueue !== oldQueue || this.#guardedActive !== oldActive) {
+            if (!this.#guardedScoped) {
+                this.#guardedMetadata.delete(event);
+            }
+
+            return 'invalid';
         }
 
         if (recall && !isPrivateRecallPollProofFor(proof, input)) {
-            this.#guardedMetadata.delete(event);
+            if (!this.#guardedScoped) {
+                this.#guardedMetadata.delete(event);
+            }
+
             return 'invalid';
+        }
+
+        if (
+            recall &&
+            this.#guardedScoped &&
+            !isPrivateRecallPollProofInEpochAccountScope(proof, eventTicket, this.#guardedScope)
+        ) {
+            return this.#guardedScopeActive() ? 'invalid' : 'scope_revoked';
+        }
+
+        if (!this.#guardedScopeActive()) {
+            return 'scope_revoked';
         }
 
         // No host callback, getter, queue method or clock between the last
         // proof check and publication of this complete replacement.
+        if (this.#guardedScoped) {
+            this.#guardedMetadata.set(event, metadata);
+        }
+
         this.#guardedQueue = nextQueue;
         this.#guardedBytes = nextBytes;
         this.#droppedOldest = nextDropped;
@@ -628,7 +811,10 @@ export class EventPollBuffer {
         return this.reserveInternal(options) as Promise<PollResult>;
     }
 
-    /** In guarded mode, existing close/quarantine wins over option validation and abort. */
+    /**
+     * In guarded mode, existing close/quarantine wins over option validation and
+     * abort. A retired scope prevents new selection, including ordinary entries.
+     */
     reserveGuarded(options: PollOptions = {}): Promise<GuardedPollResult> {
         if (this.#mode !== 'guarded-recall') {
             return Promise.resolve({ status: 'invalid' });
@@ -644,6 +830,10 @@ export class EventPollBuffer {
 
         if (this.#guardedUncertain) {
             return Promise.resolve({ status: 'uncertain' });
+        }
+
+        if (!this.#guardedScopeActive()) {
+            return Promise.resolve({ status: 'scope_revoked' });
         }
 
         let start: number;
@@ -663,6 +853,10 @@ export class EventPollBuffer {
             return Promise.resolve({ status: 'uncertain' });
         }
 
+        if (!this.#guardedScopeActive()) {
+            return Promise.resolve({ status: 'scope_revoked' });
+        }
+
         const input = dataOptions(options, ['limit', 'timeoutMs', 'maxBatchBytes', 'signal']);
 
         if (!input) {
@@ -671,17 +865,32 @@ export class EventPollBuffer {
 
         const limit = input.limit === undefined ? 0 : input.limit;
         const timeout = input.timeoutMs === undefined ? 0 : input.timeoutMs;
+        const config = this.#guardedConfig!;
         const budget =
-            input.maxBatchBytes === undefined ? this.config.maxQueueBytes : input.maxBatchBytes;
+            input.maxBatchBytes === undefined ? config.maxQueueBytes : input.maxBatchBytes;
         const signal = input.signal;
 
         if (
             !integer(limit, 0, Number.MAX_SAFE_INTEGER) ||
-            !integer(timeout, 0, this.config.maxTimeoutMs) ||
-            !integer(budget, 2, this.config.maxQueueBytes) ||
+            !integer(timeout, 0, config.maxTimeoutMs) ||
+            !integer(budget, 2, config.maxQueueBytes) ||
             (signal !== undefined && !validSignal(signal))
         ) {
             return Promise.resolve({ status: 'invalid' });
+        }
+
+        if (this.#guardedScoped) {
+            if (this.#guardedClosed) {
+                return Promise.resolve({ status: 'closed' });
+            }
+
+            if (this.#guardedUncertain) {
+                return Promise.resolve({ status: 'uncertain' });
+            }
+
+            if (!this.#guardedScopeActive()) {
+                return Promise.resolve({ status: 'scope_revoked' });
+            }
         }
 
         if (signal && signalAborted.call(signal)) {
@@ -696,6 +905,10 @@ export class EventPollBuffer {
             return Promise.resolve({ status: 'uncertain' });
         }
 
+        if (!this.#guardedScopeActive()) {
+            return Promise.resolve({ status: 'scope_revoked' });
+        }
+
         if (timeout === 0) {
             if (this.#guardedActive || this.#guardedBarrier || this.#guardedWaiters.length) {
                 return Promise.resolve({ status: 'contended' });
@@ -708,7 +921,7 @@ export class EventPollBuffer {
             return Promise.resolve(this.#selectGuarded(limit, budget));
         }
 
-        if (this.#guardedWaiters.length >= this.config.maxWaiters) {
+        if (this.#guardedWaiters.length >= config.maxWaiters) {
             return Promise.resolve({ status: 'busy' });
         }
 
@@ -720,6 +933,29 @@ export class EventPollBuffer {
                 signal: signal as AbortSignal | undefined,
                 resolve,
             };
+
+            // Recheck immediately before publication; no caller callback or
+            // replaceable config access may intervene before the dense insert.
+            if (this.#guardedClosed) {
+                resolve({ status: 'closed' });
+                return;
+            }
+
+            if (this.#guardedUncertain) {
+                resolve({ status: 'uncertain' });
+                return;
+            }
+
+            if (!this.#guardedScopeActive()) {
+                resolve({ status: 'scope_revoked' });
+                return;
+            }
+
+            if (this.#guardedWaiters.length >= config.maxWaiters) {
+                resolve({ status: 'busy' });
+                return;
+            }
+
             this.#guardedWaiters[this.#guardedWaiters.length] = waiter;
 
             try {
@@ -891,6 +1127,10 @@ export class EventPollBuffer {
     }
 
     #selectGuarded(limit: number, budget: number): GuardedPollResult {
+        if (!this.#guardedScopeActive()) {
+            return { status: 'scope_revoked' };
+        }
+
         const first = this.#guardedQueue[0];
         const firstMetadata = this.#guardedMetadata.get(first);
 
@@ -1198,6 +1438,7 @@ export class EventPollBuffer {
                     this.#finishGuarded(waiter, { status: 'aborted' });
                 } else if (
                     this.#guardedUncertain ||
+                    !this.#guardedScopeActive() ||
                     (this.#guardedBarrier && this.#guardedBarrier !== allowedBarrier)
                 ) {
                     break;
@@ -1286,9 +1527,12 @@ export class EventPollBuffer {
     }
 
     /**
-     * These receipts describe only this queue's local effect. The future owner
-     * must separately verify BoundTo, source epoch, account and owner currency at
-     * the same linearization point after all callbacks, before calling this API.
+     * These receipts describe only this queue's local effect. In scoped mode a
+     * retired scope retains the token and prefix; a current proof with unexpected
+     * ticket/account/epoch mismatch quarantines the whole batch without pruning.
+     * The owner must separately verify live binding, source, manager and gate
+     * currency after all callbacks, before calling this API. Unscoped guarded mode
+     * also requires the owner to verify BoundTo and sameSourceEpoch separately.
      */
     commitGuardedNoDrain(token: object, expectedSelection: unknown): GuardedCommitResult {
         return this.#runGuarded(
@@ -1341,24 +1585,48 @@ export class EventPollBuffer {
                 return { status: 'uncertain' };
             }
 
+            if (!this.#guardedScopeActive()) {
+                return { status: 'scope_revoked' };
+            }
+
             removed = new Array<boolean>(active.count);
             let badCount = 0;
             let badBytes = 0;
+            let scopeMismatch = false;
 
             // Every verifier is a fixed module function, not a caller callback.
             // Once this scan starts, only local data and trusted built-ins are
             // used until the queue replacement and barrier are published.
             for (let i = 0; i < active.count; i++) {
                 const slot = active.slots[i];
+                const metadata = slot.metadata;
                 const bad =
-                    slot.metadata.kind === 'recall' &&
-                    !isPrivateRecallPollProofCurrent(slot.metadata.proof);
+                    metadata.kind === 'recall' && !isPrivateRecallPollProofCurrent(metadata.proof);
                 removed[i] = bad;
 
                 if (bad) {
                     badCount++;
                     badBytes += slot.bytes;
+                } else if (
+                    this.#guardedScoped &&
+                    metadata.kind === 'recall' &&
+                    !isPrivateRecallPollProofInEpochAccountScope(
+                        metadata.proof,
+                        metadata.eventTicket,
+                        this.#guardedScope,
+                    )
+                ) {
+                    scopeMismatch = true;
                 }
+            }
+
+            if (!this.#guardedScopeActive()) {
+                return { status: 'scope_revoked' };
+            }
+
+            if (scopeMismatch) {
+                this.#quarantineGuarded();
+                return { status: 'uncertain' };
             }
 
             const removeAll = kind === 'reserved' && badCount === 0;
@@ -1449,6 +1717,10 @@ export class EventPollBuffer {
      * or replaced receipt is stale and does not drain. A drain failure is
      * uncertain and quarantines the queue; it does not undo an earlier known
      * committed/pruned/released receipt or permit retrying that prior effect.
+     * If close occurs during drain, cleanup uncertainty takes precedence over
+     * the stale result used for a cleanly closed queue.
+     * Scope retirement retains the barrier and any already selected token; the
+     * owner must release that token as appropriate and close the retired queue.
      */
     resumeGuardedDrain(receipt: unknown): GuardedDrainResult {
         return this.#runGuarded(() => this.#resumeGuardedDrain(receipt));
@@ -1461,7 +1733,15 @@ export class EventPollBuffer {
             return { status: 'stale' };
         }
 
-        if (this.#guardedUncertain || this.#guardedResuming || this.#guardedDraining) {
+        if (this.#guardedUncertain) {
+            return { status: 'uncertain' };
+        }
+
+        if (!this.#guardedScopeActive()) {
+            return { status: 'scope_revoked' };
+        }
+
+        if (this.#guardedResuming || this.#guardedDraining) {
             return { status: 'uncertain' };
         }
 
@@ -1472,13 +1752,21 @@ export class EventPollBuffer {
             // The same barrier remains visible to every reentrant short poll.
             this.#drainGuarded(barrier);
 
+            if (this.#guardedUncertain) {
+                return { status: 'uncertain' };
+            }
+
             if (this.#guardedClosed) {
                 return { status: 'stale' };
             }
 
-            if (this.#guardedUncertain || this.#guardedBarrier !== barrier) {
+            if (this.#guardedBarrier !== barrier) {
                 this.#quarantineGuarded();
                 return { status: 'uncertain' };
+            }
+
+            if (!this.#guardedScopeActive()) {
+                return { status: 'scope_revoked' };
             }
 
             this.#guardedBarrier = null;
@@ -1555,6 +1843,7 @@ export class EventPollBuffer {
         this.#guardedQueue = [];
         this.#guardedBytes = 0;
         this.#guardedBarrier = null;
+        this.#guardedScope = undefined;
         let failed = false;
 
         for (let i = 0; i < oldQueue.length; i++) {
