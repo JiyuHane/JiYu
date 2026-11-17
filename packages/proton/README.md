@@ -63,6 +63,16 @@ forwarded callbacks. It preserves wrapper bodies and passes generated codecs
 through generic calls. It also supports resolvable mapped, conditional and utility
 types; ambiguous unions and unresolved schemas fail during compilation.
 
+A known inference limitation can also affect code unrelated to protobuf: in one
+OneBot test, passing a possibly undefined value with a class-indexed result type
+through an ordinary inferred generic helper, then accessing a property of the
+result, caused the plugin to expand the application class as a schema and reject
+an unannotated class field. Removing the helper call and directly narrowing
+`undefined` before accessing the selected value avoided that failure in the same
+test. This is a compiler limitation, not a requirement to add
+protobuf markers to application classes; other affected generic forms have not
+been exhaustively characterized.
+
 Only required codecs and helpers are emitted. Nested message encoders measure and
 write into a shared output buffer. Returned bytes may be a view into a larger
 buffer; use `byteOffset` and `byteLength`, or `bytes.slice()` when an independent

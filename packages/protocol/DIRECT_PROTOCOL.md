@@ -738,19 +738,23 @@ that return is nonzero and the traced pointer is intact, seven 16-byte stores at
 `0x6be7d66` through `0x6be7d84` write zeros over `[0, 0x6c)` relative to the
 returned pointer, with overlapping stores. Instruction `0x6be7d99` then reads
 the descriptor byte at `+0xd`; the inspected continuation passes `(2, byte)` to
-the same PLT entry and tests the second return for zero. Neither allocation result
-nor subsequent object use is established. The inspected continuation has not
+the same PLT entry and tests the second return for zero. Neither runtime binding
+nor either allocation result has been observed. The inspected continuation has not
 established a read from `G + 0x28` through `G + 0x47` or a link to the eventual
 return, and it does not establish that no such link exists later.
 
 Under the further assumptions that both calls return nonzero and the traced local
 slots remain stable, the inspected dispatcher states set a local flag to zero,
 carry the address of `[rbp-0x1420]` into another local slot, and reach the
-conditional jump at `0x6bf9bb0` to `0x6bf9e8f`. The latter target has not been
-inspected in this slice. Nearby instructions compare a pointer associated with
-the second return and a different state contains XOR instructions, but their
-reachability from this conditional continuation has not been established. The
-inspected windows do not connect either to the final output or to an SSO signer.
+conditional jump at `0x6bf9bb0` to `0x6bf9e8f`. That handler reads the local
+object's descriptor pointer and, if nonzero, selects state `0xb8fe90a5`. The
+handler at `0x6bf9a20` then checks the local object's `+16` pointer slot for zero;
+this checks the pointer itself, not bytes in the allocation it points to. On the
+nonzero branch, `0x6bf9c68` reads descriptor `+0xd` again and compares it as an
+unsigned value with a previously saved value derived from descriptor `+0xc`.
+The second read is not necessarily equal to the byte used in the earlier call.
+The following states and their relation to a final return or an SSO signer remain
+unknown; an XOR instruction in a neighboring state is not established as reached.
 
 The descriptor bytes have a different file mapping from the code: the writable
 `PT_LOAD` maps linked `0x9035280` through `0x9035285` to file offsets
