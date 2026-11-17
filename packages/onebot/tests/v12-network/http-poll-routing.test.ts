@@ -11,6 +11,7 @@ vi.mock('@snowluma/websocket', () => ({
 
 import { V12Transport, type V12HttpPollCapability, type V12Response } from '../../src/v12-network';
 import { V12Dispatcher } from '../../src/v12/dispatcher';
+import type { PollOutcome, ScopedPollEffect } from '../../src/v12-runtime/poll-transaction';
 
 class Request extends EventEmitter {
     url = '/';
@@ -598,7 +599,11 @@ describe('HTTP poll capability routing without sockets', () => {
                 outcome:
                     kind === 'cleanup_uncertain'
                         ? { kind, outcome: { kind: 'queue_error' }, committed: 'unknown' }
-                        : { kind },
+                        : kind === 'release_unknown'
+                          ? { kind: 'release_unknown' }
+                          : kind === 'commit_unknown'
+                            ? { kind: 'commit_unknown' }
+                            : { kind: 'committed_unsent' },
             }),
         };
         const { transport } = make({ httpPoll: cap });
@@ -710,4 +715,197 @@ describe('HTTP poll capability routing without sockets', () => {
         expect((transport as unknown as { pollUnknown: number }).pollUnknown).toBe(1);
         await transport.close();
     });
+
+    // Scoped outcomes below are synthetic capability results. The response is an
+    // in-memory EventEmitter and attach() uses the mocked noServer WebSocketServer.
+    const safeEffects: Array<[string, ScopedPollEffect]> = [
+        ['none', { kind: 'none' }],
+        ['released', { kind: 'released' }],
+        ['blocked', { kind: 'blocked', requiredBytes: 64 }],
+        ['pruned', { kind: 'pruned', count: 2 }],
+    ];
+    const allEffects: Array<[string, ScopedPollEffect]> = [
+        ...safeEffects,
+        ['committed', { kind: 'committed' }],
+        ['unknown', { kind: 'unknown' }],
+    ];
+    const knownOutcomes: Array<[string, PollOutcome]> = [
+        ['pruned', { kind: 'pruned', count: 1 }],
+        ...safeEffects.map(([label, effect]): [string, PollOutcome] => [
+            `scope_revoked/${label}`,
+            { kind: 'scope_revoked', effect, committed: false },
+        ]),
+    ];
+
+    it.each(knownOutcomes)(
+        'returns a fixed echo-preserving failure for unwritten %s',
+        async (_label, outcome) => {
+            const cap = { run: vi.fn(() => ({ kind: 'outcome' as const, outcome })) };
+            const { transport, handle } = make({ httpPoll: cap });
+            const echo = 'poll-回声🪶\\\n"';
+            const { res } = request(transport, poll(echo));
+            await flush();
+            expect(res.status).toBe(200);
+            expect(res.destroyed).toBe(false);
+            expect(res.writes).toBe(1);
+            expect(res.bodies).toHaveLength(1);
+            expect(res.json()).toEqual({
+                status: 'failed',
+                retcode: 20002,
+                data: null,
+                message: 'poll unavailable',
+                echo,
+            });
+            expect((transport as unknown as { pollUnknown: number }).pollUnknown).toBe(0);
+            expect(cap.run).toHaveBeenCalledTimes(1);
+            expect(handle).not.toHaveBeenCalled();
+            await transport.close();
+        },
+    );
+
+    const uncertainOutcomes: Array<[string, PollOutcome]> = [
+        ...allEffects.map(([label, effect]): [string, PollOutcome] => [
+            `scope_revoked/${label}/committed`,
+            { kind: 'scope_revoked', effect, committed: true },
+        ]),
+        [
+            'scope_revoked/committed-effect',
+            {
+                kind: 'scope_revoked',
+                effect: { kind: 'committed' },
+                committed: false,
+            },
+        ],
+        [
+            'scope_revoked/unknown-effect',
+            {
+                kind: 'scope_revoked',
+                effect: { kind: 'unknown' },
+                committed: false,
+            },
+        ],
+        ...allEffects.flatMap(([label, effect]) =>
+            ([false, true, 'unknown'] as const).map((committed): [string, PollOutcome] => [
+                `scoped_uncertain/${label}/${String(committed)}`,
+                { kind: 'scoped_uncertain', effect, committed },
+            ]),
+        ),
+    ];
+
+    it.each(uncertainOutcomes)(
+        'destroys and counts unwritten uncertain %s once without a fallback',
+        async (_label, outcome) => {
+            const cap = { run: vi.fn(() => ({ kind: 'outcome' as const, outcome })) };
+            const { transport, handle } = make({ httpPoll: cap });
+            const { res } = request(transport, poll('uncertain-echo🪶'));
+            await flush();
+            expect(res.destroyed).toBe(true);
+            expect(res.writes).toBe(0);
+            expect(res.bodies).toHaveLength(0);
+            expect((transport as unknown as { pollUnknown: number }).pollUnknown).toBe(1);
+            // The host's retained error listener may observe a second signal;
+            // that signal must not count the same transaction twice.
+            res.emit('error', new Error('synthetic poll error'));
+            expect((transport as unknown as { pollUnknown: number }).pollUnknown).toBe(1);
+            expect(cap.run).toHaveBeenCalledTimes(1);
+            expect(handle).not.toHaveBeenCalled();
+            await transport.close();
+        },
+    );
+
+    const malformedEffects: Array<[string, unknown]> = [
+        ['missing', undefined],
+        ['null', null],
+        ['empty object', {}],
+        ['unknown kind', { kind: 'invented' }],
+        ['blocked missing requiredBytes', { kind: 'blocked' }],
+        ['blocked negative requiredBytes', { kind: 'blocked', requiredBytes: -1 }],
+        ['blocked fractional requiredBytes', { kind: 'blocked', requiredBytes: 1.5 }],
+        ['pruned missing count', { kind: 'pruned' }],
+        ['pruned negative count', { kind: 'pruned', count: -1 }],
+        ['pruned fractional count', { kind: 'pruned', count: 1.5 }],
+        ['pruned string count', { kind: 'pruned', count: '1' }],
+    ];
+
+    it.each(malformedEffects)(
+        'treats a malformed scope_revoked effect (%s) as unknown',
+        async (_label, effect) => {
+            const outcome = {
+                kind: 'scope_revoked',
+                effect,
+                committed: false,
+            } as unknown as PollOutcome;
+            const cap = { run: vi.fn(() => ({ kind: 'outcome' as const, outcome })) };
+            const { transport, handle } = make({ httpPoll: cap });
+            const { res } = request(transport, poll('malformed-echo'));
+            await flush();
+            expect(res.destroyed).toBe(true);
+            expect(res.writes).toBe(0);
+            expect(res.bodies).toHaveLength(0);
+            expect((transport as unknown as { pollUnknown: number }).pollUnknown).toBe(1);
+            expect(cap.run).toHaveBeenCalledTimes(1);
+            expect(handle).not.toHaveBeenCalled();
+            await transport.close();
+        },
+    );
+
+    it.each([undefined, null, 0, 'unknown'] as const)(
+        'treats non-false scope_revoked committed=%s as unknown',
+        async (committed) => {
+            const outcome = {
+                kind: 'scope_revoked',
+                effect: { kind: 'released' },
+                committed,
+            } as unknown as PollOutcome;
+            const cap = { run: vi.fn(() => ({ kind: 'outcome' as const, outcome })) };
+            const { transport, handle } = make({ httpPoll: cap });
+            const { res } = request(transport, poll('malformed-commit'));
+            await flush();
+            expect(res.destroyed).toBe(true);
+            expect(res.writes).toBe(0);
+            expect(res.bodies).toHaveLength(0);
+            expect((transport as unknown as { pollUnknown: number }).pollUnknown).toBe(1);
+            expect(cap.run).toHaveBeenCalledTimes(1);
+            expect(handle).not.toHaveBeenCalled();
+            await transport.close();
+        },
+    );
+
+    const writtenOutcomes: Array<[string, PollOutcome]> = [
+        ...knownOutcomes,
+        ['legacy epoch_invalid', { kind: 'epoch_invalid' }],
+    ];
+    const writtenCases = writtenOutcomes.flatMap(([label, outcome]) =>
+        (['header', 'body'] as const).map((write): [string, PollOutcome, 'header' | 'body'] => [
+            `${label}/${write}`,
+            outcome,
+            write,
+        ]),
+    );
+
+    it.each(writtenCases)(
+        'stops an already written %s as unknown without a second response',
+        async (_label, outcome, write) => {
+            const cap: V12HttpPollCapability = {
+                run(_input, { sink }) {
+                    sink.writeHead();
+
+                    if (write === 'body') {
+                        sink.end('synthetic partial response');
+                    }
+
+                    return { kind: 'outcome', outcome };
+                },
+            };
+            const { transport, handle } = make({ httpPoll: cap });
+            const { res } = request(transport, poll('already-written'));
+            await flush();
+            expect(res.destroyed).toBe(true);
+            expect(res.writes).toBe(1);
+            expect(res.bodies).toEqual(write === 'body' ? ['synthetic partial response'] : []);
+            expect((transport as unknown as { pollUnknown: number }).pollUnknown).toBe(1);
+            expect(handle).not.toHaveBeenCalled();
+            await transport.close();
+        },
+    );
 });

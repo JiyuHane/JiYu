@@ -71,6 +71,7 @@ type HttpPollDiagnostic =
     | 'dropped_oldest'
     | 'too_large'
     | 'invalid'
+    | 'admission_uncertain'
     | 'private_recall'
     | 'transport_error'
     | 'delivery_uncertain'
@@ -514,6 +515,11 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                                     outcome.kind === 'commit_unknown' ||
                                     outcome.kind === 'committed_unsent' ||
                                     (outcome.kind === 'unknown' && outcome.committed) ||
+                                    (outcome.kind === 'scoped_uncertain' &&
+                                        (outcome.committed === true ||
+                                            outcome.committed === 'unknown')) ||
+                                    (outcome.kind === 'scope_revoked' &&
+                                        outcome.committed === true) ||
                                     (outcome.kind === 'cleanup_uncertain' &&
                                         outcome.committed !== false)
                                 ) {
@@ -1366,7 +1372,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                         // subscriber or guard callback can reenter.
                         this.#privateRecallPublished.set(event, source);
 
-                        // The legacy HTTP owner does not enqueue this projection.
+                        // The production HTTP owner does not enqueue this projection.
                         // Capture the diagnostic before, but log only after WS fanout.
                         const pollMissesRecall = hasHttpPollOwner(this);
 
@@ -1757,6 +1763,9 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             }
         } catch {
             // An optional diagnostic must not prevent admission or WS fanout.
+            if (httpOwner) {
+                losses.push('cleanup_pending');
+            }
         }
 
         if (httpOwner && mediaGuard !== undefined) {
@@ -1787,6 +1796,10 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             if (after && after.invalid > before.invalid) {
                 losses.push('invalid');
             }
+
+            if (after && after.admission_uncertain > before.admission_uncertain) {
+                losses.push('admission_uncertain');
+            }
         } catch {
             // Admission has already completed; diagnostics remain best-effort.
         }
@@ -1808,6 +1821,8 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             dropped_oldest: 'v12 http poll queue full; oldest unreserved events dropped',
             too_large: 'v12 http poll event too large; event dropped',
             invalid: 'v12 http poll event invalid; event dropped',
+            admission_uncertain:
+                'v12 http poll admission outcome unknown; event may have been queued',
             private_recall: 'v12 http poll omits private recall events',
             transport_error: 'v12 http poll response failed',
             delivery_uncertain: 'v12 http poll delivery outcome unknown; events may be missed',

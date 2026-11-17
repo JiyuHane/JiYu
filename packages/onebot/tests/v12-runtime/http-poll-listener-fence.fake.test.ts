@@ -12,12 +12,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DispatchPayload } from '../../src/event-filter';
 import type { JsonObject, NetworkBase } from '../../src/types';
 import type { V12Transport, V12TransportOptions } from '../../src/v12-network';
-import type { EventPollBuffer, PollResult } from '../../src/v12-runtime/event-poll-buffer';
+import type { EventPollBuffer, GuardedPollResult } from '../../src/v12-runtime/event-poll-buffer';
 import type { V12Runtime } from '../../src/v12-runtime/runtime';
 import type { V12Source } from '../../src/v12-runtime/source-generation';
 
 type CapturedTransport = { options: V12TransportOptions; instance: V12Transport };
-type Selection = Extract<PollResult, { status: 'reserved' }>;
+type Selection = Extract<GuardedPollResult, { status: 'reserved' }>;
 
 // The production runtime supplies the capability and owner. Only transport open()
 // is replaced; attach(), HTTP dispatch, response sink and WS fanout remain real.
@@ -533,15 +533,16 @@ async function account() {
     };
 }
 
-// Observe the real buffer's selected token. The optional delay only holds the
-// already-resolved reservation before its continuation; it never creates a token.
+// Observe the actual production scoped queue, preserving each exact frozen
+// selection reference. The optional delay holds only its delivery to the owner;
+// it neither constructs nor replaces the selection or its token.
 function watchSelections(
     onSelected?: (selection: Selection, queue: EventPollBuffer) => void | Promise<void>,
 ) {
-    const original = bufferApi.EventPollBuffer.prototype.reserve;
+    const original = bufferApi.EventPollBuffer.prototype.reserveGuarded;
     const selected: Array<{ selection: Selection; queue: EventPollBuffer }> = [];
     const reserve = vi
-        .spyOn(bufferApi.EventPollBuffer.prototype, 'reserve')
+        .spyOn(bufferApi.EventPollBuffer.prototype, 'reserveGuarded')
         .mockImplementation(async function (this: EventPollBuffer, options) {
             const result = await original.call(this, options);
 
@@ -552,9 +553,66 @@ function watchSelections(
 
             return result;
         });
-    const commit = vi.spyOn(bufferApi.EventPollBuffer.prototype, 'commit');
-    const release = vi.spyOn(bufferApi.EventPollBuffer.prototype, 'release');
-    return { selected, reserve, commit, release };
+    const commit = vi.spyOn(bufferApi.EventPollBuffer.prototype, 'commitGuardedNoDrain');
+    const release = vi.spyOn(bufferApi.EventPollBuffer.prototype, 'releaseGuardedNoDrain');
+    const resume = vi.spyOn(bufferApi.EventPollBuffer.prototype, 'resumeGuardedDrain');
+    // These tests go through production HTTP, never a separately activated legacy
+    // owner. Observe legacy methods as well so a fallback cannot make them pass.
+    const legacyReserve = vi.spyOn(bufferApi.EventPollBuffer.prototype, 'reserve');
+    const legacyCommit = vi.spyOn(bufferApi.EventPollBuffer.prototype, 'commit');
+    const legacyRelease = vi.spyOn(bufferApi.EventPollBuffer.prototype, 'release');
+    return {
+        selected,
+        reserve,
+        commit,
+        release,
+        resume,
+        legacyReserve,
+        legacyCommit,
+        legacyRelease,
+    };
+}
+
+type WatchedSelections = ReturnType<typeof watchSelections>;
+
+function expectRelease(watched: WatchedSelections, selectionIndex = 0) {
+    expect(watched.release).toHaveBeenCalledTimes(1);
+    const selection = watched.selected[selectionIndex]!.selection;
+    const call = watched.release.mock.calls[0]!;
+    expect(call).toHaveLength(1);
+    expect(call[0]).toBe(selection.token);
+    const receipt = watched.release.mock.results[0]!.value;
+    expect(receipt).toEqual({ status: 'released' });
+    return receipt;
+}
+
+function expectCommit(watched: WatchedSelections, selectionIndex: number, commitIndex: number) {
+    expect(watched.commit).toHaveBeenCalledTimes(commitIndex + 1);
+    const selection = watched.selected[selectionIndex]!.selection;
+    const call = watched.commit.mock.calls[commitIndex]!;
+    expect(call).toHaveLength(2);
+    expect(call[0]).toBe(selection.token);
+    expect(call[1]).toBe(selection);
+    const receipt = watched.commit.mock.results[commitIndex]!.value;
+    expect(receipt).toEqual({ status: 'committed' });
+    return receipt;
+}
+
+function expectResume(
+    watched: WatchedSelections,
+    index: number,
+    receipt: unknown,
+    status: 'resumed' | 'stale' | 'uncertain' | 'scope_revoked',
+) {
+    expect(watched.resume).toHaveBeenCalledTimes(index + 1);
+    expect(watched.resume.mock.calls[index]![0]).toBe(receipt);
+    expect(watched.resume.mock.results[index]!.value).toEqual({ status });
+}
+
+function expectNoLegacy(watched: WatchedSelections) {
+    expect(watched.legacyReserve).not.toHaveBeenCalled();
+    expect(watched.legacyCommit).not.toHaveBeenCalled();
+    expect(watched.legacyRelease).not.toHaveBeenCalled();
 }
 
 function deferred() {
@@ -602,10 +660,9 @@ describe('production HTTP poll exact-listener pre-commit fence (in-memory)', () 
             expect(f.runtime[sourceApi.captureBinding]()).toBe(binding);
             expect(f.generation.isCurrent(source, binding)).toBe(true);
             expect(watched.commit).not.toHaveBeenCalled();
-            expect(watched.release).toHaveBeenCalledExactlyOnceWith(
-                watched.selected[0]!.selection.token,
-            );
-            expect(watched.release.mock.results[0]!.value).toBe(true);
+            const releaseReceipt = expectRelease(watched);
+            expectResume(watched, 0, releaseReceipt, 'resumed');
+            expectNoLegacy(watched);
             expect(watched.selected[0]!.queue.stats()).toMatchObject({ count: 1, reserved: 0 });
             expect(await run.mock.results[0]!.value).toEqual({
                 kind: 'outcome',
@@ -631,10 +688,21 @@ describe('production HTTP poll exact-listener pre-commit fence (in-memory)', () 
             const firstBatch = events(first);
             expect(firstBatch.map((event) => event.message_id)).toEqual(['1']);
             expect(firstBatch[0]!.id).toBe(peerMessages(peer)[0]!.id);
+            expect(watched.selected).toHaveLength(2);
+            const firstCommit = expectCommit(watched, 1, 0);
+            expectResume(watched, 1, firstCommit, 'resumed');
             expect(
                 events(await reply(transport, action())).map((event) => event.message_id),
             ).toEqual(['2']);
+            expect(watched.selected).toHaveLength(3);
+            const secondCommit = expectCommit(watched, 2, 1);
+            expectResume(watched, 2, secondCommit, 'resumed');
             expect(events(await reply(transport, action()))).toEqual([]);
+            expect(watched.reserve).toHaveBeenCalledTimes(4);
+            expect(watched.commit).toHaveBeenCalledTimes(2);
+            expect(watched.release).toHaveBeenCalledOnce();
+            expect(watched.resume).toHaveBeenCalledTimes(3);
+            expectNoLegacy(watched);
             expect(f.manager.get(identityApi.V12_ADAPTER_NAME)).toBe(f.runtime);
             expect(f.generation.isCurrent(source, binding)).toBe(true);
             expect(peer.terminated).toBe(false);
@@ -683,10 +751,10 @@ describe('production HTTP poll exact-listener pre-commit fence (in-memory)', () 
             expect(fired).toBe(true);
             expect(watched.selected).toHaveLength(1);
             expect(watched.commit).not.toHaveBeenCalled();
-            expect(watched.release).toHaveBeenCalledExactlyOnceWith(
-                watched.selected[0]!.selection.token,
-            );
-            expect(watched.release.mock.results[0]!.value).toBe(true);
+            const releaseReceipt = expectRelease(watched);
+            expect(watched.resume).toHaveBeenCalledOnce();
+            expect(watched.resume.mock.calls[0]![0]).toBe(releaseReceipt);
+            expectNoLegacy(watched);
             const result = await run.mock.results[0]!.value;
 
             if (mode === 'source') {
@@ -703,17 +771,31 @@ describe('production HTTP poll exact-listener pre-commit fence (in-memory)', () 
                 );
                 f.generation.setOnline(true);
             } else {
-                // Closing the response aborts the transaction; invalidating the
-                // owner closes it. Neither case is a successful batch.
-                expect(result).toEqual({
-                    kind: 'outcome',
-                    outcome: { kind: mode === 'owner' ? 'closed' : 'aborted' },
-                });
-                expect(pending.response.destroyed).toBe(true);
-                expect(pending.response.bodies).toEqual([]);
-
+                // Owner retirement revokes the scope before resuming the exact
+                // release receipt; sink-close instead aborts a live scope.
                 if (mode === 'owner') {
+                    expect(result).toEqual({
+                        kind: 'outcome',
+                        outcome: {
+                            kind: 'scope_revoked',
+                            effect: { kind: 'released' },
+                            committed: false,
+                        },
+                    });
+                    expectResume(watched, 0, releaseReceipt, 'scope_revoked');
                     expect(replacementStatus).toBe('cleanup_pending');
+                    expect(pending.response.destroyed).toBe(false);
+                    expect(pending.response.json()).toEqual({
+                        status: 'failed',
+                        retcode: 20002,
+                        data: null,
+                        message: 'poll unavailable',
+                        echo: 'reentrant-owner',
+                    });
+                } else {
+                    expect(result).toEqual({ kind: 'outcome', outcome: { kind: 'aborted' } });
+                    expect(pending.response.destroyed).toBe(true);
+                    expect(pending.response.bodies).toEqual([]);
                 }
             }
 
@@ -736,28 +818,28 @@ describe('production HTTP poll exact-listener pre-commit fence (in-memory)', () 
         const run = vi.spyOn(f.captured.options.httpPoll!, 'run');
         let ready = true;
         const readiness = vi.spyOn(transport, 'isAcceptingActions').mockImplementation(() => ready);
-        const originalCommit = bufferApi.EventPollBuffer.prototype.commit;
+        const originalCommit = bufferApi.EventPollBuffer.prototype.commitGuardedNoDrain;
         const watched = watchSelections();
         let pending!: ReturnType<typeof send>;
-        watched.commit.mockImplementation(function (this: EventPollBuffer, token) {
-            const committed = originalCommit.call(this, token);
+        watched.commit.mockImplementation(function (this: EventPollBuffer, token, selection) {
+            const receipt = originalCommit.call(this, token, selection);
 
-            if (committed) {
+            if (receipt.status === 'committed') {
                 ready = false;
                 pending.response.destroy();
             }
 
-            return committed;
+            return receipt;
         });
         pending = send(transport, action({ timeout: 5 }, 'after-commit'));
         await settle();
         await f.manager.emitEvent(message(21, 21), source);
         await settle();
         expect(watched.selected).toHaveLength(1);
-        expect(watched.commit).toHaveBeenCalledExactlyOnceWith(
-            watched.selected[0]!.selection.token,
-        );
+        const committedReceipt = expectCommit(watched, 0, 0);
+        expectResume(watched, 0, committedReceipt, 'resumed');
         expect(watched.release).not.toHaveBeenCalled();
+        expectNoLegacy(watched);
         expect(await run.mock.results[0]!.value).toEqual({
             kind: 'outcome',
             outcome: { kind: 'committed_unsent' },
@@ -819,10 +901,9 @@ describe('production HTTP poll exact-listener pre-commit fence (in-memory)', () 
                 result.outcome.kind,
             );
             expect(watched.commit).not.toHaveBeenCalled();
-            expect(watched.release).toHaveBeenCalledExactlyOnceWith(
-                watched.selected[0]!.selection.token,
-            );
-            expect(watched.release.mock.results[0]!.value).toBe(true);
+            const releaseReceipt = expectRelease(watched);
+            expectResume(watched, 0, releaseReceipt, 'resumed');
+            expectNoLegacy(watched);
             expect(watched.selected[0]!.queue.stats()).toMatchObject({ count: 1, reserved: 0 });
             expect(pending.response.bodies).toEqual([]);
             expect(
@@ -830,7 +911,15 @@ describe('production HTTP poll exact-listener pre-commit fence (in-memory)', () 
                     (event) => event.message_id,
                 ),
             ).toEqual(['31']);
+            expect(watched.selected).toHaveLength(2);
+            const retryReceipt = expectCommit(watched, 1, 0);
+            expectResume(watched, 1, retryReceipt, 'resumed');
             expect(events(await reply(transport, action()))).toEqual([]);
+            expect(watched.reserve).toHaveBeenCalledTimes(3);
+            expect(watched.release).toHaveBeenCalledOnce();
+            expect(watched.commit).toHaveBeenCalledOnce();
+            expect(watched.resume).toHaveBeenCalledTimes(2);
+            expectNoLegacy(watched);
         },
     );
 
@@ -842,6 +931,7 @@ describe('production HTTP poll exact-listener pre-commit fence (in-memory)', () 
         await f.manager.emitEvent(message(41, 30), source);
         await f.manager.emitEvent(message(42, 10), source);
         await f.manager.emitEvent(message(43, 10), source);
+        const watched = watchSelections();
         const first = await reply(transport, action({ limit: 3 }, 'normal-😺'));
         expect(first.echo).toBe('normal-😺');
         const batch = events(first);
@@ -852,6 +942,11 @@ describe('production HTTP poll exact-listener pre-commit fence (in-memory)', () 
         ]);
         const ws = peerMessages(peer);
         expect(batch.map((event) => event.id)).toEqual([ws[1]!.id, ws[2]!.id, ws[0]!.id]);
+        expect(watched.selected).toHaveLength(1);
+        const receipt = expectCommit(watched, 0, 0);
+        expectResume(watched, 0, receipt, 'resumed');
+        expect(watched.release).not.toHaveBeenCalled();
+        expectNoLegacy(watched);
         expect(f.legacy.received).toHaveLength(3);
         expect(events(await reply(transport, action({}, '')))).toEqual([]);
         expect(await reply(transport, action({}, ''))).toEqual({

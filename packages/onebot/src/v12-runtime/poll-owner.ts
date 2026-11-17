@@ -7,8 +7,15 @@ import {
     type PollOutcome,
     type PollRequest,
     type PollSink,
+    type ScopedPollStatus,
 } from './poll-transaction';
 import { sameSourceEpoch, sourceHasBinding, type V12Source } from './source-generation';
+import {
+    createPrivateRecallPollEpochAccountScope,
+    isPrivateRecallPollEpochAccountScopeActive,
+    retirePrivateRecallPollEpochAccountScope,
+    type PrivateRecallPollEpochAccountScope,
+} from './private-recall-source';
 import {
     IngressSequencer,
     type IngressFailure,
@@ -283,7 +290,14 @@ function validOrderedEvent(event: unknown, self: OrderedSelf): boolean {
 
 type PollGapReason = IngressFailure | 'committed_unsent' | 'delivery_unknown' | 'scope_lost';
 type Counter =
-    'accepted' | 'full' | 'invalid' | 'too_large' | 'closing_discard' | 'postcommit_unknown';
+    | 'accepted'
+    | 'full'
+    | 'invalid'
+    | 'too_large'
+    | 'closing_discard'
+    | 'postcommit_unknown'
+    | 'admission_uncertain'
+    | 'stale_pruned';
 type Counters = Record<Counter, number>;
 type Host = {
     /** Trusted account identity supplied by the instance, never by an action. */
@@ -450,6 +464,8 @@ export function registerPollHost(runtime: object, host: Host, gate = createPollG
             too_large: 0,
             closing_discard: 0,
             postcommit_unknown: 0,
+            admission_uncertain: 0,
+            stale_pruned: 0,
         },
         droppedOldest: 0n,
     });
@@ -607,6 +623,7 @@ function activate(
         slot.revision === revision &&
         state.transition === transition;
     let attached = false;
+    let allocatedOwner: Owner | undefined;
 
     try {
         const binding = slot.host.captureBinding();
@@ -640,9 +657,10 @@ function activate(
         }
 
         const gap = state.gap;
-        const self = ordered ? orderedSelf(slot.host) : null;
+        const scoped = !ordered && batchOrder === 'event-time';
+        const self = ordered || scoped ? orderedSelf(slot.host) : null;
 
-        if (ordered && !self) {
+        if ((ordered || scoped) && !self) {
             return { status: 'unavailable' };
         }
 
@@ -679,6 +697,46 @@ function activate(
         }
 
         const owner = new Owner(slot, binding, source, claim, ordered, self, batchOrder);
+        allocatedOwner = owner;
+
+        if (scoped) {
+            const prepared = (): boolean =>
+                stable() &&
+                state.gap === gap &&
+                owner.scopedActive() &&
+                sameSourceEpoch(source, source) === 'same' &&
+                sourceHasBinding(source, binding);
+
+            if (!prepared()) {
+                return { status: 'unavailable' };
+            }
+
+            // This queue check is separate because a substituted method can reenter.
+            const queueOpen = owner.scopedQueueOpen();
+
+            if (!queueOpen || !prepared()) {
+                return { status: 'unavailable' };
+            }
+
+            const currentBinding = slot.host.captureBinding();
+
+            if (currentBinding !== binding || !prepared()) {
+                return { status: 'unavailable' };
+            }
+
+            const currentSource = slot.host.verify(source);
+
+            if (currentSource !== true || !prepared()) {
+                return { status: 'unavailable' };
+            }
+
+            const lastBinding = slot.host.captureBinding();
+
+            if (lastBinding !== binding || !prepared()) {
+                return { status: 'unavailable' };
+            }
+        }
+
         slot.owner = owner;
         attached = true;
 
@@ -690,6 +748,15 @@ function activate(
     } catch {
         return { status: 'unavailable' };
     } finally {
+        if (!attached && allocatedOwner) {
+            try {
+                allocatedOwner.discardUnattached();
+            } catch {
+                slot.cleanupUncertain = true;
+                slot.gate.uncertain = true;
+            }
+        }
+
         slot.activating = false;
 
         if (!attached && !slot.gate.uncertain && slot.gate.claim === claim) {
@@ -711,7 +778,24 @@ export function pollOwnerStats(runtime: object): Readonly<
 > | null {
     const slot = slots.get(runtime);
     slot?.owner?.touchOrdered();
-    slot?.owner?.syncOldestDrops();
+    const owner = slot?.owner;
+
+    try {
+        owner?.syncOldestDrops();
+    } catch (error) {
+        try {
+            // A watermark failure is not an admission result. Retire only the
+            // exact scoped owner which was sampled, never a replacement owner.
+            if (owner?.hasScopedQueue() && slot?.owner === owner) {
+                owner.failScopedAdmission();
+            }
+        } catch {
+            // Preserve the original statistics failure for the caller.
+        }
+
+        throw error;
+    }
+
     return slot
         ? {
               ...slot.counters,
@@ -901,9 +985,32 @@ export function enqueuePollEvent(
         return;
     }
 
-    if (!source || !owner.valid()) {
+    if (!source) {
         return;
     }
+
+    const retireLostScope = (): void => {
+        try {
+            if (owner.hasScopedQueue() && !owner.scopedActive() && slot.owner === owner) {
+                owner.invalidate();
+            }
+        } catch {
+            // The scope check or retirement may have had effects; do not report a
+            // dropped event or allow diagnostics to interrupt normal WS fanout.
+            try {
+                owner.failScopedAdmission();
+            } catch {
+                // The best-effort sticky-gate transition was already attempted.
+            }
+        }
+    };
+
+    if (!owner.valid()) {
+        retireLostScope();
+        return;
+    }
+
+    let enqueueStarted = false;
 
     try {
         // HTTP must never admit an old source into a replacement generation,
@@ -914,6 +1021,7 @@ export function enqueuePollEvent(
             !owner.valid() ||
             (owner.batchOrder === 'event-time' && !owner.matchesScopeSource(source))
         ) {
+            retireLostScope();
             return;
         }
 
@@ -930,10 +1038,12 @@ export function enqueuePollEvent(
 
             if (!current) {
                 increment(slot, 'invalid');
+                retireLostScope();
                 return;
             }
         }
 
+        enqueueStarted = true;
         const result = owner.enqueue(event);
 
         if (result === 'accepted') {
@@ -944,10 +1054,17 @@ export function enqueuePollEvent(
             increment(slot, 'too_large');
         } else if (result === 'invalid') {
             increment(slot, 'invalid');
+        } else if (result === 'uncertain') {
+            increment(slot, 'admission_uncertain');
         }
     } catch {
-        increment(slot, 'invalid');
-        owner.invalidate();
+        if (enqueueStarted && owner.hasScopedQueue()) {
+            increment(slot, 'admission_uncertain');
+            owner.failScopedAdmission();
+        } else {
+            increment(slot, 'invalid');
+            owner.invalidate();
+        }
     }
 }
 
@@ -956,6 +1073,7 @@ export function enqueuePollEvent(
  * processes need their own coordination. */
 class Owner implements PollOwner {
     private readonly queue: EventPollBuffer;
+    readonly #scopedScope: PrivateRecallPollEpochAccountScope | null;
     private oldestDropWatermark = 0n;
     private readonly sequencer: IngressSequencer | null;
     private readonly ownerRevision: object;
@@ -989,74 +1107,242 @@ class Owner implements PollOwner {
         private readonly self: OrderedSelf | null,
         readonly batchOrder: PollBatchOrder,
     ) {
-        this.queue =
-            !ordered && batchOrder === 'event-time'
-                ? new EventPollBuffer(limits, 'drop-oldest')
+        const scoped = !ordered && batchOrder === 'event-time';
+        const scope = scoped ? createPrivateRecallPollEpochAccountScope(source, self) : undefined;
+
+        if (scoped && !scope) {
+            throw new Error('scoped poll owner unavailable');
+        }
+
+        this.#scopedScope = scope ?? null;
+        let queue: EventPollBuffer | undefined;
+        let creatingQueue = false;
+        let creatingCoordinator = false;
+
+        try {
+            creatingQueue = true;
+            this.queue = queue = scope
+                ? EventPollBuffer.scoped(limits, 'drop-oldest', scope)
                 : new EventPollBuffer(limits);
-        this.ownerRevision = slot.revision;
-        this.sequencer = ordered
-            ? new IngressSequencer(
-                  {
-                      maxParents: 128,
-                      maxChildren: 256,
-                      maxChildrenPerParent: 32,
-                      maxBytes: 256 * 1024,
-                      maxEventBytes: limits.maxEventBytes - 2,
-                      deadlineMs: 1000,
-                      maxFlushWork: 32,
-                  },
-                  {
-                      now: () => performance.now(),
-                      scheduler: {
-                          timer: (callback, ms) => setTimeout(callback, ms),
-                          clearTimer: (handle) =>
-                              clearTimeout(handle as ReturnType<typeof setTimeout>),
-                          immediate: (callback) => setImmediate(callback),
-                          clearImmediate: (handle) =>
-                              clearImmediate(handle as ReturnType<typeof setImmediate>),
+            creatingQueue = false;
+            this.ownerRevision = slot.revision;
+            this.sequencer = ordered
+                ? new IngressSequencer(
+                      {
+                          maxParents: 128,
+                          maxChildren: 256,
+                          maxChildrenPerParent: 32,
+                          maxBytes: 256 * 1024,
+                          maxEventBytes: limits.maxEventBytes - 2,
+                          deadlineMs: 1000,
+                          maxFlushWork: 32,
                       },
-                      deliver: (json) => {
-                          if (!this.valid()) {
-                              throw new Error('ordered owner invalid');
-                          }
+                      {
+                          now: () => performance.now(),
+                          scheduler: {
+                              timer: (callback, ms) => setTimeout(callback, ms),
+                              clearTimer: (handle) =>
+                                  clearTimeout(handle as ReturnType<typeof setTimeout>),
+                              immediate: (callback) => setImmediate(callback),
+                              clearImmediate: (handle) =>
+                                  clearImmediate(handle as ReturnType<typeof setImmediate>),
+                          },
+                          deliver: (json) => {
+                              if (!this.valid()) {
+                                  throw new Error('ordered owner invalid');
+                              }
 
-                          const event: unknown = JSON.parse(json);
+                              const event: unknown = JSON.parse(json);
 
-                          if (!this.self || !validOrderedEvent(event, this.self) || !this.valid()) {
-                              increment(this.slot, 'invalid');
-                              throw new Error('ordered event invalid');
-                          }
+                              if (
+                                  !this.self ||
+                                  !validOrderedEvent(event, this.self) ||
+                                  !this.valid()
+                              ) {
+                                  increment(this.slot, 'invalid');
+                                  throw new Error('ordered event invalid');
+                              }
 
-                          const result = this.queue.enqueue(event);
+                              const result = this.queue.enqueue(event);
 
-                          if (result === 'accepted') {
-                              increment(this.slot, 'accepted');
-                              return 'accepted';
-                          }
+                              if (result === 'accepted') {
+                                  increment(this.slot, 'accepted');
+                                  return 'accepted';
+                              }
 
-                          if (result === 'full') {
-                              increment(this.slot, 'full');
-                              return 'full';
-                          }
+                              if (result === 'full') {
+                                  increment(this.slot, 'full');
+                                  return 'full';
+                              }
 
-                          increment(this.slot, result === 'oversize' ? 'too_large' : 'invalid');
-                          throw new Error('ordered queue admission failed');
+                              increment(this.slot, result === 'oversize' ? 'too_large' : 'invalid');
+                              throw new Error('ordered queue admission failed');
+                          },
+                          onDegrade: (reason) => this.onGap(reason),
                       },
-                      onDegrade: (reason) => this.onGap(reason),
-                  },
-              )
-            : null;
-        const coordinatorArgs = [
-            this.queue,
-            limits.maxQueueBytes,
-            () => performance.now(),
-            () => this.valid(),
-            ordered ? 'unavailable' : 'legacy',
-        ] as const;
-        this.coordinator =
-            batchOrder === 'event-time'
-                ? new PollCoordinator(...coordinatorArgs, 'event-time')
-                : new PollCoordinator(...coordinatorArgs);
+                  )
+                : null;
+            const coordinatorArgs = [
+                this.queue,
+                limits.maxQueueBytes,
+                () => performance.now(),
+                () => this.valid(),
+                ordered ? 'unavailable' : 'legacy',
+            ] as const;
+            creatingCoordinator = true;
+            this.coordinator = scope
+                ? PollCoordinator.scoped(...coordinatorArgs, 'event-time', (status) =>
+                      this.onScopedStatus(status),
+                  )
+                : batchOrder === 'event-time'
+                  ? new PollCoordinator(...coordinatorArgs, 'event-time')
+                  : new PollCoordinator(...coordinatorArgs);
+            creatingCoordinator = false;
+        } catch (error) {
+            if (scope) {
+                // A factory that throws before returning may have retained work.
+                if (creatingQueue || creatingCoordinator) {
+                    this.markUncertain();
+                }
+
+                try {
+                    if (
+                        isPrivateRecallPollEpochAccountScopeActive(scope) &&
+                        !retirePrivateRecallPollEpochAccountScope(scope)
+                    ) {
+                        this.markUncertain();
+                    }
+
+                    if (isPrivateRecallPollEpochAccountScopeActive(scope)) {
+                        this.markUncertain();
+                    }
+                } catch {
+                    this.markUncertain();
+                }
+
+                if (queue) {
+                    try {
+                        queue.close();
+
+                        if (queue.guardedCleanupState() !== 'closed') {
+                            this.markUncertain();
+                        }
+                    } catch {
+                        this.markUncertain();
+                    }
+                }
+            }
+
+            throw error;
+        }
+    }
+
+    hasScopedQueue(): boolean {
+        return this.#scopedScope !== null;
+    }
+
+    failScopedAdmission(): void {
+        this.markUncertain();
+
+        try {
+            this.invalidate();
+        } catch {
+            this.markUncertain();
+        }
+    }
+
+    scopedQueueOpen(): boolean {
+        return this.#scopedScope !== null && this.queue.guardedCleanupState() === 'open';
+    }
+
+    scopedActive(): boolean {
+        return (
+            this.#scopedScope !== null &&
+            isPrivateRecallPollEpochAccountScopeActive(this.#scopedScope)
+        );
+    }
+
+    private retireScopedScope(): void {
+        const scope = this.#scopedScope;
+
+        if (!scope) {
+            return;
+        }
+
+        try {
+            if (
+                isPrivateRecallPollEpochAccountScopeActive(scope) &&
+                !retirePrivateRecallPollEpochAccountScope(scope)
+            ) {
+                this.markUncertain();
+            }
+
+            if (isPrivateRecallPollEpochAccountScopeActive(scope)) {
+                this.markUncertain();
+            }
+        } catch {
+            this.markUncertain();
+        }
+    }
+
+    /** Cleanup an unpublished owner before its activation claim may be released. */
+    discardUnattached(): void {
+        this.retired = true;
+
+        if (!this.ownsGate()) {
+            this.markUncertain();
+        }
+
+        this.retireScopedScope();
+
+        try {
+            this.coordinator.close();
+        } catch {
+            this.markUncertain();
+        }
+
+        try {
+            this.queue.close();
+
+            if (this.#scopedScope && this.queue.guardedCleanupState() !== 'closed') {
+                this.markUncertain();
+            }
+        } catch {
+            this.markUncertain();
+        }
+    }
+
+    private onScopedStatus(status: ScopedPollStatus): void {
+        try {
+            if (status.kind === 'pruned') {
+                const count = status.count;
+
+                if (!Number.isSafeInteger(count) || count <= 0) {
+                    this.markUncertain();
+                } else {
+                    increment(this.slot, 'stale_pruned', count);
+                    return;
+                }
+            } else if (status.kind !== 'scope_revoked') {
+                // Unknown statuses and explicit uncertainty both fail closed.
+                this.markUncertain();
+            }
+
+            // A clean scope revocation retires only this owner; uncertainty is sticky.
+            if (!this.retired && !this.invalidating && this.slot.owner === this) {
+                this.invalidate();
+            }
+        } catch {
+            this.markUncertain();
+
+            try {
+                if (!this.retired && !this.invalidating && this.slot.owner === this) {
+                    this.invalidate();
+                }
+            } catch {
+                // The gate remains uncertain even if retirement itself failed.
+            }
+        }
     }
 
     private attached(): boolean {
@@ -1407,6 +1693,10 @@ class Owner implements PollOwner {
                 this.ownsGate() &&
                 this.slot.owner === this &&
                 this.gateAllows() &&
+                (this.#scopedScope === null ||
+                    (this.scopedActive() &&
+                        sameSourceEpoch(this.source, this.source) === 'same' &&
+                        sourceHasBinding(this.source, this.binding))) &&
                 (!this.ordered || this.sequencer?.stats().state === 'active') &&
                 this.slot.host.captureBinding() === this.binding &&
                 this.slot.host.verify(this.source) &&
@@ -1418,6 +1708,7 @@ class Owner implements PollOwner {
                 this.ownsGate() &&
                 this.slot.owner === this &&
                 this.gateAllows() &&
+                (this.#scopedScope === null || this.scopedActive()) &&
                 (!this.ordered || this.sequencer?.stats().state === 'active') &&
                 this.attached()
             );
@@ -1434,7 +1725,15 @@ class Owner implements PollOwner {
             return;
         }
 
-        const count = this.queue.oldestDropCount();
+        const count: unknown = this.queue.oldestDropCount();
+
+        if (typeof count !== 'bigint' || count < 0n || count < this.oldestDropWatermark) {
+            if (this.#scopedScope !== null) {
+                this.markUncertain();
+            }
+
+            throw new Error('poll oldest-drop watermark invalid');
+        }
 
         if (count > this.oldestDropWatermark) {
             const delta = count - this.oldestDropWatermark;
@@ -1445,13 +1744,75 @@ class Owner implements PollOwner {
     }
 
     enqueue(event: unknown) {
-        try {
-            return this.queue.enqueue(event);
-        } finally {
-            // A drain failure can follow a committed eviction. The existing accepted
-            // counter counts returned admissions, not necessarily physical enqueues.
-            this.syncOldestDrops();
+        if (!this.#scopedScope) {
+            try {
+                return this.queue.enqueue(event);
+            } finally {
+                // A drain failure can follow a committed eviction.
+                this.syncOldestDrops();
+            }
         }
+
+        let result: ReturnType<EventPollBuffer['enqueue']> | undefined;
+        let uncertain = false;
+
+        try {
+            result = this.queue.enqueue(event);
+        } catch {
+            // Publication and eviction may already have happened; never retry.
+            uncertain = true;
+        } finally {
+            try {
+                this.syncOldestDrops();
+            } catch {
+                uncertain = true;
+            }
+        }
+
+        try {
+            const cleanup: unknown = this.queue.guardedCleanupState();
+
+            if (
+                (cleanup !== 'open' && cleanup !== 'closing' && cleanup !== 'closed') ||
+                ((cleanup === 'closing' || cleanup === 'closed') && !this.retired)
+            ) {
+                uncertain = true;
+            }
+        } catch {
+            uncertain = true;
+        }
+
+        if (
+            (result !== 'accepted' &&
+                result !== 'full' &&
+                result !== 'oversize' &&
+                result !== 'invalid' &&
+                result !== 'meta' &&
+                result !== 'closed' &&
+                result !== 'scope_revoked') ||
+            this.slot.gate.uncertain
+        ) {
+            uncertain = true;
+        }
+
+        if (uncertain) {
+            this.failScopedAdmission();
+            return 'uncertain' as const;
+        }
+
+        if (
+            (result === 'scope_revoked' || !this.scopedActive()) &&
+            !this.retired &&
+            this.slot.owner === this
+        ) {
+            try {
+                this.invalidate();
+            } catch {
+                this.markUncertain();
+            }
+        }
+
+        return result;
     }
 
     start(
@@ -1546,7 +1907,8 @@ class Owner implements PollOwner {
                         const uncertain =
                             outcome.kind === 'cleanup_uncertain' ||
                             core.kind === 'release_unknown' ||
-                            core.kind === 'commit_unknown';
+                            core.kind === 'commit_unknown' ||
+                            (this.#scopedScope !== null && core.kind === 'scoped_uncertain');
 
                         if (uncertain) {
                             this.markUncertain();
@@ -1564,16 +1926,26 @@ class Owner implements PollOwner {
                             core.kind === 'commit_unknown' ||
                             core.kind === 'committed_unsent' ||
                             (core.kind === 'unknown' && core.committed) ||
-                            (outcome.kind === 'cleanup_uncertain' && outcome.committed !== false)
+                            (outcome.kind === 'cleanup_uncertain' && outcome.committed !== false) ||
+                            (core.kind === 'scoped_uncertain' && core.committed !== false) ||
+                            (core.kind === 'scope_revoked' && core.committed)
                         ) {
                             increment(this.slot, 'postcommit_unknown');
                         }
 
-                        if (uncertain) {
+                        if (uncertain || core.kind === 'scope_revoked') {
                             this.invalidate();
                         }
                     } catch {
                         this.markUncertain();
+
+                        if (this.#scopedScope !== null) {
+                            try {
+                                this.invalidate();
+                            } catch {
+                                this.markUncertain();
+                            }
+                        }
                     } finally {
                         this.running.delete(tracked);
                         finish();
@@ -1613,7 +1985,164 @@ class Owner implements PollOwner {
         this.slot.gate.uncertain = true;
     }
 
+    private invalidateScoped(): void {
+        if (this.retired || this.invalidating) {
+            return;
+        }
+
+        // Retire admission before any cleanup or status hook can reenter.
+        this.invalidating = true;
+        this.retired = true;
+        const attached = this.slot.owner === this;
+
+        if (!attached || !this.ownsGate()) {
+            this.markUncertain();
+        }
+
+        if (attached) {
+            this.slot.owner = null;
+            this.slot.retiring = true;
+            this.slot.revision = {};
+
+            try {
+                const state = gateState(this.slot.gate);
+
+                if (
+                    sameSourceEpoch(this.source, this.source) === 'same' &&
+                    sourceHasBinding(this.source, this.binding) &&
+                    !state.history.some((entry) => sameSourceEpoch(entry, this.source) === 'same')
+                ) {
+                    if (state.history.length < 8) {
+                        state.history.push(this.source);
+                    } else {
+                        state.historyOverflow = true;
+                    }
+                }
+            } catch {
+                this.markUncertain();
+            }
+        }
+
+        let accountingReliable = true;
+
+        try {
+            this.syncOldestDrops();
+        } catch {
+            accountingReliable = false;
+            this.markUncertain();
+        }
+
+        // Scope retirement precedes cancellation and any late token settlement.
+        this.retireScopedScope();
+
+        try {
+            this.coordinator.close();
+        } catch {
+            this.markUncertain();
+        }
+
+        this.invalidating = false;
+
+        try {
+            void Promise.allSettled([...this.running]).then(
+                () => {
+                    let count: number | undefined;
+                    let closeReturned = false;
+                    let closed = false;
+                    let scopeRetired = false;
+                    let discardRecorded = false;
+
+                    try {
+                        this.syncOldestDrops();
+                    } catch {
+                        accountingReliable = false;
+                        this.markUncertain();
+                    }
+
+                    try {
+                        const observed = this.queue.stats().count;
+
+                        if (!Number.isSafeInteger(observed) || observed < 0) {
+                            accountingReliable = false;
+                            this.markUncertain();
+                        } else if (accountingReliable) {
+                            count = observed;
+                        }
+                    } catch {
+                        accountingReliable = false;
+                        this.markUncertain();
+                    }
+
+                    // Even an unknown watermark or count must not skip queue cleanup.
+                    try {
+                        this.queue.close();
+                        closeReturned = true;
+                    } catch {
+                        this.markUncertain();
+                    }
+
+                    try {
+                        closed = this.queue.guardedCleanupState() === 'closed';
+                    } catch {
+                        this.markUncertain();
+                    }
+
+                    try {
+                        scopeRetired = !this.scopedActive();
+                    } catch {
+                        this.markUncertain();
+                    }
+
+                    // A close request or stats().closed alone does not prove cleanup.
+                    if (!closeReturned || !closed || !scopeRetired) {
+                        this.markUncertain();
+                    }
+
+                    if (count !== undefined && closeReturned && closed && scopeRetired) {
+                        try {
+                            increment(this.slot, 'closing_discard', count);
+                            discardRecorded = true;
+                        } catch {
+                            this.markUncertain();
+                        }
+                    }
+
+                    if (
+                        !this.slot.gate.uncertain &&
+                        closeReturned &&
+                        closed &&
+                        scopeRetired &&
+                        this.ownsGate() &&
+                        this.slot.owner === null &&
+                        this.slot.retiring
+                    ) {
+                        this.slot.gate.claim = null;
+                        this.slot.retiring = false;
+                    } else if (!this.slot.gate.uncertain) {
+                        this.markUncertain();
+                    }
+
+                    if (discardRecorded && count !== undefined && count > 0) {
+                        try {
+                            this.slot.host.onClosingDiscard?.();
+                        } catch {
+                            // Diagnostics do not change cleanup or gate state.
+                        }
+                    }
+                },
+                () => this.markUncertain(),
+            );
+        } catch {
+            this.markUncertain();
+        }
+    }
+
     invalidate(): void {
+        if (this.#scopedScope !== null) {
+            this.invalidateScoped();
+            return;
+        }
+
         if (this.retired || this.invalidating) {
             return;
         }

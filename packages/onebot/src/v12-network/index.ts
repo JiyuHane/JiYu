@@ -74,6 +74,52 @@ const failed = (retcode: number, message: string, echo?: string): V12Response =>
     ...(echo !== undefined ? { echo } : {}),
 });
 
+/** Inspect scoped receipts without executing getters on a custom result. */
+function ownDataValue(value: unknown, key: string): unknown {
+    if (typeof value !== 'object' || value === null || isProxy(value) || Array.isArray(value)) {
+        return undefined;
+    }
+
+    try {
+        const property = Object.getOwnPropertyDescriptor(value, key);
+        return property && 'value' in property ? property.value : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+function positiveSafeInteger(value: unknown): boolean {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+
+function validPrunedOutcome(outcome: unknown): boolean {
+    return positiveSafeInteger(ownDataValue(outcome, 'count'));
+}
+
+/** Only explicitly uncommitted, structurally known effects permit a fallback. */
+function knownUncommittedScopeRevocation(outcome: unknown): boolean {
+    if (ownDataValue(outcome, 'committed') !== false) {
+        return false;
+    }
+
+    const effect = ownDataValue(outcome, 'effect');
+    const kind = ownDataValue(effect, 'kind');
+
+    if (kind === 'none' || kind === 'released') {
+        return true;
+    }
+
+    if (kind === 'pruned') {
+        return positiveSafeInteger(ownDataValue(effect, 'count'));
+    }
+
+    if (kind === 'blocked') {
+        return positiveSafeInteger(ownDataValue(effect, 'requiredBytes'));
+    }
+
+    return false;
+}
+
 function requestEcho(value: unknown): string | undefined {
     if (value && typeof value === 'object' && !Array.isArray(value)) {
         const echo = (value as Record<string, unknown>).echo;
@@ -1072,13 +1118,18 @@ export class V12Transport {
                     try {
                         if (
                             result?.kind === 'outcome' &&
-                            [
+                            ([
                                 'cleanup_uncertain',
                                 'release_unknown',
                                 'commit_unknown',
                                 'committed_unsent',
                                 'unknown',
-                            ].includes(result.outcome.kind)
+                            ].includes(result.outcome.kind) ||
+                                result.outcome.kind === 'scoped_uncertain' ||
+                                (result.outcome.kind === 'pruned' &&
+                                    !validPrunedOutcome(result.outcome)) ||
+                                (result.outcome.kind === 'scope_revoked' &&
+                                    !knownUncommittedScopeRevocation(result.outcome)))
                         ) {
                             countUnknown();
                         }
@@ -1162,7 +1213,10 @@ export class V12Transport {
                                 kind === 'blocked' ||
                                 kind === 'empty_unresolved' ||
                                 kind === 'epoch_invalid' ||
-                                kind === 'commit_rejected'
+                                kind === 'commit_rejected' ||
+                                (kind === 'pruned' && validPrunedOutcome(result.outcome)) ||
+                                (result.outcome.kind === 'scope_revoked' &&
+                                    knownUncommittedScopeRevocation(result.outcome))
                             ) {
                                 sendFailure(failed(20002, 'poll unavailable', echo));
                                 return;

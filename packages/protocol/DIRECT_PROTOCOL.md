@@ -793,6 +793,17 @@ writes concern `P`; they do not establish that the separately saved `K` or its
 contents are consumed, nor do they establish the identity of the eventual hash,
 return value or SSO signing callback.
 
+On the selected no-carry branch, the code tests `t = c & 63` and copies `t`,
+`K` and `n3` into further local slots. When `t` is zero, it subsequently compares
+`n3` as an unsigned length against 64. Under the additional condition `n3 >= 64`,
+the inspected handlers copy `K` and `n3` again, initialize a local index to zero,
+and dispatch to `0x6c0072e`; that target has not yet been inspected. A zero `t`
+does not by itself imply `c` is zero. The inspected post-XOR dispatch path does
+not establish a subsequent read of `K`'s contents or a call to a consumer, and
+the `n3 >= 64` condition is not a runtime observation. The current `n3` is a
+separate descriptor read and need not match the earlier lengths or the original
+file byte.
+
 The original file bytes `+0xc = 0x20` and `+0xd = 0x40` suggest `L=32` and
 64-byte halves only if they and the relevant reads remain unchanged at runtime.
 A distinct `L > r` branch performs conditional writes to the first allocation,

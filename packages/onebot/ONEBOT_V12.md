@@ -92,14 +92,22 @@ processes. Source tickets identify a local binding and online generation, not
 QQ occurrence time or a complete poll-readiness cut; upstream work can still
 be in flight when a poll returns.
 
-Before committing a selected nonempty HTTP prefix, the runtime samples the
-request's original listener, listener token and source attempt (`sourceAttempt`)
-alongside owner, cancellation and deadline checks. This listener guard does not
-cover empty, timeout or fallback responses, or writes after commit. It relies on
-trusted synchronous callbacks; these samples are not an atomic fence against
-arbitrary reentry or later lifecycle changes and do not establish client delivery.
-Source-qualified private recalls remain excluded from production polling; this
-guard does not admit them.
+The production completion-order HTTP owner now uses a scoped guarded queue for
+ordinary eligible events. Its account/epoch scope is an internal lifecycle
+correlation, not proof of QQ origin, online state or owner authority; the trusted
+owner separately checks the current binding, source and gate. The strictly
+ordered producer/owner remains a separate prototype. Scoped mode alone does not
+admit private recalls to HTTP.
+
+Before settling a selected prefix, the scoped transaction samples the request's
+original listener, listener token and source attempt (`sourceAttempt`) alongside
+owner, cancellation and deadline checks. Its own write path samples the listener
+again before writing, after the header write, and around the body/end and local
+finish checks. This also applies when that transaction writes an empty or timeout
+success or its own fallback; it is not a claim about independently generated
+transport responses. These are trusted synchronous samples, not an atomic fence:
+a callback that reenters, changes the source and returns stale `true`, later
+asynchronous changes, writes and remote delivery remain outside the guarantee.
 
 Responses select an admission-completion FIFO prefix of the surviving queue and
 then sort that batch by `time`, stably for equal timestamps. `limit: 1` selects
@@ -114,7 +122,26 @@ the oldest unreserved events would make room. An active reservation protects its
 physical prefix. If enough room can be made, those oldest unreserved events are
 evicted and the new event is admitted; otherwise the queue remains intact and
 the new event is dropped. Fixed, content-free warnings are best effort and
-category-deduplicated, not a complete loss report or client-visible gap.
+category-deduplicated, not a complete loss report or client-visible gap. If an
+admission has an uncertain effect after enqueue begins, the runtime may warn
+that the event may have been queued; it must not infer that no insertion or
+eviction occurred and retry. Separately, if the pre-admission drop-watermark
+statistics sample throws, the exact sampled scoped owner is retired if still
+attached, and a fixed cleanup-pending warning is attempted after WebSocket
+fanout. That diagnostic does not establish whether an event was lost.
+
+Internally, the scoped transaction binds a selection to its exact token, encoded
+snapshot and physical prefix. It distinguishes committed, released, pruned,
+scope-revoked and uncertain effects; when continuing after a no-drain settlement,
+it attempts to resume the queue barrier using that settlement's exact receipt.
+A `pruned` outcome is a guarded-queue outcome, not evidence that production
+admitted a private recall. Clean scope
+revocation requests owner retirement; uncertain effects or cleanup can leave the
+shared gate locked and polling unavailable. Internal `pollOwnerStats` records
+observed loss/cleanup categories, including `admission_uncertain` and
+`stale_pruned`, but these are neither durable nor a public gap API and do not
+prove that every loss was observed.
+
 Unsupported conversions and private recall are omitted from HTTP polling. A
 source-qualified private recall can still be published independently over
 WebSocket when its existing guard
@@ -480,8 +507,9 @@ and QQ-side behavior have not been verified.
 After final source and event revalidation, the runtime may publish this notice
 through v12 subscriber and WebSocket fanout; publication does not establish
 client delivery. The runtime does not enqueue private recall into either poll
-path: it lacks a final poll-commit guard on the original v11 object. For an
-already-ready, ordered-eligible admission that has converted successfully, still
+path: the production path does not bind the original v11 object and its proof to
+a final poll-commit guard. For an already-ready, ordered-eligible admission that
+has converted successfully, still
 has its valid original source and exact ticket, and is not a replay of the same
 object with the same ticket, the child is failed rather than silently skipped.
 Source-current checks depend on a trusted synchronous verifier; a callback that
@@ -501,15 +529,15 @@ fixed, category-deduplicated warning; its empty-result and bounded-overflow
 limitations are described in [HTTP event polling](#http-event-polling-partial).
 `pollOwnerStats` exposes ordering state internally, not as a public gap API. The
 poll owner's structural validator remains available to direct trusted fixtures;
-that does not establish runtime poll admission or an end-to-end completeness
-guarantee.
+that does not establish private-recall admission to production polling or an
+end-to-end completeness guarantee.
 
 Internal [source-proof and guarded-queue primitives](V12_PRIVATE_RECALL_POLL_DESIGN.md)
-are under development. Neither is connected to HTTP polling: the proof rechecks
-local object and ticket bindings, but does not establish that an owner or online
-epoch is current, that QQ issued the event, or that a client received it. HTTP
-continues to omit private recalls until the remaining guarded-commit and runtime
-integration work is complete.
+are under development. Production HTTP now uses the scoped guarded queue for
+ordinary events, but it does not bind private-recall proofs for HTTP admission.
+A proof rechecks local object and ticket bindings; it does not itself establish
+that an owner or online epoch is current, that QQ issued the event, or that a
+client received it. Private recall remains excluded from production HTTP polling.
 
 A valid v11 `group_recall` maps to `notice.group_message_delete` after account,
 time, field and identifier validation. It uses `recall` when sender and operator match;

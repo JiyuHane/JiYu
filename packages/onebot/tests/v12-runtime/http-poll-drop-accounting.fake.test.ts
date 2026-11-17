@@ -652,51 +652,89 @@ describe('HTTP oldest-drop accounting (in-memory fixtures)', () => {
         expect(ownerApi.pollOwnerStats(f.runtime)?.dropped_oldest).toBe('1');
     });
 
-    it('syncs the committed drop once even when drain throws and retirement detaches the owner', async () => {
+    it('syncs a drop once when enqueue throws after guarded publication', async () => {
         const f = hostFixture();
         expect(ownerApi.activateHttpPollOwner(f.runtime).status).toBe('ready');
+        const claim = f.gate.claim;
+        expect(claim).not.toBeNull();
 
         for (let id = 1; id <= 128; id++) {
             ownerApi.enqueuePollEvent(f.runtime, simpleEvent(id), f.source);
         }
 
-        // drain is TypeScript-private, but is a prototype method at runtime.
-        const prototype = bufferApi.EventPollBuffer.prototype as unknown as { drain(): void };
-        const captured: { reservation?: Promise<PollResult> } = {};
-        const drain = vi.spyOn(prototype, 'drain').mockImplementation(function (
-            this: InstanceType<typeof bufferApi.EventPollBuffer>,
-        ) {
-            expect(this.stats().count).toBe(128);
-            expect(this.oldestDropCount()).toBe(1n);
-            captured.reservation = this.reserve();
-            throw new Error('synthetic drain failure after commit');
-        });
-
-        let drainCalls = 0;
-
-        try {
-            ownerApi.enqueuePollEvent(f.runtime, simpleEvent(129), f.source);
-            drainCalls = drain.mock.calls.length;
-        } finally {
-            drain.mockRestore();
-        }
-
-        expect(drainCalls).toBe(1);
-        expect(captured.reservation).toBeDefined();
-        const items = await selected(captured.reservation!);
-        expect(items.map((item) => item.id)).toEqual(
-            Array.from({ length: 128 }, (_, index) => index + 2),
-        );
-        // No accepted return was observed: 128 is deliberately not a claim about
-        // all physical commits when enqueue throws after insertion.
         expect(ownerApi.pollOwnerStats(f.runtime)).toMatchObject({
             accepted: 128,
-            invalid: 1,
+            invalid: 0,
+            admission_uncertain: 0,
+            dropped_oldest: '0',
+            active: true,
+        });
+
+        const last = simpleEvent(129);
+        const original = bufferApi.EventPollBuffer.prototype.enqueue;
+        const captured: {
+            queue?: InstanceType<typeof bufferApi.EventPollBuffer>;
+            result?: ReturnType<typeof original>;
+            stats?: ReturnType<InstanceType<typeof bufferApi.EventPollBuffer>['stats']>;
+            drops?: bigint;
+            cleanup?: ReturnType<
+                InstanceType<typeof bufferApi.EventPollBuffer>['guardedCleanupState']
+            >;
+        } = {};
+        const enqueue = vi
+            .spyOn(bufferApi.EventPollBuffer.prototype, 'enqueue')
+            .mockImplementation(function (
+                this: InstanceType<typeof bufferApi.EventPollBuffer>,
+                event,
+            ) {
+                const result = original.call(this, event);
+
+                if (event === last) {
+                    // The real guarded enqueue has already returned after publication;
+                    // inject a failure before the owner observes its accepted result.
+                    captured.queue = this;
+                    captured.result = result;
+                    captured.stats = this.stats();
+                    captured.drops = this.oldestDropCount();
+                    captured.cleanup = this.guardedCleanupState();
+                    throw new Error('synthetic failure after guarded publication');
+                }
+
+                return result;
+            });
+        let enqueueCalls = 0;
+
+        try {
+            ownerApi.enqueuePollEvent(f.runtime, last, f.source);
+            enqueueCalls = enqueue.mock.calls.length;
+        } finally {
+            enqueue.mockRestore();
+        }
+
+        expect(enqueueCalls).toBe(1);
+        expect(captured.result).toBe('accepted');
+        expect(captured.stats).toMatchObject({ count: 128, reserved: 0, closed: false });
+        expect(captured.drops).toBe(1n);
+        expect(captured.cleanup).toBe('open');
+        expect(captured.queue).toBeDefined();
+        expect(ownerApi.pollOwnerStats(f.runtime)).toMatchObject({
+            accepted: 128,
+            invalid: 0,
+            admission_uncertain: 1,
             dropped_oldest: '1',
             active: false,
+            cleanup_pending: true,
+            cleanup_uncertain: true,
         });
+        expect(f.gate).toMatchObject({ claim, uncertain: true });
+        expect(ownerApi.activateHttpPollOwner(f.runtime)).toEqual({ status: 'cleanup_pending' });
+
         await settle();
-        expect(f.gate.claim).toBeNull();
+        expect(captured.queue!.guardedCleanupState()).toBe('closed');
+        expect(captured.queue!.stats()).toMatchObject({ count: 0, reserved: 0, closed: true });
+        expect(captured.queue!.oldestDropCount()).toBe(1n);
+        expect(f.gate).toMatchObject({ claim, uncertain: true });
+        expect(ownerApi.activateHttpPollOwner(f.runtime)).toEqual({ status: 'cleanup_pending' });
         expect(ownerApi.pollOwnerStats(f.runtime)?.dropped_oldest).toBe('1');
         expect(ownerApi.pollOwnerStats(f.runtime)?.dropped_oldest).toBe('1');
         expect(JSON.parse(JSON.stringify(ownerApi.pollOwnerStats(f.runtime))).dropped_oldest).toBe(

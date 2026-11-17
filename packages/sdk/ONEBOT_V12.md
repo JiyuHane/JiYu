@@ -79,13 +79,20 @@ batches, late arrivals and QQ occurrence order have no global ordering guarantee
 A successful empty array means this poll obtained no reservation, not that the
 upstream pipeline is empty or another poll holds no events.
 
-Before committing a selected nonempty HTTP prefix, Jiyu samples the request's
+For ordinary eligible events, Jiyu's production completion-order HTTP owner
+uses a scoped guarded queue. The account/epoch scope is local lifecycle
+correlation, not proof of QQ origin, online state or owner authority; trusted
+owner checks remain separate. This is not the separate ordered-producer
+prototype, and it does not admit private recalls to HTTP.
+
+Before settling a selected prefix, the scoped transaction samples the request's
 original listener, listener token and source attempt (`sourceAttempt`) alongside
-owner, cancellation and deadline checks. This listener guard does not cover
-empty, timeout or fallback responses, or writes after commit. It relies on trusted
-synchronous callbacks; these samples are not an atomic fence against arbitrary
-reentry or later lifecycle changes and do not prove delivery. They do not admit
-source-qualified private recalls to HTTP polling.
+owner, cancellation and deadline checks. Its own write path resamples the
+listener before writing, after the header write, and around body/end and local
+finish checks. This includes empty/timeout successes and its own fallback when
+written, not independently generated transport responses. These trusted
+synchronous samples are not an atomic fence against a callback that changes the
+source and returns stale `true`, later asynchronous changes or network delivery.
 
 The account and listener must be current and online. Pending prior-owner cleanup
 can temporarily prevent activation, and events may be missed while later
@@ -93,8 +100,18 @@ status, event or poll activity retries. Under queue pressure the server may
 evict the oldest unreserved events to admit a new event. An active reservation's
 physical prefix stays protected; if removing all unreserved events would still
 not make enough room, the queue remains intact and the new event is dropped.
-Loss warnings are best effort, not client-visible gap notifications. Unsupported
-conversions and private recalls are omitted from polling. A
+Loss warnings are best effort, not client-visible gap notifications. An uncertain
+admission after enqueue begins may already have queued the event; an uncertain
+effect or cleanup can leave the shared gate locked and polling unavailable. If
+the pre-admission drop-watermark statistics sample throws, Jiyu retires the
+exact sampled scoped owner if still attached and attempts a cleanup-pending
+warning after WebSocket fanout; that warning does not establish whether an event
+was lost. Internal counters and cleanup indicators are not a durable loss ledger. The transaction distinguishes
+selection, commit, release, prune, scope revocation and uncertainty; when it
+continues after no-drain settlement, it attempts to resume the queue barrier
+using that settlement's exact receipt. A prune outcome does not
+establish private-recall admission. Unsupported conversions and private recalls
+are omitted from polling. A
 source-qualified private recall may still reach WebSocket subscribers through
 its separate guarded path. Queue state is in memory and may be discarded at
 close or generation changes. A lost response after the server commits a batch

@@ -25,8 +25,9 @@ import {
  * output. Its dynamically growing representation is not covered by an RSS hard limit.
  *
  * The optional fourth constructor argument enables an exact epoch/account scope on
- * a guarded queue; it does not connect this primitive to production HTTP. The scope
- * proves registration and proof/ticket/account/epoch correlation, not online state,
+ * a guarded queue. The production HTTP event-time owner uses it for ordinary events;
+ * private-recall HTTP admission remains separate and is not enabled by the queue alone.
+ * The scope proves registration and proof/ticket/account/epoch correlation, not online state,
  * ticket issuance for an account, or manager/gate ownership. The trusted owner must
  * verify current lifecycle state separately after all potentially reentrant checks.
  * Retiring a scope does not notify waiting polls: they may wait for timeout, abort,

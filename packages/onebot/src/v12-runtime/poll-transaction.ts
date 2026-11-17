@@ -1,5 +1,15 @@
 import { addAbortListener } from 'node:events';
-import type { PollOptions, PollResult } from './event-poll-buffer';
+import type {
+    GuardedBlockedResult,
+    GuardedCleanupState,
+    GuardedCommitResult,
+    GuardedDrainResult,
+    GuardedPollResult,
+    GuardedReleaseResult,
+    GuardedSelection,
+    PollOptions,
+    PollResult,
+} from './event-poll-buffer';
 
 /** Internal transaction seam used by the bounded production HTTP poll owner.
  * The ordered-ingress owner remains a separate experimental mode.
@@ -37,6 +47,46 @@ export interface PollQueue {
     commit(token: object): boolean;
     release(token: object): boolean;
 }
+
+/** Exact queue selections and no-drain receipts belong to the scoped queue.
+ * The owner must supply a queue created for its exact active scope, and the
+ * epoch verifier must include that scope: this structural interface proves neither. */
+export interface ScopedPollQueue {
+    reserveGuarded(options: PollOptions): Promise<GuardedPollResult>;
+    commitGuardedNoDrain(token: object, selection: GuardedSelection): GuardedCommitResult;
+    settleBlockedGuardedNoDrain(token: object, selection: GuardedSelection): GuardedBlockedResult;
+    releaseGuardedNoDrain(token: object): GuardedReleaseResult;
+    resumeGuardedDrain(receipt: object): GuardedDrainResult;
+    guardedCleanupState(): GuardedCleanupState;
+}
+
+/** Synchronous owner signals; scope_revoked requests retirement, not proof of cleanup. */
+export type ScopedPollStatus =
+    | { readonly kind: 'pruned'; readonly count: number }
+    | { readonly kind: 'uncertain' | 'scope_revoked' };
+
+export type ScopedPollEffect =
+    | { readonly kind: 'none' | 'released' | 'committed' | 'unknown' }
+    | { readonly kind: 'pruned'; readonly count: number }
+    | { readonly kind: 'blocked'; readonly requiredBytes: number };
+
+type ScopedBackend = {
+    readonly queue: ScopedPollQueue;
+    readonly onScopedStatus?: (status: ScopedPollStatus) => void;
+};
+
+// This sentinel is never used to translate guarded results. Selecting it is a bug.
+const inactiveLegacyQueue: PollQueue = {
+    reserve: () => {
+        throw new Error('inactive legacy poll backend');
+    },
+    commit: () => {
+        throw new Error('inactive legacy poll backend');
+    },
+    release: () => {
+        throw new Error('inactive legacy poll backend');
+    },
+};
 
 export interface PollSink {
     isOpen(): boolean;
@@ -78,7 +128,19 @@ type PollCoreOutcome =
           readonly kind:
               'aborted' | 'cancelled' | 'closed' | 'deadline' | 'epoch_invalid' | 'clock_error';
       }
-    | { readonly kind: 'blocked' | 'invalid' | 'busy' | 'contended' };
+    | { readonly kind: 'blocked'; readonly requiredBytes?: number }
+    | { readonly kind: 'invalid' | 'busy' | 'contended' }
+    | { readonly kind: 'pruned'; readonly count: number }
+    | {
+          readonly kind: 'scope_revoked';
+          readonly effect: ScopedPollEffect;
+          readonly committed: boolean;
+      }
+    | {
+          readonly kind: 'scoped_uncertain';
+          readonly effect: ScopedPollEffect;
+          readonly committed: boolean | 'unknown';
+      };
 
 export type PollOutcome =
     | PollCoreOutcome
@@ -94,6 +156,7 @@ type WriteKind =
     | { readonly response: 'events' | 'fallback' }
     | { readonly response: 'empty'; readonly reason: 'empty' | 'timeout' };
 
+const bindScopedBackend = Symbol('bind scoped poll backend');
 const prefix = '{"status":"ok","retcode":0,"data":';
 const unknownMessage =
     'outcome unknown; side effects may have occurred; do not retry automatically';
@@ -142,6 +205,29 @@ function orderEventsByTime(events: unknown[]): string | undefined {
 export class PollCoordinator {
     private closed = false;
     private readonly transactions = new Set<PollTransaction>();
+    private scopedBackend: ScopedBackend | undefined;
+
+    /** Internal scoped queue seam; its owner must bind lifecycle and status handling. */
+    static scoped(
+        queue: ScopedPollQueue,
+        maxQueueBytes: number,
+        now: () => number,
+        isEpochValid: () => boolean,
+        emptyPolicy: 'legacy' | 'unavailable' = 'legacy',
+        batchOrder: 'fifo' | 'event-time' = 'fifo',
+        onScopedStatus?: (status: ScopedPollStatus) => void,
+    ): PollCoordinator {
+        const coordinator = new PollCoordinator(
+            inactiveLegacyQueue,
+            maxQueueBytes,
+            now,
+            isEpochValid,
+            emptyPolicy,
+            batchOrder,
+        );
+        coordinator.scopedBackend = { queue, onScopedStatus };
+        return coordinator;
+    }
 
     constructor(
         private readonly queue: PollQueue,
@@ -190,6 +276,10 @@ export class PollCoordinator {
             listenerGuard,
         );
 
+        if (this.scopedBackend) {
+            transaction[bindScopedBackend](this.scopedBackend);
+        }
+
         return transaction;
     }
 
@@ -222,7 +312,17 @@ export class PollTransaction {
     private endReturned = false;
     private finishSeen = false;
     private committed = false;
+    private scopedBackend: ScopedBackend | undefined;
+    private scopedEffect: ScopedPollEffect = { kind: 'none' };
+    private scopedCommitUnknown = false;
+    private scopedUncertain = false;
+    private scopedScopeRevoked = false;
+    private scopedFinishChecking = false;
     private readonly request: PollRequest;
+
+    [bindScopedBackend](backend: ScopedBackend): void {
+        this.scopedBackend = backend;
+    }
 
     constructor(
         private readonly queue: PollQueue,
@@ -309,6 +409,190 @@ export class PollTransaction {
             action();
         } catch {
             this.cleanupUncertain = true;
+
+            if (this.scopedBackend) {
+                this.markScopedUncertain();
+            }
+        }
+    }
+
+    private notifyScoped(status: ScopedPollStatus): void {
+        try {
+            this.scopedBackend?.onScopedStatus?.(status);
+        } catch {
+            // A notification can have changed the owner before throwing.
+            this.cleanupUncertain = true;
+            this.markScopedUncertain();
+        }
+    }
+
+    private markScopedUncertain(): void {
+        if (this.scopedUncertain) {
+            return;
+        }
+
+        this.scopedUncertain = true;
+        this.notifyScoped({ kind: 'uncertain' });
+    }
+
+    private markScopeRevoked(): void {
+        if (this.scopedScopeRevoked) {
+            return;
+        }
+
+        this.scopedScopeRevoked = true;
+        this.notifyScoped({ kind: 'scope_revoked' });
+    }
+
+    private sampleScopedCleanup(): void {
+        const backend = this.scopedBackend;
+
+        if (!backend) {
+            return;
+        }
+
+        try {
+            const state = backend.queue.guardedCleanupState();
+
+            if (state === 'uncertain' || state === 'unavailable') {
+                this.markScopedUncertain();
+                this.stop('closed');
+            } else if (state === 'closing' || state === 'closed') {
+                // This signal requests owner retirement; it does not claim the
+                // exact scope has already been retired or cleanup has finished.
+                this.markScopeRevoked();
+                this.stop('closed');
+            } else if (state !== 'open') {
+                this.markScopedUncertain();
+                this.stop('closed');
+            }
+        } catch {
+            this.markScopedUncertain();
+            this.stop('closed');
+        }
+    }
+
+    /** Resume only the exact receipt after recording its local effect. */
+    private resumeScoped(receipt: object): void {
+        const backend = this.scopedBackend!;
+
+        try {
+            const result = backend.queue.resumeGuardedDrain(receipt);
+
+            if (result.status === 'scope_revoked') {
+                this.markScopeRevoked();
+            } else if (result.status === 'uncertain') {
+                this.markScopedUncertain();
+            } else if (result.status === 'stale') {
+                // A clean close can clear a barrier during drain. Other stale
+                // receipts are not evidence that cleanup or delivery succeeded.
+                if (backend.queue.guardedCleanupState() === 'closed') {
+                    this.stop('closed');
+                } else {
+                    this.markScopedUncertain();
+                }
+            } else if (result.status !== 'resumed') {
+                this.markScopedUncertain();
+            }
+        } catch {
+            this.markScopedUncertain();
+        }
+
+        this.sampleScopedCleanup();
+    }
+
+    /** Cancellation releases either kind of selection without checking its proof. */
+    private releaseScoped(selection: GuardedSelection): void {
+        const backend = this.scopedBackend!;
+
+        try {
+            const receipt = backend.queue.releaseGuardedNoDrain(selection.token);
+
+            if (receipt.status !== 'released') {
+                this.scopedEffect = { kind: 'unknown' };
+                this.markScopedUncertain();
+                return;
+            }
+
+            this.scopedEffect = { kind: 'released' };
+            this.resumeScoped(receipt);
+        } catch {
+            this.scopedEffect = { kind: 'unknown' };
+            this.markScopedUncertain();
+        }
+    }
+
+    /** Final synchronous owner, sink and listener samples around a scoped effect. */
+    private scopedFence(): Stop | undefined {
+        let stopped = this.check() ?? this.check(false);
+        const listenerGuard = this.listenerGuard;
+
+        if (!stopped && listenerGuard !== undefined) {
+            try {
+                if (listenerGuard() !== true) {
+                    this.stop('epoch_invalid');
+                }
+            } catch {
+                this.stop('epoch_invalid');
+            }
+
+            stopped = this.stopReason ?? this.check() ?? this.check(false);
+
+            if (!stopped) {
+                try {
+                    if (listenerGuard() !== true) {
+                        this.stop('epoch_invalid');
+                    }
+                } catch {
+                    this.stop('epoch_invalid');
+                }
+
+                stopped = this.stopReason;
+            }
+        }
+
+        return stopped;
+    }
+
+    /** Sample only the scoped listener after callback-capable write checks. */
+    private sampleScopedListener(): Stop | undefined {
+        if (!this.scopedBackend || this.stopReason) {
+            return this.stopReason;
+        }
+
+        const listenerGuard = this.listenerGuard;
+
+        if (listenerGuard !== undefined) {
+            try {
+                if (listenerGuard() !== true) {
+                    this.stop('epoch_invalid');
+                }
+            } catch {
+                this.stop('epoch_invalid');
+            }
+        }
+
+        return this.stopReason;
+    }
+
+    /** A reentrant finish must not publish success before the last sample returns. */
+    private finishScopedIfReady(): void {
+        if (this.scopedFinishChecking || this.writeOutcome) {
+            return;
+        }
+
+        this.scopedFinishChecking = true;
+
+        try {
+            if (this.check(false) || this.sampleScopedListener()) {
+                return;
+            }
+
+            if (this.finishSeen && !this.writeOutcome && !this.stopReason) {
+                this.finishLocalWrite();
+            }
+        } finally {
+            this.scopedFinishChecking = false;
         }
     }
 
@@ -323,8 +607,12 @@ export class PollTransaction {
 
         if (!this.endStarted) {
             this.finishWrite({ kind: 'unknown', committed: this.committed });
-        } else if (this.endReturned && !this.check(false)) {
-            this.finishLocalWrite();
+        } else if (this.endReturned) {
+            if (this.scopedBackend) {
+                this.finishScopedIfReady();
+            } else if (!this.check(false)) {
+                this.finishLocalWrite();
+            }
         }
     };
 
@@ -382,6 +670,10 @@ export class PollTransaction {
     }
 
     private check(requireOpen = true): Stop | undefined {
+        if (this.scopedBackend) {
+            this.sampleScopedCleanup();
+        }
+
         if (this.stopReason) {
             return this.stopReason;
         }
@@ -418,6 +710,10 @@ export class PollTransaction {
             }
         }
 
+        if (this.scopedBackend) {
+            this.sampleScopedCleanup();
+        }
+
         return this.stopReason;
     }
 
@@ -430,7 +726,11 @@ export class PollTransaction {
     }
 
     private async write(body: string, kind: WriteKind): Promise<PollCoreOutcome> {
-        const stop = this.check();
+        let stop = this.check();
+
+        if (!stop && this.scopedBackend) {
+            stop = this.sampleScopedListener();
+        }
 
         if (stop) {
             return this.committed ? { kind: 'committed_unsent' } : { kind: stop };
@@ -448,16 +748,25 @@ export class PollTransaction {
             // the remaining deadline even without emitting a sink event.
             this.check();
 
+            if (this.scopedBackend && !this.writeOutcome) {
+                this.sampleScopedListener();
+            }
+
             if (!this.writeOutcome) {
                 this.endStarted = true;
                 this.sink.end(body);
                 this.endReturned = true;
+
                 // A normal finish can make the sink no longer writable, so only
                 // epoch and clock are checked after end, not isOpen().
-                this.check(false);
+                if (this.scopedBackend) {
+                    this.finishScopedIfReady();
+                } else {
+                    this.check(false);
 
-                if (this.finishSeen && !this.writeOutcome && !this.stopReason) {
-                    this.finishLocalWrite();
+                    if (this.finishSeen && !this.writeOutcome && !this.stopReason) {
+                        this.finishLocalWrite();
+                    }
                 }
             }
         } catch {
@@ -498,7 +807,7 @@ export class PollTransaction {
         let outcome: PollCoreOutcome;
 
         try {
-            outcome = await this.executeCore();
+            outcome = await (this.scopedBackend ? this.executeScopedCore() : this.executeCore());
         } finally {
             // Drop this transaction's direct reference to the listener guard.
             this.listenerGuard = undefined;
@@ -524,13 +833,358 @@ export class PollTransaction {
         }
 
         this.cleanup(this.onDone);
+
+        if (this.scopedBackend) {
+            // Sink and owner cleanup can reenter a guarded queue after the last write.
+            this.sampleScopedCleanup();
+            this.scopedBackend = undefined;
+        }
+
+        if (this.scopedUncertain) {
+            outcome = {
+                kind: 'scoped_uncertain',
+                effect: this.scopedEffect,
+                committed: this.scopedCommitUnknown ? 'unknown' : this.committed,
+            };
+        } else if (this.scopedScopeRevoked) {
+            outcome = {
+                kind: 'scope_revoked',
+                effect: this.scopedEffect,
+                committed: this.committed,
+            };
+        }
+
         return this.cleanupUncertain
             ? {
                   kind: 'cleanup_uncertain',
                   outcome,
-                  committed: outcome.kind === 'commit_unknown' ? 'unknown' : this.committed,
+                  committed:
+                      outcome.kind === 'commit_unknown'
+                          ? 'unknown'
+                          : outcome.kind === 'scoped_uncertain'
+                            ? outcome.committed
+                            : this.committed,
               }
             : outcome;
+    }
+
+    /** The scoped path keeps selections and no-drain receipts as distinct objects. */
+    private async executeScopedCore(): Promise<PollCoreOutcome> {
+        const backend = this.scopedBackend!;
+        let selection: GuardedSelection | undefined;
+        let selectionOwned = false;
+        let reservePending = false;
+        let settlementPending: 'reserved' | 'blocked_guarded' | undefined;
+
+        const releaseSelection = (): void => {
+            if (!selectionOwned || !selection) {
+                return;
+            }
+
+            selectionOwned = false;
+            this.releaseScoped(selection);
+        };
+
+        try {
+            const {
+                limit,
+                timeoutMs,
+                echo,
+                maxOutputBytes,
+                responseDeadline,
+                externalAbortSignal,
+            } = this.request;
+
+            if (
+                !nonnegativeInteger(limit) ||
+                !nonnegativeInteger(timeoutMs) ||
+                !nonnegativeInteger(maxOutputBytes) ||
+                !Number.isFinite(responseDeadline) ||
+                (echo !== undefined && typeof echo !== 'string')
+            ) {
+                return { kind: 'invalid_input' };
+            }
+
+            this.state = 'waiting';
+            this.sinkListening = true;
+            this.sink.on('close', this.onClose);
+            this.sink.on('error', this.onError);
+            this.sink.on('finish', this.onFinish);
+
+            if (externalAbortSignal) {
+                this.abortListener = addAbortListener(externalAbortSignal, () =>
+                    this.stop('aborted'),
+                );
+
+                if (externalAbortSignal.aborted) {
+                    this.stop('aborted');
+                }
+            }
+
+            this.armDeadline();
+            const stopped = this.check();
+
+            if (stopped) {
+                return { kind: stopped };
+            }
+
+            let suffix: string;
+
+            try {
+                suffix = `,"message":""${echo === undefined ? '' : `,"echo":${JSON.stringify(echo)}`}}`;
+            } catch {
+                return await this.fallback(echo);
+            }
+
+            const overhead = Buffer.byteLength(prefix, 'utf8') + Buffer.byteLength(suffix, 'utf8');
+            const budget = Math.min(maxOutputBytes - overhead, this.maxQueueBytes);
+
+            if (budget < 2) {
+                return await this.fallback(echo);
+            }
+
+            reservePending = true;
+            const result = await backend.queue.reserveGuarded({
+                limit,
+                timeoutMs,
+                maxBatchBytes: budget,
+                signal: this.controller.signal,
+            });
+            const status = result.status;
+
+            // Both outcomes own a physical prefix, including when they arrive late.
+            if (status === 'reserved' || status === 'blocked_guarded') {
+                selection = result;
+                selectionOwned = true;
+            }
+
+            reservePending = false;
+
+            if (status === 'uncertain') {
+                this.markScopedUncertain();
+            } else if (status === 'scope_revoked' || status === 'closed') {
+                this.markScopeRevoked();
+            }
+
+            // A waiter may have resolved before its timer/listener cleanup failed.
+            const afterReserve = this.check();
+
+            if (afterReserve || this.scopedUncertain || this.scopedScopeRevoked) {
+                releaseSelection();
+                return afterReserve ? { kind: afterReserve } : { kind: 'queue_error' };
+            }
+
+            if (status !== 'reserved' && status !== 'blocked_guarded') {
+                if (status === 'empty' || status === 'timeout') {
+                    if (this.emptyPolicy === 'unavailable') {
+                        return { kind: 'empty_unresolved', reason: status };
+                    }
+
+                    const body = `${prefix}[]${suffix}`;
+
+                    if (Buffer.byteLength(body, 'utf8') > maxOutputBytes) {
+                        return await this.fallback(echo);
+                    }
+
+                    return await this.write(body, { response: 'empty', reason: status });
+                }
+
+                if (status === 'blocked') {
+                    if (!nonnegativeInteger(result.requiredBytes) || result.requiredBytes < 2) {
+                        this.markScopedUncertain();
+                        return { kind: 'queue_error' };
+                    }
+
+                    return { kind: 'blocked', requiredBytes: result.requiredBytes };
+                }
+
+                if (status === 'aborted') {
+                    return { kind: 'aborted' };
+                }
+
+                if (
+                    status === 'closed' ||
+                    status === 'busy' ||
+                    status === 'contended' ||
+                    status === 'invalid'
+                ) {
+                    return { kind: status };
+                }
+
+                this.markScopedUncertain();
+                return { kind: 'queue_error' };
+            }
+
+            this.state = 'prepared';
+            let body: string | undefined;
+
+            if (status === 'reserved') {
+                try {
+                    if (
+                        typeof result.eventsJson === 'string' &&
+                        Buffer.byteLength(result.eventsJson, 'utf8') <= budget &&
+                        result.bytes === Buffer.byteLength(result.eventsJson, 'utf8') &&
+                        Number.isSafeInteger(result.count) &&
+                        result.count > 0
+                    ) {
+                        const parsed: unknown = JSON.parse(result.eventsJson);
+
+                        if (Array.isArray(parsed) && parsed.length === result.count) {
+                            if (this.batchOrder === 'fifo') {
+                                const candidate = prefix + result.eventsJson + suffix;
+
+                                if (Buffer.byteLength(candidate, 'utf8') <= maxOutputBytes) {
+                                    body = candidate;
+                                }
+                            } else {
+                                const ordered = orderEventsByTime(parsed);
+
+                                if (
+                                    ordered !== undefined &&
+                                    Buffer.byteLength(ordered, 'utf8') <= budget
+                                ) {
+                                    const candidate = prefix + ordered + suffix;
+
+                                    if (Buffer.byteLength(candidate, 'utf8') <= maxOutputBytes) {
+                                        body = candidate;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch {
+                    // Malformed controlled fake results cannot be committed.
+                }
+
+                if (body === undefined) {
+                    releaseSelection();
+
+                    if (this.scopedUncertain || this.scopedScopeRevoked) {
+                        return { kind: 'queue_error' };
+                    }
+
+                    return await this.fallback(echo);
+                }
+            }
+
+            // Keep the legacy double listener sample before either guarded effect.
+            const beforeSettlement = this.scopedFence();
+
+            if (beforeSettlement) {
+                releaseSelection();
+                return { kind: beforeSettlement };
+            }
+
+            // A thrown or uncertain no-drain operation may already have changed
+            // the prefix. Do not attempt release until scope_revoked proves it held.
+            this.state = 'committing';
+            selectionOwned = false;
+            settlementPending = status;
+            let receipt: GuardedCommitResult | GuardedBlockedResult;
+
+            try {
+                receipt =
+                    status === 'reserved'
+                        ? backend.queue.commitGuardedNoDrain(result.token, result)
+                        : backend.queue.settleBlockedGuardedNoDrain(result.token, result);
+            } catch {
+                this.scopedEffect = { kind: 'unknown' };
+                this.scopedCommitUnknown = status === 'reserved';
+                this.markScopedUncertain();
+                return { kind: 'queue_error' };
+            }
+
+            if (receipt.status === 'scope_revoked') {
+                settlementPending = undefined;
+                selectionOwned = true;
+                releaseSelection();
+                this.markScopeRevoked();
+                return { kind: 'queue_error' };
+            }
+
+            if (receipt.status === 'stale' || receipt.status === 'uncertain') {
+                this.scopedEffect = { kind: 'unknown' };
+                this.scopedCommitUnknown = status === 'reserved';
+                this.markScopedUncertain();
+                return { kind: 'queue_error' };
+            }
+
+            if (receipt.status === 'pruned') {
+                const maximum = status === 'reserved' ? result.count : 1;
+
+                if (
+                    !nonnegativeInteger(receipt.count) ||
+                    receipt.count < 1 ||
+                    receipt.count > maximum
+                ) {
+                    this.scopedEffect = { kind: 'unknown' };
+                    this.scopedCommitUnknown = status === 'reserved';
+                    this.markScopedUncertain();
+                    return { kind: 'queue_error' };
+                }
+
+                settlementPending = undefined;
+                this.scopedEffect = { kind: 'pruned', count: receipt.count };
+                this.notifyScoped({ kind: 'pruned', count: receipt.count });
+
+                if (!this.scopedUncertain) {
+                    this.resumeScoped(receipt);
+                    this.scopedFence();
+                }
+
+                return { kind: 'pruned', count: receipt.count };
+            }
+
+            if (receipt.status === 'blocked' && status === 'blocked_guarded') {
+                if (
+                    !nonnegativeInteger(receipt.requiredBytes) ||
+                    receipt.requiredBytes < 2 ||
+                    receipt.requiredBytes !== result.requiredBytes
+                ) {
+                    this.scopedEffect = { kind: 'unknown' };
+                    this.markScopedUncertain();
+                    return { kind: 'queue_error' };
+                }
+
+                settlementPending = undefined;
+                this.scopedEffect = { kind: 'blocked', requiredBytes: receipt.requiredBytes };
+                this.resumeScoped(receipt);
+                const afterBlocked = this.scopedFence();
+                return afterBlocked
+                    ? { kind: afterBlocked }
+                    : { kind: 'blocked', requiredBytes: receipt.requiredBytes };
+            }
+
+            if (receipt.status !== 'committed' || status !== 'reserved' || body === undefined) {
+                this.scopedEffect = { kind: 'unknown' };
+                this.scopedCommitUnknown = status === 'reserved';
+                this.markScopedUncertain();
+                return { kind: 'queue_error' };
+            }
+
+            // Publish the committed fact before the resume or any status callback.
+            settlementPending = undefined;
+            this.committed = true;
+            this.scopedEffect = { kind: 'committed' };
+            this.resumeScoped(receipt);
+
+            if (this.scopedUncertain || this.scopedScopeRevoked || this.scopedFence()) {
+                return { kind: 'committed_unsent' };
+            }
+
+            return await this.write(body, { response: 'events' });
+        } catch {
+            if (reservePending || settlementPending !== undefined) {
+                // A violating queue could have selected or changed the prefix
+                // before rejecting or returning an unreadable receipt.
+                this.scopedEffect = { kind: 'unknown' };
+                this.scopedCommitUnknown = settlementPending === 'reserved';
+                this.markScopedUncertain();
+            }
+
+            releaseSelection();
+            return this.stopReason ? { kind: this.stopReason } : { kind: 'queue_error' };
+        }
     }
 
     private async executeCore(): Promise<PollCoreOutcome> {
