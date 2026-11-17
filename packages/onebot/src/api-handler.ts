@@ -1,3 +1,4 @@
+import { isPromise, isProxy } from 'node:util/types';
 import { renderParamsVerbose, summarizeParams } from '@snowluma/common/log-summary';
 import { createLogger, runWithTraceRequest, type Logger } from '@snowluma/common/logger';
 import type { BridgeInterface } from '@snowluma/core/bridge-interface';
@@ -192,14 +193,168 @@ interface RegisteredHandler {
     readonly kind: CompiledActionKind;
 }
 
+type ActionMode = 'normal' | 'v12-sensitive';
+type SensitiveMessageAction = 'send_private_msg' | 'send_group_msg';
+type SensitiveHandlerResponse = 'reported' | 'unavailable';
+type SensitiveLogMessage =
+    | 'action_input [redacted]'
+    | 'action_params [redacted]'
+    | 'action_stream_frame [redacted]'
+    | 'action_terminal [redacted]'
+    | 'action_quiesced [redacted]'
+    | 'action_unknown [redacted]'
+    | 'action_failed [redacted]'
+    | 'action_invalid_response [redacted]'
+    | 'action_observer_error [redacted]';
+
+function safeSensitiveLog(level: 'trace' | 'debug' | 'warn', message: SensitiveLogMessage): void {
+    try {
+        moduleLog[level](message);
+    } catch {
+        // A log subscriber must not break sensitive dispatch or expose its error.
+    }
+}
+
 /** A handled-action record handed to debug observers. */
 export interface ActionRecord {
     action: string;
     params: JsonObject;
     response: import('./types').ApiResponse;
     ms: number;
+    /** Present only on a v12-sensitive record. */
+    redacted?: true;
+    /** `unavailable` describes the handler response, not whether effects occurred. */
+    handler_response?: SensitiveHandlerResponse;
+    /** Handler status is unknown when its response is unavailable. */
+    handler_status?: 'unknown';
+    /** The original failure retcode is withheld, or unknown when unavailable. */
+    handler_retcode?: null;
 }
 export type ActionObserver = (rec: ActionRecord) => void;
+
+/** Make a v12-sensitive failure independent of response and Object prototypes. */
+function sensitiveFailure(retcode: number, wording: string): import('./types').ApiResponse {
+    const response = Object.create(null) as import('./types').ApiResponse;
+    response.status = 'failed';
+    response.retcode = retcode;
+    response.data = null;
+    response.wording = wording;
+    return response;
+}
+
+/** Project an already awaited response without invoking accessors or Proxy traps. */
+function snapshotSensitiveResponse(value: unknown): import('./types').ApiResponse | null {
+    if (typeof value !== 'object' || value === null || isProxy(value) || Array.isArray(value)) {
+        return null;
+    }
+
+    try {
+        const status = Object.getOwnPropertyDescriptor(value, 'status');
+        const retcode = Object.getOwnPropertyDescriptor(value, 'retcode');
+        const data = Object.getOwnPropertyDescriptor(value, 'data');
+
+        if (
+            !status ||
+            !('value' in status) ||
+            !retcode ||
+            !('value' in retcode) ||
+            !data ||
+            !('value' in data)
+        ) {
+            return null;
+        }
+
+        if (!(
+            (status.value === 'ok' && retcode.value === 0) ||
+            (status.value === 'failed' &&
+                typeof retcode.value === 'number' &&
+                Number.isSafeInteger(retcode.value) &&
+                retcode.value > 0)
+        )) {
+            return null;
+        }
+
+        for (const key of ['message', 'wording', 'echo', 'stream']) {
+            const descriptor = Object.getOwnPropertyDescriptor(value, key);
+
+            if (descriptor && !('value' in descriptor)) {
+                return null;
+            }
+        }
+
+        // Project before post-handler logging or observers. The fresh
+        // null-prototype envelopes have no `then`, and share no mutable response
+        // or data object with the handler. The dispatcher validates the message ID.
+        const result = Object.create(null) as import('./types').ApiResponse;
+        result.status = status.value;
+        result.retcode = retcode.value;
+        result.data = null;
+
+        if (status.value === 'failed') {
+            result.wording = 'sensitive action failed';
+            return result;
+        }
+
+        const originalData: unknown = data.value;
+
+        if (
+            typeof originalData !== 'object' ||
+            originalData === null ||
+            isProxy(originalData) ||
+            Array.isArray(originalData)
+        ) {
+            return result;
+        }
+
+        try {
+            const messageId = Object.getOwnPropertyDescriptor(originalData, 'message_id');
+
+            if (
+                messageId &&
+                'value' in messageId &&
+                ((typeof messageId.value === 'string' && messageId.value.length <= 11) ||
+                    (typeof messageId.value === 'number' && Number.isFinite(messageId.value)))
+            ) {
+                const projectedData = Object.create(null) as JsonObject;
+                projectedData.message_id = messageId.value;
+                result.data = projectedData;
+            }
+        } catch {
+            // The action reported success; missing metadata is not a send failure.
+        }
+
+        return result;
+    } catch {
+        return null;
+    }
+}
+
+/** Classify ordinary thrown errors without traversing a Proxy prototype. */
+function isSensitiveValidationError(error: unknown): boolean {
+    if ((typeof error !== 'object' || error === null) && typeof error !== 'function') {
+        return false;
+    }
+
+    try {
+        let current: object | null = error;
+
+        for (let depth = 0; current !== null && depth < 100; depth++) {
+            if (isProxy(current)) {
+                return false;
+            }
+
+            current = Object.getPrototypeOf(current) as object | null;
+
+            if (current === MessageElementValidationError.prototype) {
+                return true;
+            }
+        }
+    } catch {
+        return false;
+    }
+
+    return false;
+}
 
 export class ApiHandler {
     /** Handler + dispatch kind live in one record so stream classification can
@@ -298,6 +453,31 @@ export class ApiHandler {
         return runWithTraceRequest(() => this.handleInContext(action, params, sink));
     }
 
+    /**
+     * Internal v12 message dispatch with per-call redaction at ApiHandler's
+     * diagnostics and action-observer boundary only. The registered action,
+     * media callbacks, bridge and other downstream code still receive the
+     * original input; this is not isolation from untrusted in-process code.
+     * An optional synchronous canStart checks the caller's current lease just
+     * before dispatch; its result is trusted and is not a lasting guarantee.
+     * JavaScript await can inspect a returned thenable before this layer can
+     * inspect its response descriptors.
+     */
+    async handleV12SensitiveMessage(
+        action: SensitiveMessageAction,
+        params: JsonObject,
+        canStart?: () => boolean,
+    ): Promise<import('./types').ApiResponse> {
+        // Keep the boundary closed even for JavaScript callers and unsafe casts.
+        if (action !== 'send_private_msg' && action !== 'send_group_msg') {
+            return sensitiveFailure(RETCODE.UNKNOWN_ACTION, 'sensitive action failed');
+        }
+
+        return runWithTraceRequest(() =>
+            this.handleInContext(action, params, undefined, 'v12-sensitive', canStart),
+        );
+    }
+
     traceQuiescedAction(
         action: string,
         params: JsonObject,
@@ -332,31 +512,53 @@ export class ApiHandler {
         action: string,
         params: JsonObject,
         sink?: StreamSink,
+        mode: ActionMode = 'normal',
+        canStart?: () => boolean,
     ): Promise<import('./types').ApiResponse> {
         const startedAt = Date.now();
-        this.traceActionInput(action, params);
+        this.traceActionInput(action, params, mode);
 
         if (!this.acceptingActions) {
-            const response = failedResponse(
-                RETCODE.ACTION_FAILED,
-                'OneBot instance is shutting down',
-            );
-            this.actionLogger(action).warn('rejected Action %s after instance quiesce', action);
-            this.traceActionTerminal(action, response, startedAt, 'failed', 'quiesced');
-            this.notifyObservers(action, params, response, 0);
+            const response =
+                mode === 'v12-sensitive'
+                    ? sensitiveFailure(RETCODE.ACTION_FAILED, 'sensitive action unavailable')
+                    : failedResponse(RETCODE.ACTION_FAILED, 'OneBot instance is shutting down');
+
+            if (mode === 'v12-sensitive') {
+                safeSensitiveLog('warn', 'action_quiesced [redacted]');
+            } else {
+                this.actionLogger(action).warn('rejected Action %s after instance quiesce', action);
+            }
+
+            this.traceActionTerminal(action, response, startedAt, 'failed', 'quiesced', mode);
+            this.notifyObservers(action, params, response, 0, mode, 'unavailable');
             return response;
         }
 
         const registered = this.handlers.get(action);
 
-        if (!registered) {
-            const response = failedResponse(RETCODE.UNKNOWN_ACTION, 'unknown action');
-            this.actionLogger(action).debug('unknown action %s', action);
-            this.traceActionTerminal(action, response, startedAt, 'failed', 'unknown_action');
+        if (!registered || (mode === 'v12-sensitive' && registered.canonical !== action)) {
+            const response =
+                mode === 'v12-sensitive'
+                    ? sensitiveFailure(RETCODE.UNKNOWN_ACTION, 'unknown action')
+                    : failedResponse(RETCODE.UNKNOWN_ACTION, 'unknown action');
+
+            if (mode === 'v12-sensitive') {
+                safeSensitiveLog('debug', 'action_unknown [redacted]');
+            } else {
+                this.actionLogger(action).debug('unknown action %s', action);
+            }
+
+            this.traceActionTerminal(action, response, startedAt, 'failed', 'unknown_action', mode);
+
+            if (mode === 'v12-sensitive') {
+                this.notifyObservers(action, params, response, 0, mode, 'unavailable');
+            }
+
             return response;
         }
 
-        return this.runAction(action, registered.handler, params, sink, startedAt);
+        return this.runAction(action, registered.handler, params, sink, startedAt, mode, canStart);
     }
 
     private async runAction(
@@ -365,38 +567,105 @@ export class ApiHandler {
         params: JsonObject,
         sink: StreamSink | undefined,
         startedAt: number,
+        mode: ActionMode = 'normal',
+        canStart?: () => boolean,
     ): Promise<import('./types').ApiResponse> {
         // Terse breadcrumb to the log file (debug, which is written to disk under the default
         // file level): lets the operator grep "what did the bot get asked to do" in post-mortems.
-        this.actionLogger(action).debug(
-            '%s params=%s',
-            action,
-            hasSensitiveActionInput(action) ? '[redacted]' : summarizeActionParams(action, params),
-        );
+        if (mode === 'v12-sensitive') {
+            safeSensitiveLog('debug', 'action_params [redacted]');
+        } else {
+            this.actionLogger(action).debug(
+                '%s params=%s',
+                action,
+                hasSensitiveActionInput(action)
+                    ? '[redacted]'
+                    : summarizeActionParams(action, params),
+            );
+        }
 
         let response: import('./types').ApiResponse;
         let outcome: 'ok' | 'failed' | 'cancelled';
         let reason: 'response_returned' | 'handler_threw' | 'transport_closed';
+        let handlerResponse: SensitiveHandlerResponse = 'unavailable';
 
         try {
+            if (mode === 'v12-sensitive') {
+                let permitted = true;
+
+                try {
+                    permitted = canStart === undefined || canStart() === true;
+                } catch {
+                    permitted = false;
+                }
+
+                // The guard itself can reenter and quiesce the instance. No
+                // external callback or await may occur between this gate and
+                // the registered handler invocation below.
+                if (!this.acceptingActions || !permitted) {
+                    const unavailable = sensitiveFailure(
+                        RETCODE.ACTION_FAILED,
+                        'sensitive action unavailable',
+                    );
+                    this.traceActionTerminal(
+                        action,
+                        unavailable,
+                        startedAt,
+                        'failed',
+                        'not_started',
+                        mode,
+                    );
+                    this.notifyObservers(
+                        action,
+                        params,
+                        unavailable,
+                        Date.now() - startedAt,
+                        mode,
+                        'unavailable',
+                    );
+                    return unavailable;
+                }
+            }
+
             response = await handler(
                 params,
                 sink
                     ? {
                           send: async (frame) => {
-                              this.actionLogger(action).trace(() => [
-                                  'action_stream_frame action=%s frame=%s',
-                                  action,
-                                  hasPrivateGroupActionDiagnostics(action)
-                                      ? '[redacted]'
-                                      : renderParamsVerbose(frame),
-                              ]);
+                              if (mode === 'v12-sensitive') {
+                                  safeSensitiveLog('trace', 'action_stream_frame [redacted]');
+                              } else {
+                                  this.actionLogger(action).trace(() => [
+                                      'action_stream_frame action=%s frame=%s',
+                                      action,
+                                      hasPrivateGroupActionDiagnostics(action)
+                                          ? '[redacted]'
+                                          : renderParamsVerbose(frame),
+                                  ]);
+                              }
+
                               await sink.send(frame);
                           },
                       }
                     : undefined,
             );
-            outcome = response.status === 'ok' ? 'ok' : 'failed';
+
+            if (mode === 'v12-sensitive') {
+                const snapshot = snapshotSensitiveResponse(response);
+
+                if (snapshot) {
+                    response = snapshot;
+                    handlerResponse = 'reported';
+                    outcome = snapshot.status;
+                } else {
+                    response = sensitiveFailure(RETCODE.ACTION_FAILED, 'sensitive action failed');
+                    outcome = 'failed';
+                    safeSensitiveLog('warn', 'action_invalid_response [redacted]');
+                }
+            } else {
+                outcome = response.status === 'ok' ? 'ok' : 'failed';
+            }
+
             reason = 'response_returned';
         } catch (error) {
             // Single error seam: typed message-contract failures are caller errors
@@ -407,34 +676,62 @@ export class ApiHandler {
             // `OidbError.message` already carries the QQ server code, so it needs no
             // special casing. warn (not error) keeps the log file useful without
             // drowning it in expected client-side failures.
-            if (hasSensitiveActionDiagnostics(action)) {
-                this.actionLogger(action).warn(`${action} failed: [redacted]`);
-            } else {
-                this.log.warn(
-                    '%s failed: %s\n%s',
-                    action,
-                    error instanceof Error ? error.message : String(error),
-                    error instanceof Error ? (error.stack ?? '') : '',
-                );
-            }
-
-            const message = error instanceof Error ? error.message : String(error);
-            const retcode =
-                error instanceof MessageElementValidationError
+            if (mode === 'v12-sensitive') {
+                const retcode = isSensitiveValidationError(error)
                     ? RETCODE.BAD_REQUEST
                     : RETCODE.ACTION_FAILED;
-            response = failedResponse(retcode, message);
-            outcome = error instanceof StreamTransportClosedError ? 'cancelled' : 'failed';
-            reason =
-                error instanceof StreamTransportClosedError ? 'transport_closed' : 'handler_threw';
+                response = sensitiveFailure(retcode, 'sensitive action failed');
+                outcome = 'failed';
+                reason = 'handler_threw';
+                safeSensitiveLog('warn', 'action_failed [redacted]');
+            } else {
+                if (hasSensitiveActionDiagnostics(action)) {
+                    this.actionLogger(action).warn(`${action} failed: [redacted]`);
+                } else {
+                    this.log.warn(
+                        '%s failed: %s\n%s',
+                        action,
+                        error instanceof Error ? error.message : String(error),
+                        error instanceof Error ? (error.stack ?? '') : '',
+                    );
+                }
+
+                const message = error instanceof Error ? error.message : String(error);
+                const retcode =
+                    error instanceof MessageElementValidationError
+                        ? RETCODE.BAD_REQUEST
+                        : RETCODE.ACTION_FAILED;
+                response = failedResponse(retcode, message);
+                outcome = error instanceof StreamTransportClosedError ? 'cancelled' : 'failed';
+                reason =
+                    error instanceof StreamTransportClosedError
+                        ? 'transport_closed'
+                        : 'handler_threw';
+            }
         }
 
-        this.traceActionTerminal(action, response, startedAt, outcome, reason);
-        this.notifyObservers(action, params, response, Date.now() - startedAt);
+        this.traceActionTerminal(action, response, startedAt, outcome, reason, mode);
+        this.notifyObservers(
+            action,
+            params,
+            response,
+            Date.now() - startedAt,
+            mode,
+            handlerResponse,
+        );
         return response;
     }
 
-    private traceActionInput(action: string, params: JsonObject): void {
+    private traceActionInput(
+        action: string,
+        params: JsonObject,
+        mode: ActionMode = 'normal',
+    ): void {
+        if (mode === 'v12-sensitive') {
+            safeSensitiveLog('trace', 'action_input [redacted]');
+            return;
+        }
+
         this.actionLogger(action).trace(() => [
             'action_input action=%s params=%s',
             action,
@@ -452,8 +749,15 @@ export class ApiHandler {
             | 'handler_threw'
             | 'transport_closed'
             | 'unknown_action'
-            | 'quiesced',
+            | 'quiesced'
+            | 'not_started',
+        mode: ActionMode = 'normal',
     ): void {
+        if (mode === 'v12-sensitive') {
+            safeSensitiveLog('trace', 'action_terminal [redacted]');
+            return;
+        }
+
         this.actionLogger(action).trace(() => [
             'action_terminal action=%s outcome=%s reason=%s ms=%d response=%s',
             action,
@@ -469,8 +773,59 @@ export class ApiHandler {
         params: JsonObject,
         response: import('./types').ApiResponse,
         ms: number,
+        mode: ActionMode = 'normal',
+        handlerResponse: SensitiveHandlerResponse = 'unavailable',
     ): void {
         if (!this.observers.size) {
+            return;
+        }
+
+        if (mode === 'v12-sensitive') {
+            const status = snapshotSensitiveResponse(response);
+            const source = status ? handlerResponse : 'unavailable';
+            const observed =
+                status ?? sensitiveFailure(RETCODE.ACTION_FAILED, 'sensitive action failed');
+
+            for (const cb of this.observers) {
+                try {
+                    // Each observer receives its own JSON record, never the
+                    // input, handler response, or another observer's objects.
+                    const result: unknown = cb({
+                        action,
+                        params: {},
+                        response: {
+                            status: observed.status,
+                            retcode: observed.status === 'ok' ? 0 : RETCODE.ACTION_FAILED,
+                            data: null,
+                            message: '[redacted]',
+                        },
+                        ms: 0,
+                        redacted: true,
+                        handler_response: source,
+                        ...(source === 'unavailable' ? { handler_status: 'unknown' as const } : {}),
+                        ...(source === 'unavailable' || observed.status === 'failed'
+                            ? { handler_retcode: null }
+                            : {}),
+                    });
+
+                    // A callback typed `void` may still be async. This is best
+                    // effort for native Promises with ordinary constructor/species;
+                    // arbitrary thenables and hostile in-process callbacks are not
+                    // isolated or guaranteed to have their rejections consumed.
+                    if (isPromise(result)) {
+                        void Promise.prototype.then.call(
+                            result,
+                            () => undefined,
+                            () => {
+                                safeSensitiveLog('warn', 'action_observer_error [redacted]');
+                            },
+                        );
+                    }
+                } catch {
+                    safeSensitiveLog('warn', 'action_observer_error [redacted]');
+                }
+            }
+
             return;
         }
 

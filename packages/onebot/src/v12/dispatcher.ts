@@ -1,3 +1,4 @@
+import { createHash, Hash } from 'node:crypto';
 import { isProxy } from 'node:util/types';
 import type { ApiResponse, JsonObject, JsonValue } from '../types';
 import type { V12CoreOptions, V12FileLease, V12Response } from './types';
@@ -14,7 +15,28 @@ import {
     snapshotRequest,
 } from './validation';
 
+// Assume genuine Node intrinsics at module initialization, as the upload store does.
 const apply = Reflect.apply;
+const getPrototypeOf = Object.getPrototypeOf;
+const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const isArray = Array.isArray;
+const stringCharCodeAt = Function.prototype.call.bind(String.prototype.charCodeAt) as (
+    value: string,
+    index: number,
+) => number;
+const stringIncludes = Function.prototype.call.bind(String.prototype.includes) as (
+    value: string,
+    search: string,
+) => boolean;
+const bufferFrom = Buffer.from;
+const hashUpdate = Hash.prototype.update;
+const hashDigest = Hash.prototype.digest;
+const typedArrayFill = Uint8Array.prototype.fill;
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+const typedArrayByteLength = Object.getOwnPropertyDescriptor(
+    typedArrayPrototype,
+    'byteLength',
+)!.get!;
 
 type PreparedRequest = {
     input: Record<string, unknown>;
@@ -32,6 +54,16 @@ type FragmentProviders = {
     metadata: NonNullable<V12CoreOptions['getUploadedDataFileMetadata']>;
     chunk: NonNullable<V12CoreOptions['getUploadedDataFileChunk']>;
     readiness: V12CoreOptions['isUploadDataSupported'];
+};
+
+type ImageBindings = {
+    options: V12CoreOptions;
+    optionsPrototype: object | null;
+    api: V12CoreOptions['api'];
+    method: NonNullable<V12CoreOptions['api']['handleV12SensitiveMessage']>;
+    methodChain: readonly object[];
+    get: NonNullable<V12CoreOptions['getUploadedDataFile']>;
+    readiness: NonNullable<V12CoreOptions['isUploadDataSupported']>;
 };
 
 type Preflight =
@@ -90,6 +122,8 @@ function extraKeys(value: Record<string, unknown>, allowed: readonly string[]): 
 const MAX_FILE_SUCCESS_JSON_BYTES = 1024 * 1024 - 14;
 const MAX_UPLOAD_BASE64_LENGTH = 349528;
 const MAX_UPLOAD_DATA_BYTES = 256 * 1024;
+const MAX_IMAGE_SENDS = 4;
+const MAX_SENSITIVE_METHOD_PROTOTYPES = 16;
 
 function fileSuccessFits(data: JsonObject, echo?: string): boolean {
     return (
@@ -109,18 +143,18 @@ function fileLeaseCurrent(lease?: V12FileLease): boolean {
 
 /** Inspect only own data properties of a non-Proxy provider result. */
 function ownData(value: object, key: string): unknown {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    const descriptor = getOwnPropertyDescriptor(value, key);
     return descriptor && 'value' in descriptor ? descriptor.value : undefined;
 }
 
 /** Fragment provider fields must also survive ordinary JSON enumeration. */
 function ownEnumerableData(value: object, key: string): unknown {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    const descriptor = getOwnPropertyDescriptor(value, key);
     return descriptor?.enumerable && 'value' in descriptor ? descriptor.value : undefined;
 }
 
 function isProviderRecord(value: unknown): value is object {
-    return typeof value === 'object' && value !== null && !isProxy(value) && !Array.isArray(value);
+    return typeof value === 'object' && value !== null && !isProxy(value) && !isArray(value);
 }
 
 function isCanonicalUploadId(value: unknown): value is string {
@@ -151,7 +185,7 @@ function isCanonicalUploadData(value: unknown): value is string {
         length > 0 && value[length - 1] === '=' ? (value[length - 2] === '=' ? 2 : 1) : 0;
 
     for (let index = 0; index < length - padding; index += 1) {
-        const code = value.charCodeAt(index);
+        const code = stringCharCodeAt(value, index);
 
         if (!(
             (code >= 65 && code <= 90) ||
@@ -164,15 +198,31 @@ function isCanonicalUploadData(value: unknown): value is string {
         }
     }
 
-    if (padding === 2 && !'AQgw'.includes(value[length - 3]!)) {
+    if (padding === 2 && !stringIncludes('AQgw', value[length - 3]!)) {
         return false;
     }
 
-    if (padding === 1 && !'AEIMQUYcgkosw048'.includes(value[length - 2]!)) {
+    if (padding === 1 && !stringIncludes('AEIMQUYcgkosw048', value[length - 2]!)) {
         return false;
     }
 
     return (length / 4) * 3 - padding <= MAX_UPLOAD_DATA_BYTES;
+}
+
+function isLowerSha256(value: unknown): value is string {
+    if (typeof value !== 'string' || value.length !== 64) {
+        return false;
+    }
+
+    for (let index = 0; index < value.length; index += 1) {
+        const code = stringCharCodeAt(value, index);
+
+        if (!((code >= 48 && code <= 57) || (code >= 97 && code <= 102))) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 /** Only call on an already bounded snapshot, never on caller-owned objects. */
@@ -230,10 +280,15 @@ export class V12Dispatcher {
     private readonly self: V12CoreOptions['self'];
     private readonly version: V12CoreOptions['version'];
     readonly #preparedOrdinary = new WeakMap<object, PreparedOrdinary>();
+    readonly #imageBindings: ImageBindings | null;
+    #imageSends = 0;
     // A provider/readiness callback may synchronously reenter this dispatcher.
     #fragmentBusy = false;
 
     constructor(private readonly options: V12CoreOptions) {
+        // Capture without invoking option or API getters, before other constructor reads.
+        // An unavailable initial capability stays unavailable for this dispatcher.
+        this.#imageBindings = this.#captureImageBindings(options);
         let self: unknown;
 
         try {
@@ -416,6 +471,142 @@ export class V12Dispatcher {
             return await this.handleSnapshot(request.input, fileLease);
         } catch {
             return response(10001, 'invalid action request', null, request.fallbackEcho);
+        }
+    }
+
+    /** Pin the initial own-data capability and its bounded, non-Proxy method chain. */
+    #captureImageBindings(options: V12CoreOptions): ImageBindings | null {
+        try {
+            if (!isProviderRecord(options)) {
+                return null;
+            }
+
+            const optionsPrototype: object | null = getPrototypeOf(options);
+
+            if (optionsPrototype !== Object.prototype && optionsPrototype !== null) {
+                return null;
+            }
+
+            const api = ownData(options, 'api');
+            const get = ownData(options, 'getUploadedDataFile');
+            const readiness = ownData(options, 'isUploadDataSupported');
+
+            if (
+                !isProviderRecord(api) ||
+                typeof get !== 'function' ||
+                isProxy(get) ||
+                typeof readiness !== 'function' ||
+                isProxy(readiness)
+            ) {
+                return null;
+            }
+
+            const methodChain: object[] = [];
+            let current: object | null = api;
+
+            while (current !== null && methodChain.length < MAX_SENSITIVE_METHOD_PROTOTYPES) {
+                if (isProxy(current)) {
+                    return null;
+                }
+
+                methodChain.push(current);
+                const descriptor = getOwnPropertyDescriptor(current, 'handleV12SensitiveMessage');
+
+                if (descriptor) {
+                    if (
+                        !('value' in descriptor) ||
+                        typeof descriptor.value !== 'function' ||
+                        isProxy(descriptor.value)
+                    ) {
+                        return null;
+                    }
+
+                    return {
+                        options,
+                        optionsPrototype,
+                        api: api as V12CoreOptions['api'],
+                        method: descriptor.value as ImageBindings['method'],
+                        methodChain,
+                        get: get as ImageBindings['get'],
+                        readiness: readiness as ImageBindings['readiness'],
+                    };
+                }
+
+                current = getPrototypeOf(current) as object | null;
+            }
+        } catch {
+            // A malformed initial capability is unavailable, not a constructor error.
+        }
+
+        return null;
+    }
+
+    /** No accessors, Proxy traps, or provider callbacks during this identity check. */
+    #sameImageBindings(expected: ImageBindings): boolean {
+        try {
+            const optionSlot = getOwnPropertyDescriptor(this, 'options');
+            const options = expected.options;
+
+            if (
+                !optionSlot ||
+                !('value' in optionSlot) ||
+                optionSlot.value !== options ||
+                !isProviderRecord(options) ||
+                getPrototypeOf(options) !== expected.optionsPrototype ||
+                ownData(options, 'api') !== expected.api ||
+                ownData(options, 'getUploadedDataFile') !== expected.get ||
+                ownData(options, 'isUploadDataSupported') !== expected.readiness
+            ) {
+                return false;
+            }
+
+            let current: object | null = expected.api;
+
+            for (let index = 0; index < expected.methodChain.length; index += 1) {
+                if (
+                    current === null ||
+                    current !== expected.methodChain[index] ||
+                    isProxy(current)
+                ) {
+                    return false;
+                }
+
+                const descriptor = getOwnPropertyDescriptor(current, 'handleV12SensitiveMessage');
+
+                if (index === expected.methodChain.length - 1) {
+                    return (
+                        !!descriptor &&
+                        'value' in descriptor &&
+                        descriptor.value === expected.method
+                    );
+                }
+
+                if (descriptor) {
+                    return false;
+                }
+
+                current = getPrototypeOf(current) as object | null;
+            }
+        } catch {
+            return false;
+        }
+
+        return false;
+    }
+
+    /** Readiness and the original lease may reenter; compare all identities afterwards. */
+    #imageBindingsCurrent(expected: ImageBindings, fileLease: V12FileLease): boolean {
+        try {
+            return (
+                this.#sameImageBindings(expected) &&
+                apply(fileLease, undefined, []) === true &&
+                this.#sameImageBindings(expected) &&
+                apply(expected.readiness, expected.options, [fileLease]) === true &&
+                apply(fileLease, undefined, []) === true &&
+                this.#sameImageBindings(expected)
+            );
+        } catch {
+            return false;
         }
     }
 
@@ -778,7 +969,7 @@ export class V12Dispatcher {
             return this.getFile(params.file_id, echo);
         }
 
-        return this.send(params, echo);
+        return this.send(params, echo, fileLease);
     }
 
     private async getSelfInfo(echo?: string): Promise<V12Response> {
@@ -2029,7 +2220,225 @@ export class V12Dispatcher {
         }
     }
 
-    private async send(params: Record<string, unknown>, echo?: string): Promise<V12Response> {
+    /** The slot covers provider reentry, the actual handler promise and metadata lookup. */
+    async #sendImage(
+        targetKey: 'user_id' | 'group_id',
+        target: number,
+        fileId: string,
+        echo: string | undefined,
+        fileLease: V12FileLease | undefined,
+    ): Promise<V12Response> {
+        const unavailable = () => response(20002, 'image unavailable', null, echo);
+
+        if (this.#imageSends >= MAX_IMAGE_SENDS) {
+            return unavailable();
+        }
+
+        this.#imageSends += 1;
+        let submitted = false;
+        let canStartPending = false;
+        let canStartGranted = false;
+
+        try {
+            const bindings = this.#imageBindings;
+
+            if (
+                bindings === null ||
+                typeof fileLease !== 'function' ||
+                isProxy(fileLease) ||
+                !this.#imageBindingsCurrent(bindings, fileLease)
+            ) {
+                return unavailable();
+            }
+
+            // Exactly one read, always with the original listener lease and receiver.
+            const result: unknown = apply(bindings.get, bindings.options, [fileId, fileLease]);
+
+            if (!isProviderRecord(result) || ownEnumerableData(result, 'kind') !== 'ok') {
+                return unavailable();
+            }
+
+            const name = ownEnumerableData(result, 'name');
+            const data = ownEnumerableData(result, 'data');
+            const sha256 = ownEnumerableData(result, 'sha256');
+
+            if (
+                typeof name !== 'string' ||
+                name.length > 4096 ||
+                !isCanonicalUploadData(data) ||
+                data.length === 0 ||
+                !isLowerSha256(sha256)
+            ) {
+                return unavailable();
+            }
+
+            const length = data.length;
+            const padding = data[length - 1] === '=' ? (data[length - 2] === '=' ? 2 : 1) : 0;
+            const decodedLength = (length / 4) * 3 - padding;
+
+            if (decodedLength <= 0 || decodedLength > MAX_UPLOAD_DATA_BYTES) {
+                return unavailable();
+            }
+
+            let bytes: Buffer | null = null;
+
+            try {
+                bytes = bufferFrom(data, 'base64');
+
+                if (apply(typedArrayByteLength, bytes, []) !== decodedLength) {
+                    return unavailable();
+                }
+
+                const hash = createHash('sha256');
+                apply(hashUpdate, hash, [bytes]);
+
+                if (apply(hashDigest, hash, ['hex']) !== sha256) {
+                    return unavailable();
+                }
+            } finally {
+                if (bytes !== null) {
+                    try {
+                        apply(typedArrayFill, bytes, [0]);
+                    } catch {
+                        // Best effort for this temporary buffer; strings remain managed by JS.
+                    }
+                }
+            }
+
+            const action = targetKey === 'user_id' ? 'send_private_msg' : 'send_group_msg';
+            const params: JsonObject = {
+                [targetKey]: target,
+                message: [{ type: 'image', data: { file: `base64://${data}` } }],
+                auto_escape: false,
+            };
+            const originalLease: V12FileLease = fileLease;
+            canStartPending = true;
+
+            const canStart = (): boolean => {
+                if (!canStartPending) {
+                    return false;
+                }
+
+                // Consume before callbacks, so reentry or later reuse cannot grant another start.
+                canStartPending = false;
+                canStartGranted = this.#imageBindingsCurrent(bindings, originalLease);
+                return canStartGranted;
+            };
+
+            // No callback or await between the final lease/readiness/identity check and submit.
+            if (!this.#imageBindingsCurrent(bindings, originalLease)) {
+                return unavailable();
+            }
+
+            submitted = true;
+            const sent: unknown = await apply(bindings.method, bindings.api, [
+                action,
+                params,
+                canStart,
+            ]);
+            canStartPending = false;
+
+            if (!canStartGranted) {
+                // A custom capability can ignore the guard or report success after
+                // it failed. Effects may already have begun, so do not infer a retry.
+                return response(
+                    20002,
+                    'action outcome unavailable; do not retry automatically',
+                    null,
+                    echo,
+                );
+            }
+
+            return await this.#imageSendResult(sent, echo);
+        } catch {
+            return submitted
+                ? response(
+                      20002,
+                      'message outcome unavailable; do not retry automatically',
+                      null,
+                      echo,
+                  )
+                : unavailable();
+        } finally {
+            canStartPending = false;
+            this.#imageSends -= 1;
+        }
+    }
+
+    /** Project only safe descriptors before reusing the existing v11 failure mapping. */
+    async #imageSendResult(result: unknown, echo?: string): Promise<V12Response> {
+        const unknownOutcome = () =>
+            response(20001, 'action outcome unavailable; do not retry automatically', null, echo);
+
+        if (!isProviderRecord(result)) {
+            return unknownOutcome();
+        }
+
+        const status = ownData(result, 'status');
+        const retcode = ownData(result, 'retcode');
+
+        if ((status !== 'ok' && status !== 'failed') || typeof retcode !== 'number') {
+            return unknownOutcome();
+        }
+
+        const failure = v11Failure({ status, retcode, data: null }, echo);
+
+        if (failure) {
+            return failure;
+        }
+
+        const data = ownData(result, 'data');
+        const messageId = isProviderRecord(data) ? ownData(data, 'message_id') : undefined;
+        // A signed int32 has at most eleven characters, including the sign.
+        const id =
+            typeof messageId === 'string' && messageId.length > 11
+                ? null
+                : fromV11MessageId(messageId);
+
+        if (id === null) {
+            return response(
+                20001,
+                'message sent but result metadata is invalid; do not retry automatically',
+                null,
+                echo,
+            );
+        }
+
+        let timestamp: number | null;
+
+        try {
+            timestamp = await this.options.getSentMessageTime(Number(id));
+        } catch {
+            return response(
+                20002,
+                'message sent but result metadata is unavailable; do not retry automatically',
+                null,
+                echo,
+            );
+        }
+
+        if (
+            typeof timestamp !== 'number' ||
+            !Number.isFinite(timestamp) ||
+            timestamp <= 0 ||
+            timestamp > Number.MAX_SAFE_INTEGER
+        ) {
+            return response(
+                20001,
+                'message sent but result metadata is unavailable; do not retry automatically',
+                null,
+                echo,
+            );
+        }
+
+        return response(0, '', { message_id: id, time: timestamp }, echo);
+    }
+
+    private async send(
+        params: Record<string, unknown>,
+        echo?: string,
+        fileLease?: V12FileLease,
+    ): Promise<V12Response> {
         if (extraKeys(params, ['detail_type', 'user_id', 'group_id', 'message'])) {
             return response(10004, 'unsupported parameter', null, echo);
         }
@@ -2063,6 +2472,46 @@ export class V12Dispatcher {
 
         if (target === null || segments === null || segments.length === 0) {
             return response(10003, 'invalid target or message', null, echo);
+        }
+
+        // Images are an exclusive local-upload subset, never a partial mixed send.
+        if (segments.length > 1) {
+            for (let index = 0; index < segments.length; index += 1) {
+                const segment = segments[index];
+
+                if (isObject(segment) && segment.type === 'image') {
+                    return response(10005, 'unsupported segment combination', null, echo);
+                }
+            }
+        }
+
+        const onlySegment = segments.length === 1 ? segments[0] : undefined;
+
+        if (isObject(onlySegment) && onlySegment.type === 'image') {
+            if (!isObject(onlySegment.data)) {
+                return response(10006, 'invalid message segment', null, echo);
+            }
+
+            if (
+                extraKeys(onlySegment, ['type', 'data']) ||
+                extraKeys(onlySegment.data, ['file_id'])
+            ) {
+                return response(10007, 'unsupported message segment field', null, echo);
+            }
+
+            if (typeof onlySegment.data.file_id !== 'string') {
+                return response(10006, 'invalid image segment', null, echo);
+            }
+
+            if (!isCanonicalUploadId(onlySegment.data.file_id)) {
+                return response(10005, 'unsupported message segment', null, echo);
+            }
+
+            if (params.detail_type === 'private' && target > 0xffffffff) {
+                return response(10003, 'invalid target or message', null, echo);
+            }
+
+            return this.#sendImage(targetKey, target, onlySegment.data.file_id, echo, fileLease);
         }
 
         const message: JsonObject[] = [];

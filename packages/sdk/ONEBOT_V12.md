@@ -194,13 +194,16 @@ Their combined UTF-8 length must be at most 64 KiB (65,536 bytes). Missing or
 invalid values, out-of-range coordinates and this text limit return `10006`;
 extra segment or data fields return `10007`. An otherwise valid location mixed
 with text or mentions, or with a second location, returns `10005` without a v11
-send. Segment checks run in order, so an earlier invalid segment or other
-preflight failure can take precedence; non-finite in-process inputs can fail
-snapshot validation with `10001`. Separate request and transport limits also
+send. On the non-image path segment checks run in order, so an earlier invalid
+segment or other preflight failure can take precedence. A multi-segment message
+containing an image is rejected by an earlier combination scan with `10005`,
+after request checks and basic target parsing. Non-finite in-process inputs can fail snapshot
+validation with `10001`. Separate request and transport limits also
 apply. These ranges, length and combination restrictions are Jiyu policies, not
 claims about requirements of the OneBot standard. `get_supported_actions` reports
-action names, not per-segment support. Other outbound media, including image and
-voice, remain unsupported by Jiyu v12.
+action names, not per-segment support. Apart from the [restricted single-image
+path](#sending-one-locally-uploaded-image-with-jiyu) described below, other
+outbound media, including voice, remain unsupported by Jiyu v12.
 
 Jiyu passes the accepted location as a v11 `location` segment. The existing v11
 parser builds a `com.tencent.map` / `LocationShare` JSON card, encoded as a
@@ -220,6 +223,48 @@ failure or timeout after a send begins can leave its outcome uncertain; neither
 the SDK nor Jiyu retries automatically. Existing v11 message behavior is
 unchanged. See the [server details](../onebot/ONEBOT_V12.md#sending-a-single-location).
 
+## Sending one locally uploaded image with Jiyu
+
+`OneBot12ImageSegment` is an optional TypeScript description of the image
+segment's `file_id` shape, not action-specific runtime validation or a guarantee
+that a server accepts that ID. With Jiyu, `send_message` accepts exactly one
+`{type: 'image', data: {file_id}}` object, either directly or in a one-element
+array, for a private or group target. The ID must be a canonical
+`jiyu-upload:v1:` handle from `upload_file` data mode for the same account and
+current listener generation. Incoming media handles, legacy IDs, URLs, local
+paths, multiple images and mixed segments are unsupported.
+
+The upload must contain 1–262,144 bytes; Jiyu checks canonical Base64 and the
+returned SHA-256 before submitting. An otherwise valid one-byte upload passes
+these local content checks, which do not establish image decodability or QQ
+acceptance. Zero-byte uploads are valid for data retrieval but not this send.
+Sending neither consumes the handle nor extends its TTL; the existing upload
+store limits remain in effect.
+
+The original listener lease, readiness, local reader and sensitive v11 method
+must remain valid. In the built-in handler, the one-shot guard and quiescence
+check run after synchronous input/debug logging returns and immediately before
+the registered handler starts. If a sensitive capability returns without its
+guard having granted, the dispatcher reports 20002 with an unknown outcome, even
+if the capability claims success; a custom method may already have caused
+effects, and the check does not prove that it respected the guard. A dispatcher
+allows four in-flight image sends from before reading through the send and
+sent-time lookup; an HTTP timeout does not release a slot before that work
+settles. This limit is per dispatcher, not a global or account-wide concurrency
+cap or an RSS bound. Once the registered handler starts, closing cannot retract
+its effects and a timeout or failed response may leave the outcome unknown. Neither client nor server automatically retries the whole send;
+existing lower-level Highway chunk handling may retry individual chunks.
+
+The sensitive `ApiHandler` action diagnostics and observer records are locally
+redacted; observer retcodes are only 0/100 classifications, and a reported
+handler status is not proof of delivery. Other logs, media/Bridge sinks and
+same-process callbacks can still see content, and a supplied `echo` follows
+normal response rules. JavaScript Base64 copies cannot be guaranteed erased;
+observer Promise rejection handling is best effort, not a guarantee against
+malicious constructors/species, arbitrary thenables or asynchronous logger
+subscriber failures. See the [server's image-send contract](../onebot/ONEBOT_V12.md#sending-a-single-local-upload-image)
+for guards, status details and limitations. Live QQ acceptance remains unverified.
+
 ## Local file data subset
 
 `@harehane/sdk/v12` exports `OneBot12UploadFileDataParams`,
@@ -233,8 +278,9 @@ not Base64 canonicality, digest integrity or action-specific result fields. A
 response type assertion is not validation, and the generic v12 client does not
 automatically encode, decode or verify file bytes.
 
-For a connected `client`, this synthetic example sends the Base64 string for
-`hello` and omits the optional upload hash:
+For a connected `client`, this synthetic upload/retrieval example uses the
+Base64 string for `hello` and omits the optional upload hash. It does not claim
+those bytes form a decodable image:
 
 ```ts
 import type {
@@ -326,8 +372,9 @@ already queued WebSocket output or a closed connection may still prevent deliver
 A failed or missing response can leave the upload outcome unknown; do not
 automatically retry. These local actions do not contact QQ, call v11, read or write
 files or make outbound network requests. The client transport is separate, and
-this v12 data subset does not upload to QQ or send image, voice or file messages.
-See the [server details](../onebot/ONEBOT_V12.md#local-data-uploads).
+these v12 data actions do not themselves upload to QQ or send image, voice or
+file messages. A separate [`send_message` image path](#sending-one-locally-uploaded-image-with-jiyu)
+can use an eligible current-generation handle. See the [server details](../onebot/ONEBOT_V12.md#local-data-uploads).
 
 ## `get_file_fragmented` read-only types
 
@@ -456,9 +503,9 @@ friend/private or normal/group incoming v11 `record` whose public data is
 exactly `{file: string, url: nonempty HTTP(S) string}`. It outputs only
 `{type: 'voice', data: {file_id}}`, with `[语音]` in `alt_message`. Supported
 text, mentions, images and voices retain their order; unsupported or invalid
-visible segments reject the whole event. Outbound image/voice, self-sent media
-echoes, v11 `audio`, video, flash and marketplace-face conversions remain
-unsupported.
+visible segments reject the whole event. Apart from the restricted outbound
+single-image path described above, outbound voice, self-sent media echoes, v11
+`audio`, video, flash and marketplace-face conversions remain unsupported.
 
 Before issuing any handle for an incoming v12 event containing images or voice,
 the Jiyu runtime limits the combined number of image/voice segments to 128 and

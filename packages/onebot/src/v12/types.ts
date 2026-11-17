@@ -26,6 +26,12 @@ export interface V12Response {
 /** Structural subset of ApiHandler; the real instance handler satisfies this. */
 export interface V11ActionHandler {
     handle(action: string, params: JsonObject): Promise<ApiResponse>;
+    /** Per-call diagnostics redaction; canStart fences the registered action's start. */
+    handleV12SensitiveMessage?(
+        action: 'send_private_msg' | 'send_group_msg',
+        params: JsonObject,
+        canStart?: () => boolean,
+    ): Promise<ApiResponse>;
 }
 
 export interface V12CoreOptions {

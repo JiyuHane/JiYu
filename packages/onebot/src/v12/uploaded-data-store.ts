@@ -183,9 +183,10 @@ function wipeDefaultRandom(value: unknown): void {
 }
 
 /**
- * Account-owner-local, synchronous content cache, not a QQ upload: these handles
- * are not yet usable to send media through send_message. The runtime owner
- * controls its lifetime and must call close when revoking this instance.
+ * Account-owner-local, synchronous content cache, not a QQ upload. The runtime
+ * can use an eligible current-generation handle for its separately guarded,
+ * single-image send subset; this store itself does not initiate a media send.
+ * The runtime owner controls its lifetime and must call close when revoking it.
  *
  * Limits apply to this instance's retained raw data and entry count, not process
  * RSS. TTL is 600,000 ms from the initial validated upload clock sample, not

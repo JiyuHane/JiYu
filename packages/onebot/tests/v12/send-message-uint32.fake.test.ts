@@ -119,7 +119,8 @@ describe('V12 private send target uint32 boundary', () => {
                 { ...privateRequest(id), params: { ...privateRequest(id).params, group_id: '1' } },
                 10004,
             ],
-            [privateRequest(id, { type: 'image', data: {} }), 10005],
+            // Image is recognized; missing file_id is an invalid segment.
+            [privateRequest(id, { type: 'image', data: {} }), 10006],
             [privateRequest(id, { type: 'text', data: { text: 1 } }), 10006],
             [privateRequest(id, { type: 'text', data: { text: 'x', extra: true } }), 10007],
             [privateRequest(id, { type: 'mention', data: { user_id: '0' } }), 10006],

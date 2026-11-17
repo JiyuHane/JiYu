@@ -7,11 +7,12 @@ import https from 'node:https';
 import net from 'node:net';
 import { performance } from 'node:perf_hooks';
 import tls from 'node:tls';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 import type { V12TransportOptions } from '../../src/v12-network';
-import type { JsonObject } from '../../src/types';
+import type { ApiResponse, JsonObject } from '../../src/types';
 import type { V12Runtime } from '../../src/v12-runtime/runtime';
 import type { V12Source } from '../../src/v12-runtime/source-generation';
+import type { V11ActionHandler } from '../../src/v12/types';
 import type { V12UploadedDataStore } from '../../src/v12/uploaded-data-store';
 
 type MemoryTransport = {
@@ -29,7 +30,7 @@ type FakeTransport = {
     close: ReturnType<typeof vi.fn>;
     quiesce: ReturnType<typeof vi.fn>;
     forceClose: ReturnType<typeof vi.fn>;
-    isAcceptingActions: ReturnType<typeof vi.fn>;
+    isAcceptingActions: Mock<() => boolean>;
     backing?: MemoryTransport;
 };
 
@@ -212,6 +213,8 @@ async function account(
         trackAction?: <T>(label: string, start: () => Promise<T>) => Promise<T>;
         canAccept?: () => boolean;
         open?: boolean;
+        handleV12SensitiveMessage?: V11ActionHandler['handleV12SensitiveMessage'];
+        getSentMessageTime?: (id: number) => Promise<number | null>;
     } = {},
 ) {
     const generation = new sourceApi.SourceGeneration();
@@ -229,6 +232,9 @@ async function account(
                 data: { file_name: 'legacy.bin', url: LEGACY_URL },
             };
         }),
+        ...(overrides.handleV12SensitiveMessage === undefined
+            ? {}
+            : { handleV12SensitiveMessage: overrides.handleV12SensitiveMessage }),
     };
     let runtime!: V12Runtime;
     runtime = new runtimeApi.V12Runtime(
@@ -250,7 +256,7 @@ async function account(
         },
         {
             getStatus: () => ({ good: true, online: true }),
-            getSentMessageTime: async () => null,
+            getSentMessageTime: overrides.getSentMessageTime ?? (async () => null),
             trackAction:
                 overrides.trackAction ?? (<T>(_label: string, start: () => Promise<T>) => start()),
             canAccept: overrides.canAccept ?? (() => true),
@@ -652,6 +658,170 @@ describe('v12 uploaded data through SDK and fake listener', () => {
         );
     });
 
+    it('sends an uploaded single image through the runtime and retires its listener lease', async () => {
+        const messageId = -2147483648;
+        const time = 1_700_000_000;
+        const echo = 'synthetic-image-send-echo-🪶';
+
+        const makeSensitive = () => {
+            const startCheck = vi.fn((canStart: () => boolean) => canStart());
+            const submitted = vi.fn(
+                (
+                    _action: 'send_private_msg' | 'send_group_msg',
+                    _params: JsonObject,
+                ): ApiResponse => ({
+                    status: 'ok',
+                    retcode: 0,
+                    data: { message_id: messageId },
+                }),
+            );
+            const method = vi.fn<NonNullable<V11ActionHandler['handleV12SensitiveMessage']>>(
+                async (action, params, canStart) => {
+                    if (canStart === undefined || !startCheck(canStart)) {
+                        return { status: 'failed', retcode: 100, data: null };
+                    }
+
+                    return submitted(action, params);
+                },
+            );
+            const getSentMessageTime = vi.fn(async (_id: number): Promise<number | null> => time);
+            return { startCheck, submitted, method, getSentMessageTime };
+        };
+
+        const imageParams = (fileId: string) => ({
+            detail_type: 'private',
+            user_id: '20001',
+            message: [{ type: 'image', data: { file_id: fileId } }],
+        });
+        const expectedV11 = (data: string) => ({
+            user_id: 20001,
+            message: [{ type: 'image', data: { file: `base64://${data}` } }],
+            auto_escape: false,
+        });
+        const first = makeSensitive();
+        // Both capabilities must be present before the runtime constructs its dispatcher.
+        const a = await account('10001', {
+            handleV12SensitiveMessage: first.method,
+            getSentMessageTime: first.getSentMessageTime,
+        });
+        const selfA = { platform: 'qq', user_id: a.uin };
+        const savedHandler = a.transport().options.handle;
+        expect(BYTES.length).toBeGreaterThan(0);
+        const id = uploadedId(await upload(a));
+        const sent = await a.client.request('send_message', imageParams(id), { self: selfA, echo });
+        expect(sent).toEqual({
+            status: 'ok',
+            retcode: 0,
+            data: { message_id: String(messageId), time },
+            message: '',
+            echo,
+        });
+        expect(a.fakeFetch).toHaveBeenCalledTimes(2);
+        expect(JSON.parse(a.fakeFetch.mock.calls[1]![1]!.body as string)).toEqual({
+            action: 'send_message',
+            params: imageParams(id),
+            self: selfA,
+            echo,
+        });
+        expect(first.method).toHaveBeenCalledExactlyOnceWith(
+            'send_private_msg',
+            expectedV11(DATA),
+            expect.any(Function),
+        );
+        expect(first.method.mock.contexts[0]).toBe(a.api);
+        expect(first.startCheck).toHaveBeenCalledExactlyOnceWith(first.method.mock.calls[0]![2]);
+        expect(first.startCheck).toHaveReturnedWith(true);
+        expect(first.submitted).toHaveBeenCalledExactlyOnceWith(
+            'send_private_msg',
+            expectedV11(DATA),
+        );
+        expect(first.getSentMessageTime).toHaveBeenCalledExactlyOnceWith(messageId);
+        expect(a.api.handle).not.toHaveBeenCalled();
+        expect((await getData(a, id)).data).toEqual({ name: NAME, data: DATA, sha256: SHA256 });
+
+        // The foreign account has the same capabilities, but not A's store.
+        const second = makeSensitive();
+        const b = await account('10002', {
+            handleV12SensitiveMessage: second.method,
+            getSentMessageTime: second.getSentMessageTime,
+        });
+        const selfB = { platform: 'qq', user_id: b.uin };
+        const foreign = await b.client.request('send_message', imageParams(id), {
+            self: selfB,
+            echo: 'foreign-echo',
+        });
+        expect(foreign).toMatchObject({
+            status: 'failed',
+            retcode: 20002,
+            data: null,
+            echo: 'foreign-echo',
+        });
+        expect(second.method).not.toHaveBeenCalled();
+        expect(second.startCheck).not.toHaveBeenCalled();
+        expect(second.submitted).not.toHaveBeenCalled();
+        expect(second.getSentMessageTime).not.toHaveBeenCalled();
+        const otherData = Buffer.from('synthetic-other-image').toString('base64');
+        const otherId = uploadedId(await upload(b, 'other-image.bin', otherData));
+        expect(otherId).not.toBe(id);
+        expect(
+            await b.client.request('send_message', imageParams(otherId), { self: selfB, echo }),
+        ).toEqual({
+            status: 'ok',
+            retcode: 0,
+            data: { message_id: String(messageId), time },
+            message: '',
+            echo,
+        });
+        expect(second.method).toHaveBeenCalledExactlyOnceWith(
+            'send_private_msg',
+            expectedV11(otherData),
+            expect.any(Function),
+        );
+        expect(second.startCheck).toHaveBeenCalledExactlyOnceWith(second.method.mock.calls[0]![2]);
+        expect(second.startCheck).toHaveReturnedWith(true);
+        expect(second.submitted).toHaveBeenCalledExactlyOnceWith(
+            'send_private_msg',
+            expectedV11(otherData),
+        );
+        expect(second.getSentMessageTime).toHaveBeenCalledExactlyOnceWith(messageId);
+        expect(b.api.handle).not.toHaveBeenCalled();
+
+        await a.runtime.close();
+        await a.open();
+        const staleId = await a.client.request('send_message', imageParams(id), {
+            self: selfA,
+            echo,
+        });
+        expect(staleId).toMatchObject({ status: 'failed', retcode: 20002, data: null, echo });
+        const staleRequest = { action: 'send_message', params: imageParams(id), self: selfA, echo };
+        expect(await savedHandler(staleRequest)).toMatchObject({
+            status: 'failed',
+            retcode: 20002,
+            data: null,
+            echo,
+        });
+        const freshId = uploadedId(await upload(a, 'new-generation'));
+        expect(freshId).not.toBe(id);
+        expect(await savedHandler({ ...staleRequest, params: imageParams(freshId) })).toMatchObject(
+            {
+                status: 'failed',
+                retcode: 20002,
+                data: null,
+                echo,
+            },
+        );
+        expect((await getData(a, freshId)).data).toEqual({
+            name: 'new-generation',
+            data: DATA,
+            sha256: SHA256,
+        });
+        expect(first.method).toHaveBeenCalledTimes(1);
+        expect(first.startCheck).toHaveBeenCalledTimes(1);
+        expect(first.submitted).toHaveBeenCalledTimes(1);
+        expect(first.getSentMessageTime).toHaveBeenCalledTimes(1);
+        expect(a.api.handle).not.toHaveBeenCalled();
+    });
+
     it('never forwards uploaded file, image or voice segments to v11', async () => {
         const f = await account('10001');
         const id = uploadedId(await upload(f));
@@ -662,7 +832,11 @@ describe('v12 uploaded data through SDK and fake listener', () => {
                 user_id: '20001',
                 message: [{ type, data: { file_id: id } }],
             });
-            expect(result).toMatchObject({ status: 'failed', retcode: 10005, data: null });
+            expect(result).toMatchObject({
+                status: 'failed',
+                retcode: type === 'image' ? 20002 : 10005,
+                data: null,
+            });
         }
 
         expect(f.api.handle).not.toHaveBeenCalled();
