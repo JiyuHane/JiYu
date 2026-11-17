@@ -41,6 +41,7 @@ export type {
     OneBot12UploadFileDataResult,
     OneBot12UserInfo,
     OneBot12UserInfoResponse,
+    OneBot12VideoSegment,
     OneBot12VoiceSegment,
 } from './types.js';
 export {

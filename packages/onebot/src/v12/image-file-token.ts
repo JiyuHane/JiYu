@@ -5,6 +5,7 @@ import { classifyFileUrl } from './file-url';
 /** Local OneBot 12 media handles, unrelated to QQ signatures or QQ encryption. */
 export const V12_IMAGE_TOKEN_PREFIX = 'jiyu-image:v1:';
 export const V12_VOICE_TOKEN_PREFIX = 'jiyu-voice:v1:';
+export const V12_VIDEO_TOKEN_PREFIX = 'jiyu-video:v1:';
 
 const KEY_BYTES = 32;
 const NONCE_PREFIX_BYTES = 4;
@@ -32,7 +33,14 @@ const VOICE_PURPOSE = Object.freeze({
     accountError: 'invalid voice file token account',
     providerFailure: 'voice token provider failure',
 });
-type TokenPurpose = typeof IMAGE_PURPOSE | typeof VOICE_PURPOSE;
+const VIDEO_PURPOSE = Object.freeze({
+    prefix: V12_VIDEO_TOKEN_PREFIX,
+    aad: 'jiyu-onebot12-video-v1',
+    error: 'video file token unavailable',
+    accountError: 'invalid video file token account',
+    providerFailure: 'video token provider failure',
+});
+type TokenPurpose = typeof IMAGE_PURPOSE | typeof VOICE_PURPOSE | typeof VIDEO_PURPOSE;
 
 /** Identifies the reserved namespace, including malformed or expired handles. */
 export function isV12ImageToken(id: string): boolean {
@@ -42,6 +50,11 @@ export function isV12ImageToken(id: string): boolean {
 /** Identifies the reserved namespace, including malformed or expired handles. */
 export function isV12VoiceToken(id: string): boolean {
     return typeof id === 'string' && id.startsWith(V12_VOICE_TOKEN_PREFIX);
+}
+
+/** Identifies the reserved namespace, including malformed or expired handles. */
+export function isV12VideoToken(id: string): boolean {
+    return typeof id === 'string' && id.startsWith(V12_VIDEO_TOKEN_PREFIX);
 }
 
 /** Validates a sealable URL snapshot without issuing a handle or performing I/O. */
@@ -333,6 +346,39 @@ export class V12VoiceFileTokens {
             return this.#engine.issue(url);
         } catch {
             throw new Error(VOICE_PURPOSE.error);
+        }
+    }
+
+    redeem(id: string): string | null {
+        let engine: V12FileTokenEngine;
+
+        try {
+            engine = this.#engine;
+        } catch {
+            return null;
+        }
+
+        return engine.redeem(id);
+    }
+
+    revoke(): void {
+        this.#engine.revoke();
+    }
+}
+
+/** Account-instance-local video URL snapshot handles. */
+export class V12VideoFileTokens {
+    readonly #engine: V12FileTokenEngine;
+
+    constructor(accountId: string) {
+        this.#engine = new V12FileTokenEngine(accountId, VIDEO_PURPOSE);
+    }
+
+    issue(url: string): string {
+        try {
+            return this.#engine.issue(url);
+        } catch {
+            throw new Error(VIDEO_PURPOSE.error);
         }
     }
 

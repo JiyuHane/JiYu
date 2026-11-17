@@ -92,6 +92,15 @@ processes. Source tickets identify a local binding and online generation, not
 QQ occurrence time or a complete poll-readiness cut; upstream work can still
 be in flight when a poll returns.
 
+Before committing a selected nonempty HTTP prefix, the runtime samples the
+request's original listener, listener token and source attempt (`sourceAttempt`)
+alongside owner, cancellation and deadline checks. This listener guard does not
+cover empty, timeout or fallback responses, or writes after commit. It relies on
+trusted synchronous callbacks; these samples are not an atomic fence against
+arbitrary reentry or later lifecycle changes and do not establish client delivery.
+Source-qualified private recalls remain excluded from production polling; this
+guard does not admit them.
+
 Responses select an admission-completion FIFO prefix of the surviving queue and
 then sort that batch by `time`, stably for equal timestamps. `limit: 1` selects
 the FIFO head, not necessarily the globally oldest event. Cross-batch order, later arrivals and
@@ -149,8 +158,9 @@ performed thenable handling, which may itself execute a `then` getter.
 For `get_file` with `type: "url"`, non-reserved opaque `file_id` values are
 passed once to the existing account-local v11 media lookup; supported hits come
 from that account's cached image or voice metadata. The ID must be a nonempty
-string of at most 4,096 UTF-16 code units. Supported v12 incoming image and voice
-segments can instead supply separate transient URL handles as described below.
+string of at most 4,096 UTF-16 code units. Supported v12 incoming image, voice
+and video segments can instead supply separate transient URL handles as described
+below.
 URL success returns only `name` and the original HTTP(S) `url`. The
 [OneBot URL mode](https://12.onebot.dev/interface/file/actions/#get_file) requires
 the application to be able to download the file; Jiyu's best-effort URL syntax
@@ -203,11 +213,12 @@ except that, once installed, this capability shadows a pre-existing v11 alias
 starting `jiyu-upload:v1:` through v12 URL lookup; v11 itself is unchanged. Malformed or oversized IDs may
 fail earlier common validation. Upload `type: "url"`, `type: "path"` and unknown
 types return 10004; the separate `upload_file_fragmented` action remains
-unimplemented and returns 10002. Other group/normal file and video operations, local-path modes and outbound media
-remain unsupported apart from the [restricted single local-upload image send](#sending-a-single-local-upload-image).
+unimplemented and returns 10002. Outbound video sending, other group/normal
+file and local-path operations, and other outbound media remain unsupported
+apart from the [restricted single local-upload image send](#sending-a-single-local-upload-image).
 
 The restricted `get_file_fragmented` capability reads only these local upload
-handles; image, voice and v11 file IDs do not fall back to another source. It is
+handles; image, voice, video and v11 file IDs do not fall back to another source. It is
 advertised only while the local data capability, both fragment callbacks and the
 listener lease are available. `prepare` returns `{name, total_size, sha256}`;
 `transfer` returns `{data}` as padded Base64 of exactly the requested byte range.
@@ -281,44 +292,53 @@ outcome unknown; neither Jiyu nor the SDK automatically retries it.
 
 Incoming friend/private and normal/group messages with text and v11 `at`
 segments are converted to v12 `text`, `mention` and `mention_all` segments.
-A current internal source ticket also permits ordinary incoming images and
-voice records with the supported v11 public shapes. In particular, voice must be
-exactly `{type: 'record', data: {file: <string>, url: <nonempty HTTP(S) string>}}`
-at the public JSON-visible boundary; `file` may be empty. Required fields are own
-enumerable data properties, and visible extras, accessors and proxies are
-rejected. Non-enumerable internal metadata is not projected or treated as
-evidence of QQ origin. An accepted record is projected lossily as exactly
-`{type: 'voice', data: {file_id}}`, with `[语音]` in `alt_message`; an accepted
-image renders as `[图片]`. Before issuing any media handle, the account-local
-runtime checks the required event data, every supported segment shape and every
-media URL against its syntax and size limits. Text, mentions, images and voice
-retain their source order. Media issuers recheck their URLs and issue in that
-order; a later issuance failure exposes no partial event but does not roll back
-earlier issuer side effects. Flash images, marketplace faces, nonzero image
-subtypes, custom summaries, audio/video segments, media-bearing sent-message
+A current internal source ticket also permits ordinary incoming images, voice
+records and videos with the supported v11 public shapes. At the public
+JSON-visible boundary voice must be exactly
+`{type: 'record', data: {file: <string>, url: <nonempty HTTP(S) string>}}`, and
+video must be exactly
+`{type: 'video', data: {file: <string>, url: <nonempty HTTP(S) string>}}`;
+`file` may be empty. Required fields are own enumerable data properties, and
+visible extras, accessors and proxies are rejected. Non-enumerable internal
+metadata is not projected or treated as evidence of QQ origin. An accepted
+record is projected lossily as exactly `{type: 'voice', data: {file_id}}`, with
+`[语音]` in `alt_message`; an accepted video becomes exactly
+`{type: 'video', data: {file_id}}` with `[视频]`, and an accepted image renders
+as `[图片]`. Before issuing any media handle, the account-local runtime checks
+the required event data, every supported segment shape and every media URL against
+its syntax and size limits. Text, mentions, images, voice and video retain their
+source order. Media issuers recheck their URLs and issue in that order; a later
+issuance failure exposes no partial event but does not roll back earlier issuer
+side effects. Flash images, marketplace faces, nonzero image subtypes, custom
+summaries, v11 `audio`, unsupported video shapes, media-bearing sent-message
 echoes and other unsupported segments visible at this boundary reject the whole
-v12 event; sending voice remains unsupported and v11 message and action
+v12 event. Sending voice or video remains unsupported, and v11 message and action
 semantics are unchanged.
 
-Before issuing any handle for an incoming v12 event containing images or voice,
-the runtime also enforces a combined maximum of 128 image/voice segments and
-256 KiB (262,144 bytes) across their UTF-8 URLs. Exceeding either limit fails
-the whole conversion without truncation; an already-prepared internal ordered
-prototype admission records an ordering gap under its existing rules. Production
-HTTP polling uses a separate completion-order owner and can omit the failed
-event. Text-only events and v11 behavior are unaffected by these media limits.
-These are local workload policies, not QQ or OneBot protocol limits, and they
-do not bound total CPU use or process RSS. If a subsequent issuer or provider
-fails after reserving a nonce, that nonce is not rolled back.
+Before issuing any handle for an incoming v12 event containing images, voice
+or video, the runtime also enforces a combined maximum of 128 media segments
+and 256 KiB (262,144 bytes) across their UTF-8 URLs. Exceeding either limit
+fails the whole conversion without truncation; an already-prepared internal
+ordered prototype admission records an ordering gap under its existing rules.
+Production HTTP polling uses a separate completion-order owner and can omit the
+failed event; its 64 KiB per-event and 256 KiB encoded-queue limits are separate
+from the media URL budget. Text-only events and v11 behavior are unaffected by
+these media limits. These are local workload policies, not QQ or OneBot protocol
+limits, and they do not bound total CPU use or process RSS. If a subsequent
+issuer or provider fails after reserving a nonce, that nonce is not rolled back.
 
 This projection is not lossless or an end-to-end no-network guarantee. A real
-`OneBotInstance` normally passes through the existing v11 RKey and, for voice,
-PTT URL resolution before constructing the event. That resolver may access the
-network or change the source element; an upstream decoder or v11 conversion
-may already have omitted a segment or semantics such as format and duration.
-In particular, a reply that v11 cannot resolve may be dropped before v12 sees the
-message; the remaining text can then appear without a reply segment. A reply still
-visible at the v12 boundary is unsupported and rejects the whole v12 event. Neither
+`OneBotInstance` normally passes through the existing v11 RKey and voice or video
+URL resolution before constructing the event. Those resolvers may make QQ requests
+or change the source element; an upstream decoder or v11 conversion may already
+have omitted a segment or semantics such as format and duration. An exception
+escaping video resolution can cause the existing per-element conversion loop to
+skip that video before the v12 boundary, so v12 may see only the remaining text.
+That earlier catch is distinct from the redacted URL-population warning below and
+may log exception details. A reply that v11 cannot resolve may also be dropped
+before v12 sees the message; the remaining text can then appear without a reply
+segment. A reply still visible at the v12 boundary is unsupported and rejects
+the whole v12 event. Neither
 case identifies the original quoted sender or proves the quoted message's content.
 Existing v11 file-ID logic remains unchanged. If the v11 media URL population
 step throws, that particular resolver catch logs a fixed redacted warning
@@ -337,30 +357,54 @@ it. This is partial event conversion support. HTTP polling has the separate
 admission, ordering and loss limits described above; local fixtures do not prove
 QQ interoperability.
 
-Each supported image or voice segment carries a transient `jiyu-image:v1:` or
-`jiyu-voice:v1:` file ID that seals the exact HTTP(S) URL observed in its v11
-segment. A later `get_file` on the same active v12 runtime returns that exact URL
-and `name: ''`, without calling the v11 media lookup, refreshing the URL,
-downloading or validating the file, or invoking v11 `get_file` action observers
-or logs. URLs above 3,000 UTF-8 bytes, IDs above 4,096 UTF-16 code units, and
-URLs rejected by the existing syntax checks are unsupported. The ID protects an
-observed URL string, not the original bytes, QQ source identity, actual file
-identity, future URL content or access. Local AES-GCM is unrelated to QQ signing
-or its encryption algorithms; voice uses a separate purpose, random key, AAD and
-nonce state from images.
+Each supported image, voice or video segment carries a transient
+`jiyu-image:v1:`, `jiyu-voice:v1:` or `jiyu-video:v1:` file ID that seals the
+exact HTTP(S) URL observed in its v11 segment. A later `get_file` in URL mode on
+the same active v12 runtime can resolve that exact URL and construct a core
+success with `name: ''`, without calling the v11 media lookup, refreshing the
+URL, downloading or validating the file, or invoking v11 `get_file` action
+observers or logs. Incoming video handles are not supported by `get_file` data
+or path mode or by `get_file_fragmented`.
+URLs above 3,000 UTF-8 bytes, IDs above 4,096 UTF-16 code units, and URLs rejected
+by the existing syntax checks are unsupported. The ID protects an observed URL
+string, not the original bytes, QQ source identity, actual file identity, format,
+playability, future URL content or access. Local AES-GCM is unrelated to QQ
+signing or its encryption algorithms; image, voice and video each have a separate
+purpose, random key, AAD and nonce state.
+
+For image, voice and video handles, a core success is still subject to the
+transport's output byte limit for the entire JSON response, including the URL
+and `echo`. Quotes in accepted URLs and quotes or backslashes in `echo` are
+JSON-escaped and can enlarge the response; raw backslashes in URLs are rejected
+by the URL check. Even when the URL and request meet their individual limits,
+the response may exceed the transport budget and be replaced by a fallback or
+the connection may close. Successful redemption alone does not guarantee that a
+client receives the URL.
 
 Each ID is a transferable bearer reference: anyone who can call `get_file` on
-the issuing runtime can recover the URL, and its length is visible. The same
-runtime retains its keys across listener close/reopen and online-status changes;
-permanent runtime quiesce/force-close revokes them, while replacement or restart
-uses new keys. Each key issues at most 2²⁴ handles; exhaustion rejects new
-projections for that purpose without revoking previously issued handles.
-Key-buffer clearing is best effort and does not erase copies held by JavaScript,
-native crypto or consumers. Both prefixes are reserved: an invalid, tampered,
-revoked or foreign handle fails rather than falling back to v11. In particular,
-a pre-existing v11 alias beginning `jiyu-voice:v1:` is no longer accepted via
-v12 `get_file`; v11 actions themselves remain unchanged. The original v11 event
-and debug/observer channels may still contain the URL.
+the issuing runtime can attempt to recover the URL, and its length is visible.
+These URL snapshot handles have no built-in TTL; they can be submitted for
+redemption while the issuing account runtime accepts actions and retains the
+unrevoked issuing key. The original URL may independently expire or become
+inaccessible sooner. The 10-minute TTL above applies to local uploads, not these
+handles. An ordinary
+listener close/reopen or online-status change does not itself revoke the issuer.
+Each key issues at most 2²⁴ handles; exhaustion rejects new projections for that
+purpose without revoking previously issued handles.
+
+Permanent runtime quiesce or force-close stops new input and detaches all three
+issuer references before attempting their individual revocations. After a
+successful revocation, the old issuer no longer redeems its handles; a replacement
+or restarted runtime creates its own issuer and key. If revocation throws, cleanup
+of that issuer and key remains unknown; if it throws before clearing the issuer,
+a separately held reference may still redeem old handles. Clearing is best effort
+even when revocation succeeds; it does not guarantee erasure of copies held by
+JavaScript, native crypto or consumers. All three prefixes are reserved: an
+invalid, tampered, revoked or foreign handle fails through v12 rather than
+falling back to v11. In particular, a pre-existing v11 alias beginning
+`jiyu-video:v1:` or `jiyu-voice:v1:` is shadowed through v12 `get_file`; v11
+actions themselves remain unchanged. The original v11 event and debug/observer
+channels may still contain the URL.
 
 For an ordinary event delivered with an internal source ticket, v12 WebSocket
 fanout now rechecks its original listener binding and online epoch before
@@ -368,15 +412,18 @@ publishing and before each subscriber. An expired, foreign or unverifiable
 provided ticket is not published to v12 subscribers; v11 dispatch is unchanged.
 Events with no ticket retain the legacy unguarded fanout. A synchronous reentry
 with the exact same event and payload can inherit the surrounding ticket scope.
-For image and voice projections the source and current issuer references are also
-rechecked before poll admission and WebSocket delivery. Production HTTP poll
-admission and batch ordering follow the limits above. A poll result already
-committed before a later WebSocket check is not rolled back, and the internal poll seam is not a
-same-process authentication boundary. These checks depend on the instance's
-synchronous source verifier and observed issuer identity; they do not establish
-upstream QQ identity, prevent arbitrary same-process mutation, suppress same-epoch
-delivery to a later-joining client, or cancel an asynchronous subscriber that
-already began work.
+For image, voice and video, the production completion-order HTTP path samples
+the source and issuer before enqueue, and the owner samples the issuer again
+after its last host callbacks. These checks rely on trusted synchronous callbacks
+and are not an atomic enqueue guarantee: later queue serialization, callbacks
+or other same-process code may change state. The ordered owner is a separate
+prototype, not the production HTTP owner. WebSocket fanout separately rechecks
+the source and current issuer references. A poll result already committed before
+a later WebSocket check is not rolled back, and the internal poll seam is not a
+same-process authentication boundary. These checks do not establish upstream QQ
+identity, prevent arbitrary same-process mutation, suppress same-epoch delivery
+to a later-joining client, or cancel an asynchronous subscriber that already
+began work.
 
 A private `friend_recall` may produce `notice.private_message_delete` only
 through the account-local runtime path. The originating upstream
@@ -874,9 +921,10 @@ For private or group `send_message`, Jiyu supports exactly one standalone
 single-element array. The only accepted `file_id` is a canonical
 `jiyu-upload:v1:` handle from this account's current listener generation,
 previously returned by `upload_file` with `type: 'data'`. The suffix is the
-canonical unpadded base64url encoding of 32 bytes. Incoming `jiyu-image:v1:` or
-`jiyu-voice:v1:` handles, legacy IDs, URLs, local paths, multiple image segments
-and image mixed with any other segment are unsupported. This path does not
+canonical unpadded base64url encoding of 32 bytes. Incoming `jiyu-image:v1:`,
+`jiyu-voice:v1:` or `jiyu-video:v1:` handles, legacy IDs, URLs, local paths,
+multiple image segments and image mixed with any other segment are unsupported.
+This path does not
 fetch a URL or read an arbitrary file.
 
 After request and basic target checks, the multi-segment image scan returns

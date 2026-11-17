@@ -3,7 +3,7 @@ import { isProxy } from 'node:util/types';
 import type { ApiResponse, JsonObject, JsonValue } from '../types';
 import type { V12CoreOptions, V12FileLease, V12Response } from './types';
 import { classifyFileUrl } from './file-url';
-import { isV12ImageToken, isV12VoiceToken } from './image-file-token';
+import { isV12ImageToken, isV12VideoToken, isV12VoiceToken } from './image-file-token';
 import { isV12UploadToken, V12_UPLOAD_TOKEN_PREFIX } from './uploaded-data-store';
 import {
     MAX_REQUEST_STRING_LENGTH,
@@ -1186,7 +1186,7 @@ export class V12Dispatcher {
             }
         }
 
-        // Do not redeem image/voice handles or fall back to the v11 file lookup.
+        // Do not redeem image/voice/video handles or fall back to the v11 file lookup.
         if (!isV12UploadToken(fileId)) {
             return response(10004, 'unsupported file source', null, echo);
         }
@@ -1412,6 +1412,20 @@ export class V12Dispatcher {
             // fall back to a v11 alias, even when malformed or unredeemable.
             try {
                 const url = this.options.resolveVoiceFileUrl?.(fileId);
+                const checked = classifyFileUrl(url);
+                return checked.kind === 'valid'
+                    ? response(0, '', { name: '', url: checked.url }, echo)
+                    : invalid();
+            } catch {
+                return unavailable();
+            }
+        }
+
+        if (isV12VideoToken(fileId)) {
+            // The new reserved prefix shadows matching legacy aliases through
+            // v12 get_file, even for malformed or unredeemable video handles.
+            try {
+                const url = this.options.resolveVideoFileUrl?.(fileId);
                 const checked = classifyFileUrl(url);
                 return checked.kind === 'valid'
                     ? response(0, '', { name: '', url: checked.url }, echo)

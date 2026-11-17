@@ -117,11 +117,12 @@ function ordinaryImageUrl(segment: object): string | null {
 }
 
 // This projects only the observable V11 shape; it does not establish the
-// identity or playability of the original QQ media.
-function ordinaryVoiceUrl(segment: object): string | null {
+// identity or playability of the original QQ media. An earlier V11 conversion
+// may have omitted an element, which this later projection cannot recover.
+function ordinarySimpleMediaUrl(segment: object, type: 'record' | 'video'): string | null {
     const outer = visibleOwnData(segment, ['type', 'data']);
 
-    if (!outer || outer.type !== 'record') {
+    if (!outer || outer.type !== type) {
         return null;
     }
 
@@ -188,6 +189,7 @@ export function convertV11Event(
     options?: {
         issueImageFileId: (url: string) => string;
         issueVoiceFileId?: (url: string) => string;
+        issueVideoFileId?: (url: string) => string;
         validateMediaFileUrl?: (url: string) => boolean;
     },
 ): V12ConvertedEvent | null {
@@ -544,7 +546,7 @@ export function convertV11Event(
 
     const message: V12MessageEvent['message'] = [];
     const alt: string[] = [];
-    const media: { type: 'image' | 'voice'; index: number; url: string }[] = [];
+    const media: { type: 'image' | 'voice' | 'video'; index: number; url: string }[] = [];
 
     for (let index = 0; index < sourceSegments.length; index += 1) {
         const segment = sourceSegments[index];
@@ -555,27 +557,33 @@ export function convertV11Event(
 
         const type = segmentProperty(segment, 'type');
 
-        if (type === 'image' || type === 'record') {
+        if (type === 'image' || type === 'record' || type === 'video') {
             if (isSent || !options) {
                 throw new Error('unsupported or invalid V11 message segment');
             }
 
-            const url = type === 'image' ? ordinaryImageUrl(segment) : ordinaryVoiceUrl(segment);
+            const url =
+                type === 'image'
+                    ? ordinaryImageUrl(segment)
+                    : ordinarySimpleMediaUrl(segment, type);
 
             if (url === null) {
                 throw new Error('unsupported or invalid V11 message segment');
             }
 
-            const mediaType = type === 'image' ? 'image' : 'voice';
+            const mediaType = type === 'record' ? 'voice' : type;
             media.push({ type: mediaType, index: message.length, url });
 
             // These placeholders remain private until all issuance succeeds.
             if (mediaType === 'image') {
                 message.push({ type: 'image', data: { file_id: '' } });
                 alt.push('[图片]');
-            } else {
+            } else if (mediaType === 'voice') {
                 message.push({ type: 'voice', data: { file_id: '' } });
                 alt.push('[语音]');
+            } else {
+                message.push({ type: 'video', data: { file_id: '' } });
+                alt.push('[视频]');
             }
 
             continue;
@@ -641,8 +649,12 @@ export function convertV11Event(
     const issueVoice = media.some((item) => item.type === 'voice')
         ? options?.issueVoiceFileId
         : undefined;
+    const issueVideo = media.some((item) => item.type === 'video')
+        ? options?.issueVideoFileId
+        : undefined;
     const issuance = media.map((item) => {
-        const issue = item.type === 'image' ? issueImage : issueVoice;
+        const issue =
+            item.type === 'image' ? issueImage : item.type === 'voice' ? issueVoice : issueVideo;
 
         if (typeof issue !== 'function') {
             throw new Error('unsupported or invalid V11 message segment');
@@ -718,7 +730,9 @@ export function convertV11Event(
         message[item.index] =
             item.type === 'image'
                 ? { type: 'image', data: { file_id: fileId } }
-                : { type: 'voice', data: { file_id: fileId } };
+                : item.type === 'voice'
+                  ? { type: 'voice', data: { file_id: fileId } }
+                  : { type: 'video', data: { file_id: fileId } };
     }
 
     return converted;

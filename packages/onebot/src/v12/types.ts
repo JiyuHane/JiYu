@@ -46,6 +46,8 @@ export interface V12CoreOptions {
     resolveImageFileUrl?(fileId: string): string | null;
     /** Resolve an implementation-issued voice file ID for the current account. */
     resolveVoiceFileUrl?(fileId: string): string | null;
+    /** Resolve an implementation-issued video file ID for the current account. */
+    resolveVideoFileUrl?(fileId: string): string | null;
     /** Synchronous local data store; a listener owner may supply a commit lease. */
     uploadDataFile?(
         name: string,
@@ -71,10 +73,12 @@ export interface V12CoreOptions {
 export type V12TextSegment = { type: 'text'; data: { text: string } };
 export type V12ImageSegment = { type: 'image'; data: { file_id: string } };
 export type V12VoiceSegment = { type: 'voice'; data: { file_id: string } };
+export type V12VideoSegment = { type: 'video'; data: { file_id: string } };
 export type V12MessageSegment =
     | V12TextSegment
     | V12ImageSegment
     | V12VoiceSegment
+    | V12VideoSegment
     | { type: 'mention'; data: { user_id: string } }
     | { type: 'mention_all'; data: Record<string, never> };
 

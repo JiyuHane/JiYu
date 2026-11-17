@@ -42,6 +42,12 @@ export interface OneBot12VoiceSegment extends OneBot12MessageSegment {
     data: OneBot12JsonObject & { file_id: string };
 }
 
+/** Describes a video segment; the generic segment parser does not validate file_id. */
+export interface OneBot12VideoSegment extends OneBot12MessageSegment {
+    type: 'video';
+    data: OneBot12JsonObject & { file_id: string };
+}
+
 /** Describes a location segment; the generic segment parser does not validate location fields. */
 export interface OneBot12LocationSegment extends OneBot12MessageSegment {
     type: 'location';

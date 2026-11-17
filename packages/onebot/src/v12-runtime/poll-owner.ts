@@ -3,6 +3,7 @@ import { isObject, parseAccountId, parseMessageId } from '../v12/validation';
 import { EventPollBuffer } from './event-poll-buffer';
 import {
     PollCoordinator,
+    type PollListenerGuard,
     type PollOutcome,
     type PollRequest,
     type PollSink,
@@ -180,6 +181,15 @@ function validOrderedEvent(event: unknown, self: OrderedSelf): boolean {
             }
 
             if (segment.type === 'voice') {
+                return (
+                    exact(segment.data, ['file_id']) &&
+                    typeof segment.data.file_id === 'string' &&
+                    segment.data.file_id.length > 0 &&
+                    segment.data.file_id.length <= 4096
+                );
+            }
+
+            if (segment.type === 'video') {
                 return (
                     exact(segment.data, ['file_id']) &&
                     typeof segment.data.file_id === 'string' &&
@@ -381,7 +391,11 @@ type Slot = {
 const slots = new WeakMap<object, Slot>();
 
 export interface PollOwner {
-    start(request: PollRequest, sink: PollSink): { result: Promise<PollOutcome>; cancel(): void };
+    start(
+        request: PollRequest,
+        sink: PollSink,
+        listenerGuard?: PollListenerGuard,
+    ): { result: Promise<PollOutcome>; cancel(): void };
     invalidate(): void;
 }
 
@@ -872,6 +886,7 @@ export function enqueuePollEvent(
     runtime: object,
     event: unknown,
     source: V12Source | undefined,
+    mediaGuard?: () => boolean,
 ): void {
     const slot = slots.get(runtime);
     const owner = slot?.owner;
@@ -900,6 +915,23 @@ export function enqueuePollEvent(
             (owner.batchOrder === 'event-time' && !owner.matchesScopeSource(source))
         ) {
             return;
+        }
+
+        // The production media guard is a trusted, synchronous issuer-identity
+        // sample. It must not call host verification or be retained by the queue.
+        if (owner.batchOrder === 'event-time' && mediaGuard !== undefined) {
+            let current = false;
+
+            try {
+                current = mediaGuard() === true;
+            } catch {
+                // A throwing guard rejects this admission just like a false result.
+            }
+
+            if (!current) {
+                increment(slot, 'invalid');
+                return;
+            }
         }
 
         const result = owner.enqueue(event);
@@ -933,7 +965,10 @@ class Owner implements PollOwner {
     private invalidating = false;
     private checking = false;
     readonly facade: PollOwner = Object.freeze({
-        start: (request: PollRequest, sink: PollSink) => this.start(request, sink),
+        start: (request: PollRequest, sink: PollSink, listenerGuard?: PollListenerGuard) =>
+            listenerGuard === undefined
+                ? this.start(request, sink)
+                : this.start(request, sink, listenerGuard),
         invalidate: () => this.invalidate(),
     });
     readonly orderedFacade: OrderedPollOwner = Object.freeze({
@@ -1419,11 +1454,25 @@ class Owner implements PollOwner {
         }
     }
 
-    start(request: PollRequest, sink: PollSink): { result: Promise<PollOutcome>; cancel(): void } {
+    start(
+        request: PollRequest,
+        sink: PollSink,
+        listenerGuard?: PollListenerGuard,
+    ): { result: Promise<PollOutcome>; cancel(): void } {
         const failure = (kind: 'epoch_invalid' | 'busy' | 'invalid_input' | 'queue_error') => ({
             result: Promise.resolve({ kind } as PollOutcome),
             cancel() {},
         });
+
+        // Only the production HTTP owner requires a listener-specific guard.
+        // Legacy and ordered owners keep their existing two-argument contract.
+        if (
+            !this.ordered &&
+            this.batchOrder === 'event-time' &&
+            typeof listenerGuard !== 'function'
+        ) {
+            return failure('epoch_invalid');
+        }
 
         if (!this.valid()) {
             this.invalidate();
@@ -1476,7 +1525,10 @@ class Owner implements PollOwner {
                 return failure('epoch_invalid');
             }
 
-            const tx = this.coordinator.create(snapshot, sink);
+            const tx =
+                listenerGuard === undefined
+                    ? this.coordinator.create(snapshot, sink)
+                    : this.coordinator.create(snapshot, sink, listenerGuard);
 
             if (!this.valid()) {
                 this.invalidate();

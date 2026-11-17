@@ -46,6 +46,9 @@ export interface PollSink {
     end(body: string): void;
 }
 
+/** Trusted per-transaction listener check; never supplied by a poll request. */
+export type PollListenerGuard = () => boolean;
+
 export interface PollRequest {
     readonly limit: number;
     readonly timeoutMs: number;
@@ -161,7 +164,11 @@ export class PollCoordinator {
         }
     }
 
-    create(request: PollRequest, sink: PollSink): PollTransaction {
+    create(
+        request: PollRequest,
+        sink: PollSink,
+        listenerGuard?: PollListenerGuard,
+    ): PollTransaction {
         const transaction = new PollTransaction(
             this.queue,
             this.maxQueueBytes,
@@ -180,6 +187,7 @@ export class PollCoordinator {
             () => this.transactions.delete(transaction),
             this.emptyPolicy,
             this.batchOrder,
+            listenerGuard,
         );
 
         return transaction;
@@ -227,6 +235,7 @@ export class PollTransaction {
         private readonly onDone: () => void,
         private readonly emptyPolicy: 'legacy' | 'unavailable' = 'legacy',
         private readonly batchOrder: 'fifo' | 'event-time' = 'fifo',
+        private listenerGuard?: PollListenerGuard,
     ) {
         if (emptyPolicy !== 'legacy' && emptyPolicy !== 'unavailable') {
             throw new RangeError('invalid empty policy');
@@ -486,7 +495,15 @@ export class PollTransaction {
     }
 
     private async execute(): Promise<PollOutcome> {
-        const outcome = await this.executeCore();
+        let outcome: PollCoreOutcome;
+
+        try {
+            outcome = await this.executeCore();
+        } finally {
+            // Drop this transaction's direct reference to the listener guard.
+            this.listenerGuard = undefined;
+        }
+
         this.state = 'terminal';
 
         if (this.timer !== undefined) {
@@ -682,7 +699,37 @@ export class PollTransaction {
             // isOpen() can synchronously change epoch or clock after their first
             // samples. Recheck without reentering the sink; injected sampling may
             // itself reenter, so this is not an atomic or hard real-time guarantee.
-            const beforeCommit = this.check() ?? this.check(false);
+            let beforeCommit = this.check() ?? this.check(false);
+            const listenerGuard = this.listenerGuard;
+
+            if (!beforeCommit && listenerGuard !== undefined) {
+                try {
+                    if (listenerGuard() !== true) {
+                        this.stop('epoch_invalid');
+                    }
+                } catch {
+                    this.stop('epoch_invalid');
+                }
+
+                // The trusted listener check can reenter cancellation, source or
+                // listener lifecycle code. Recheck the sink, owner and deadline.
+                beforeCommit = this.stopReason ?? this.check() ?? this.check(false);
+
+                if (!beforeCommit) {
+                    // The recheck can itself change listener readiness. Sample the
+                    // same trusted guard last; do not invoke another host callback
+                    // between this sample and the commit. This is not atomic.
+                    try {
+                        if (listenerGuard() !== true) {
+                            this.stop('epoch_invalid');
+                        }
+                    } catch {
+                        this.stop('epoch_invalid');
+                    }
+
+                    beforeCommit = this.stopReason;
+                }
+            }
 
             if (beforeCommit) {
                 tokenOwned = false;

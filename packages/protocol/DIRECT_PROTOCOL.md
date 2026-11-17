@@ -771,13 +771,24 @@ The selected state initializes index `i` to zero and, when `i < L`, reads `K[i]`
 and `S[i]`, XORs them and writes the low byte back to `K[i]`. It then reads
 `K[n1+i]` and `S[i]`, writes their XOR to `K[n1+i]`, increments `i`, and returns
 to the unsigned `i < L` test. This describes the inspected loop control under
-valid-address, stable-pointer and non-destructive-alias assumptions; it does not
-establish what happens at the exit state. The original file bytes `+0xc = 0x20`
-and `+0xd = 0x40` suggest `L=32` and 64-byte halves only if they and the relevant
-reads remain unchanged at runtime. A distinct `L > r` branch performs conditional
-writes to the first allocation, but its subsequent behavior is not yet traced.
-Neither branch is connected here to `G + 0x28..0x47`, the final output, or an
-SSO signer; the observed padding and XOR steps alone do not establish that link.
+valid-address, stable-pointer and non-destructive-alias assumptions. On exit
+state `0x83fd5b18`, code checks the descriptor again and, if its `+8` dword
+still equals 4 and the first allocation `P` remains valid and writable, initializes
+parts of `P`. It then rereads descriptor `+0xd` as a separate length `n3` and
+saves both `K` and `n3` in local slots. A subsequent handler independently
+rereads descriptor `+8`; if this later read also equals 4, the selected branch
+calculates the addresses `P+0x28` and `P+8`. Those address calculations do not
+read their contents or use `G` as the base, and do not establish a reference to
+`G+0x28`; aliasing between `P` and `G` remains unobserved. The later consumer
+of `K` and the exit of this path remain unresolved. Neither `n3` nor either `+8`
+check is an observation of runtime values, and the repeated reads need not match.
+
+The original file bytes `+0xc = 0x20` and `+0xd = 0x40` suggest `L=32` and
+64-byte halves only if they and the relevant reads remain unchanged at runtime.
+A distinct `L > r` branch performs conditional writes to the first allocation,
+but its subsequent behavior is not yet traced. Neither branch is connected here
+to `G + 0x28..0x47`, the final output, or an SSO signer; these observations alone
+do not establish that link.
 
 The descriptor bytes have a different file mapping from the code: the writable
 `PT_LOAD` maps linked `0x9035280` through `0x9035285` to file offsets

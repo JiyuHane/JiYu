@@ -11,6 +11,7 @@ import { V12Dispatcher } from '../v12/dispatcher';
 import {
     isV12SealableFileUrl,
     V12ImageFileTokens,
+    V12VideoFileTokens,
     V12VoiceFileTokens,
 } from '../v12/image-file-token';
 import {
@@ -110,6 +111,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     private readonly dispatcher: V12Dispatcher;
     private imageFileTokens: V12ImageFileTokens | null = null;
     #voiceFileTokens: V12VoiceFileTokens | null = null;
+    #videoFileTokens: V12VideoFileTokens | null = null;
     #uploadGeneration: UploadGeneration | null = null;
     #uploadSlot: UploadSlot | null = null;
     private readonly subscribers = new Set<(event: unknown) => void>();
@@ -207,6 +209,18 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
 
                 const url = tokens.redeem(fileId);
                 return this.#voiceFileTokens === tokens && this.isEnabled && this.accepting
+                    ? url
+                    : null;
+            },
+            resolveVideoFileUrl: (fileId) => {
+                const tokens = this.#videoFileTokens;
+
+                if (!tokens || !this.isEnabled || !this.accepting) {
+                    return null;
+                }
+
+                const url = tokens.redeem(fileId);
+                return this.#videoFileTokens === tokens && this.isEnabled && this.accepting
                     ? url
                     : null;
             },
@@ -388,6 +402,25 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             }
         };
 
+        // Capture this exact listener and source attempt, rather than whichever
+        // listener happens to be current when a waiting poll resumes.
+        const pollLease = (): boolean => {
+            const owns = (): boolean =>
+                this.transport === transport &&
+                this.currentStatusTransportToken === token &&
+                this.openingOwner === token &&
+                this.sourceAttempt === sourceAttempt &&
+                this.sourceBinding === sourceAttempt &&
+                this.isEnabled &&
+                this.accepting;
+
+            try {
+                return owns() && fileLease() && owns();
+            } catch {
+                return false;
+            }
+        };
+
         try {
             transport = new V12Transport({
                 host: this.config.host,
@@ -472,6 +505,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                                         externalAbortSignal: context.signal,
                                     },
                                     context.sink,
+                                    pollLease,
                                 ).result;
 
                                 // A committed prefix is not requeued after an ambiguous
@@ -1102,9 +1136,24 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
             let converted: ReturnType<typeof convertV11Event>;
             let issuedImageIssuer: V12ImageFileTokens | null = null;
             let issuedVoiceIssuer: V12VoiceFileTokens | null = null;
-            const mediaIssuersCurrent = (): boolean =>
-                (issuedImageIssuer === null || this.imageFileTokens === issuedImageIssuer) &&
-                (issuedVoiceIssuer === null || this.#voiceFileTokens === issuedVoiceIssuer);
+            let issuedVideoIssuer: V12VideoFileTokens | null = null;
+
+            const mediaIssuersCurrent = (): boolean => {
+                if (issuedImageIssuer !== null) {
+                    // The TS-private image slot is an ordinary own property at
+                    // runtime; do not invoke a substituted accessor here.
+                    const image = Object.getOwnPropertyDescriptor(this, 'imageFileTokens');
+
+                    if (!image || !('value' in image) || image.value !== issuedImageIssuer) {
+                        return false;
+                    }
+                }
+
+                return (
+                    (issuedVoiceIssuer === null || this.#voiceFileTokens === issuedVoiceIssuer) &&
+                    (issuedVideoIssuer === null || this.#videoFileTokens === issuedVideoIssuer)
+                );
+            };
 
             if (privateRecall) {
                 converted =
@@ -1235,18 +1284,70 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                         issuedVoiceIssuer ??= issuer;
                         return fileId;
                     },
+                    issueVideoFileId: (url) => {
+                        // Video uses its own account-instance issuer and the same
+                        // internal source epoch and synchronous scope as other media.
+                        if (!sourceScopeCurrent() || !mediaIssuersCurrent()) {
+                            throw new Error('v12 video source unavailable');
+                        }
+
+                        if (!this.#videoFileTokens) {
+                            const candidate = new V12VideoFileTokens(this.self.user_id);
+
+                            if (!sourceScopeCurrent() || !mediaIssuersCurrent()) {
+                                candidate.revoke();
+                                throw new Error('v12 video source unavailable');
+                            }
+
+                            // Verification may reenter and install a different issuer.
+                            if (this.#videoFileTokens) {
+                                candidate.revoke();
+                            } else {
+                                this.#videoFileTokens = candidate;
+                            }
+                        }
+
+                        const issuer = this.#videoFileTokens;
+
+                        if (
+                            !issuer ||
+                            !sourceScopeCurrent() ||
+                            this.#videoFileTokens !== issuer ||
+                            !mediaIssuersCurrent()
+                        ) {
+                            throw new Error('v12 video source unavailable');
+                        }
+
+                        const fileId = issuer.issue(url);
+                        const current = sourceScopeCurrent();
+
+                        if (
+                            !current ||
+                            this.#videoFileTokens !== issuer ||
+                            !mediaIssuersCurrent()
+                        ) {
+                            throw new Error('v12 video source unavailable');
+                        }
+
+                        issuedVideoIssuer ??= issuer;
+                        return fileId;
+                    },
                 });
 
                 // This must precede poll resolution: an already committed item
                 // cannot be recalled by the later WebSocket fanout guard.
                 if (
-                    (issuedImageIssuer !== null || issuedVoiceIssuer !== null) &&
+                    (issuedImageIssuer !== null ||
+                        issuedVoiceIssuer !== null ||
+                        issuedVideoIssuer !== null) &&
                     (!sourceScopeCurrent() || !mediaIssuersCurrent())
                 ) {
                     throw new Error(
                         issuedImageIssuer !== null
                             ? 'v12 image source unavailable'
-                            : 'v12 voice source unavailable',
+                            : issuedVoiceIssuer !== null
+                              ? 'v12 voice source unavailable'
+                              : 'v12 video source unavailable',
                     );
                 }
             }
@@ -1302,7 +1403,16 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                         ) {
                             // Only an unprepared legacy input may use completion-order FIFO.
                             // A proven pre-ready input never enters a later consumer group.
-                            pollLosses = this.enqueuePollWithDiagnostics(converted, source);
+                            pollLosses =
+                                issuedImageIssuer !== null ||
+                                issuedVoiceIssuer !== null ||
+                                issuedVideoIssuer !== null
+                                    ? this.enqueuePollWithDiagnostics(
+                                          converted,
+                                          source,
+                                          mediaIssuersCurrent,
+                                      )
+                                    : this.enqueuePollWithDiagnostics(converted, source);
                         }
                     } catch {
                         failOrderedAdmission(admission);
@@ -1633,19 +1743,27 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     private enqueuePollWithDiagnostics(
         event: unknown,
         source: V12Source | undefined,
+        mediaGuard?: () => boolean,
     ): HttpPollDiagnostic[] {
         let before: ReturnType<typeof pollOwnerStats> = null;
+        let httpOwner = false;
         const losses: HttpPollDiagnostic[] = [];
 
         try {
-            if (hasHttpPollOwner(this)) {
+            httpOwner = hasHttpPollOwner(this);
+
+            if (httpOwner) {
                 before = pollOwnerStats(this);
             }
         } catch {
             // An optional diagnostic must not prevent admission or WS fanout.
         }
 
-        enqueuePollEvent(this, event, source);
+        if (httpOwner && mediaGuard !== undefined) {
+            enqueuePollEvent(this, event, source, mediaGuard);
+        } else {
+            enqueuePollEvent(this, event, source);
+        }
 
         if (!before) {
             return losses;
@@ -1849,13 +1967,15 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
     private revokeMediaTokens(): void {
         const imageTokens = this.imageFileTokens;
         const voiceTokens = this.#voiceFileTokens;
-        // Remove both references before any reentrant revocation or diagnostic.
+        const videoTokens = this.#videoFileTokens;
+        // Remove all references before any reentrant revocation or diagnostic.
         this.imageFileTokens = null;
         this.#voiceFileTokens = null;
+        this.#videoFileTokens = null;
 
         const revoke = (
-            tokens: V12ImageFileTokens | V12VoiceFileTokens | null,
-            kind: 'image' | 'voice',
+            tokens: V12ImageFileTokens | V12VoiceFileTokens | V12VideoFileTokens | null,
+            kind: 'image' | 'voice' | 'video',
         ): void => {
             if (!tokens) {
                 return;
@@ -1881,6 +2001,7 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
 
         revoke(imageTokens, 'image');
         revoke(voiceTokens, 'voice');
+        revoke(videoTokens, 'video');
     }
 
     private revokePoll(): void {
