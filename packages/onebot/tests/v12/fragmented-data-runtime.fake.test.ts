@@ -8,6 +8,7 @@ import net from 'node:net';
 import { performance } from 'node:perf_hooks';
 import tls from 'node:tls';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { OneBot12JsonObject } from '../../../sdk/src/v12/types.js';
 import type { V12TransportOptions } from '../../src/v12-network';
 import type { V12Runtime } from '../../src/v12-runtime/runtime';
 import type { V12Source } from '../../src/v12-runtime/source-generation';
@@ -28,12 +29,17 @@ type FakeTransport = {
 const fixture = vi.hoisted(() => ({
     transports: [] as FakeTransport[],
     forbiddenModules: [] as string[],
+    openGate: undefined as Promise<void> | undefined,
 }));
 
 vi.mock('../../src/v12-network', () => ({
     V12Transport: class {
         private accepting = false;
         readonly open = vi.fn(async () => {
+            if (fixture.openGate) {
+                await fixture.openGate;
+            }
+
             this.accepting = true;
         });
         readonly close = vi.fn(async () => {
@@ -86,6 +92,10 @@ vi.mock('@snowluma/sqlite', () => ({
 const ENDPOINT = 'http://fixture.invalid/';
 const TOKEN = 'synthetic-transport-token';
 const PREFIX = 'jiyu-upload:v1:';
+const DRAFT_PREFIX = 'jiyu-upload-draft:v1:';
+const FRAGMENT_UPLOAD = 'upload_file_fragmented';
+const MAX_UPLOAD_BYTES = 256 * 1024;
+const UPLOAD_TTL_MS = 600_000;
 const NAME = 'fixture.txt';
 const DATA = 'aGVsbG8=';
 const SHA256 = '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824';
@@ -115,6 +125,7 @@ function blocked(): never {
 beforeEach(async () => {
     fixture.transports.length = 0;
     fixture.forbiddenModules.length = 0;
+    fixture.openGate = undefined;
     vi.stubEnv('SNOWLUMA_LOG_FILE', '0');
     fetchGuard = vi.fn(blocked);
     webSocketGuard = vi.fn(function ForbiddenWebSocket() {
@@ -233,8 +244,7 @@ async function account(
     generation.setOnline(true);
     let current!: FakeTransport;
 
-    const open = async () => {
-        await runtime.open();
+    const captureTransport = () => {
         const candidate = fixture.transports.at(-1);
 
         if (!candidate) {
@@ -242,6 +252,11 @@ async function account(
         }
 
         current = candidate;
+    };
+
+    const open = async () => {
+        await runtime.open();
+        captureTransport();
     };
 
     await open();
@@ -261,7 +276,16 @@ async function account(
         fetch: fakeFetch,
         requestTimeoutMs: 0,
     });
-    return { uin, runtime, api, client, fakeFetch, open, transport: () => current };
+    return {
+        uin,
+        runtime,
+        api,
+        client,
+        fakeFetch,
+        open,
+        captureTransport,
+        transport: () => current,
+    };
 }
 
 type Account = Awaited<ReturnType<typeof account>>;
@@ -274,8 +298,20 @@ async function upload(f: Account, name = NAME, data = DATA) {
     );
 }
 
-function uploadedId(result: Awaited<ReturnType<typeof upload>>): string {
-    expect(result).toMatchObject({ status: 'ok', retcode: 0, echo: 'upload' });
+function okEnvelope(data: unknown, echo: string) {
+    return { status: 'ok', retcode: 0, data, message: '', echo };
+}
+
+function failedEnvelope(retcode: number, echo: string) {
+    return { status: 'failed', retcode, data: null, echo };
+}
+
+function uploadedId(
+    result: Awaited<ReturnType<typeof upload>>,
+    echo = 'upload',
+    prefix = PREFIX,
+): string {
+    expect(result).toMatchObject({ status: 'ok', retcode: 0, echo });
     const data = result.data;
 
     if (
@@ -287,11 +323,33 @@ function uploadedId(result: Awaited<ReturnType<typeof upload>>): string {
         throw new Error('synthetic upload ID missing');
     }
 
-    expect(data.file_id).toMatch(/^jiyu-upload:v1:[A-Za-z0-9_-]{43}$/);
-    const suffix = data.file_id.slice(PREFIX.length);
+    expect(result).toEqual(okEnvelope({ file_id: data.file_id }, echo));
+    expect(data.file_id.startsWith(prefix)).toBe(true);
+    const suffix = data.file_id.slice(prefix.length);
+    expect(suffix).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(Buffer.from(suffix, 'base64url').length).toBe(32);
     expect(Buffer.from(suffix, 'base64url').toString('base64url')).toBe(suffix);
     return data.file_id;
+}
+
+function uploadFragment(f: Account, params: OneBot12JsonObject, echo: string) {
+    return f.client.request(FRAGMENT_UPLOAD, params, {
+        self: { platform: 'qq', user_id: f.uin },
+        echo,
+    });
+}
+
+async function reserveDraft(f: Account, name: string, totalSize: number, echo = 'reserve') {
+    const result = await uploadFragment(f, { stage: 'prepare', name, total_size: totalSize }, echo);
+    return uploadedId(result, echo, DRAFT_PREFIX);
+}
+
+function writeFragment(f: Account, fileId: string, offset: number, data: string, echo = 'write') {
+    return uploadFragment(f, { stage: 'transfer', file_id: fileId, offset, data }, echo);
+}
+
+function finishDraft(f: Account, fileId: string, sha256: string, echo = 'finish') {
+    return uploadFragment(f, { stage: 'finish', file_id: fileId, sha256 }, echo);
 }
 
 async function prepare(f: Account, fileId: string, echo = 'prepare') {
@@ -363,6 +421,242 @@ async function flushMicrotasks(): Promise<void> {
         await Promise.resolve();
     }
 }
+
+async function expectDraftUnreadable(f: Account, draft: string) {
+    const echo = 'draft-read';
+
+    for (const type of ['data', 'url']) {
+        const result = await f.client.request('get_file', { type, file_id: draft }, { echo });
+        expect(result).toMatchObject(failedEnvelope(10004, echo));
+    }
+
+    expect(await prepare(f, draft, echo)).toMatchObject(failedEnvelope(10004, echo));
+    expect(await transfer(f, draft, 0, 1, echo)).toMatchObject(failedEnvelope(10004, echo));
+}
+
+describe('upload_file_fragmented through SDK, runtime and generation-local store', () => {
+    it('publishes ordered binary fragments only after finish, at the 256 KiB limit', async () => {
+        const f = await account('10001');
+        expect((await f.client.request('get_supported_actions')).data).toContain(FRAGMENT_UPLOAD);
+        const name = '分片🪶.bin';
+        const chunks = [
+            Buffer.from([0x00, 0xff]),
+            Buffer.alloc(MAX_UPLOAD_BYTES - 5, 0xa3),
+            Buffer.from([0x80, 0x0d, 0x00]),
+        ];
+        const bytes = Buffer.concat(chunks);
+        const digest = createHash('sha256').update(bytes).digest('hex');
+        const draft = await reserveDraft(f, name, bytes.length, '');
+        await expectDraftUnreadable(f, draft);
+
+        const chunkEcho = '中文🪶\\\n\t\u0000"';
+        let offset = 0;
+
+        for (const chunk of chunks) {
+            const result = await writeFragment(
+                f,
+                draft,
+                offset,
+                chunk.toString('base64'),
+                chunkEcho,
+            );
+            expect(result).toEqual(okEnvelope(null, chunkEcho));
+            offset += chunk.length;
+        }
+
+        await expectDraftUnreadable(f, draft);
+        const id = uploadedId(await finishDraft(f, draft, digest), 'finish');
+        const data = await f.client.request(
+            'get_file',
+            { type: 'data', file_id: id },
+            { echo: '' },
+        );
+        expect(data).toEqual(
+            okEnvelope({ name, data: bytes.toString('base64'), sha256: digest }, ''),
+        );
+        expect(await prepare(f, id)).toEqual(
+            okEnvelope({ name, total_size: MAX_UPLOAD_BYTES, sha256: digest }, 'prepare'),
+        );
+        expect(await transfer(f, id, 1, 4, chunkEcho)).toEqual(
+            okEnvelope({ data: bytes.subarray(1, 5).toString('base64') }, chunkEcho),
+        );
+        expect(await finishDraft(f, draft, digest)).toMatchObject(failedEnvelope(20001, 'finish'));
+        expect(f.api.handle).not.toHaveBeenCalled();
+    });
+
+    it('rejects gaps, empty chunks, overruns and failed finishes without advancing the draft', async () => {
+        const f = await account('10001');
+        const overLimit = { stage: 'prepare', name: NAME, total_size: MAX_UPLOAD_BYTES + 1 };
+        expect(await uploadFragment(f, overLimit, 'limit')).toMatchObject(
+            failedEnvelope(10004, 'limit'),
+        );
+        const draft = await reserveDraft(f, NAME, 5);
+        const oversized = Buffer.alloc(MAX_UPLOAD_BYTES + 1).toString('base64');
+        expect(await writeFragment(f, draft, 0, oversized)).toMatchObject(
+            failedEnvelope(10004, 'write'),
+        );
+
+        expect(await writeFragment(f, draft, 0, '', '')).toMatchObject(failedEnvelope(10003, ''));
+        expect(await writeFragment(f, draft, 0, 'AB==')).toMatchObject(
+            failedEnvelope(10003, 'write'),
+        );
+        expect(await writeFragment(f, draft, 1, 'aGU=')).toMatchObject(
+            failedEnvelope(10004, 'write'),
+        );
+        expect(await writeFragment(f, draft, 0, 'aGU=')).toEqual(okEnvelope(null, 'write'));
+        expect(await writeFragment(f, draft, 0, 'aGU=')).toMatchObject(
+            failedEnvelope(10004, 'write'),
+        );
+        expect(await writeFragment(f, draft, 2, DATA)).toMatchObject(
+            failedEnvelope(10004, 'write'),
+        );
+        expect(await finishDraft(f, draft, SHA256)).toMatchObject(failedEnvelope(10004, 'finish'));
+
+        expect(await writeFragment(f, draft, 2, 'bGxv')).toEqual(okEnvelope(null, 'write'));
+        expect(await finishDraft(f, draft, EMPTY_SHA256)).toMatchObject(
+            failedEnvelope(10003, 'finish'),
+        );
+        await expectDraftUnreadable(f, draft);
+        const id = uploadedId(await finishDraft(f, draft, SHA256), 'finish');
+        expect(await transfer(f, id, 0, 5)).toEqual(okEnvelope({ data: DATA }, 'transfer'));
+        expect(f.api.handle).not.toHaveBeenCalled();
+    });
+
+    it('expires both a draft and a published file at their original prepare deadline', async () => {
+        let now = 1_000_000;
+        vi.spyOn(performance, 'now').mockImplementation(() => now);
+        const f = await account('10001');
+        const finishing = await reserveDraft(f, NAME, 5);
+        const pending = await reserveDraft(f, 'pending.bin', 5);
+        now += UPLOAD_TTL_MS - 2;
+        expect(await writeFragment(f, finishing, 0, DATA)).toEqual(okEnvelope(null, 'write'));
+        expect(await writeFragment(f, pending, 0, 'aGU=')).toEqual(okEnvelope(null, 'write'));
+        now++;
+        const id = uploadedId(await finishDraft(f, finishing, SHA256), 'finish');
+        expect(await transfer(f, id, 0, 5)).toEqual(okEnvelope({ data: DATA }, 'transfer'));
+        now++;
+        expect(await writeFragment(f, pending, 2, 'bGxv')).toMatchObject(
+            failedEnvelope(20001, 'write'),
+        );
+        expect(await finishDraft(f, pending, SHA256)).toMatchObject(
+            failedEnvelope(20001, 'finish'),
+        );
+        expect(await prepare(f, id)).toMatchObject(failedEnvelope(20001, 'prepare'));
+        expect(f.api.handle).not.toHaveBeenCalled();
+    });
+
+    it('does not advertise or prepare before the first ready listener or while disabled', async () => {
+        const gate = Promise.withResolvers<void>();
+        fixture.openGate = gate.promise;
+        const opening = account('10001');
+        const request = {
+            action: FRAGMENT_UPLOAD,
+            params: { stage: 'prepare', name: NAME, total_size: 5 },
+            echo: '',
+        };
+        const unsupported = {
+            ...failedEnvelope(10002, ''),
+            message: 'unsupported action',
+        };
+        const actions = { action: 'get_supported_actions', params: {} };
+        let f: Account;
+
+        try {
+            const pending = fixture.transports.at(-1)!;
+            expect(pending.isAcceptingActions()).toBe(false);
+            expect(await pending.options.handle(request)).toEqual(unsupported);
+            expect((await pending.options.handle(actions)).data).not.toContain(FRAGMENT_UPLOAD);
+        } finally {
+            fixture.openGate = undefined;
+            gate.resolve();
+            f = await opening;
+        }
+
+        const listener = f.transport();
+        expect((await f.client.request('get_supported_actions')).data).toContain(FRAGMENT_UPLOAD);
+        await reserveDraft(f, NAME, 5);
+        await f.runtime.reload({ ...f.runtime.currentConfig, enabled: false });
+        expect(await listener.options.handle(request)).toEqual(unsupported);
+        expect((await listener.options.handle(actions)).data).not.toContain(FRAGMENT_UPLOAD);
+        expect(f.api.handle).not.toHaveBeenCalled();
+    });
+
+    it.each(['reload', 'close', 'error'] as const)(
+        'revokes the old draft on listener %s and leaves the replacement able to upload',
+        async (change) => {
+            const f = await account('10001');
+            const old = f.transport();
+            const draft = await reserveDraft(f, NAME, 5);
+            expect(await writeFragment(f, draft, 0, 'aGU=')).toEqual(okEnvelope(null, 'write'));
+            const requests = [
+                { stage: 'transfer', file_id: draft, offset: 2, data: 'bGxv' },
+                { stage: 'finish', file_id: draft, sha256: SHA256 },
+            ] as const;
+            const echo = 'retired🪶';
+
+            const checkRetired = async () => {
+                for (const params of requests) {
+                    const result = await old.options.handle({
+                        action: FRAGMENT_UPLOAD,
+                        params,
+                        echo,
+                    });
+                    expect(result).toEqual({
+                        ...failedEnvelope(10002, echo),
+                        message: 'unsupported action',
+                    });
+                }
+            };
+
+            if (change === 'reload') {
+                await f.runtime.reload({ ...f.runtime.currentConfig, accessToken: 'next-token' });
+                f.captureTransport();
+            } else {
+                if (change === 'error') {
+                    old.options.onError!(new Error('synthetic listener error'));
+                    await checkRetired();
+                }
+
+                await f.runtime.close();
+                await f.open();
+            }
+
+            expect(f.transport()).not.toBe(old);
+            await checkRetired();
+
+            // The new store has not issued a draft yet: there is no ID collision assumption.
+            for (const params of requests) {
+                expect(await uploadFragment(f, params, echo)).toMatchObject(
+                    failedEnvelope(20001, echo),
+                );
+            }
+
+            const fresh = await reserveDraft(f, 'new.bin', 5);
+            expect(await writeFragment(f, fresh, 0, DATA)).toEqual(okEnvelope(null, 'write'));
+            const id = uploadedId(await finishDraft(f, fresh, SHA256), 'finish');
+            expect(await transfer(f, id, 0, 5)).toEqual(okEnvelope({ data: DATA }, 'transfer'));
+            expect(f.api.handle).not.toHaveBeenCalled();
+        },
+    );
+
+    it('does not continue a draft on another ready runtime even with the same self', async () => {
+        const first = await account('10001');
+        const other = await account(first.uin);
+        const draft = await reserveDraft(first, NAME, 5);
+        expect(await writeFragment(first, draft, 0, 'aGU=')).toEqual(okEnvelope(null, 'write'));
+        expect(await writeFragment(other, draft, 2, 'bGxv')).toMatchObject(
+            failedEnvelope(20001, 'write'),
+        );
+        expect(await writeFragment(first, draft, 2, 'bGxv')).toEqual(okEnvelope(null, 'write'));
+        expect(await finishDraft(other, draft, SHA256)).toMatchObject(
+            failedEnvelope(20001, 'finish'),
+        );
+        const id = uploadedId(await finishDraft(first, draft, SHA256), 'finish');
+        expect(await transfer(first, id, 0, 5)).toEqual(okEnvelope({ data: DATA }, 'transfer'));
+        expect(first.api.handle).not.toHaveBeenCalled();
+        expect(other.api.handle).not.toHaveBeenCalled();
+    });
+});
 
 describe('get_file_fragmented through SDK, runtime and generation-local store', () => {
     it('uploads hello and returns the exact prepare and transfer envelopes', async () => {
@@ -972,6 +1266,67 @@ describe('get_file_fragmented capability', () => {
 });
 
 describe('real V12Transport authentication with only in-memory request/response fakes', () => {
+    it('authenticates fragment writes and wraps a rejected handler in the fixed failure envelope', async () => {
+        const f = await account('10001');
+        const draft = await reserveDraft(f, NAME, 5);
+        const actual =
+            await vi.importActual<typeof import('../../src/v12-network')>('../../src/v12-network');
+        const handle = vi.fn((request: unknown) => f.transport().options.handle(request));
+        const wire = new actual.V12Transport({
+            host: 'fixture.invalid',
+            port: 1,
+            accessToken: TOKEN,
+            handle,
+            getConnectEvent: () => null,
+            subscribe: () => () => {},
+        });
+        const echo = '写入认证🪶';
+        const body = Buffer.from(
+            JSON.stringify({
+                action: FRAGMENT_UPLOAD,
+                params: { stage: 'transfer', file_id: draft, offset: 0, data: DATA },
+                echo,
+            }),
+        );
+
+        const post = async (token: string) => {
+            const req = new FakeRequest();
+            req.rawHeaders = ['Authorization', `Bearer ${token}`];
+            const res = new FakeResponse();
+            wire.handleRequest(req as unknown as IncomingMessage, res as unknown as ServerResponse);
+            req.emit('data', body);
+            req.emit('end');
+            await flushMicrotasks();
+            return res;
+        };
+
+        wire.attach();
+
+        try {
+            expect((await post('synthetic-wrong')).status).toBe(401);
+            expect(handle).not.toHaveBeenCalled();
+
+            // Fail before starting the runtime callback, so the draft stays untouched.
+            handle.mockRejectedValueOnce(new Error('synthetic handler exception'));
+            const wrapped = await post(TOKEN);
+            expect(wrapped.status).toBe(200);
+            expect(JSON.parse(wrapped.body!)).toEqual({
+                ...failedEnvelope(20002, echo),
+                message:
+                    'outcome unknown; side effects may have occurred; do not retry automatically',
+            });
+            expect(handle).toHaveBeenCalledOnce();
+
+            const accepted = await post(TOKEN);
+            expect(accepted.status).toBe(200);
+            expect(JSON.parse(accepted.body!)).toEqual(okEnvelope(null, echo));
+            expect(handle).toHaveBeenCalledTimes(2);
+            expect(f.api.handle).not.toHaveBeenCalled();
+        } finally {
+            await wire.close();
+        }
+    });
+
     it('returns 401 before dispatch for a wrong token and accepts the correct path and token', async () => {
         const f = await account('10001');
         const id = uploadedId(await upload(f));

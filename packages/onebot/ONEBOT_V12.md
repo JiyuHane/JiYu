@@ -174,8 +174,8 @@ location, and a restricted local-upload image alone or with exactly one text
 segment in either conversation type,
 `delete_message`, `set_group_name`,
 `leave_group`, and the restricted URL mode of `get_file`. The account runtime also
-installs local `upload_file`, `get_file` data, and `get_file_fragmented` read
-capabilities described below.
+installs the local `upload_file`, `upload_file_fragmented`, `get_file` data,
+and `get_file_fragmented` capabilities described below.
 Setting a group name
 requires a canonical positive uint32 group ID encoded as a string and a string
 group name, including an empty string; it forwards one request to the existing account-local v11 handler. The
@@ -247,8 +247,8 @@ alias starting `jiyu-upload:v1:` through v12 URL lookup; direct v11 lookup is
 unchanged. Other reserved media URL handles have the listener-lease checks
 described below. Malformed or oversized IDs may
 fail earlier common validation. Upload `type: "url"`, `type: "path"` and unknown
-types return 10004; the separate `upload_file_fragmented` action remains
-unimplemented and returns 10002. Outbound video sending, other group/normal
+types return 10004. See [local fragmented uploads](#local-fragmented-uploads)
+for the separate staged action. Outbound video sending, other group/normal
 file and local-path operations, and other outbound media remain unsupported
 apart from the [restricted single local-upload image send](#sending-a-single-local-upload-image).
 
@@ -322,6 +322,57 @@ budget covers one frame for the default transport with an empty queue only; a
 smaller custom limit, existing WebSocket queued frames or a terminated connection
 can still prevent delivery. A failed or missing response can leave the upload
 outcome unknown; neither Jiyu nor the SDK automatically retries it.
+
+### Local fragmented uploads
+
+[`upload_file_fragmented`](https://12.onebot.dev/interface/file/actions/#upload_file_fragmented)
+uses the same account and listener store as `upload_file` data mode. The action
+is listed by `get_supported_actions` only when the ordinary local upload/read
+pair, all three stage callbacks, and the current lease are available. It returns
+10002 without that capability. It uses the existing v12 action path and
+whatever authentication the listener already requires; there is no new endpoint.
+
+| Stage | Required fields besides `stage` | Successful `data` |
+| --- | --- | --- |
+| `prepare` | `name`, `total_size` | `{file_id}` with a draft ID |
+| `transfer` | draft `file_id`, byte `offset`, nonempty canonical padded Base64 `data` | `null` |
+| `finish` | draft `file_id`, lowercase whole-file `sha256` | `{file_id}` with the published ID |
+
+`prepare` reserves the declared bytes (0–256 KiB) and one entry even before data
+arrives. `name` has the same 4,096 UTF-16 unit limit and may be empty. Byte
+counts and offsets must be nonnegative JavaScript safe integers. Transfers
+start at offset zero and must be sequential, with no gaps, overlaps or replayed
+chunks. An empty file can go directly to `finish`. `finish` checks that every
+byte was staged and that the raw content matches the SHA-256. Only then does
+it consume the draft and return an ordinary `jiyu-upload:v1:` ID for `get_file`
+data mode and `get_file_fragmented`. Finish replaces the reservation rather
+than charging the file again.
+
+Draft IDs use `jiyu-upload-draft:v1:` and the same random suffix format as data
+file IDs. Drafts are bearer references for staging within the same account and
+listener generation. `get_file` rejects the draft prefix without any v11
+fallback, even for malformed or expired drafts; this reserves the prefix in
+v12 but leaves direct v11 lookup unchanged. Drafts are also not accepted for
+fragment reads or the local-upload image send. Drafts and published files
+share the 32-entry/4 MiB budget, cleanup and listener invalidation described
+above. The ten-minute TTL starts at prepare; neither transfer, finish nor
+reads extend it. There is no abort stage; abandoned drafts retain the
+reservation until expiry or listener retirement.
+
+Unknown stages or additional stage fields, unsupported handle sources,
+excessive sizes, unsupported ranges and an incomplete `finish` return 10004.
+Ill-typed fields, malformed Base64 within the size limit, an empty chunk and a
+malformed or mismatched digest return 10003. A malformed same-prefix, expired,
+foreign or already consumed draft returns 20001 once the other stage inputs
+are valid. Capacity and provider failures return 20002. Transport failure
+messages may differ from core messages. Failed input validation does not
+advance a draft. Each stage checks the exact success envelope size before
+calling the mutating provider (including `echo`, even when `data` is `null`).
+A response lost after commit does not roll back the stage; the SDK and Jiyu
+never automatically retry it.
+
+No stage calls v11, the filesystem, a plugin, QQ, or an outbound service.
+There is no claim of a live QQ file transfer or new media-send capability.
 
 ### Incoming messages
 
@@ -1020,7 +1071,8 @@ single-element array, or an array of exactly that image and one
 `{type: 'text', data: {text: <string>}}` segment in either order. No extra
 segment or data fields are accepted. The only accepted `file_id` is a canonical
 `jiyu-upload:v1:` handle from this account's current listener generation,
-previously returned by `upload_file` with `type: 'data'`. The suffix is the
+previously returned by `upload_file` with `type: 'data'` or by a successful
+`upload_file_fragmented` finish. The suffix is the
 canonical unpadded base64url encoding of 32 bytes. Incoming `jiyu-image:v1:`,
 `jiyu-voice:v1:` or `jiyu-video:v1:` handles, legacy IDs, URLs, local paths,
 multiple images and other mixed segment combinations are unsupported. This path

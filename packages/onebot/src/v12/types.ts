@@ -2,6 +2,9 @@ import type { ApiResponse, JsonObject, JsonValue } from '../types';
 import type {
     V12FragmentChunkResult,
     V12FragmentMetadataResult,
+    V12FragmentUploadFinishResult,
+    V12FragmentUploadPrepareResult,
+    V12FragmentUploadTransferResult,
     V12ReadUploadResult,
     V12UploadResult,
 } from './uploaded-data-store';
@@ -66,6 +69,25 @@ export interface V12CoreOptions {
         size: number,
         lease?: V12FileLease,
     ): V12FragmentChunkResult;
+    /** Reserve a local draft. Mutating providers must sample the supplied guard before commit. */
+    prepareUploadFileFragments?(
+        name: string,
+        totalSize: number,
+        lease?: V12FileLease,
+    ): V12FragmentUploadPrepareResult;
+    /** Append a nonempty local fragment at the current contiguous offset. */
+    transferUploadFileFragment?(
+        draftId: string,
+        offset: number,
+        data: string,
+        lease?: V12FileLease,
+    ): V12FragmentUploadTransferResult;
+    /** Verify and publish a complete draft as a readable local data file. */
+    finishUploadFileFragments?(
+        draftId: string,
+        sha256: string,
+        lease?: V12FileLease,
+    ): V12FragmentUploadFinishResult;
     /** Optional listener readiness; absence preserves direct core callback behavior. */
     isUploadDataSupported?(lease?: V12FileLease): boolean;
 }

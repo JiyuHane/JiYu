@@ -320,6 +320,18 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
                     return { kind: 'unavailable' };
                 }
             },
+            prepareUploadFileFragments: (name, totalSize, lease) =>
+                this.withFragmentUpload(lease, (store, current) =>
+                    store.prepareFragments(name, totalSize, current),
+                ),
+            transferUploadFileFragment: (draftId, offset, data, lease) =>
+                this.withFragmentUpload(lease, (store, current) =>
+                    store.transferFragment(draftId, offset, data, current),
+                ),
+            finishUploadFileFragments: (draftId, sha256, lease) =>
+                this.withFragmentUpload(lease, (store, current) =>
+                    store.finishFragments(draftId, sha256, current),
+                ),
         });
         registerOrderedRuntime(this, (source) => recordPreparedScopeLoss(this, source));
     }
@@ -2204,6 +2216,30 @@ export class V12Runtime extends IOneBotNetworkAdapter<V12ManagedConfig> {
 
         slot = this.#uploadSlot;
         return slot && this.isUploadSlotCurrent(slot, lease) ? slot : null;
+    }
+
+    private withFragmentUpload<T>(
+        lease: V12FileLease | undefined,
+        operation: (store: V12UploadedDataStore, current: V12FileLease) => T,
+    ): T | { kind: 'unavailable' } {
+        try {
+            const slot = this.acquireUploadSlot(lease);
+
+            if (!slot) {
+                return { kind: 'unavailable' };
+            }
+
+            const current = () => this.isUploadSlotCurrent(slot, lease);
+
+            if (!current()) {
+                return { kind: 'unavailable' };
+            }
+
+            const result = operation(slot.store, current);
+            return current() ? result : { kind: 'unavailable' };
+        } catch {
+            return { kind: 'unavailable' };
+        }
     }
 
     private retireUploadGeneration(generation: UploadGeneration): void {

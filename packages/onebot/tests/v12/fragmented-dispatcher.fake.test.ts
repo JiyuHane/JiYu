@@ -11,6 +11,9 @@ import type { V12CoreOptions, V12FileLease, V12Response } from '../../src/v12/ty
 import type {
     V12FragmentChunkResult,
     V12FragmentMetadataResult,
+    V12FragmentUploadFinishResult,
+    V12FragmentUploadPrepareResult,
+    V12FragmentUploadTransferResult,
 } from '../../src/v12/uploaded-data-store';
 
 // Only V12Dispatcher is instantiated. These module fakes detect accidental
@@ -286,32 +289,6 @@ describe('get_file_fragmented on the real V12 dispatcher with synthetic callback
         expect(supported.data).toContain('upload_file');
         expect(f.isUploadDataSupported).toHaveBeenCalledWith(f.lease);
         expect(f.lease).toHaveBeenCalled();
-        noDataProviders(f);
-    });
-
-    it('keeps fragmented upload off the wire even with the local read and upload providers', async () => {
-        const f = fixture();
-        const supported = await f.dispatcher.handle(
-            { action: 'get_supported_actions', params: {} },
-            f.lease,
-        );
-        expect(supported.data).toContain('upload_file');
-        expect(supported.data).toContain('get_file_fragmented');
-        expect(supported.data).not.toContain('upload_file_fragmented');
-
-        for (const params of [
-            { stage: 'prepare', name: 'fixture.bin', total_size: 1 },
-            { stage: 'transfer', file_id: 'fixture-draft', offset: 0, data: 'AA==' },
-            { stage: 'finish', file_id: 'fixture-draft', sha256: '0'.repeat(64) },
-        ]) {
-            const result = await f.dispatcher.handle(
-                { action: 'upload_file_fragmented', params, echo: params.stage },
-                f.lease,
-            );
-            failed(result, 10002);
-            expect(result.echo).toBe(params.stage);
-        }
-
         noDataProviders(f);
     });
 
@@ -1302,5 +1279,556 @@ describe('ordinary actions and diagnostic privacy', () => {
         }
 
         expect(f.api.handle).not.toHaveBeenCalled();
+    });
+});
+
+const UPLOAD_ACTION = 'upload_file_fragmented';
+const DRAFT_PREFIX = 'jiyu-upload-draft:v1:';
+const DRAFT_ID = DRAFT_PREFIX + 'A'.repeat(43);
+const MISSING_DRAFT_ID = DRAFT_PREFIX + 'B' + 'A'.repeat(42);
+const UPLOAD_DATA = BYTES.toString('base64');
+const DISCOVERY = { action: 'get_supported_actions', params: {} };
+const UPLOAD_CAPABILITIES = [
+    'prepareUploadFileFragments',
+    'transferUploadFileFragment',
+    'finishUploadFileFragments',
+    'uploadDataFile',
+    'getUploadedDataFile',
+] as const;
+
+function uploadFixture(overrides: Partial<V12CoreOptions> = {}) {
+    const prepareUploadFileFragments = vi.fn(
+        (_name: string, _size: number, _guard?: V12FileLease): V12FragmentUploadPrepareResult => ({
+            kind: 'ok',
+            draftId: DRAFT_ID,
+        }),
+    );
+    const transferUploadFileFragment = vi.fn(
+        (
+            _id: string,
+            _offset: number,
+            _data: string,
+            _guard?: V12FileLease,
+        ): V12FragmentUploadTransferResult => ({ kind: 'ok' }),
+    );
+    const finishUploadFileFragments = vi.fn(
+        (_id: string, _digest: string, _guard?: V12FileLease): V12FragmentUploadFinishResult => ({
+            kind: 'ok',
+            fileId: FILE_ID,
+        }),
+    );
+    return {
+        ...fixture(BYTES, {
+            prepareUploadFileFragments,
+            transferUploadFileFragment,
+            finishUploadFileFragments,
+            ...overrides,
+        }),
+        prepareUploadFileFragments,
+        transferUploadFileFragment,
+        finishUploadFileFragments,
+    };
+}
+
+type UploadFixture = ReturnType<typeof uploadFixture>;
+
+function uploadPrepare(name: unknown = NAME, totalSize: unknown = BYTES.length) {
+    return { stage: 'prepare', name, total_size: totalSize };
+}
+
+function uploadTransfer(
+    fileId: unknown = DRAFT_ID,
+    offset: unknown = 0,
+    data: unknown = UPLOAD_DATA,
+) {
+    return { stage: 'transfer', file_id: fileId, offset, data };
+}
+
+function uploadFinish(fileId: unknown = DRAFT_ID, sha256: unknown = SHA256) {
+    return { stage: 'finish', file_id: fileId, sha256 };
+}
+
+function uploadRequest(params: unknown, extra: object = {}) {
+    return { action: UPLOAD_ACTION, params, ...extra };
+}
+
+function noUploadFragmentProviders(f: UploadFixture): void {
+    expect(f.prepareUploadFileFragments).not.toHaveBeenCalled();
+    expect(f.transferUploadFileFragment).not.toHaveBeenCalled();
+    expect(f.finishUploadFileFragments).not.toHaveBeenCalled();
+    noDataProviders(f);
+}
+
+function noPrivateUploadResult(result: V12Response): void {
+    noPrivateResult(result);
+    const text = JSON.stringify(result);
+    expect(text).not.toContain(DRAFT_ID);
+    expect(text).not.toContain(MISSING_DRAFT_ID);
+}
+
+describe('upload_file_fragmented on the real V12 dispatcher with synthetic callbacks', () => {
+    it('advertises exactly once without requiring the fragmented read callbacks', async () => {
+        const f = uploadFixture({
+            getUploadedDataFileMetadata: undefined,
+            getUploadedDataFileChunk: undefined,
+        });
+        const supported = await f.dispatcher.handle(DISCOVERY, f.lease);
+        expect(supported).toMatchObject({ status: 'ok', retcode: 0 });
+        expect((supported.data as unknown[]).filter((value) => value === UPLOAD_ACTION)).toEqual([
+            UPLOAD_ACTION,
+        ]);
+        expect(supported.data).toContain('upload_file');
+        expect(supported.data).not.toContain('get_file_fragmented');
+        expect(f.isUploadDataSupported).toHaveBeenCalledWith(f.lease);
+        noUploadFragmentProviders(f);
+    });
+
+    it.each(UPLOAD_CAPABILITIES)('requires %s for discovery and all three stages', async (key) => {
+        const f = uploadFixture({ [key]: undefined });
+        const supported = await f.dispatcher.handle(DISCOVERY, f.lease);
+        expect(supported.data).not.toContain(UPLOAD_ACTION);
+
+        for (const params of [uploadPrepare(), uploadTransfer(), uploadFinish()]) {
+            const result = await f.dispatcher.handle(
+                uploadRequest(params, { echo: 'safe' }),
+                f.lease,
+            );
+            failed(result, 10002);
+            expect(result.echo).toBe('safe');
+        }
+
+        noUploadFragmentProviders(f);
+    });
+
+    it('requires readiness to return literal true and withholds support after shutdown', async () => {
+        const f = uploadFixture();
+
+        for (const readiness of [
+            () => false,
+            () => 1 as unknown as boolean,
+            () => {
+                throw new Error(ERROR_MARKER);
+            },
+            () => {
+                f.state.current = false;
+                return true;
+            },
+        ]) {
+            f.isUploadDataSupported.mockImplementation(readiness);
+            const supported = await f.dispatcher.handle(DISCOVERY, f.lease);
+            expect(supported.data).not.toContain(UPLOAD_ACTION);
+            const result = await f.dispatcher.handle(uploadRequest(uploadPrepare()), f.lease);
+            failed(result, 10002);
+            noPrivateUploadResult(result);
+        }
+
+        noUploadFragmentProviders(f);
+    });
+
+    it('returns the exact stage envelopes, preserving echo and passing a distinct guard', async () => {
+        const f = uploadFixture();
+        const chunk = Buffer.alloc(MAX_BYTES, 0xff).toString('base64');
+        const steps = [
+            [uploadPrepare(NAME, MAX_BYTES), { file_id: DRAFT_ID }, ''],
+            [uploadTransfer(DRAFT_ID, 0, chunk), null, '偏移 🪶'],
+            [uploadFinish(), { file_id: FILE_ID }, 'finished'],
+        ] as const;
+
+        for (const [params, data, echo] of steps) {
+            expect(
+                await f.dispatcher.handle(uploadRequest(params, { echo, self: SELF }), f.lease),
+            ).toEqual({ status: 'ok', retcode: 0, message: '', data, echo });
+        }
+
+        expect(f.prepareUploadFileFragments).toHaveBeenCalledExactlyOnceWith(
+            NAME,
+            MAX_BYTES,
+            expect.any(Function),
+        );
+        expect(f.transferUploadFileFragment).toHaveBeenCalledExactlyOnceWith(
+            DRAFT_ID,
+            0,
+            chunk,
+            expect.any(Function),
+        );
+        expect(f.finishUploadFileFragments).toHaveBeenCalledExactlyOnceWith(
+            DRAFT_ID,
+            SHA256,
+            expect.any(Function),
+        );
+        expect(f.prepareUploadFileFragments.mock.calls[0]![2]).not.toBe(f.lease);
+        expect(f.transferUploadFileFragment.mock.calls[0]![3]).not.toBe(f.lease);
+        expect(f.finishUploadFileFragments.mock.calls[0]![2]).not.toBe(f.lease);
+        expect(f.isUploadDataSupported).toHaveBeenCalled();
+
+        for (const [candidate] of f.isUploadDataSupported.mock.calls) {
+            expect(candidate).toBe(f.lease);
+        }
+
+        noDataProviders(f);
+    });
+
+    it('preserves optional readiness and supports preparing an empty file with a guard', async () => {
+        const f = uploadFixture({ isUploadDataSupported: undefined });
+        let canCommit: boolean | undefined;
+        f.prepareUploadFileFragments.mockImplementationOnce((_name, _size, guard) => {
+            canCommit = guard?.();
+            return { kind: 'ok', draftId: DRAFT_ID };
+        });
+        const supported = await f.dispatcher.handle(DISCOVERY);
+        expect(supported.data).toContain(UPLOAD_ACTION);
+        expect(await f.dispatcher.handle(uploadRequest(uploadPrepare(NAME, 0)))).toEqual({
+            status: 'ok',
+            retcode: 0,
+            message: '',
+            data: { file_id: DRAFT_ID },
+        });
+        expect(canCommit).toBe(true);
+        expect(f.prepareUploadFileFragments).toHaveBeenCalledExactlyOnceWith(
+            NAME,
+            0,
+            expect.any(Function),
+        );
+        noDataProviders(f);
+    });
+
+    it('validates the stage, allowed fields, sizes, canonical Base64 and digest before writing', async () => {
+        const f = uploadFixture();
+        const cases: Array<[object, number]> = [
+            [{}, 10003],
+            [{ stage: null }, 10003],
+            [{ stage: 'discard' }, 10004],
+            [{ ...uploadPrepare(), type: 'data' }, 10004],
+            [{ ...uploadTransfer(), size: 1 }, 10004],
+            [{ ...uploadFinish(), data: UPLOAD_DATA }, 10004],
+            [{ stage: 'prepare', name: NAME }, 10003],
+            [uploadPrepare(1), 10003],
+            [uploadPrepare(NAME, '1'), 10003],
+            [uploadPrepare(NAME, -1), 10003],
+            [uploadPrepare(NAME, MAX_BYTES + 1), 10004],
+            [{ stage: 'transfer', file_id: DRAFT_ID, offset: 0 }, 10003],
+            [uploadTransfer('', 0), 10003],
+            [uploadTransfer(DRAFT_ID, '0'), 10003],
+            [uploadTransfer(DRAFT_ID, 0.5), 10003],
+            [uploadTransfer(DRAFT_ID, MAX_BYTES, 'AA=='), 10004],
+            [uploadTransfer(DRAFT_ID, Number.MAX_SAFE_INTEGER, 'AA=='), 10004],
+            [uploadTransfer(DRAFT_ID, 0, Buffer.alloc(MAX_BYTES + 1).toString('base64')), 10004],
+            [uploadTransfer(FILE_ID), 10004],
+            [uploadFinish('legacy-id'), 10004],
+            [{ stage: 'finish', file_id: DRAFT_ID }, 10003],
+            [uploadFinish(DRAFT_ID, 0), 10003],
+            [uploadFinish(DRAFT_ID, 'A'.repeat(64)), 10003],
+            [uploadFinish(DRAFT_ID, SHA256.slice(1)), 10003],
+        ];
+
+        for (const data of [null, '', 'AA', 'AA===', 'AA==\n', '_w==', 'AB==', 'AAB=']) {
+            cases.push([uploadTransfer(DRAFT_ID, 0, data), 10003]);
+        }
+
+        for (const [params, code] of cases) {
+            const result = await f.dispatcher.handle(
+                uploadRequest(params, { echo: 'safe' }),
+                f.lease,
+            );
+            failed(result, code);
+            expect(result.echo).toBe('safe');
+            noPrivateUploadResult(result);
+        }
+
+        noUploadFragmentProviders(f);
+    });
+
+    it.each([
+        ['prepare', uploadPrepare(), { file_id: DRAFT_ID }],
+        ['transfer', uploadTransfer(), null],
+        ['finish', uploadFinish(), { file_id: FILE_ID }],
+    ] as const)(
+        'preflights the exact %s success envelope before writing',
+        async (_stage, params, data) => {
+            const f = uploadFixture();
+            const limit = 1024 * 1024 - 14;
+            const empty = { status: 'ok', retcode: 0, data, message: '', echo: '' };
+            const budget = limit - Buffer.byteLength(JSON.stringify(empty), 'utf8');
+            const sample = '"\\\n霁🪶';
+            const cost = Buffer.byteLength(JSON.stringify(sample), 'utf8') - 2;
+            const echo = sample.repeat(Math.floor(budget / cost)) + 'x'.repeat(budget % cost);
+            const oversized = `${echo}x`;
+            const badParams = await f.dispatcher.handle(
+                uploadRequest({ ...params, extra: true }, { echo: oversized }),
+                f.lease,
+            );
+            failed(badParams, 10004);
+            const badEcho = await f.dispatcher.handle(
+                uploadRequest(params, { echo: oversized }),
+                f.lease,
+            );
+            failed(badEcho, 10003);
+            expect(badEcho.echo === oversized).toBe(true);
+            noUploadFragmentProviders(f);
+
+            const exact = await f.dispatcher.handle(uploadRequest(params, { echo }), f.lease);
+            expect(exact).toMatchObject({ status: 'ok', retcode: 0, data, message: '' });
+            expect(exact.echo === echo).toBe(true);
+            expect(Buffer.byteLength(JSON.stringify(exact), 'utf8')).toBe(limit);
+        },
+    );
+
+    it('returns the same fixed miss for a malformed draft token and a canonical unknown draft', async () => {
+        const f = uploadFixture();
+        const invalid = [DRAFT_PREFIX, DRAFT_PREFIX + 'A'.repeat(42) + 'B'];
+        const misses: V12Response[] = [];
+
+        for (const id of invalid) {
+            misses.push(await f.dispatcher.handle(uploadRequest(uploadTransfer(id)), f.lease));
+            misses.push(await f.dispatcher.handle(uploadRequest(uploadFinish(id)), f.lease));
+        }
+
+        noUploadFragmentProviders(f);
+        f.transferUploadFileFragment.mockReturnValueOnce({ kind: 'not_found' });
+        f.finishUploadFileFragments.mockReturnValueOnce({ kind: 'not_found' });
+        misses.push(
+            await f.dispatcher.handle(uploadRequest(uploadTransfer(MISSING_DRAFT_ID)), f.lease),
+            await f.dispatcher.handle(uploadRequest(uploadFinish(MISSING_DRAFT_ID)), f.lease),
+        );
+        expect(f.transferUploadFileFragment).toHaveBeenCalledExactlyOnceWith(
+            MISSING_DRAFT_ID,
+            0,
+            UPLOAD_DATA,
+            expect.any(Function),
+        );
+        expect(f.finishUploadFileFragments).toHaveBeenCalledExactlyOnceWith(
+            MISSING_DRAFT_ID,
+            SHA256,
+            expect.any(Function),
+        );
+
+        for (const result of misses) {
+            failed(result, 20001);
+            expect(result).toEqual(misses[0]);
+            noPrivateUploadResult(result);
+        }
+
+        noDataProviders(f);
+    });
+
+    it('maps capacity, range, incomplete and digest errors from the owning stage callback', async () => {
+        const f = uploadFixture();
+        f.prepareUploadFileFragments.mockReturnValueOnce({ kind: 'capacity' });
+        failed(await f.dispatcher.handle(uploadRequest(uploadPrepare()), f.lease), 20002);
+
+        // These syntactically valid chunks represent overlap, a gap, and overrun
+        // for a draft of three bytes with one already written. Only the provider
+        // knows that draft state, so all three must reach it.
+        for (const [offset, data] of [
+            [0, 'AA=='],
+            [2, 'AA=='],
+            [1, 'AAAA'],
+        ] as const) {
+            f.transferUploadFileFragment.mockReturnValueOnce({ kind: 'invalid_range' });
+            const result = await f.dispatcher.handle(
+                uploadRequest(uploadTransfer(DRAFT_ID, offset, data)),
+                f.lease,
+            );
+            failed(result, 10004);
+            expect(f.transferUploadFileFragment).toHaveBeenLastCalledWith(
+                DRAFT_ID,
+                offset,
+                data,
+                expect.any(Function),
+            );
+        }
+
+        for (const [kind, code] of [
+            ['incomplete', 10004],
+            ['invalid', 10003],
+        ] as const) {
+            f.finishUploadFileFragments.mockReturnValueOnce({ kind });
+            failed(await f.dispatcher.handle(uploadRequest(uploadFinish()), f.lease), code);
+        }
+
+        noDataProviders(f);
+    });
+
+    it.each([...UPLOAD_CAPABILITIES, 'isUploadDataSupported'] as const)(
+        'does not invoke an accessor or callable Proxy in %s on direct upload',
+        async (key) => {
+            const f = uploadFixture();
+            const trap = vi.fn(() => {
+                throw new Error(ERROR_MARKER);
+            });
+            const callable = new Proxy(() => true, { apply: trap, get: trap });
+            const input = uploadRequest(uploadPrepare(), { echo: 'safe' });
+            Object.defineProperty(f.options, key, { configurable: true, get: trap });
+            failed(await f.dispatcher.handle(input, f.lease), 10002);
+            Object.defineProperty(f.options, key, { configurable: true, value: callable });
+            failed(await f.dispatcher.handle(input, f.lease), 10002);
+            expect(trap).not.toHaveBeenCalled();
+            noUploadFragmentProviders(f);
+        },
+    );
+
+    it('does not admit inherited upload callbacks', async () => {
+        const f = uploadFixture();
+        delete f.options.prepareUploadFileFragments;
+        Object.setPrototypeOf(f.options, {
+            prepareUploadFileFragments: f.prepareUploadFileFragments,
+        });
+        failed(await f.dispatcher.handle(uploadRequest(uploadPrepare()), f.lease), 10002);
+        expect((await f.dispatcher.handle(DISCOVERY, f.lease)).data).not.toContain(UPLOAD_ACTION);
+        noUploadFragmentProviders(f);
+    });
+
+    it('fences write and read reentry from readiness and a stage callback', async () => {
+        const f = uploadFixture();
+        let nestedWrite: Promise<V12Response> | undefined;
+        let nestedRead: Promise<V12Response> | undefined;
+        let probed = false;
+        f.isUploadDataSupported.mockImplementation(() => {
+            if (!probed) {
+                probed = true;
+                nestedWrite = f.dispatcher.handle(uploadRequest(uploadTransfer()), f.lease);
+            }
+
+            return true;
+        });
+        f.prepareUploadFileFragments.mockImplementationOnce(() => {
+            nestedRead = f.dispatcher.handle(request(prepare()), f.lease);
+            return { kind: 'ok', draftId: DRAFT_ID };
+        });
+
+        const outer = await f.dispatcher.handle(uploadRequest(uploadPrepare()), f.lease);
+        expect(outer.data).toEqual({ file_id: DRAFT_ID });
+        expect(nestedWrite).toBeDefined();
+        expect(nestedRead).toBeDefined();
+        failed(await nestedWrite!, 20002);
+        failed(await nestedRead!, 20002);
+        expect(f.prepareUploadFileFragments).toHaveBeenCalledOnce();
+        expect(f.transferUploadFileFragment).not.toHaveBeenCalled();
+        noDataProviders(f);
+    });
+
+    it.each(['readiness', 'binding'] as const)(
+        'rechecks %s in the commit guard and masks a stale provider error',
+        async (effect) => {
+            const f = uploadFixture();
+            const seen: Array<boolean | undefined> = [];
+            f.transferUploadFileFragment.mockImplementationOnce((_id, _offset, _data, guard) => {
+                seen.push(guard?.());
+
+                if (effect === 'readiness') {
+                    f.isUploadDataSupported.mockReturnValue(false);
+                } else {
+                    f.options.finishUploadFileFragments = () => ({ kind: 'ok', fileId: FILE_ID });
+                }
+
+                seen.push(guard?.());
+                return { kind: 'invalid_range' };
+            });
+
+            const result = await f.dispatcher.handle(uploadRequest(uploadTransfer()), f.lease);
+            expect(seen).toEqual([true, false]);
+            failed(result, 20002);
+            noPrivateUploadResult(result);
+            noDataProviders(f);
+        },
+    );
+
+    it.each(['revoked', 'throwing'] as const)(
+        'discards a finish result on a %s lease and fences a prepared token',
+        async (effect) => {
+            const f = uploadFixture();
+            const input = uploadRequest(uploadFinish(), { echo: 'safe' });
+            const prepared = f.dispatcher.createInternalHttpPreflight(f.lease).classify(input);
+
+            if (prepared.kind !== 'ordinary') {
+                throw new Error('expected an ordinary dispatcher token');
+            }
+
+            f.finishUploadFileFragments.mockImplementationOnce(() => {
+                f.state.current = false;
+                f.state.throws = effect === 'throwing';
+                return { kind: 'ok', fileId: FILE_ID };
+            });
+
+            const result = await f.dispatcher.handle(input, f.lease);
+            failed(result, 20002);
+            expect(result.echo).toBe('safe');
+            noPrivateUploadResult(result);
+            failed(await f.dispatcher.handlePreparedOrdinary(prepared.token), 10002);
+            expect(f.finishUploadFileFragments).toHaveBeenCalledOnce();
+            noDataProviders(f);
+        },
+    );
+
+    it('contains bad provider records, exceptions and private values in responses and logs', async () => {
+        const f = uploadFixture();
+        const markers = [DRAFT_ID, FILE_ID, NAME, UPLOAD_DATA, SHA256, ERROR_MARKER];
+        const trap = vi.fn(() => {
+            throw new Error(markers.join(' '));
+        });
+        const good = { kind: 'ok', draftId: DRAFT_ID };
+        const badPrepare: unknown[] = [
+            new Proxy(good, { get: trap, ownKeys: trap, getOwnPropertyDescriptor: trap }),
+            Object.defineProperty({ kind: 'ok' }, 'draftId', { enumerable: true, get: trap }),
+            hiddenField(good, 'kind'),
+            { kind: 'ok', draftId: FILE_ID },
+            { kind: 'ok', draftId: DRAFT_PREFIX + 'A'.repeat(42) + 'B' },
+        ];
+
+        for (const value of badPrepare) {
+            f.prepareUploadFileFragments.mockReturnValueOnce(
+                value as V12FragmentUploadPrepareResult,
+            );
+            const result = await f.dispatcher.handle(uploadRequest(uploadPrepare()), f.lease);
+            failed(result, 20002);
+            noPrivateUploadResult(result);
+        }
+
+        f.transferUploadFileFragment.mockReturnValueOnce({ kind: 'unavailable' });
+        f.finishUploadFileFragments.mockReturnValueOnce({ kind: 'ok', fileId: DRAFT_ID });
+        f.finishUploadFileFragments.mockImplementationOnce(() => {
+            throw new Error(markers.join(' '));
+        });
+
+        for (const params of [uploadTransfer(), uploadFinish(), uploadFinish()]) {
+            const result = await f.dispatcher.handle(
+                uploadRequest(params, { echo: 'safe' }),
+                f.lease,
+            );
+            failed(result, 20002);
+            expect(result.echo).toBe('safe');
+            noPrivateUploadResult(result);
+        }
+
+        const observed =
+            JSON.stringify(entries) +
+            consoleGuards
+                .flatMap((guard) => guard.mock.calls)
+                .flat()
+                .map(String)
+                .join('\n');
+
+        for (const marker of markers) {
+            expect(observed).not.toContain(marker);
+        }
+
+        expect(trap).not.toHaveBeenCalled();
+        noDataProviders(f);
+    });
+
+    it('keeps canonical and malformed draft handles out of V11 get_file URL lookup', async () => {
+        const f = uploadFixture();
+
+        for (const fileId of [DRAFT_ID, DRAFT_PREFIX + 'bad']) {
+            const result = await f.dispatcher.handle(
+                { action: 'get_file', params: { file_id: fileId, type: 'url' }, echo: 'safe' },
+                f.lease,
+            );
+            failed(result, 10004);
+            expect(result.echo).toBe('safe');
+            noPrivateUploadResult(result);
+        }
+
+        noUploadFragmentProviders(f);
     });
 });

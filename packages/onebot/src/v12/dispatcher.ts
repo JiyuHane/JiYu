@@ -4,7 +4,12 @@ import type { ApiResponse, JsonObject, JsonValue } from '../types';
 import type { V12CoreOptions, V12FileLease, V12Response } from './types';
 import { classifyFileUrl } from './file-url';
 import { isV12ImageToken, isV12VideoToken, isV12VoiceToken } from './image-file-token';
-import { isV12UploadToken, V12_UPLOAD_TOKEN_PREFIX } from './uploaded-data-store';
+import {
+    isV12UploadDraftToken,
+    isV12UploadToken,
+    V12_UPLOAD_DRAFT_TOKEN_PREFIX,
+    V12_UPLOAD_TOKEN_PREFIX,
+} from './uploaded-data-store';
 import {
     MAX_REQUEST_STRING_LENGTH,
     fromV11MessageId,
@@ -53,6 +58,17 @@ type FragmentProviders = {
     get: NonNullable<V12CoreOptions['getUploadedDataFile']>;
     metadata: NonNullable<V12CoreOptions['getUploadedDataFileMetadata']>;
     chunk: NonNullable<V12CoreOptions['getUploadedDataFileChunk']>;
+    readiness: V12CoreOptions['isUploadDataSupported'];
+};
+
+type FragmentUploadProviders = {
+    options: V12CoreOptions;
+    prototype: object | null;
+    upload: NonNullable<V12CoreOptions['uploadDataFile']>;
+    get: NonNullable<V12CoreOptions['getUploadedDataFile']>;
+    prepare: NonNullable<V12CoreOptions['prepareUploadFileFragments']>;
+    transfer: NonNullable<V12CoreOptions['transferUploadFileFragment']>;
+    finish: NonNullable<V12CoreOptions['finishUploadFileFragments']>;
     readiness: V12CoreOptions['isUploadDataSupported'];
 };
 
@@ -125,7 +141,7 @@ const MAX_UPLOAD_DATA_BYTES = 256 * 1024;
 const MAX_IMAGE_SENDS = 4;
 const MAX_SENSITIVE_METHOD_PROTOTYPES = 16;
 
-function fileSuccessFits(data: JsonObject, echo?: string): boolean {
+function fileSuccessFits(data: JsonObject | null, echo?: string): boolean {
     return (
         Buffer.byteLength(JSON.stringify(response(0, '', data, echo)), 'utf8') <=
         MAX_FILE_SUCCESS_JSON_BYTES
@@ -157,27 +173,35 @@ function isProviderRecord(value: unknown): value is object {
     return typeof value === 'object' && value !== null && !isProxy(value) && !isArray(value);
 }
 
-function isCanonicalUploadId(value: unknown): value is string {
+const UPLOAD_ID_SUFFIX_LENGTH = 43;
+
+function isCanonicalUploadId(
+    value: unknown,
+    prefix:
+        | typeof V12_UPLOAD_TOKEN_PREFIX
+        | typeof V12_UPLOAD_DRAFT_TOKEN_PREFIX = V12_UPLOAD_TOKEN_PREFIX,
+): value is string {
     if (
         typeof value !== 'string' ||
-        !isV12UploadToken(value) ||
-        value.length !== V12_UPLOAD_TOKEN_PREFIX.length + 43
+        value.length !== prefix.length + UPLOAD_ID_SUFFIX_LENGTH ||
+        !(prefix === V12_UPLOAD_TOKEN_PREFIX
+            ? isV12UploadToken(value)
+            : isV12UploadDraftToken(value))
     ) {
         return false;
     }
 
-    const encoded = value.slice(V12_UPLOAD_TOKEN_PREFIX.length);
     // 32-byte base64url has 42 unrestricted characters and two zero pad bits.
-    return /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/.test(encoded);
+    return /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/.test(value.slice(prefix.length));
 }
 
-function isCanonicalUploadData(value: unknown): value is string {
+function canonicalUploadByteLength(value: unknown): number | null {
     if (
         typeof value !== 'string' ||
         value.length > MAX_UPLOAD_BASE64_LENGTH ||
         value.length % 4 !== 0
     ) {
-        return false;
+        return null;
     }
 
     const length = value.length;
@@ -194,19 +218,24 @@ function isCanonicalUploadData(value: unknown): value is string {
             code === 43 ||
             code === 47
         )) {
-            return false;
+            return null;
         }
     }
 
     if (padding === 2 && !stringIncludes('AQgw', value[length - 3]!)) {
-        return false;
+        return null;
     }
 
     if (padding === 1 && !stringIncludes('AEIMQUYcgkosw048', value[length - 2]!)) {
-        return false;
+        return null;
     }
 
-    return (length / 4) * 3 - padding <= MAX_UPLOAD_DATA_BYTES;
+    return (length / 4) * 3 - padding;
+}
+
+function isCanonicalUploadData(value: unknown): value is string {
+    const length = canonicalUploadByteLength(value);
+    return length !== null && length <= MAX_UPLOAD_DATA_BYTES;
 }
 
 function isLowerSha256(value: unknown): value is string {
@@ -744,6 +773,81 @@ export class V12Dispatcher {
         }
     }
 
+    private fragmentUploadProviders(): FragmentUploadProviders | null {
+        const options = this.options;
+
+        if (!isProviderRecord(options)) {
+            return null;
+        }
+
+        const prototype: object | null = getPrototypeOf(options);
+
+        if (prototype !== Object.prototype && prototype !== null) {
+            return null;
+        }
+
+        const upload = ownData(options, 'uploadDataFile');
+        const get = ownData(options, 'getUploadedDataFile');
+        const prepare = ownData(options, 'prepareUploadFileFragments');
+        const transfer = ownData(options, 'transferUploadFileFragment');
+        const finish = ownData(options, 'finishUploadFileFragments');
+        const descriptor = getOwnPropertyDescriptor(options, 'isUploadDataSupported');
+        const readiness: unknown = descriptor?.value;
+
+        if (
+            [upload, get, prepare, transfer, finish].some(
+                (fn) => typeof fn !== 'function' || isProxy(fn),
+            ) ||
+            (descriptor && !('value' in descriptor)) ||
+            (readiness !== undefined && (typeof readiness !== 'function' || isProxy(readiness)))
+        ) {
+            return null;
+        }
+
+        return {
+            options,
+            prototype,
+            upload,
+            get,
+            prepare,
+            transfer,
+            finish,
+            readiness,
+        } as FragmentUploadProviders;
+    }
+
+    private sameFragmentUploadProviders(expected: FragmentUploadProviders): boolean {
+        const current = this.fragmentUploadProviders();
+        return (
+            current !== null &&
+            current.options === expected.options &&
+            current.prototype === expected.prototype &&
+            current.upload === expected.upload &&
+            current.get === expected.get &&
+            current.prepare === expected.prepare &&
+            current.transfer === expected.transfer &&
+            current.finish === expected.finish &&
+            current.readiness === expected.readiness
+        );
+    }
+
+    private fragmentUploadProvidersCurrent(
+        providers: FragmentUploadProviders,
+        fileLease: V12FileLease | undefined,
+    ): boolean {
+        try {
+            return (
+                this.sameFragmentUploadProviders(providers) &&
+                (providers.readiness === undefined ||
+                    apply(providers.readiness, providers.options, [fileLease]) === true) &&
+                fileLeaseCurrent(fileLease) &&
+                this.sameFragmentUploadProviders(providers)
+            );
+        } catch {
+            return false;
+        }
+    }
+
     private async handleSnapshot(
         input: Record<string, unknown>,
         fileLease?: V12FileLease,
@@ -752,7 +856,7 @@ export class V12Dispatcher {
         const action = input.action as string;
         const params = input.params as Record<string, unknown>;
 
-        if (action === 'get_file_fragmented') {
+        if (action === 'get_file_fragmented' || action === 'upload_file_fragmented') {
             if (this.#fragmentBusy) {
                 return response(20002, 'file unavailable', null, echo);
             }
@@ -760,9 +864,16 @@ export class V12Dispatcher {
             this.#fragmentBusy = true;
 
             try {
-                const providers = this.validatedFragmentProviders(fileLease);
-                return providers
-                    ? this.getFileFragmented(params, echo, fileLease, providers)
+                if (action === 'get_file_fragmented') {
+                    const providers = this.validatedFragmentProviders(fileLease);
+                    return providers
+                        ? this.getFileFragmented(params, echo, fileLease, providers)
+                        : response(10002, 'unsupported action', null, echo);
+                }
+
+                const providers = this.fragmentUploadProviders();
+                return providers && this.fragmentUploadProvidersCurrent(providers, fileLease)
+                    ? this.uploadFileFragmented(params, echo, fileLease, providers)
                     : response(10002, 'unsupported action', null, echo);
             } finally {
                 this.#fragmentBusy = false;
@@ -793,27 +904,39 @@ export class V12Dispatcher {
             if (action === 'get_supported_actions') {
                 const actions: string[] = [...ACTIONS];
 
-                const wasFragmentBusy = this.#fragmentBusy;
+                // Reentrant discovery must not probe readiness recursively.
+                if (this.#fragmentBusy) {
+                    return response(0, '', actions, echo);
+                }
+
                 this.#fragmentBusy = true;
 
                 try {
                     const uploadSupported = this.supportsUploadData(fileLease);
-                    const providers =
-                        uploadSupported && !wasFragmentBusy
-                            ? this.validatedFragmentProviders(fileLease)
-                            : null;
+                    const writers = uploadSupported ? this.fragmentUploadProviders() : null;
+                    const readers = uploadSupported
+                        ? this.validatedFragmentProviders(fileLease)
+                        : null;
+                    const canWrite =
+                        writers !== null &&
+                        ((readers !== null && readers.readiness === writers.readiness) ||
+                            this.fragmentUploadProvidersCurrent(writers, fileLease));
 
                     // The final lease callback may reenter or alter providers;
                     // compare their identities once more without callbacks.
                     if (uploadSupported && fileLeaseCurrent(fileLease)) {
                         actions.push('upload_file');
 
-                        if (providers && this.sameFragmentProviders(providers)) {
+                        if (readers && this.sameFragmentProviders(readers)) {
                             actions.push('get_file_fragmented');
+                        }
+
+                        if (canWrite && this.sameFragmentUploadProviders(writers)) {
+                            actions.push('upload_file_fragmented');
                         }
                     }
                 } finally {
-                    this.#fragmentBusy = wasFragmentBusy;
+                    this.#fragmentBusy = false;
                 }
 
                 return response(0, '', actions, echo);
@@ -981,9 +1104,13 @@ export class V12Dispatcher {
                 return this.getUploadedFile(params.file_id, echo, fileLease);
             }
 
-            if (params.type !== 'url' || isV12UploadToken(params.file_id)) {
-                // The reserved upload prefix shadows any v11 alias only through
-                // v12 get_file; direct v11 actions and lookups are unchanged.
+            if (
+                params.type !== 'url' ||
+                isV12UploadToken(params.file_id) ||
+                isV12UploadDraftToken(params.file_id)
+            ) {
+                // Local file and draft namespaces never fall back to v11 via
+                // v12 get_file. Direct v11 actions and lookups are unchanged.
                 return response(10004, 'unsupported file type', null, echo);
             }
 
@@ -1139,6 +1266,176 @@ export class V12Dispatcher {
 
             const fileId = ownData(result, 'fileId');
             return isCanonicalUploadId(fileId)
+                ? response(0, '', { file_id: fileId }, echo)
+                : unavailable();
+        } catch {
+            return unavailable();
+        }
+    }
+
+    private uploadFileFragmented(
+        params: Record<string, unknown>,
+        echo: string | undefined,
+        fileLease: V12FileLease | undefined,
+        providers: FragmentUploadProviders,
+    ): V12Response {
+        const invalid = () => response(10003, 'invalid upload parameters', null, echo);
+        const unavailable = () => response(20002, 'upload unavailable', null, echo);
+        const notFound = () => response(20001, 'upload draft not found', null, echo);
+        const range = () => response(10004, 'unsupported file range', null, echo);
+        const stage = params.stage;
+
+        if (typeof stage !== 'string') {
+            return invalid();
+        }
+
+        if (stage !== 'prepare' && stage !== 'transfer' && stage !== 'finish') {
+            return response(10004, 'unsupported file stage', null, echo);
+        }
+
+        const fields =
+            stage === 'prepare'
+                ? ['stage', 'name', 'total_size']
+                : stage === 'transfer'
+                  ? ['stage', 'file_id', 'offset', 'data']
+                  : ['stage', 'file_id', 'sha256'];
+
+        if (extraKeys(params, fields)) {
+            return response(10004, 'unsupported parameter', null, echo);
+        }
+
+        let operation: FragmentUploadProviders['prepare' | 'transfer' | 'finish'];
+        let args: unknown[];
+
+        if (stage === 'prepare') {
+            const { name, total_size: size } = params;
+
+            if (
+                typeof name !== 'string' ||
+                name.length > 4096 ||
+                typeof size !== 'number' ||
+                !Number.isSafeInteger(size) ||
+                size < 0
+            ) {
+                return invalid();
+            }
+
+            if (size > MAX_UPLOAD_DATA_BYTES) {
+                return range();
+            }
+
+            operation = providers.prepare;
+            args = [name, size === 0 ? 0 : size];
+        } else {
+            const draftId = params.file_id;
+
+            if (typeof draftId !== 'string' || draftId.length === 0 || draftId.length > 4096) {
+                return invalid();
+            }
+
+            if (stage === 'transfer') {
+                const { offset, data } = params;
+
+                if (
+                    typeof offset !== 'number' ||
+                    !Number.isSafeInteger(offset) ||
+                    offset < 0 ||
+                    typeof data !== 'string' ||
+                    data.length === 0
+                ) {
+                    return invalid();
+                }
+
+                if (data.length > MAX_UPLOAD_BASE64_LENGTH) {
+                    return range();
+                }
+
+                const length = canonicalUploadByteLength(data);
+
+                if (length === null) {
+                    return invalid();
+                }
+
+                if (offset > MAX_UPLOAD_DATA_BYTES || length > MAX_UPLOAD_DATA_BYTES - offset) {
+                    return range();
+                }
+
+                operation = providers.transfer;
+                args = [draftId, offset === 0 ? 0 : offset, data];
+            } else {
+                if (!isLowerSha256(params.sha256)) {
+                    return invalid();
+                }
+
+                operation = providers.finish;
+                args = [draftId, params.sha256];
+            }
+
+            if (!isV12UploadDraftToken(draftId)) {
+                return response(10004, 'unsupported file source', null, echo);
+            }
+
+            if (!isCanonicalUploadId(draftId, V12_UPLOAD_DRAFT_TOKEN_PREFIX)) {
+                return notFound();
+            }
+        }
+
+        const prefix =
+            stage === 'prepare' ? V12_UPLOAD_DRAFT_TOKEN_PREFIX : V12_UPLOAD_TOKEN_PREFIX;
+        const current = () => this.fragmentUploadProvidersCurrent(providers, fileLease);
+
+        try {
+            // Canonical IDs contain only unescaped ASCII, so the placeholder
+            // has the exact wire size of every success. Bound it before effects.
+            const success =
+                stage === 'transfer'
+                    ? null
+                    : { file_id: prefix + 'A'.repeat(UPLOAD_ID_SUFFIX_LENGTH) };
+
+            if (!fileSuccessFits(success, echo)) {
+                return response(10003, 'file response too large', null, echo);
+            }
+
+            if (!current()) {
+                return unavailable();
+            }
+
+            // The runtime also samples this guard just before its store commits.
+            // A direct custom provider must honor that contract itself.
+            const result: unknown = apply(operation, providers.options, [...args, current]);
+
+            if (!current() || !isProviderRecord(result)) {
+                return unavailable();
+            }
+
+            const kind = ownEnumerableData(result, 'kind');
+
+            if (kind === 'invalid') {
+                return invalid();
+            }
+
+            if (kind === 'not_found' && stage !== 'prepare') {
+                return notFound();
+            }
+
+            if (kind === 'invalid_range' && stage === 'transfer') {
+                return range();
+            }
+
+            if (kind === 'incomplete' && stage === 'finish') {
+                return response(10004, 'incomplete upload', null, echo);
+            }
+
+            if (kind !== 'ok') {
+                return unavailable();
+            }
+
+            if (stage === 'transfer') {
+                return response(0, '', null, echo);
+            }
+
+            const fileId = ownEnumerableData(result, stage === 'prepare' ? 'draftId' : 'fileId');
+            return isCanonicalUploadId(fileId, prefix)
                 ? response(0, '', { file_id: fileId }, echo)
                 : unavailable();
         } catch {

@@ -352,8 +352,9 @@ array, or exactly two segments containing that image and one
 `{type: 'text', data: {text: <string>}}` in either order, for a private or group
 target. Both segments require their supported fields only. They are validated in
 input order before any store read or sensitive call. The ID must be a canonical
-`jiyu-upload:v1:` handle from `upload_file` data mode for the same account and
-current listener generation. Incoming media handles, legacy IDs, URLs, local
+`jiyu-upload:v1:` handle from `upload_file` data mode or `upload_file_fragmented`
+finish for the same account and current listener generation. Incoming media
+handles, legacy IDs, URLs, local
 paths, multiple images and other mixed combinations are unsupported.
 
 In the two-segment form, text with an unpaired UTF-16 surrogate returns `10006`
@@ -475,8 +476,9 @@ mode without a v11 lookup; URL mode returns 10004 for this prefix without v11 fa
 alias with the prefix is shadowed by v12 URL lookup, while direct v11 lookup is
 unchanged. Other reserved media URL handles have the listener-lease checks
 described below. Common snapshot and ID checks
-can fail earlier. Upload `url`, `path` and unknown types return 10004; the
-separate `upload_file_fragmented` action returns 10002. In Jiyu's account runtime,
+can fail earlier. Upload `url`, `path` and unknown types return 10004. See
+[`upload_file_fragmented`](#upload_file_fragmented-stage-types) for Jiyu's
+separate local staging action. In Jiyu's account runtime,
 `get_supported_actions` will list `upload_file` only when both data callbacks
 exist and the current listener's upload lease is valid; a standalone core without a
 readiness callback instead checks the callback pair. Listing the action does not
@@ -533,10 +535,19 @@ The two ID-bearing result shapes are also exported. Byte lengths and offsets
 use the JavaScript safe-integer subset of `int64`; these static types do not
 validate ranges, Base64, digest syntax or content. The failure branches retain
 generic JSON `data`. `call()` and `request()` remain generic; no upload loop,
-retry, digest calculation, or stage-specific response validation is added. An
-implementation must separately support this action. Jiyu's dispatcher still
-returns 10002 for it; the internal in-memory staging work is not a public
-upload path, and neither is a QQ media transfer.
+retry, digest calculation, or stage-specific response validation is added.
+
+On Jiyu, discover `upload_file_fragmented` on the active listener, then send the
+three stages as separate calls. Wait for each success before submitting the next.
+Use the `prepare` ID only for `transfer` and `finish`. Send nonempty canonical
+padded Base64 chunks at consecutive byte offsets starting at zero, or skip
+`transfer` for an empty file. `finish` requires the SHA-256 of the complete raw
+file; its new ID works with local data or fragment reads. The file cap is 256
+KiB and the draft counts against the same 32-entry / 4 MiB limit as ordinary
+uploads. The ten-minute TTL starts at `prepare` and does not renew. There is no
+abort stage. If a response is lost, do not automatically retry: the stage may
+already have changed state. This is a local temporary upload, not a QQ media
+transfer. See the [server contract](../onebot/ONEBOT_V12.md#local-fragmented-uploads).
 
 ## `get_file_fragmented` read-only types
 

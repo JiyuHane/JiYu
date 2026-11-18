@@ -100,6 +100,11 @@ export function isV12UploadToken(value: unknown): value is string {
     return typeof value === 'string' && startsWith(value, V12_UPLOAD_TOKEN_PREFIX);
 }
 
+/** Reserved for staging, including malformed, consumed and expired draft handles. */
+export function isV12UploadDraftToken(value: unknown): value is string {
+    return typeof value === 'string' && startsWith(value, V12_UPLOAD_DRAFT_TOKEN_PREFIX);
+}
+
 function erase(bytes: Uint8Array): void {
     try {
         apply(typedArrayFill, bytes, [0]);
