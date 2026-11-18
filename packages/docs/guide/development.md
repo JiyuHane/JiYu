@@ -14,7 +14,9 @@ pnpm test
 
 ## 文档站
 
-站点使用 VitePress 默认主题，文档源位于 `packages/docs`。从仓库根目录执行：
+站点使用 VitePress 默认主题，文档源位于 `packages/docs`。面向使用者的功能变更应同步更新对应包的参考文档和站点接入指南；新增指南时也要补上站内入口。只修改文档时，请构建站点并检查链接和示例，不必启动运行时。
+
+从仓库根目录执行：
 
 ```sh
 pnpm --filter @jiyu/docs dev

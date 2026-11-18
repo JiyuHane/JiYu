@@ -40,6 +40,7 @@ export default defineConfig({
         text: '接入与开发',
         items: [
           { text: 'OneBot、WebUI、SDK 与 MCP', link: '/guide/integrations' },
+          { text: 'OneBot 12 本地文件传输', link: '/guide/onebot12-files' },
           { text: '独立协议研究', link: '/guide/protocol' },
           { text: '开发与文档', link: '/guide/development' },
         ],

@@ -7,6 +7,7 @@ OneBot 层负责动作校验与分发、事件转换、消息存储以及 HTTP /
 - [OneBot v11 规范](https://github.com/botuniverse/onebot-11)
 - [OneBot 12 候选标准](https://12.onebot.dev/)
 - [霁羽 OneBot 12 配置与支持范围](https://github.com/JiyuHane/JiYu/blob/dev/packages/onebot/ONEBOT_V12.md)
+- [OneBot 12 本地文件传输](/guide/onebot12-files)：普通数据模式、分片上传与下载示例、配额和生命周期。
 - [HTTP SSE 事件流说明](https://github.com/JiyuHane/Jiyu/blob/dev/packages/onebot/HTTP_SSE.md)
 - [OneBot 实现目录](https://github.com/JiyuHane/Jiyu/tree/dev/packages/onebot)
 
@@ -26,12 +27,15 @@ WebUI 管理运行状态、OneBot 配置和日志；它需要对应的运行时�
 
 插件兼容层是独立实现的部分 NapCat 接口，原项目及各插件的作者和许可声明保持独立。具体支持范围、目录和已知限制见[插件兼容说明](https://github.com/JiyuHane/JiYu/blob/dev/packages/onebot/PLUGIN_COMPAT.md)。
 
+仓库内的[离线 ZIP 预检](https://github.com/JiyuHane/JiYu/blob/dev/packages/core/src/webui/plugin-install/README.md)仅检查有限的 ZIP32 格式并分类归档中的 ESM 入口候选。它不向磁盘解压、不执行插件，也未接入 WebUI 或安装流程。即使存在入口候选，也不能证明插件可以加载或与霁羽兼容。当前仍需手动准备本地插件目录，社区索引没有自动下载、安装或更新流程。
+
 ## TypeScript SDK
 
 仓库内的 TypeScript SDK 使用包名 `@harehane/sdk`，提供 OneBot HTTP / WebSocket 客户端、事件处理中间件与消息构造工具。原有 `@snowluma/sdk` 包名并非自动别名；包的发布状态和可用版本以对应 npm 条目为准。
 
 - [SDK 指南](https://github.com/JiyuHane/Jiyu/blob/dev/packages/sdk/README.md)
 - [消息构造与事件](https://github.com/JiyuHane/Jiyu/blob/dev/packages/sdk/MESSAGING.md)
+- [OneBot 12 客户端与类型](https://github.com/JiyuHane/JiYu/blob/dev/packages/sdk/ONEBOT_V12.md)
 - [流式传输](https://github.com/JiyuHane/Jiyu/blob/dev/packages/sdk/STREAMING.md)
 
 ## MCP
