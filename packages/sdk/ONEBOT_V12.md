@@ -765,6 +765,56 @@ guarantees. URL/path uploads, legacy v11 IDs and incoming QQ media handles
 are outside that scope. This is not a claim about QQ media retrieval, other
 OneBot servers or network availability.
 
+### Opt-in bounded download
+
+`downloadOneBot12FragmentedFile` from `@harehane/sdk/v12` combines the two read
+stages only when explicitly called. It accepts the same structural requester as
+the single-stage helpers. `maxBytes` is required and must be an integer from
+zero through 8 MiB. The helper checks the reported size before allocation, then
+requests consecutive, non-overlapping ranges, one at a time, with no retries.
+`chunkSize` defaults to 64 KiB and may be set from 1 byte through 256 KiB; at
+most 256 transfers are allowed. An empty file needs no transfer call. These are
+client limits, not OneBot guarantees. On Jiyu the current listener's eligible
+in-memory upload ID and 256 KiB server limit still apply.
+
+```ts
+import { downloadOneBot12FragmentedFile } from '@harehane/sdk/v12';
+
+const result = await downloadOneBot12FragmentedFile(client, fileId, {
+    maxBytes: 256 * 1024,
+    timeoutMs: 15_000,
+});
+if (result.status === 'ok') {
+    const { bytes, sha256 } = result; // caller-owned Uint8Array, verified against prepare
+    void [bytes, sha256];
+} else {
+    const { stage, response } = result; // first business failure, unchanged JSON contents
+    void [stage, response];
+}
+```
+
+Each response must decode as canonical padded Base64 of exactly the requested
+byte length. The helper hashes the complete file (including an empty file) with
+Web Crypto SHA-256 and compares it to the 64 lowercase hex digits returned by
+prepare. An optional `expectedSha256` of the same form must also match before any
+transfer starts. The server-reported hash alone checks consistency, not origin
+or authenticity; use a separately trusted expected hash when needed. No partial
+bytes are returned. The reported filename is metadata, not a safe filesystem
+path; the helper never creates files. It requires Web Crypto (a secure context
+in browsers), `atob`/`btoa`, and `structuredClone` when `self` is used.
+
+The shared `timeoutMs` is a positive millisecond value (default 30 seconds),
+covering the staged requests and asynchronous verification. `signal` cancels
+that operation; every request receives the same derived signal and a private
+copy of the initially selected `self`, when supplied. Transport defaults still
+apply to each request. This does not interrupt synchronous processing or stop
+work in a custom requester that ignores cancellation; it prevents further stages
+and result publication after cancellation is observed. Local option, budget and
+response failures use `OneBot12ClientError`; non-cancellation transport
+rejections propagate unchanged. The decoded allocation and transfer count
+limits do not bound transport buffering or process memory. Single-stage helpers,
+generic calls, and OneBot v11 are unchanged.
+
 ## `get_file` URL subset
 
 `@harehane/sdk/v12` exports `OneBot12GetFileUrlParams`,

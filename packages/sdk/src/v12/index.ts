@@ -75,6 +75,11 @@ export {
 } from './protocol.js';
 export { prepareOneBot12FileFragment, transferOneBot12FileFragment } from './file-fragmented.js';
 export type { OneBot12FileFragmentRequester } from './file-fragmented.js';
+export { downloadOneBot12FragmentedFile } from './file-fragmented-download.js';
+export type {
+    OneBot12FragmentedDownloadOptions,
+    OneBot12FragmentedDownloadResult,
+} from './file-fragmented-download.js';
 export {
     finishOneBot12FragmentedUpload,
     prepareOneBot12FragmentedUpload,

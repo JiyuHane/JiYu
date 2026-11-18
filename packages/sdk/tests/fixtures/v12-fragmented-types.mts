@@ -1,5 +1,8 @@
+import { downloadOneBot12FragmentedFile } from '@harehane/sdk/v12';
 import type {
     OneBot12ActionResponse,
+    OneBot12FragmentedDownloadOptions,
+    OneBot12FragmentedDownloadResult,
     OneBot12GetFileFragmentedPrepareParams,
     OneBot12GetFileFragmentedPrepareResponse,
     OneBot12GetFileFragmentedPrepareResult,
@@ -102,6 +105,33 @@ export function genericFragmentedCalls(
         ws.call('get_file_fragmented', prepare),
         ws.call('get_file_fragmented', transfer),
     ];
+}
+
+// The helper returns decoded bytes only on verified success; it is not a JSON envelope.
+export async function readFragmentedFromPublishedSdk(http: OneBot12HttpClient): Promise<void> {
+    const fileId = 'fixture-file-id';
+    const options: OneBot12FragmentedDownloadOptions = { maxBytes: 4096, chunkSize: 512 };
+    const result: OneBot12FragmentedDownloadResult = await downloadOneBot12FragmentedFile(
+        http,
+        fileId,
+        options,
+    );
+
+    if (result.status === 'ok') {
+        const bytes: Uint8Array = result.bytes;
+        void bytes;
+        // @ts-expect-error A successful download is not the transport's JSON envelope.
+        void result.retcode;
+    } else {
+        const stage: 'prepare' | 'transfer' = result.stage;
+        const status: 'failed' = result.response.status;
+        void [stage, status];
+        // @ts-expect-error A failed stage never exposes partially assembled bytes.
+        void result.bytes;
+    }
+
+    // @ts-expect-error Applications must select an explicit allocation limit.
+    void downloadOneBot12FragmentedFile(http, fileId, { chunkSize: 512 });
 }
 
 export const prepareParams: OneBot12GetFileFragmentedPrepareParams = {

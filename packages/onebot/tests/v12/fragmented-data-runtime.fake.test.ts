@@ -693,6 +693,113 @@ describe('upload_file_fragmented through SDK, runtime and generation-local store
 });
 
 describe('get_file_fragmented through SDK, runtime and generation-local store', () => {
+    function expectDownloadRequests(f: Account, params: OneBot12JsonObject[]) {
+        expect(f.fakeFetch).toHaveBeenCalledTimes(params.length);
+        const requests = f.fakeFetch.mock.calls.map(([, init]) => JSON.parse(String(init?.body)));
+        expect(requests).toMatchObject(
+            params.map((requestParams) => ({
+                action: 'get_file_fragmented',
+                params: requestParams,
+                self: { platform: 'qq', user_id: f.uin },
+            })),
+        );
+    }
+
+    it('downloads a published fragment upload and skips transfers for an empty file', async () => {
+        const { downloadOneBot12FragmentedFile } = await import('../../../sdk/src/v12/index.js');
+        const f = await account('10001');
+        const self = { platform: 'qq', user_id: f.uin };
+        const name = '下载🪶.bin';
+        const bytes = Buffer.from([0x00, 0xff, 0x80, 0x41, 0x0a]);
+        const sha256 = createHash('sha256').update(bytes).digest('hex');
+        const draft = await reserveDraft(f, name, bytes.length);
+        expect(await writeFragment(f, draft, 0, bytes.subarray(0, 3).toString('base64'))).toEqual(
+            okEnvelope(null, 'write'),
+        );
+        expect(await writeFragment(f, draft, 3, bytes.subarray(3).toString('base64'))).toEqual(
+            okEnvelope(null, 'write'),
+        );
+        const id = uploadedId(await finishDraft(f, draft, sha256), 'finish');
+        const empty = uploadedId(await upload(f, '', ''));
+        f.fakeFetch.mockClear();
+
+        expect(
+            await downloadOneBot12FragmentedFile(f.client, id, {
+                maxBytes: bytes.length,
+                chunkSize: 2,
+                expectedSha256: sha256,
+                self,
+            }),
+        ).toEqual({ status: 'ok', name, sha256, bytes: Uint8Array.from(bytes) });
+        expect(
+            await downloadOneBot12FragmentedFile(f.client, empty, {
+                maxBytes: 0,
+                expectedSha256: EMPTY_SHA256,
+                self,
+            }),
+        ).toEqual({ status: 'ok', name: '', sha256: EMPTY_SHA256, bytes: new Uint8Array() });
+        expectDownloadRequests(f, [
+            { stage: 'prepare', file_id: id },
+            { stage: 'transfer', file_id: id, offset: 0, size: 2 },
+            { stage: 'transfer', file_id: id, offset: 2, size: 2 },
+            { stage: 'transfer', file_id: id, offset: 4, size: 1 },
+            { stage: 'prepare', file_id: empty },
+        ]);
+        expect(f.api.handle).not.toHaveBeenCalled();
+    });
+
+    it('returns the first failure without retrying after listener replacement', async () => {
+        const { downloadOneBot12FragmentedFile } = await import('../../../sdk/src/v12/index.js');
+        const f = await account('10001');
+        const id = uploadedId(await upload(f));
+        const old = f.transport();
+        const request = f.client.request.bind(f.client);
+        const responses: Awaited<ReturnType<typeof request>>[] = [];
+        vi.spyOn(f.client, 'request').mockImplementation(async (...args) => {
+            const response = await request(...args);
+            responses.push(response);
+
+            if (responses.length === 2) {
+                // The old listener served the first chunk; the next request sees an empty store.
+                await f.runtime.close();
+                await f.open();
+            }
+
+            return response;
+        });
+        f.fakeFetch.mockClear();
+
+        const options = { maxBytes: 5, chunkSize: 2, self: { platform: 'qq', user_id: f.uin } };
+        const prepareParams = { stage: 'prepare', file_id: id };
+        const miss = {
+            status: 'failed',
+            retcode: 20001,
+            data: null,
+            message: 'invalid file result',
+        };
+        const interrupted = await downloadOneBot12FragmentedFile(f.client, id, options);
+        expect(f.transport()).not.toBe(old);
+        expect(responses[1]).toMatchObject({ status: 'ok', data: { data: 'aGU=' } });
+        expect(responses[2]).toMatchObject(miss);
+        expect(interrupted).toEqual({
+            status: 'failed',
+            stage: 'transfer',
+            response: responses[2],
+        });
+        expectDownloadRequests(f, [
+            prepareParams,
+            { stage: 'transfer', file_id: id, offset: 0, size: 2 },
+            { stage: 'transfer', file_id: id, offset: 2, size: 2 },
+        ]);
+
+        f.fakeFetch.mockClear();
+        const stale = await downloadOneBot12FragmentedFile(f.client, id, options);
+        expect(responses[3]).toMatchObject(miss);
+        expect(stale).toEqual({ status: 'failed', stage: 'prepare', response: responses[3] });
+        expectDownloadRequests(f, [prepareParams]);
+        expect(f.api.handle).not.toHaveBeenCalled();
+    });
+
     it('uploads hello and returns the exact prepare and transfer envelopes', async () => {
         const f = await account('10001');
         const id = uploadedId(await upload(f));
