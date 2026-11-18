@@ -19,6 +19,7 @@ type FixtureEntry = {
     flags?: number;
     method?: number;
     extra?: Uint8Array;
+    descriptor?: boolean | ((signed: Buffer) => Buffer);
 };
 
 function crc32(bytes: Uint8Array): number {
@@ -45,19 +46,24 @@ function zip(entries: FixtureEntry[]): Buffer {
         const data = Buffer.from(entry.data ?? []);
         const extra = Buffer.from(entry.extra ?? []);
         const directory = entry.name.endsWith('/');
-        const flags = entry.flags ?? 0;
+        const flags = (entry.flags ?? 0) | (entry.descriptor ? 8 : 0);
         const method = entry.method ?? 0;
         const payload = Buffer.from(
             entry.payload ?? (method === 8 ? zlib.deflateRawSync(data) : data),
         );
+        const crc = crc32(data);
         const local = Buffer.alloc(30);
         local.writeUInt32LE(0x04034b50, 0);
         local.writeUInt16LE(20, 4);
         local.writeUInt16LE(flags, 6);
         local.writeUInt16LE(method, 8);
-        local.writeUInt32LE(crc32(data), 14);
-        local.writeUInt32LE(payload.length, 18);
-        local.writeUInt32LE(data.length, 22);
+
+        if ((flags & 8) === 0) {
+            local.writeUInt32LE(crc, 14);
+            local.writeUInt32LE(payload.length, 18);
+            local.writeUInt32LE(data.length, 22);
+        }
+
         local.writeUInt16LE(name.length, 26);
         local.writeUInt16LE(extra.length, 28);
         locals.push(local, name, extra, payload);
@@ -67,7 +73,7 @@ function zip(entries: FixtureEntry[]): Buffer {
         central.writeUInt16LE(20, 6);
         central.writeUInt16LE(flags, 8);
         central.writeUInt16LE(method, 10);
-        central.writeUInt32LE(crc32(data), 16);
+        central.writeUInt32LE(crc, 16);
         central.writeUInt32LE(payload.length, 20);
         central.writeUInt32LE(data.length, 24);
         central.writeUInt16LE(name.length, 28);
@@ -77,6 +83,18 @@ function zip(entries: FixtureEntry[]): Buffer {
         central.writeUInt32LE(offset, 42);
         centrals.push(central, name, extra);
         offset += local.length + name.length + extra.length + payload.length;
+
+        if (entry.descriptor) {
+            const signed = Buffer.alloc(16);
+            signed.writeUInt32LE(0x08074b50, 0);
+            signed.writeUInt32LE(crc, 4);
+            signed.writeUInt32LE(payload.length, 8);
+            signed.writeUInt32LE(data.length, 12);
+            const descriptor =
+                typeof entry.descriptor === 'function' ? entry.descriptor(signed) : signed;
+            locals.push(descriptor);
+            offset += descriptor.length;
+        }
     }
 
     const cd = Buffer.concat(centrals);
@@ -206,9 +224,10 @@ describe('ZIP32 stored preflight', () => {
         size.writeUInt32LE(1, cdOffset(size) + 24);
         rejected(size, 'integrity');
     });
-    it('rejects descriptor, encrypted, unknown flags, unsupported methods and extras', () => {
+    it('rejects a missing descriptor and unsupported flags, methods and extras', () => {
+        rejected(zip([{ name: 'x', flags: 8 }]), 'malformed');
+
         for (const entry of [
-            { flags: 8 },
             { flags: 1 },
             { flags: 0x2000 },
             { method: 9 },
@@ -588,5 +607,123 @@ describe('ZIP32 stored preflight', () => {
             connect.mockRestore();
             fetcher.mockRestore();
         }
+    });
+});
+
+describe('ZIP32 signed data descriptors', () => {
+    it('accepts stored version 10 and an ASCII UTF-8 name without scanning the payload', () => {
+        const name = 'bytes.bin';
+        const data = Buffer.from('00504b0708504b0708ff', 'hex');
+        const z = zip([{ name, data, flags: 0x800, descriptor: true }]);
+        z.writeUInt16LE(10, 4);
+        z.writeUInt16LE(10, cdOffset(z) + 6);
+        expect(preflightZip(z)).toEqual({
+            ok: true,
+            entries: [
+                {
+                    path: name,
+                    kind: 'file',
+                    compressedSize: data.length,
+                    actualSize: data.length,
+                    crc32: crc32(data),
+                },
+            ],
+            totalSize: data.length,
+            sha256: createHash('sha256').update(z).digest('hex'),
+        });
+    });
+
+    it.each([
+        ['an unsigned 12-byte descriptor', (signed: Buffer) => signed.subarray(4)],
+        ['a truncated descriptor', (signed: Buffer) => signed.subarray(0, -1)],
+        [
+            'a widened descriptor',
+            (signed: Buffer) => {
+                // ZIP64 layout with zero high words for both sizes.
+                const wide = Buffer.alloc(24);
+                signed.copy(wide, 0, 0, 12);
+                signed.copy(wide, 16, 12);
+                return wide;
+            },
+        ],
+        [
+            'a descriptor followed by padding',
+            (signed: Buffer) => Buffer.concat([signed, Buffer.alloc(1)]),
+        ],
+    ] as const)('rejects %s at either record boundary', (_label, descriptor) => {
+        const entry = { name: 'x', data: Buffer.from('abc'), descriptor };
+        rejected(zip([entry]), 'malformed');
+        rejected(zip([entry, { name: 'after' }]), 'malformed');
+    });
+
+    it.each([
+        ['marker', 0],
+        ['CRC', 4],
+        ['compressed size', 8],
+        ['uncompressed size', 12],
+    ] as const)('rejects an incorrect descriptor %s', (_field, offset) => {
+        const z = zip([{ name: 'x', data: Buffer.from('abc'), descriptor: true }]);
+        z[cdOffset(z) - 16 + offset] ^= 1;
+        rejected(z, 'malformed');
+    });
+
+    it('does not scan for a matching descriptor outside the declared payload boundary', () => {
+        const data = Buffer.from('abc');
+        const payload = zlib.deflateRawSync(data);
+
+        for (const length of [payload.length - 1, payload.length + 1]) {
+            const z = zip([{ name: 'x', method: 8, data, payload, descriptor: true }]);
+            const central = cdOffset(z);
+            // The two length fields agree, but do not locate this descriptor.
+            z.writeUInt32LE(length, central + 20);
+            z.writeUInt32LE(length, central - 8);
+            rejected(z, 'malformed');
+        }
+    });
+
+    it('rejects a one-sided descriptor flag or an unflagged descriptor', () => {
+        const localOnly = zip([{ name: 'x' }]);
+        localOnly.writeUInt16LE(8, 6);
+        rejected(localOnly, 'malformed');
+        const centralOnly = zip([{ name: 'x', descriptor: true }]);
+        centralOnly.writeUInt16LE(0, 6);
+        rejected(centralOnly, 'malformed');
+        centralOnly.writeUInt16LE(0, cdOffset(centralOnly) + 8);
+        rejected(centralOnly, 'malformed');
+    });
+
+    it.each([
+        ['CRC', 14, 16],
+        ['compressed size', 18, 20],
+        ['uncompressed size', 22, 24],
+    ] as const)(
+        'requires zero local %s even when it matches the descriptor',
+        (_field, local, cd) => {
+            const z = zip([{ name: 'x', data: Buffer.from('abc'), descriptor: true }]);
+            z.writeUInt32LE(z.readUInt32LE(cdOffset(z) + cd), local);
+            rejected(z, 'malformed');
+        },
+    );
+
+    it('keeps flag, file type and DEFLATE version checks with descriptors', () => {
+        for (const flags of [1, 2, 4, 0x2000]) {
+            rejected(zip([{ name: 'x', method: 8, flags, descriptor: true }]), 'unsupported');
+        }
+
+        rejected(zip([{ name: 'd/', descriptor: true }, { name: 'x' }]), 'unsupported');
+        rejected(zip([{ name: 'x', host: 3, mode: 0xa1ff, descriptor: true }]), 'unsupported');
+        const version = zip([{ name: 'x', method: 8, descriptor: true }]);
+        version.writeUInt16LE(10, 4);
+        version.writeUInt16LE(10, cdOffset(version) + 6);
+        rejected(version, 'unsupported');
+    });
+
+    it('keeps the declared file budget with matching descriptor sizes', () => {
+        const z = zip([{ name: 'x', method: 8, descriptor: true }]);
+        const central = cdOffset(z);
+        const size = 8 * 1024 * 1024 + 1;
+        z.writeUInt32LE(size, central + 24);
+        z.writeUInt32LE(size, central - 4);
+        rejected(z, 'limit');
     });
 });

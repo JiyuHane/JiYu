@@ -10,15 +10,26 @@ permissions and crash recovery require separate platform-specific handling.
 
 The limited ZIP32 profile accepts stored (method 0) and raw DEFLATE (method 8)
 regular files, portable ASCII paths and recognized DOS or Unix declarations.
-Directories must be stored and empty; method 8 requires version-needed 20. Each
-entry may have either no extra field, or exactly one mtime-only extended timestamp
-field (`0x5455`, data length 5, flags 1) whose four raw timestamp bytes match in
-its local and central headers. These bytes are checked for consistency, not
-interpreted as trusted dates. Other or duplicate extra fields, asymmetric fields,
-data descriptors, ZIP64, encryption, comments, unsupported creator metadata,
-path and case collisions, non-contiguous record layouts, empty archives and
-directory-only archives remain rejected. This is not general compatibility with
-common community ZIPs; many legitimate releases are rejected.
+Directories must be stored, empty and descriptor-free; method 8 requires
+version-needed 20. Each entry may have either no extra field, or exactly one
+mtime-only extended timestamp field (`0x5455`, data length 5, flags 1) whose four
+raw timestamp bytes match in its local and central headers. These bytes are
+checked for consistency, not interpreted as trusted dates.
+
+Regular files may set general-purpose bit 3 in both headers. The local CRC and
+both local sizes then must be zero. The payload must be followed immediately by
+exactly 16 bytes: the ZIP32 data-descriptor record marker (`0x08074b50`), CRC-32,
+compressed size and uncompressed size. Those three metadata words must match the
+central directory. The parser uses the recorded compressed length and the next
+local header or central directory boundary, not a search inside the payload.
+This is a narrow subset of
+[PKWARE APPNOTE §§4.3.9 and 4.4.4](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT).
+The record marker is not a digital signature. Missing, misplaced or inconsistent
+data descriptors fail structural validation (`malformed`). Descriptors without
+that marker, ZIP64, other or duplicate extra fields, asymmetric extra fields,
+encryption, comments, unsupported creator metadata, path and case collisions,
+non-contiguous record layouts, and archives without files remain rejected. Many
+legitimate community releases still fall outside this profile.
 
 The primitive validates a private snapshot and all local and central records
 before processing any archive content, then decompresses in memory for inspection

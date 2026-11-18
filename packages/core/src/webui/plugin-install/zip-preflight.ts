@@ -50,6 +50,10 @@ const MAX_MANIFEST = 65536;
 const MAX_ARCHIVE = 32 * 1024 * 1024;
 const MAX_FILE = 8 * 1024 * 1024;
 const MAX_ENTRIES = 512;
+const DATA_DESCRIPTOR_FLAG = 0x08;
+const UTF8_NAME_FLAG = 0x0800;
+const DATA_DESCRIPTOR_SIGNATURE = 0x08074b50;
+const ZIP32_DATA_DESCRIPTOR_BYTES = 16;
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
 const typedBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
 const typedOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get!;
@@ -237,8 +241,8 @@ interface RecordMetadata {
 /**
  * Synchronous preflight of a strict ZIP32 stored/raw-DEFLATE subset, suited to
  * synthetic fixtures. An archive with no file entries is malformed. Only a
- * symmetric mtime-only UT extra field is supported; other extra fields and data
- * descriptors remain unsupported. The result establishes neither plugin
+ * symmetric mtime-only UT extra field and fixed, marked ZIP32 file data
+ * descriptors are supported. The result establishes neither plugin
  * compatibility, provenance, permission nor filesystem safety; this function
  * performs no extraction or installation.
  * Work is bounded by one input snapshot, entry count and declared output limits;
@@ -424,7 +428,7 @@ function parseZip(
                 startDisk !== 0 ||
                 comment !== 0 ||
                 internal !== 0 ||
-                (flags & ~0x800) !== 0 ||
+                (flags & ~(UTF8_NAME_FLAG | DATA_DESCRIPTOR_FLAG)) !== 0 ||
                 (method !== 0 && method !== 8) ||
                 (version !== 10 && version !== 20) ||
                 (method === 8 && version !== 20) ||
@@ -470,7 +474,7 @@ function parseZip(
                 fail('unsupported');
             }
 
-            if (directory && method !== 0) {
+            if (directory && (method !== 0 || (flags & DATA_DESCRIPTOR_FLAG) !== 0)) {
                 fail('unsupported');
             }
 
@@ -517,7 +521,8 @@ function parseZip(
                 fail('malformed');
             }
 
-            bound(localCursor, 30, centralStart);
+            bound(nextOffset, 0, centralStart);
+            bound(localCursor, 30, nextOffset);
 
             if (u32(localCursor) !== 0x04034b50) {
                 fail('malformed');
@@ -527,12 +532,17 @@ function parseZip(
             const extraLength = u16(localCursor + 28);
             const extraStart = localCursor + 30 + nameLength;
 
-            bound(localCursor + 30, nameLength, centralStart);
-            bound(extraStart, extraLength, centralStart);
+            bound(localCursor + 30, nameLength, nextOffset);
+            bound(extraStart, extraLength, nextOffset);
             const dataStart = extraStart + extraLength;
-            bound(dataStart, record.compressed, centralStart);
+            const dataEnd = dataStart + record.compressed;
+            const hasDescriptor = (record.flags & DATA_DESCRIPTOR_FLAG) !== 0;
+            const descriptorBytes = hasDescriptor ? ZIP32_DATA_DESCRIPTOR_BYTES : 0;
+            const localEnd = dataEnd + descriptorBytes;
+            bound(dataStart, record.compressed + descriptorBytes, nextOffset);
 
-            if (dataStart + record.compressed !== nextOffset) {
+            // Use directory lengths and the next record boundary, not a marker search.
+            if (localEnd !== nextOffset) {
                 fail('malformed');
             }
 
@@ -542,10 +552,28 @@ function parseZip(
                 u16(localCursor + 8) !== record.method ||
                 u16(localCursor + 10) !== record.time ||
                 u16(localCursor + 12) !== record.date ||
-                u32(localCursor + 14) !== record.crc ||
-                u32(localCursor + 18) !== record.compressed ||
-                u32(localCursor + 22) !== record.size ||
                 nameLength !== record.name.length
+            ) {
+                fail('malformed');
+            }
+
+            if (
+                hasDescriptor &&
+                (u32(localCursor + 14) !== 0 ||
+                    u32(localCursor + 18) !== 0 ||
+                    u32(localCursor + 22) !== 0 ||
+                    u32(dataEnd) !== DATA_DESCRIPTOR_SIGNATURE)
+            ) {
+                fail('malformed');
+            }
+
+            // CRC and both sizes must match the directory in the selected location.
+            const fieldsStart = hasDescriptor ? dataEnd + 4 : localCursor + 14;
+
+            if (
+                u32(fieldsStart) !== record.crc ||
+                u32(fieldsStart + 4) !== record.compressed ||
+                u32(fieldsStart + 8) !== record.size
             ) {
                 fail('malformed');
             }
@@ -561,7 +589,7 @@ function parseZip(
             }
 
             record.dataStart = dataStart;
-            localCursor = dataStart + record.compressed;
+            localCursor = localEnd;
         }
 
         if (localCursor !== centralStart || !records.some((record) => !record.directory)) {

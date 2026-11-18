@@ -29,6 +29,7 @@ type Entry = {
     localExtra?: Uint8Array;
     centralExtra?: Uint8Array;
     payload?: Uint8Array;
+    descriptor?: boolean;
 };
 
 // This is a ZIP fixture writer, not an implementation of the parser under test.
@@ -108,7 +109,8 @@ function makeZip(entries: Entry[]): {
         const localExtra = Buffer.from(entry.localExtra ?? []);
         const centralExtra = Buffer.from(entry.centralExtra ?? []);
         const method = entry.method ?? 0;
-        const flags = entry.flags ?? 0;
+        const flags = (entry.flags ?? 0) | (entry.descriptor ? 8 : 0);
+        const hasDescriptorFlag = (flags & 8) !== 0;
         const payload = Buffer.from(
             entry.payload ?? (method === 8 ? zlib.deflateRawSync(data) : data),
         );
@@ -124,14 +126,21 @@ function makeZip(entries: Entry[]): {
         local.u16(method);
         local.u16(0);
         local.u16(0);
-        local.u32(crc);
-        local.u32(payload.length);
-        local.u32(data.length);
+        local.u32(hasDescriptorFlag ? 0 : crc);
+        local.u32(hasDescriptorFlag ? 0 : payload.length);
+        local.u32(hasDescriptorFlag ? 0 : data.length);
         local.u16(name.length);
         local.u16(localExtra.length);
         local.raw(name);
         local.raw(localExtra);
         local.raw(payload);
+
+        if (entry.descriptor) {
+            local.u32(0x08074b50);
+            local.u32(crc);
+            local.u32(payload.length);
+            local.u32(data.length);
+        }
 
         central.u32(0x02014b50);
         central.u16(20);
@@ -229,15 +238,21 @@ afterEach(() => {
 });
 
 describe('synthetic ZIP32 paired UT extra', () => {
-    it('accepts a mixture of missing and matching UT fields without changing metadata', () => {
+    it.each([false, true])('keeps mixed UT metadata (descriptors: %s)', (descriptor) => {
         const manifest = '{"type":"module","main":"index.mjs"}';
         const entries: Entry[] = [
-            { name: 'package.json', data: manifest, method: 8, ...pair(0) },
+            { name: 'package.json', data: manifest, method: 8, descriptor, ...pair(0) },
             { name: 'lib/', ...pair(0xffffffff) },
-            { name: 'lib/data.bin', data: Buffer.from([0, 1, 0xff, 42]), ...pair(1794272800) },
+            {
+                name: 'lib/data.bin',
+                data: Buffer.from([0, 1, 0xff, 42]),
+                descriptor,
+                ...pair(1794272800),
+            },
             { name: 'plain', data: 'stored without extra' },
             { name: 'empty/', ...pair(1) },
-            { name: 'empty-file', method: 8, ...pair(0xffffffff) },
+            { name: 'empty-stored', descriptor },
+            { name: 'empty-file', method: 8, descriptor, ...pair(0xffffffff) },
         ];
         const fixture = makeZip(entries);
         const digest = createHash('sha256').update(fixture.bytes).digest('hex');
@@ -354,7 +369,7 @@ describe('synthetic ZIP32 paired UT extra', () => {
         expect(inspectZipManifest(scalar.bytes)).toEqual({ ok: false, code: 'manifest_invalid' });
     });
 
-    it('accepts PK-like signatures as payload bytes when CRC and sizes match', () => {
+    it.each([false, true])('treats PK-like payload as bytes (descriptors: %s)', (descriptor) => {
         const binary = Buffer.from(
             '00504b0304504b0102504b0506504b0606504b0708504b06075554050001ffffffff00504bff',
             'hex',
@@ -362,8 +377,9 @@ describe('synthetic ZIP32 paired UT extra', () => {
 
         for (const method of [0, 8] as const) {
             const payload = method === 8 ? zlib.deflateRawSync(binary, { level: 0 }) : binary;
+            expect(payload.includes(Buffer.from('504b0708', 'hex'))).toBe(true);
             const fixture = makeZip([
-                { name: 'bytes.bin', data: binary, method, payload, ...pair(7) },
+                { name: 'bytes.bin', data: binary, method, payload, descriptor, ...pair(7) },
             ]);
             const result = preflightZip(fixture.bytes);
             expect(result.ok).toBe(true);
@@ -379,7 +395,7 @@ describe('synthetic ZIP32 paired UT extra', () => {
         }
     });
 
-    it('rejects an unmatched side or different mtime', () => {
+    it.each([false, true])('rejects unmatched UT mtimes (descriptors: %s)', (descriptor) => {
         const cases: Entry[] = [
             { name: 'x', centralExtra: ut(1) },
             { name: 'x', localExtra: ut(1) },
@@ -387,7 +403,7 @@ describe('synthetic ZIP32 paired UT extra', () => {
         ];
 
         for (const entry of cases) {
-            expectRejected(makeZip([entry]).bytes, 'malformed');
+            expectRejected(makeZip([{ ...entry, descriptor }]).bytes, 'malformed');
         }
     });
 
@@ -468,13 +484,19 @@ describe('synthetic ZIP32 paired UT extra', () => {
         expectRejected(centralSize, 'malformed');
     });
 
-    it('preserves descriptor/encryption, unsafe path and collision rejection with UT', () => {
-        for (const flags of [1, 8, 0x2000]) {
+    it('preserves flag, unsafe path and collision checks with UT', () => {
+        expectRejected(makeZip([{ name: 'x', flags: 8, ...pair(7) }]).bytes, 'malformed');
+
+        for (const flags of [1, 0x2000]) {
             expectRejected(makeZip([{ name: 'x', flags, ...pair(7) }]).bytes, 'unsupported');
         }
 
         for (const name of ['é', '../x', 'a/../b', '/root']) {
             expectRejected(makeZip([{ name, ...pair(7) }]).bytes, 'unsafe_path');
+            expectRejected(
+                makeZip([{ name, flags: 0x800, descriptor: true, ...pair(7) }]).bytes,
+                'unsafe_path',
+            );
         }
 
         for (const names of [
@@ -482,7 +504,10 @@ describe('synthetic ZIP32 paired UT extra', () => {
             ['x', 'x'],
             ['a', 'a/b'],
         ]) {
-            expectRejected(makeZip(names.map((name) => ({ name, ...pair(7) }))).bytes, 'collision');
+            for (const descriptor of [false, true]) {
+                const entries = names.map((name) => ({ name, descriptor, ...pair(7) }));
+                expectRejected(makeZip(entries).bytes, 'collision');
+            }
         }
     });
 
@@ -511,17 +536,20 @@ describe('synthetic ZIP32 paired UT extra', () => {
         }
     });
 
-    it('rejects corrupt stored data and raw-deflate trailing bytes as integrity failures', () => {
-        const stored = makeZip([{ name: 'x', data: 'abc', ...pair(0) }]);
+    it.each([false, true])('checks content integrity (descriptors: %s)', (descriptor) => {
+        const stored = makeZip([{ name: 'x', data: 'abc', descriptor, ...pair(0) }]);
         const corrupt = Buffer.from(stored.bytes);
         corrupt[stored.locals[0] + 30 + Buffer.byteLength('x') + 9] ^= 1;
         expectRejected(corrupt, 'integrity');
         const data = Buffer.from('abc');
+        const entry = { name: 'x', data, method: 8 as const, descriptor, ...pair(3) };
         const payload = Buffer.concat([zlib.deflateRawSync(data), Buffer.from([0])]);
-        expectRejected(
-            makeZip([{ name: 'x', data, method: 8, payload, ...pair(3) }]).bytes,
-            'integrity',
-        );
+        expectRejected(makeZip([{ ...entry, payload }]).bytes, 'integrity');
+        const wrongSize = makeZip([entry]);
+        const sizeOffset = descriptor ? wrongSize.centralStart - 4 : wrongSize.locals[0] + 22;
+        wrongSize.bytes.writeUInt32LE(data.length + 1, sizeOffset);
+        wrongSize.bytes.writeUInt32LE(data.length + 1, wrongSize.centrals[0] + 24);
+        expectRejected(wrongSize.bytes, 'integrity');
     });
 
     it('validates a later entry before any inflate call, including the runtime probe', () => {
@@ -541,6 +569,12 @@ describe('synthetic ZIP32 paired UT extra', () => {
         const secondSize = Buffer.byteLength('stored second') + 1;
         badSize.writeUInt32LE(secondSize, fixture.locals[1] + 22);
         badSize.writeUInt32LE(secondSize, fixture.centrals[1] + 24);
+        const withDescriptor = makeZip([
+            { name: 'package.json', data: '{}', method: 8, descriptor: true, ...pair(0) },
+            { name: 'later', data: 'stored second', descriptor: true, ...pair(0xffffffff) },
+        ]);
+        const badDescriptor = Buffer.from(withDescriptor.bytes);
+        badDescriptor[withDescriptor.centralStart - 12] ^= 1; // Later descriptor CRC.
         const inflate = vi.spyOn(zlib, 'inflateRawSync');
 
         for (const [bytes, code] of [
@@ -549,6 +583,7 @@ describe('synthetic ZIP32 paired UT extra', () => {
             [badExtra, 'unsupported'],
             [mismatchedTime, 'malformed'],
             [badSize, 'integrity'],
+            [badDescriptor, 'malformed'],
         ] as const) {
             inflate.mockClear();
             expect(preflightZip(bytes)).toEqual({ ok: false, code });
