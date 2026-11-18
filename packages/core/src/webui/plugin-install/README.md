@@ -57,8 +57,34 @@ Manifest decoding is strict UTF-8; the standard `TextDecoder` removes a UTF-8
 BOM. JSON must be an object, and duplicate names follow `JSON.parse`'s
 last-value behavior. The temporary byte copy is cleared on exit, but decoder,
 JSON, compression-library and runtime-managed copies are not guaranteed to be
-cleared. The same synchronous execution and resource limits apply; this API is
-not wired to the Worker, WebUI, installer or plugin host.
+cleared. The same synchronous execution and resource limits apply. The
+separate v2 Worker protocol below can report the manifest classifications.
+
+### Offline plugin entry classification
+
+`inspectZipPluginEntry` adds a fixed `entry` result to the successful manifest
+summary. It uses the same single privately copied archive, does not decode entry
+source or return paths, and retains the existing ZIP/manifest failure priority.
+An explicit `main` never falls back. If `main` is absent, the first exact member
+named `index.mjs`, `index.js`, `main.mjs`, or `main.js` wins, including a directory
+created implicitly by a nested member. Missing or unsuitable results are not
+skipped. Matching is case-sensitive. Manifest paths may contain `.` components
+such as `./index.mjs`; parent segments, empty segments and other paths outside
+the portable archive profile are not resolved. The suffix must be `.mjs`, or
+`.js` with root `type: "module"`.
+
+`entry.source` is `declared` or `fallback`. `candidate` includes a format (`mjs`
+or `js`) only for a matching regular archive member under these rules. Other
+statuses are `invalid_main`, `unsupported_extension`, `module_type_required`,
+`missing`, `directory`, and `scope_unknown`. A matching `.js` file below a
+`node_modules` directory or a nested `package.json` marker has unknown module
+scope; this check treats those marker names conservatively regardless of case
+and does not parse nested manifests. `ok: true` means the ZIP and root manifest
+were inspected successfully, not that the entry is a candidate. A candidate does
+not establish the loader's final module format, importability, required exports,
+dependencies, filesystem behavior, or plugin compatibility. This API is not wired
+to any Worker protocol, installer, WebUI or plugin activation. The v1 and v2
+Worker result shapes are unchanged.
 
 Method 8 runs a small built-in capability probe after structural validation;
 probe failure returns `unsupported` while stored-only archives remain independent.

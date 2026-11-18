@@ -3,7 +3,11 @@ import fs from 'node:fs';
 import net from 'node:net';
 import * as zlib from 'node:zlib';
 import { describe, expect, it, vi } from 'vitest';
-import { inspectZipManifest, preflightZip } from '../src/webui/plugin-install/zip-preflight';
+import {
+    inspectZipManifest,
+    inspectZipPluginEntry,
+    preflightZip,
+} from '../src/webui/plugin-install/zip-preflight';
 
 vi.mock('node:zlib', async (importOriginal) => {
     const original = await importOriginal<typeof import('node:zlib')>();
@@ -87,6 +91,140 @@ const expectedError = (data: unknown, code: string) => {
     expect(result).toEqual({ ok: false, code });
     expect(Object.isFrozen(result)).toBe(true);
 };
+
+describe('offline plugin entry classification', () => {
+    function fixture(manifest: string, files: string[], method: 0 | 8 = 0) {
+        return archive([
+            { name: 'package.json', data: bytes(manifest), method },
+            ...files.map((name) => ({ name })),
+        ]).bytes;
+    }
+
+    it.each([0, 8] as const)('classifies an exact declared member with method %i', (method) => {
+        const input = fixture(
+            '{"main":"./private/./entry.js","type":"module"}',
+            ['private/entry.js', 'index.mjs'],
+            method,
+        );
+        const summary = inspectZipManifest(input);
+        const result = inspectZipPluginEntry(input);
+        expect(result).toStrictEqual({
+            ...summary,
+            entry: { source: 'declared', status: 'candidate', format: 'js' },
+        });
+        expect(summary).not.toHaveProperty('entry');
+        expect(Object.isFrozen(result)).toBe(true);
+
+        if (!result.ok) {
+            throw new Error(`unexpected entry result: ${result.code}`);
+        }
+
+        expect(Object.isFrozen(result.manifest)).toBe(true);
+        expect(Object.isFrozen(result.entry)).toBe(true);
+        expect(JSON.stringify(result)).not.toMatch(/private|entry\.js|index\.mjs/);
+    });
+
+    it.each([
+        null,
+        1,
+        '',
+        '/entry.mjs',
+        '../entry.mjs',
+        'lib/../entry.mjs',
+        'lib//entry.mjs',
+        'lib\\entry.mjs',
+        'C:entry.mjs',
+        'NUL.mjs',
+        '带字.mjs',
+        'e\u0000.mjs',
+        'x'.repeat(101) + '.mjs',
+        './'.repeat(256) + 'entry.mjs',
+    ])('rejects %j as an explicit main without falling back', (main) => {
+        const input = fixture(JSON.stringify({ main }), ['entry.mjs', 'index.mjs']);
+        expect(inspectZipPluginEntry(input)).toMatchObject({
+            ok: true,
+            entry: { source: 'declared', status: 'invalid_main' },
+        });
+    });
+
+    it.each([
+        ['missing.mjs', {}, ['index.mjs'], 'missing'],
+        ['LOWER.mjs', {}, ['lower.mjs', 'index.mjs'], 'missing'],
+        ['lib.mjs', {}, ['lib.mjs/data.bin', 'index.mjs'], 'directory'],
+        ['folder/', {}, ['folder/'], 'invalid_main'],
+        ['entry.cjs', { type: 'module' }, ['entry.cjs', 'index.mjs'], 'unsupported_extension'],
+        ['entry.JS', { type: 'module' }, ['entry.JS'], 'unsupported_extension'],
+        ['entry.mjs/.', {}, ['entry.mjs'], 'unsupported_extension'],
+        ['entry.js', { type: 'commonjs' }, ['entry.js', 'index.mjs'], 'module_type_required'],
+        ['entry.js', { type: null }, ['entry.js'], 'module_type_required'],
+        ['absent.js', {}, ['index.mjs'], 'module_type_required'],
+        ['lib/entry.js', { type: 'module' }, ['lib/entry.js', 'lib/PACKAGE.JSON'], 'scope_unknown'],
+        [
+            'x/node_modules/pkg/entry.js',
+            { type: 'module' },
+            ['x/node_modules/pkg/entry.js'],
+            'scope_unknown',
+        ],
+        ['lib/entry.mjs', { type: 'commonjs' }, ['lib/entry.mjs', 'lib/package.json'], 'mjs'],
+        ['entry.js', { type: 'module' }, ['entry.js', 'unrelated/package.json'], 'js'],
+    ] as const)(
+        'classifies declared %s without executing a member (%j)',
+        (main, manifest, files, status) => {
+            const input = fixture(JSON.stringify({ ...manifest, main }), [...files]);
+            const entry =
+                status === 'mjs' || status === 'js'
+                    ? { source: 'declared', status: 'candidate', format: status }
+                    : { source: 'declared', status };
+            expect(inspectZipPluginEntry(input)).toStrictEqual({
+                ...inspectZipManifest(input),
+                entry,
+            });
+        },
+    );
+
+    it.each([
+        [
+            '{}',
+            ['main.js', 'main.mjs', 'index.js', 'index.mjs'],
+            { status: 'candidate', format: 'mjs' },
+        ],
+        ['{"type":"module"}', ['main.mjs', 'index.js'], { status: 'candidate', format: 'js' }],
+        ['{}', ['index.js', 'main.mjs'], { status: 'module_type_required' }],
+        ['{}', ['index.mjs/notes.txt', 'main.mjs'], { status: 'directory' }],
+        ['{}', ['INDEX.MJS', 'main.mjs'], { status: 'candidate', format: 'mjs' }],
+        ['{"__proto__":{"main":"index.mjs"}}', ['INDEX.MJS'], { status: 'missing' }],
+    ] as const)('selects the first exact fallback for %s (%j)', (manifest, files, entry) => {
+        const input = fixture(manifest, [...files]);
+        expect(inspectZipPluginEntry(input)).toStrictEqual({
+            ...inspectZipManifest(input),
+            entry: { source: 'fallback', ...entry },
+        });
+    });
+
+    it('keeps ZIP and root-manifest error priority; does not return partial entry data', () => {
+        const malformedManifest = fixture('{', ['index.mjs']);
+        const oversizeManifest = fixture(' '.repeat(65537), ['index.mjs']);
+        const withoutManifest = archive([{ name: 'index.mjs' }]).bytes;
+        const wrongZip = archive([
+            { name: 'package.json', data: bytes('{') },
+            { name: 'index.mjs', data: bytes('fixture') },
+        ]);
+        wrongZip.bytes[wrongZip.dataOffsets[1]] ^= 1;
+
+        for (const [input, code] of [
+            [null, 'invalid_input'],
+            [withoutManifest, 'manifest_missing'],
+            [malformedManifest, 'manifest_invalid'],
+            [oversizeManifest, 'manifest_too_large'],
+            [wrongZip.bytes, 'integrity'],
+        ] as const) {
+            const result = inspectZipPluginEntry(input);
+            expect(result).toStrictEqual({ ok: false, code });
+            expect(result).toStrictEqual(inspectZipManifest(input));
+            expect(Object.isFrozen(result)).toBe(true);
+        }
+    });
+});
 
 describe('offline archive manifest classification', () => {
     it.each([0, 8] as const)(
@@ -280,12 +418,17 @@ describe('offline archive manifest classification', () => {
 
         try {
             const data = archive([
-                { name: 'package.json', data: bytes('{"main":"secret"}') },
-                { name: 'index.js', data: bytes(`globalThis.${key}=true`) },
+                { name: 'package.json', data: bytes('{"main":"secret.mjs"}') },
+                { name: 'secret.mjs', data: bytes(`globalThis.${key}=true`) },
             ]).bytes;
             const result = inspectZipManifest(data);
+            const entry = inspectZipPluginEntry(data);
             expect(result.ok).toBe(true);
-            expect(JSON.stringify(result)).not.toContain('secret');
+            expect(entry).toStrictEqual({
+                ...result,
+                entry: { source: 'declared', status: 'candidate', format: 'mjs' },
+            });
+            expect(JSON.stringify([result, entry])).not.toContain('secret');
             expect((globalThis as Record<string, unknown>)[key]).toBeUndefined();
             expect(read).not.toHaveBeenCalled();
             expect(connect).not.toHaveBeenCalled();

@@ -183,6 +183,8 @@ checks a limited ZIP32 stored/raw-DEFLATE subset and is not an installer. A
 single matching mtime-only `0x5455` extra field and fixed ZIP32 file data
 descriptors with or without the record marker are supported under the documented
 record-boundary and byte-integrity checks. Other extra fields, ZIP64 descriptors
-and non-ASCII paths remain outside the profile. The host and index can be tested with synthetic local
-plugins without running QQ. Real plugin and QQ interoperability require separate
-validation.
+and non-ASCII paths remain outside the profile. An offline entry classification
+can report whether the validated archive contains a candidate for its declared or
+fallback ESM entry; it does not execute or verify compatibility of that member.
+The host and index can be tested with synthetic local plugins without running QQ.
+Real plugin and QQ interoperability require separate validation.

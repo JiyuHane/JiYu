@@ -27,29 +27,50 @@ export type ZipPreflightResult =
       }>
     | Readonly<{ ok: false; code: ZipPreflightError }>;
 
-export type ZipManifestResult =
-    | Readonly<{
-          ok: true;
-          sha256: string;
-          manifest: Readonly<{
-              main: 'absent' | 'empty' | 'string' | 'non_string';
-              type: 'absent' | 'module' | 'commonjs' | 'other_string' | 'non_string';
-          }>;
-      }>
-    | Readonly<{
-          ok: false;
-          code:
-              | ZipPreflightError
-              | 'manifest_missing'
-              | 'manifest_too_large'
-              | 'manifest_invalid'
-              | 'manifest_internal';
-      }>;
+type ZipManifestSummary = Readonly<{
+    ok: true;
+    sha256: string;
+    manifest: Readonly<{
+        main: 'absent' | 'empty' | 'string' | 'non_string';
+        type: 'absent' | 'module' | 'commonjs' | 'other_string' | 'non_string';
+    }>;
+}>;
+
+type ZipManifestFailure = Readonly<{
+    ok: false;
+    code:
+        | ZipPreflightError
+        | 'manifest_missing'
+        | 'manifest_too_large'
+        | 'manifest_invalid'
+        | 'manifest_internal';
+}>;
+
+export type ZipManifestResult = ZipManifestSummary | ZipManifestFailure;
+
+type EntrySource = 'declared' | 'fallback';
+type EntryIssue =
+    | 'invalid_main'
+    | 'unsupported_extension'
+    | 'module_type_required'
+    | 'missing'
+    | 'directory'
+    | 'scope_unknown';
+
+type ZipPluginEntry = Readonly<
+    { source: EntrySource } & (
+        { status: 'candidate'; format: 'mjs' | 'js' } | { status: EntryIssue }
+    )
+>;
+
+export type ZipPluginEntryResult =
+    Readonly<ZipManifestSummary & { entry: ZipPluginEntry }> | ZipManifestFailure;
 
 const MAX_MANIFEST = 65536;
 const MAX_ARCHIVE = 32 * 1024 * 1024;
 const MAX_FILE = 8 * 1024 * 1024;
 const MAX_ENTRIES = 512;
+const MAX_PATH_BYTES = 512;
 const DATA_DESCRIPTOR_FLAG = 0x08;
 const UTF8_NAME_FLAG = 0x0800;
 const DATA_DESCRIPTOR_MARKER = 0x08074b50;
@@ -163,14 +184,14 @@ function supportsRawInflate(): boolean {
 
 type Tree = { spelling: string; explicit: boolean; file: boolean; children: Map<string, Tree> };
 
-function addPath(root: Tree, path: string, directory: boolean): void {
+function portablePathParts(path: string, directory: boolean): string[] | null {
     if (
         path.length === 0 ||
-        path.length > 512 ||
+        path.length > MAX_PATH_BYTES ||
         !/^[A-Za-z0-9._/-]+$/.test(path) ||
         path.startsWith('/')
     ) {
-        fail('unsafe_path');
+        return null;
     }
 
     const parts = (directory ? path.slice(0, -1) : path).split('/');
@@ -187,6 +208,16 @@ function addPath(root: Tree, path: string, directory: boolean): void {
                 /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part),
         )
     ) {
+        return null;
+    }
+
+    return parts;
+}
+
+function addPath(root: Tree, path: string, directory: boolean): void {
+    const parts = portablePathParts(path, directory);
+
+    if (!parts) {
         fail('unsafe_path');
     }
 
@@ -223,6 +254,85 @@ function addPath(root: Tree, path: string, directory: boolean): void {
     }
 }
 
+const ENTRY_FALLBACKS = ['index.mjs', 'index.js', 'main.mjs', 'main.js'] as const;
+
+function exactChild(parent: Tree, name: string): Tree | undefined {
+    const child = parent.children.get(name.toLowerCase());
+    return child?.spelling === name ? child : undefined;
+}
+
+/** Uses only the validated archive tree; this is not Node module resolution. */
+function classifyPluginEntry(root: Tree, manifest: Record<string, unknown>): ZipPluginEntry {
+    const declared = Object.hasOwn(manifest, 'main');
+    const source: EntrySource = declared ? 'declared' : 'fallback';
+    const issue = (status: EntryIssue): ZipPluginEntry => Object.freeze({ source, status });
+    const main = declared
+        ? manifest.main
+        : ENTRY_FALLBACKS.find((name) => exactChild(root, name) !== undefined);
+
+    if (!declared && main === undefined) {
+        return issue('missing');
+    }
+
+    if (typeof main !== 'string' || main.length > MAX_PATH_BYTES) {
+        return issue('invalid_main');
+    }
+
+    // Accept the conventional ./ spelling but never resolve parent segments.
+    // Preserve empty segments so the shared path check still rejects them.
+    const parts = portablePathParts(
+        main
+            .split('/')
+            .filter((part) => part !== '.')
+            .join('/'),
+        false,
+    );
+
+    if (!parts) {
+        return issue('invalid_main');
+    }
+
+    const format = main.endsWith('.mjs') ? 'mjs' : main.endsWith('.js') ? 'js' : null;
+
+    if (format === null) {
+        return issue('unsupported_extension');
+    }
+
+    if (format === 'js' && (!Object.hasOwn(manifest, 'type') || manifest.type !== 'module')) {
+        return issue('module_type_required');
+    }
+
+    let node = root;
+    let nestedScope = false;
+
+    for (const part of parts) {
+        if (
+            node !== root &&
+            (node.spelling.toLowerCase() === 'node_modules' || node.children.has('package.json'))
+        ) {
+            nestedScope = true;
+        }
+
+        const child = exactChild(node, part);
+
+        if (!child) {
+            return issue('missing');
+        }
+
+        node = child;
+    }
+
+    if (!node.file) {
+        return issue('directory');
+    }
+
+    if (format === 'js' && nestedScope) {
+        return issue('scope_unknown');
+    }
+
+    return Object.freeze({ source, status: 'candidate', format });
+}
+
 interface RecordMetadata {
     name: string;
     flags: number;
@@ -250,21 +360,28 @@ interface RecordMetadata {
  * no wall-clock or process RSS bound is promised.
  */
 export function preflightZip(input: unknown): ZipPreflightResult {
-    return parseZip(input, false);
+    return parseZip(input, 'archive');
 }
 
 /** Offline classification of a validated root package.json, without returning its contents. */
 export function inspectZipManifest(input: unknown): ZipManifestResult {
-    return parseZip(input, true);
+    return parseZip(input, 'manifest');
 }
 
-function parseZip(input: unknown, inspectManifest: false): ZipPreflightResult;
-function parseZip(input: unknown, inspectManifest: true): ZipManifestResult;
+/** Classify a possible entry member from the same validated bytes, without loading it. */
+export function inspectZipPluginEntry(input: unknown): ZipPluginEntryResult {
+    return parseZip(input, 'entry');
+}
+
+function parseZip(input: unknown, inspection: 'archive'): ZipPreflightResult;
+function parseZip(input: unknown, inspection: 'manifest'): ZipManifestResult;
+function parseZip(input: unknown, inspection: 'entry'): ZipPluginEntryResult;
 
 function parseZip(
     input: unknown,
-    inspectManifest: boolean,
-): ZipPreflightResult | ZipManifestResult {
+    inspection: 'archive' | 'manifest' | 'entry',
+): ZipPreflightResult | ZipManifestResult | ZipPluginEntryResult {
+    const inspectManifest = inspection !== 'archive';
     let bytes: Uint8Array;
     let manifestBytes: Uint8Array | undefined;
     let manifestCopyFailed = false;
@@ -442,7 +559,7 @@ function parseZip(
                 fail('limit');
             }
 
-            if (nameLength === 0 || nameLength > 512) {
+            if (nameLength === 0 || nameLength > MAX_PATH_BYTES) {
                 fail('unsafe_path');
             }
 
@@ -761,11 +878,17 @@ function parseZip(
                     : object.type === 'commonjs'
                       ? 'commonjs'
                       : 'other_string';
-            return Object.freeze({
+            const summary: ZipManifestSummary = {
                 ok: true,
                 sha256: createHash('sha256').update(bytes).digest('hex'),
                 manifest: Object.freeze({ main, type }),
-            });
+            };
+
+            if (inspection === 'entry') {
+                return Object.freeze({ ...summary, entry: classifyPluginEntry(root, object) });
+            }
+
+            return Object.freeze(summary);
         }
 
         const entries = Object.freeze(
