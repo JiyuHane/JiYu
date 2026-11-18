@@ -803,10 +803,21 @@ observation. The current `n3` is a separate descriptor read and need not match
 the earlier lengths or the original file byte.
 
 On that further selected path, `0x6c0072e` first controls a loop that copies eight
-32-bit values through a separately obtained base pointer into stack storage; its
-alias relationship with `K` is unobserved. Only after that loop finishes does the
-code initialize an index `j` to zero and, while `j < 16`, read four bytes per
-iteration from the pointer saved at `[rbp-0x1b18]`. The previously traced
+32-bit values into the stack array beginning at `V = rbp-0x12b0`. The source is
+`P0+8`, where `P0` is the value read from `[rbp-0x1558]` and saved in
+`[rbp-0x1b40]` by `0x6bfda47–0x6bfda5c`. The adjacent slot `[rbp-0x1b28]`
+saves `P0+8` at that time. Separately, `0x6be3ccd–0x6be3ce6` computes `V` and
+stores it in `[rbp-0x1b78]`; relating these facts requires the same execution
+frame and stable intervening slots. The copying source's alias relationship
+with `K` remains unobserved. Valid reads and writes and non-destructive overlap
+are required for the copied words to retain their respective source values; a
+single simultaneous eight-word source state additionally requires the source
+not to change across reads. The 32-byte working array at `[rbp-0x12b0,
+rbp-0x1290)` is adjacent to, and does not overlap, the 256-byte schedule array
+at `[rbp-0x13b0, rbp-0x12b0)`; the source range has not been shown disjoint
+from either. Only after that loop finishes does the code initialize an index
+`j` to zero and, while `j < 16`, read four bytes per iteration from the pointer
+saved at `[rbp-0x1b18]`. The previously traced
 pointer-copy chain identifies that pointer as `K` under the same slot-stability
 and non-destructive-alias assumptions. The byte loads at `0x6c0058c`,
 `0x6c00593`, `0x6c0059d` and `0x6bff4d1` are combined and written to the stack
@@ -823,25 +834,38 @@ first iteration, `0x6c004bc–0x6c004dd` reads `W[0]` and the first 32-bit table
 entry at linked address `0x00fe6a00`. Assuming `W[0]` remains intact between
 its creation and this use, these values and the `r15` fields are readable and
 stable across their uses, and the intermediate stack slots are writable without
-destructive aliasing, write `E`, `F`, `G` and `H` for
-the loaded 32-bit fields at offsets `+0x10`, `+0x14`, `+0x18` and `+0x1c` of
-`r15`. The inspected instructions compute, modulo 2^32:
+destructive aliasing, write `A` through `H` for the 32-bit fields at offsets
+`0` through `+0x1c` of the `r15` value at `0x6c0042a`. Under those same
+conditions, the inspected first item computes and writes, modulo 2^32:
 
 ```text
-mix = G ^ ((F ^ G) & E)
-rot = ROL32(E, 26) ^ ROL32(E, 21) ^ ROL32(E, 7)
-T   = H + rot + table[0] + mix + W[0]
+T1 = H + (ROL32(E, 26) ^ ROL32(E, 21) ^ ROL32(E, 7))
+       + (G ^ ((F ^ G) & E)) + table[0] + W[0]
+T2 = (ROL32(A, 30) ^ ROL32(A, 19) ^ ROL32(A, 10))
+       + ((A & B) | (A & C) | (B & C))
+[r15+0x0c] = D + T1
+[r15+0x1c] = T1 + T2
 ```
 
-The result is stored in a temporary stack slot at `0x6c004f5`. The table's first
+The `T1` result is stored in a temporary stack slot at `0x6c004f5`; `T2` is
+stored at `0x6c000ed`, followed by the two writes at `0x6c0011a` and
+`0x6c00135`. A second static decoder independently confirmed this first item.
+Linking that `r15` to `V` additionally requires the register to still contain,
+or have restored, the saved pointer when entering `0x6c0042a`; it is used as
+scratch on other paths. A separate trace identifies two unrolled batches
+beginning at `k=0` and `k=8`, reading `W[k+n]` and `table[k+n]` for `n=0..7`
+and advancing `k` by eight. The independent check covers the first update,
+not the complete formula of every unrolled item. These are in-place slot writes,
+not proof that the code literally shifts all eight fields. The table's first
 16 original file bytes are `98 2f 8a 42 91 44 37 71 cf fb c0 b5 a5 db b5 e9`;
 interpreted as little-endian 32-bit words they are `428a2f98`, `71374491`,
 `b5c0fbcf` and `e9b5dba5`. Treating those as runtime table values additionally
 requires the loading, any relocations and subsequent writes to preserve the
-corresponding file bytes. The first-round expression and these first four
-constants match the corresponding SHA-256 compression term and round constants;
-this local match does not prove the complete algorithm, final output, or a
-connection to the current QQ SSO signing callback.
+corresponding file bytes. The first-item expressions, two writes and these first
+four constants are consistent with one SHA-256 compression update using rotating
+slots and the corresponding round constants. This local match does not prove the
+complete algorithm, final output, or a connection to the current QQ SSO signing
+callback.
 
 On the further selected `k >= 16` branch, `0x6bff5c8` initializes a batch index
 `b` to 16. At `0x6c00b43`, an unsigned comparison selects the expansion path
@@ -875,14 +899,22 @@ a runtime execution of the target.
 After the `b=64` branch, the selected dispatcher initializes a new index to
 zero and loops while it is below eight. `0x6c006cf` reads a 32-bit word through
 `r15`, and `0x6c006ff` adds it modulo 2^32 to the corresponding word through
-`Q = [rbp-0x1b28]`, writing the sum back through `Q`. The traced setup makes
-`Q = *[rbp-0x1c10] + 8`, with `[rbp-0x1c10] = &[rbp-0x1558]`; it is `P+8` only
-if the previously established `P` slot and intervening pointer values remain
-unchanged. The eight source words and destination words must be readable and
-the destination writable; `r15`, `Q`, the index and intermediate pointer slots
-must stay stable across the loop, without concurrent interference or destructive
-aliasing. The original identity of the `r15` value at writeback, the complete
-preceding round sequence, final output and any SSO connection remain unestablished.
+`Q = [rbp-0x1b28]`, writing the sum back through `Q`. The traced setup saved
+`P0+8` there, using the value read through `[rbp-0x1c10]` at that time; the
+latter pointer was set to `&[rbp-0x1558]`. The saved `Q` equals `P+8` only if
+that earlier slot still held the previously established `P` when sampled and
+the saved `Q` slot remains unchanged. Later changes to `[rbp-0x1558]` do not
+themselves change the already-saved pointers. On the selected last expansion
+batch, `0x6bffbcc` restores `r15`
+from `[rbp-0x1b78]`; if that slot still contains `V`, the traced successors
+leave the register unchanged, and `[rbp-0x1b28]` still contains the previously
+saved `P0+8` through the writeback reads, this add-back reads `V` and writes to
+`P0+8`. The eight source words and destination words must be readable and the
+destination writable; `r15`, `Q`, the index and intermediate pointer slots must
+stay stable across the loop, without concurrent interference or destructive
+aliasing. If the two ranges coincide, these additions instead double the words;
+partial overlap can also affect subsequent reads. The complete preceding round
+sequence, final output and any SSO connection remain unestablished.
 
 The original file bytes `+0xc = 0x20` and `+0xd = 0x40` suggest `L=32` and
 64-byte halves only if they and the relevant reads remain unchanged at runtime.

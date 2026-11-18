@@ -532,7 +532,8 @@ JSON `int64`; `offset` and `size` are byte counts. TypeScript's `number` type do
 not enforce integer or range restrictions. The shapes permit JSON extension
 fields, although a particular server may reject them. The generic codec retains
 its existing JSON and safe-number policies, but performs no action-specific field,
-range, Base64 or digest validation; these new types add no runtime interception.
+range, Base64 or digest validation. These type declarations alone add no runtime
+interception; the separate helpers below perform their stated shape checks.
 
 For a `client` and a `fileId` supplied by a supporting implementation, the
 existing generic calls can describe the two stages:
@@ -572,15 +573,126 @@ source authenticity or content integrity. Callers that require integrity need to
 verify the assembled bytes and assess the trust of any expected digest separately.
 The SDK does not automatically decode, assemble, verify, retry or stream these calls.
 
+### Single-stage helpers
+
+`@harehane/sdk/v12` also exports browser-safe standalone functions
+`prepareOneBot12FileFragment` and `transferOneBot12FileFragment`. Their signatures
+use the exported `OneBot12FileFragmentRequester` structural `request` interface:
+
+```ts
+interface OneBot12FileFragmentRequester {
+    request(
+        action: string,
+        params?: OneBot12JsonObject,
+        options?: OneBot12RequestOptions,
+    ): Promise<OneBot12ActionResponse>;
+}
+
+declare function prepareOneBot12FileFragment<T extends OneBot12FileFragmentRequester>(
+    transport: T,
+    params: OneBot12GetFileFragmentedPrepareParams,
+    options?: Parameters<T['request']>[2],
+): Promise<OneBot12GetFileFragmentedPrepareResponse>;
+
+declare function transferOneBot12FileFragment<T extends OneBot12FileFragmentRequester>(
+    transport: T,
+    params: OneBot12GetFileFragmentedTransferParams,
+    options?: Parameters<T['request']>[2],
+): Promise<OneBot12GetFileFragmentedTransferResponse>;
+```
+
+Each helper attempts at most one `request('get_file_fragmented', ...)` call.
+Invalid local input is rejected before that attempt. Neither function starts a
+multi-request download or automatically requests the other stage.
+
+For example, with the HTTP `client` above and a `fileId` from a supporting
+implementation:
+
+```ts
+import {
+    prepareOneBot12FileFragment,
+    transferOneBot12FileFragment,
+} from '@harehane/sdk/v12';
+
+const metadata = await prepareOneBot12FileFragment(
+    client,
+    { stage: 'prepare', file_id: fileId },
+    { echo: 'prepare-file' }, // HTTP option
+);
+
+if (metadata.status === 'ok' && metadata.data.total_size >= 1) {
+    // A supporting server may still reject this illustrative range.
+    const fragment = await transferOneBot12FileFragment(
+        client,
+        { stage: 'transfer', file_id: fileId, offset: 0, size: 1 },
+        { echo: 'read-file' }, // HTTP option
+    );
+    if (fragment.status === 'ok') {
+        const encoded = fragment.data.data; // string, not verified bytes
+        void encoded;
+    }
+}
+```
+
+The helper snapshots the whole JSON parameter object before calling the
+transport and validates the requested `stage` and a string `file_id`. For
+transfer, `offset` and `size` must also be safe integers: zero and negative safe
+integers pass the helper; fractions and unsafe integers do not. A successful
+prepare response must have string `name` and `sha256` and a safe-integer
+`total_size`, also including zero or negative values; a successful transfer
+response must have string `data`. Strings can be empty. JSON extension fields
+are retained subject to the SDK's generic JSON limits. Although the TypeScript
+index signature permits `undefined`, an own field with that value is not JSON
+and the generic parser rejects it; omit the field instead. The helper does not
+validate a server's allowed ranges, decode or check Base64, validate digest
+syntax, compare a hash, authenticate a source, assemble data or retry. A
+server-reported digest alone does not establish integrity. Applications must
+select ranges and perform any decoding and integrity checks they require.
+
+A rejected parameter snapshot or stage-specific input yields a rejected promise
+with `OneBot12ClientError` code `invalid_options` and fixed message
+`Invalid get_file_fragmented parameters`. If the transport resolves with a
+malformed envelope or malformed successful stage result, the helper rejects
+with code `invalid_response` and fixed message `Invalid get_file_fragmented response`.
+An `ok` response must also satisfy the generic zero-retcode rule. A valid
+`failed` response is returned rather than thrown, preserving its JSON contents
+and extensions, including a zero or negative safe-integer `retcode`; its object
+identity and original prototypes are not preserved. Transport exceptions,
+including abort and timeout errors, propagate unchanged. Existing SDK `call()`
+and `request()` remain generic; these helpers have stage-specific return types.
+
+The response envelope and its JSON data are snapshotted again after the
+transport request resolves. Both that response snapshot and the synchronous
+parameter snapshot occur outside the SDK transport's own timeout: the timeout is
+not a whole-helper deadline and cannot interrupt synchronous processing. The SDK
+codec rejects accessors in the copied JSON shape, but reflection on a Proxy can
+execute traps; a custom transport's `request` or returned thenable can also
+reenter.
+These snapshots are not a security or atomicity boundary. Object inputs also
+cannot recover precision already lost in an earlier JSON parse.
+
+A supplied options object is passed through by the same reference, not
+snapshotted. While a WebSocket is opening, for example, a later change to
+`options.self` may affect what that transport serializes. HTTP retains its
+existing echo policy; WebSocket transports generate their own correlation echo
+and do not use a caller-supplied `echo`. An extra `echo` property passed from
+JavaScript is ignored by those transports rather than rejected. The options type
+is inferred from the visible third parameter of `T['request']`: widening to the
+structural requester or using an overloaded or generic request method can lose
+transport-specific option information. Use the concrete transport type where
+that information is needed.
+
 An implementation must support the action; exporting types does not establish
 server support. Even a listed action does not promise every file ID or range is
 accepted. Jiyu's account runtime provides this action only while its local data
 capability and listener lease are available. It covers only an `upload_file`
 `type: 'data'` token held in memory for the same account and current listener
-generation, subject to its lifetime and capacity limits. Jiyu permits zero-byte
-ranges, rejects ranges extending beyond the file rather than truncating them, and
-samples expiry on each read; these are implementation policies, not universal
-server guarantees. URL/path uploads, legacy v11 IDs and incoming QQ media handles
+generation, subject to its lifetime and capacity limits. Jiyu requires
+nonnegative `offset` and `size`, permits zero-byte ranges, bounds local files and
+ranges to 256 KiB, rejects ranges extending beyond the file rather than truncating
+them, and samples expiry on each read. Thus a negative value accepted by a helper
+is rejected by Jiyu. These are implementation policies, not universal server
+guarantees. URL/path uploads, legacy v11 IDs and incoming QQ media handles
 are outside that scope. This is not a claim about QQ media retrieval, other
 OneBot servers or network availability.
 

@@ -65,6 +65,8 @@ export {
     serializeOneBot12ActionResponse,
     serializeOneBot12Event,
 } from './protocol.js';
+export { prepareOneBot12FileFragment, transferOneBot12FileFragment } from './file-fragmented.js';
+export type { OneBot12FileFragmentRequester } from './file-fragmented.js';
 export { OneBot12ClientError } from './client-types.js';
 export type { OneBot12ClientOptions, OneBot12RequestOptions } from './client-types.js';
 export { OneBot12HttpClient } from './http-client.js';
