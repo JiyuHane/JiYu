@@ -534,8 +534,43 @@ corresponding `Response` types, all exported by `@harehane/sdk/v12`.
 The two ID-bearing result shapes are also exported. Byte lengths and offsets
 use the JavaScript safe-integer subset of `int64`; these static types do not
 validate ranges, Base64, digest syntax or content. The failure branches retain
-generic JSON `data`. `call()` and `request()` remain generic; no upload loop,
-retry, digest calculation, or stage-specific response validation is added.
+generic JSON `data`. `call()` and `request()` remain generic. Use the optional
+helpers below for stage-specific validation and response types.
+
+### Single-stage upload helpers
+
+`@harehane/sdk/v12` exports three browser-safe functions:
+
+- `prepareOneBot12FragmentedUpload(transport, params, options?)`
+- `transferOneBot12FragmentedUpload(transport, params, options?)`
+- `finishOneBot12FragmentedUpload(transport, params, options?)`
+
+Each accepts the corresponding typed params, including the literal `stage`,
+checks a snapshot of the JSON object, and calls
+`transport.request('upload_file_fragmented', …)` at most once. The transport
+implements the same structural `OneBot12FileFragmentRequester` used by the
+read helpers. HTTP, forward WebSocket and Node reverse WebSocket sessions
+keep their own request options; the helper forwards the original options
+object. It starts no next stage, upload loop, automatic retry or hash calculation.
+
+The checks require a string `name` (possibly empty), nonnegative safe integers
+for `total_size` and `offset`, nonempty opaque IDs, a string `data` for transfer,
+and exactly 64 lowercase hexadecimal characters for the finish digest. The
+helper does not check the Base64 alphabet, decode bytes, verify a digest,
+apply Jiyu's size cap, or track offset continuity. The server may reject a
+string (including empty data), a size or a range the helper accepted. JSON
+extensions are preserved by the SDK codec; Jiyu rejects extra stage fields.
+
+A resolved envelope is snapshotted again. On success, prepare and finish
+must return a data object with a nonempty string `file_id`; transfer must
+return `data: null`. A valid business failure is returned as JSON, not thrown.
+Local snapshot/shape failures reject with `OneBot12ClientError` code
+`invalid_options` (`Invalid upload_file_fragmented parameters`) or
+`invalid_response` (`Invalid upload_file_fragmented response`). Transport
+rejections propagate unchanged. As with the read helpers, snapshots happen
+outside the transport deadline and are not an isolation boundary for custom
+JavaScript objects or transports. A malformed response or a timeout is not
+evidence that a mutating stage did not run.
 
 On Jiyu, discover `upload_file_fragmented` on the active listener, then send the
 three stages as separate calls. Wait for each success before submitting the next.
@@ -718,9 +753,10 @@ that information is needed.
 An implementation must support the action; exporting types does not establish
 server support. Even a listed action does not promise every file ID or range is
 accepted. Jiyu's account runtime provides this action only while its local data
-capability and listener lease are available. It covers only an `upload_file`
-`type: 'data'` token held in memory for the same account and current listener
-generation, subject to its lifetime and capacity limits. Jiyu requires
+capability and listener lease are available. It covers only a published local
+file ID from `upload_file` data mode or `upload_file_fragmented` finish, held in
+memory for the same account and current listener generation, subject to its
+lifetime and capacity limits. Jiyu requires
 nonnegative `offset` and `size`, permits zero-byte ranges, bounds local files and
 ranges to 256 KiB, rejects ranges extending beyond the file rather than truncating
 them, and samples expiry on each read. Thus a negative value accepted by a helper

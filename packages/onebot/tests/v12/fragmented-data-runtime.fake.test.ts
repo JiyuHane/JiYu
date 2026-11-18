@@ -435,6 +435,40 @@ async function expectDraftUnreadable(f: Account, draft: string) {
 }
 
 describe('upload_file_fragmented through SDK, runtime and generation-local store', () => {
+    it('round-trips the public upload helpers and preserves an incomplete finish', async () => {
+        const {
+            prepareOneBot12FragmentedUpload,
+            transferOneBot12FragmentedUpload,
+            finishOneBot12FragmentedUpload,
+        } = await import('../../../sdk/src/v12/index.js');
+        const f = await account('10001');
+        const options = { self: { platform: 'qq', user_id: f.uin }, echo: 'sdk-upload🪶' };
+        const prepared = await prepareOneBot12FragmentedUpload(
+            f.client,
+            { stage: 'prepare', name: NAME, total_size: 5 },
+            options,
+        );
+        const draft = uploadedId(prepared, options.echo, DRAFT_PREFIX);
+        const finish = { stage: 'finish', file_id: draft, sha256: SHA256 } as const;
+        expect(await finishOneBot12FragmentedUpload(f.client, finish, options)).toEqual({
+            ...failedEnvelope(10004, options.echo),
+            message: 'incomplete upload',
+        });
+        const written = await transferOneBot12FragmentedUpload(
+            f.client,
+            { stage: 'transfer', file_id: draft, offset: 0, data: DATA },
+            options,
+        );
+        expect(written).toEqual(okEnvelope(null, options.echo));
+        await expectDraftUnreadable(f, draft);
+
+        const finished = await finishOneBot12FragmentedUpload(f.client, finish, options);
+        const id = uploadedId(finished, options.echo);
+        const read = await f.client.request('get_file', { type: 'data', file_id: id }, options);
+        expect(read).toEqual(okEnvelope({ name: NAME, data: DATA, sha256: SHA256 }, options.echo));
+        expect(f.api.handle).not.toHaveBeenCalled();
+    });
+
     it('publishes ordered binary fragments only after finish, at the 256 KiB limit', async () => {
         const f = await account('10001');
         expect((await f.client.request('get_supported_actions')).data).toContain(FRAGMENT_UPLOAD);

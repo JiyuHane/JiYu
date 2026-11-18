@@ -8,8 +8,11 @@ import { describe, expect, it } from 'vitest';
 // entry points; published declarations need a separate packaging check.
 const consumerSource = `
 import {
+    finishOneBot12FragmentedUpload,
     prepareOneBot12FileFragment,
+    prepareOneBot12FragmentedUpload,
     transferOneBot12FileFragment,
+    transferOneBot12FragmentedUpload,
 } from '@harehane/sdk/v12';
 import type {
     OneBot12ActionResponse,
@@ -24,6 +27,12 @@ import type {
     OneBot12JsonObject,
     OneBot12JsonValue,
     OneBot12RequestOptions,
+    OneBot12UploadFileFragmentedFinishParams,
+    OneBot12UploadFileFragmentedFinishResponse,
+    OneBot12UploadFileFragmentedPrepareParams,
+    OneBot12UploadFileFragmentedPrepareResponse,
+    OneBot12UploadFileFragmentedTransferParams,
+    OneBot12UploadFileFragmentedTransferResponse,
     OneBot12WebSocketClient,
 } from '@harehane/sdk/v12';
 import type { OneBot12ReverseWebSocketSession } from '@harehane/sdk/v12/node';
@@ -39,7 +48,7 @@ type SyntheticRequester = {
         this: SyntheticRequester,
         action: string,
         params?: OneBot12JsonObject,
-        options?: OneBot12RequestOptions,
+        options?: OneBot12RequestOptions & { fixture?: 'in-memory' },
     ): Promise<OneBot12ActionResponse>;
 };
 
@@ -171,6 +180,63 @@ async function publicConsumer() {
     void prepareOneBot12FileFragment(http, { stage: 'prepare', file_id: 'id', 'vendor.invalid': () => 1 });
 }
 void publicConsumer;
+
+async function uploadConsumer() {
+    const prepareUpload: OneBot12UploadFileFragmentedPrepareParams = {
+        stage: 'prepare',
+        name: 'fixture.bin',
+        total_size: 0,
+        'vendor.options': { nested: [true, null] },
+    };
+    const transferUpload: OneBot12UploadFileFragmentedTransferParams = {
+        stage: 'transfer', file_id: 'draft-id', offset: 0, data: '',
+    };
+    const finishUpload: OneBot12UploadFileFragmentedFinishParams = {
+        stage: 'finish', file_id: 'draft-id', sha256: 'a'.repeat(64),
+    };
+    const prepared = prepareOneBot12FragmentedUpload(http, prepareUpload, {
+        ...httpOptions,
+        echo: 'upload-echo',
+    });
+    const transferred = transferOneBot12FragmentedUpload(ws, transferUpload, baseOptions);
+    const finished = finishOneBot12FragmentedUpload(reverse, finishUpload, baseOptions);
+    void prepareOneBot12FragmentedUpload(ws, prepareUpload, baseOptions);
+    // @ts-expect-error forward WebSocket options do not accept echo
+    void prepareOneBot12FragmentedUpload(ws, prepareUpload, { ...baseOptions, echo: 'http-only' });
+    void transferOneBot12FragmentedUpload(http, transferUpload, { echo: 'upload-echo' });
+    void finishOneBot12FragmentedUpload(http, finishUpload, { echo: 'upload-echo' });
+    void prepareOneBot12FragmentedUpload(synthetic, prepareUpload);
+    void finishOneBot12FragmentedUpload(synthetic, finishUpload, { fixture: 'in-memory' });
+
+    type ReturnChecks = [
+        Assert<Equal<Awaited<typeof prepared>, OneBot12UploadFileFragmentedPrepareResponse>>,
+        Assert<Equal<Awaited<typeof transferred>, OneBot12UploadFileFragmentedTransferResponse>>,
+        Assert<Equal<Awaited<typeof finished>, OneBot12UploadFileFragmentedFinishResponse>>
+    ];
+    const checkReturns: ReturnChecks = [true, true, true];
+    void checkReturns;
+
+    const p = await prepared;
+    const t = await transferred;
+    const f = await finished;
+    if (p.status === 'ok' && t.status === 'ok' && f.status === 'ok') {
+        void (p.data.file_id satisfies string);
+        void (t.data satisfies null);
+        void (f.data.file_id satisfies string);
+    }
+
+    // @ts-expect-error forward WebSocket options do not accept echo
+    void transferOneBot12FragmentedUpload(ws, transferUpload, { ...baseOptions, echo: 'http-only' });
+    // @ts-expect-error reverse WebSocket options do not accept echo
+    void finishOneBot12FragmentedUpload(reverse, finishUpload, { ...baseOptions, echo: 'http-only' });
+    // @ts-expect-error stages are not interchangeable
+    void prepareOneBot12FragmentedUpload(http, transferUpload);
+    // @ts-expect-error transfer requires a data string
+    void transferOneBot12FragmentedUpload(http, { stage: 'transfer', file_id: 'draft-id', offset: 0 });
+    // @ts-expect-error finish requires a digest
+    void finishOneBot12FragmentedUpload(http, { stage: 'finish', file_id: 'draft-id' });
+}
+void uploadConsumer;
 `;
 
 function typecheckPublicConsumer(): void {
