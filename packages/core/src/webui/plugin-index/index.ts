@@ -265,6 +265,43 @@ async function readBody(response: Response, resources: ResponseResources): Promi
     }
 }
 
+type IndexSnapshot = {
+    index: CommunityIndex;
+    fetchedAt: number;
+    validatedAt: number;
+    etag: string | null;
+};
+
+type IndexRefresh =
+    | { kind: 'replaced'; index: CommunityIndex; etag: string | null }
+    | { kind: 'unchanged'; previous: IndexSnapshot; etag: string };
+
+type IndexFlight = { promise: Promise<IndexResult>; force: boolean };
+
+/** Admit one bounded ASCII entity-tag, never a list or wildcard. */
+function entityTag(value: unknown): string | null {
+    return typeof value === 'string' &&
+        value.length <= 1024 &&
+        /^(?:W\/)?"[\x21\x23-\x7e]*"$/.test(value)
+        ? value
+        : null;
+}
+
+function opaqueTag(value: string): string {
+    return value.startsWith('W/') ? value.slice(2) : value;
+}
+
+function snapshotResult(snapshot: IndexSnapshot, error: IndexError | null): IndexResult {
+    return {
+        index: snapshot.index,
+        fetchedAt: snapshot.fetchedAt,
+        stale: error !== null,
+        error,
+        verified: false,
+        minVersionTarget: 'NapCat',
+    };
+}
+
 export interface CommunityIndexOptions {
     fetch?: typeof globalThis.fetch;
     now?: () => number;
@@ -276,22 +313,27 @@ export function createCommunityIndexService(options: CommunityIndexOptions = {})
     const fetchIndex = options.fetch ?? globalThis.fetch;
     const now = options.now ?? Date.now;
     const timeoutMs = options.timeoutMs ?? INDEX_TIMEOUT_MS;
-    let snapshot: { index: CommunityIndex; fetchedAt: number } | null = null;
-    let pending: Promise<IndexResult> | null = null;
+    let snapshot: IndexSnapshot | null = null;
+    let pending: IndexFlight | null = null;
     let lastError: IndexError | null = null;
 
     async function refresh(): Promise<IndexResult> {
+        const previous = snapshot;
+        const validator = previous?.etag ?? null;
         const controller = new AbortController();
         const resources: ResponseResources = { body: null, reader: null };
         let timer: ReturnType<typeof setTimeout> | undefined;
 
         try {
-            const request = async () => {
+            const request = async (): Promise<IndexRefresh> => {
                 const response = await fetchIndex(COMMUNITY_INDEX_URL, {
                     method: 'GET',
                     redirect: 'error',
                     signal: controller.signal,
-                    headers: { Accept: 'application/json' },
+                    headers: {
+                        Accept: 'application/json',
+                        ...(validator === null ? {} : { 'If-None-Match': validator }),
+                    },
                 });
 
                 resources.body = response.body;
@@ -301,18 +343,39 @@ export function createCommunityIndexService(options: CommunityIndexOptions = {})
                     throw new IndexFailure('timeout');
                 }
 
-                if (
-                    !response.ok ||
-                    response.redirected ||
-                    (response.url && response.url !== COMMUNITY_INDEX_URL)
-                ) {
+                const url = response.url;
+
+                if (response.redirected || (url && url !== COMMUNITY_INDEX_URL)) {
                     throw new IndexFailure('http');
                 }
 
-                return parseCommunityIndex(await readBody(response, resources));
+                const status = response.status;
+
+                if (status === 304) {
+                    if (previous === null || validator === null || resources.body !== null) {
+                        throw new IndexFailure('http');
+                    }
+
+                    const field = response.headers.get('etag');
+                    const etag = field === null ? validator : entityTag(field);
+
+                    if (etag === null || opaqueTag(etag) !== opaqueTag(validator)) {
+                        throw new IndexFailure('http');
+                    }
+
+                    return { kind: 'unchanged', previous, etag };
+                }
+
+                if (!response.ok) {
+                    throw new IndexFailure('http');
+                }
+
+                const index = parseCommunityIndex(await readBody(response, resources));
+                const etag = status === 200 ? entityTag(response.headers.get('etag')) : null;
+                return { kind: 'replaced', index, etag };
             };
 
-            const index = await Promise.race([
+            const result = await Promise.race([
                 request(),
                 new Promise<never>((_, reject) => {
                     timer = setTimeout(() => {
@@ -321,27 +384,29 @@ export function createCommunityIndexService(options: CommunityIndexOptions = {})
                     }, timeoutMs);
                 }),
             ]);
-            snapshot = { index, fetchedAt: now() };
+            const validatedAt = now();
+
+            if (controller.signal.aborted) {
+                throw new IndexFailure('timeout');
+            }
+
+            snapshot =
+                result.kind === 'unchanged'
+                    ? { ...result.previous, validatedAt, etag: result.etag }
+                    : {
+                          index: result.index,
+                          fetchedAt: validatedAt,
+                          validatedAt,
+                          etag: result.etag,
+                      };
             lastError = null;
-            return {
-                ...snapshot,
-                stale: false,
-                error: null,
-                verified: false,
-                minVersionTarget: 'NapCat',
-            };
+            return snapshotResult(snapshot, null);
         } catch (error) {
             const code = error instanceof IndexFailure ? error.code : 'network';
             lastError = code;
 
             if (snapshot) {
-                return {
-                    ...snapshot,
-                    stale: true,
-                    error: code,
-                    verified: false,
-                    minVersionTarget: 'NapCat',
-                };
+                return snapshotResult(snapshot, code);
             }
 
             return {
@@ -364,30 +429,64 @@ export function createCommunityIndexService(options: CommunityIndexOptions = {})
 
     async function get(force = false): Promise<IndexResult> {
         if (pending) {
-            return structuredClone(await pending);
+            pending.force ||= force;
+            return structuredClone(await pending.promise);
         }
 
-        if (
-            !force &&
-            snapshot &&
-            now() >= snapshot.fetchedAt &&
-            now() - snapshot.fetchedAt < INDEX_TTL_MS
-        ) {
-            return structuredClone({
-                ...snapshot,
-                stale: lastError !== null,
-                error: lastError,
-                verified: false,
-                minVersionTarget: 'NapCat',
-            } as IndexResult);
-        }
-
-        pending = refresh();
+        // Publish the shared decision before the injected clock or fetch can reenter.
+        let resolve!: (result: IndexResult | PromiseLike<IndexResult>) => void;
+        let reject!: (error: unknown) => void;
+        const promise = new Promise<IndexResult>((onSuccess, onFailure) => {
+            resolve = onSuccess;
+            reject = onFailure;
+        });
+        const flight: IndexFlight = { promise, force };
+        pending = flight;
 
         try {
-            return structuredClone(await pending);
+            const cached = snapshot;
+            let hit: IndexResult | null = null;
+
+            if (!flight.force && cached) {
+                try {
+                    const time = now();
+
+                    if (
+                        !flight.force &&
+                        time >= cached.validatedAt &&
+                        time - cached.validatedAt < INDEX_TTL_MS
+                    ) {
+                        hit = snapshotResult(cached, lastError);
+                    }
+                } catch (error) {
+                    // A reentrant explicit refresh does not need the failed cache-age sample.
+                    if (!flight.force) {
+                        throw error;
+                    }
+                }
+            }
+
+            if (hit) {
+                // A completed cache decision must not absorb a subsequent explicit refresh.
+                pending = null;
+                resolve(hit);
+            } else {
+                resolve(refresh());
+            }
+        } catch (error) {
+            if (pending === flight) {
+                pending = null;
+            }
+
+            reject(error);
+        }
+
+        try {
+            return structuredClone(await promise);
         } finally {
-            pending = null;
+            if (pending === flight) {
+                pending = null;
+            }
         }
     }
 

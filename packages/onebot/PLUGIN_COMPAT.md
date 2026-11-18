@@ -14,6 +14,26 @@ plugin's author, source authenticity, license, safety, or compatibility with
 Jiyu. Its `minVersion` describes NapCat, not Jiyu. Treat each plugin's own
 license and attribution independently.
 
+### Index refresh
+
+Jiyu fetches only the fixed public index URL and does not follow redirects.
+An accepted HTTP `200` can supply a single ASCII `ETag` of at most 1,024
+characters. An invalid or unsupported tag on that response is ignored without
+discarding its index body. On expiry of the ten-minute cache window or an
+explicit refresh, a retained tag is sent only to that URL
+as `If-None-Match`. Concurrent refreshes on the same service share one request.
+
+A `304` can reuse the cached index only for a conditional request, with no
+response body exposed by Fetch and with no conflicting URL or redirect. A
+returned `ETag`, if present, must match the requested opaque value under weak
+comparison (the `W/` prefix is ignored for comparison). An accepted `304`
+restarts the cache window and clears staleness without refetching the index
+body; `fetchedAt` remains the last successful full-body timestamp. Neither the
+validator nor the internal revalidation time is exposed by the API. Failed,
+unsolicited or conflicting responses preserve the last index as stale, if
+available, without extending its cache window. This narrow cache behavior is not
+a source or signature check and does not verify plugin contents or compatibility.
+
 ## Third-party plugin responsibility
 
 Third-party plugins are independently developed, maintained and operated by
