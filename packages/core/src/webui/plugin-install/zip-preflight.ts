@@ -52,8 +52,9 @@ const MAX_FILE = 8 * 1024 * 1024;
 const MAX_ENTRIES = 512;
 const DATA_DESCRIPTOR_FLAG = 0x08;
 const UTF8_NAME_FLAG = 0x0800;
-const DATA_DESCRIPTOR_SIGNATURE = 0x08074b50;
-const ZIP32_DATA_DESCRIPTOR_BYTES = 16;
+const DATA_DESCRIPTOR_MARKER = 0x08074b50;
+const ZIP32_DATA_DESCRIPTOR_BYTES = 12;
+const MARKED_ZIP32_DATA_DESCRIPTOR_BYTES = 4 + ZIP32_DATA_DESCRIPTOR_BYTES;
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
 const typedBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
 const typedOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get!;
@@ -241,8 +242,8 @@ interface RecordMetadata {
 /**
  * Synchronous preflight of a strict ZIP32 stored/raw-DEFLATE subset, suited to
  * synthetic fixtures. An archive with no file entries is malformed. Only a
- * symmetric mtime-only UT extra field and fixed, marked ZIP32 file data
- * descriptors are supported. The result establishes neither plugin
+ * symmetric mtime-only UT extra field and fixed ZIP32 file data descriptors
+ * with or without the record marker are supported. The result establishes neither plugin
  * compatibility, provenance, permission nor filesystem safety; this function
  * performs no extraction or installation.
  * Work is bounded by one input snapshot, entry count and declared output limits;
@@ -535,14 +536,19 @@ function parseZip(
             bound(localCursor + 30, nameLength, nextOffset);
             bound(extraStart, extraLength, nextOffset);
             const dataStart = extraStart + extraLength;
+            bound(dataStart, record.compressed, nextOffset);
             const dataEnd = dataStart + record.compressed;
             const hasDescriptor = (record.flags & DATA_DESCRIPTOR_FLAG) !== 0;
-            const descriptorBytes = hasDescriptor ? ZIP32_DATA_DESCRIPTOR_BYTES : 0;
-            const localEnd = dataEnd + descriptorBytes;
-            bound(dataStart, record.compressed + descriptorBytes, nextOffset);
+            const remaining = nextOffset - dataEnd;
 
-            // Use directory lengths and the next record boundary, not a marker search.
-            if (localEnd !== nextOffset) {
+            // Select the layout by the physical boundary, not by scanning or
+            // interpreting an unmarked descriptor's first word as a marker.
+            if (
+                hasDescriptor
+                    ? remaining !== ZIP32_DATA_DESCRIPTOR_BYTES &&
+                      remaining !== MARKED_ZIP32_DATA_DESCRIPTOR_BYTES
+                    : remaining !== 0
+            ) {
                 fail('malformed');
             }
 
@@ -557,18 +563,29 @@ function parseZip(
                 fail('malformed');
             }
 
-            if (
-                hasDescriptor &&
-                (u32(localCursor + 14) !== 0 ||
-                    u32(localCursor + 18) !== 0 ||
-                    u32(localCursor + 22) !== 0 ||
-                    u32(dataEnd) !== DATA_DESCRIPTOR_SIGNATURE)
-            ) {
-                fail('malformed');
+            let fieldsStart = localCursor + 14;
+
+            if (hasDescriptor) {
+                if (
+                    u32(fieldsStart) !== 0 ||
+                    u32(fieldsStart + 4) !== 0 ||
+                    u32(fieldsStart + 8) !== 0
+                ) {
+                    fail('malformed');
+                }
+
+                fieldsStart = dataEnd;
+
+                if (remaining === MARKED_ZIP32_DATA_DESCRIPTOR_BYTES) {
+                    if (u32(fieldsStart) !== DATA_DESCRIPTOR_MARKER) {
+                        fail('malformed');
+                    }
+
+                    fieldsStart += 4;
+                }
             }
 
             // CRC and both sizes must match the directory in the selected location.
-            const fieldsStart = hasDescriptor ? dataEnd + 4 : localCursor + 14;
 
             if (
                 u32(fieldsStart) !== record.crc ||
@@ -589,7 +606,7 @@ function parseZip(
             }
 
             record.dataStart = dataStart;
-            localCursor = localEnd;
+            localCursor = nextOffset;
         }
 
         if (localCursor !== centralStart || !records.some((record) => !record.directory)) {

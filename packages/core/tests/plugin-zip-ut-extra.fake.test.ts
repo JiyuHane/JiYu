@@ -21,6 +21,8 @@ vi.mock('node:zlib', async (importOriginal) => {
     return { ...actual, inflateRawSync: vi.fn(actual.inflateRawSync) };
 });
 
+const formats = [false, true, 'unmarked'] as const;
+
 type Entry = {
     name: string;
     data?: Uint8Array | string;
@@ -29,7 +31,7 @@ type Entry = {
     localExtra?: Uint8Array;
     centralExtra?: Uint8Array;
     payload?: Uint8Array;
-    descriptor?: boolean;
+    descriptor?: boolean | 'unmarked';
 };
 
 // This is a ZIP fixture writer, not an implementation of the parser under test.
@@ -136,7 +138,10 @@ function makeZip(entries: Entry[]): {
         local.raw(payload);
 
         if (entry.descriptor) {
-            local.u32(0x08074b50);
+            if (entry.descriptor === true) {
+                local.u32(0x08074b50);
+            }
+
             local.u32(crc);
             local.u32(payload.length);
             local.u32(data.length);
@@ -238,7 +243,7 @@ afterEach(() => {
 });
 
 describe('synthetic ZIP32 paired UT extra', () => {
-    it.each([false, true])('keeps mixed UT metadata (descriptors: %s)', (descriptor) => {
+    it.each(formats)('keeps mixed UT metadata (descriptors: %s)', (descriptor) => {
         const manifest = '{"type":"module","main":"index.mjs"}';
         const entries: Entry[] = [
             { name: 'package.json', data: manifest, method: 8, descriptor, ...pair(0) },
@@ -301,11 +306,12 @@ describe('synthetic ZIP32 paired UT extra', () => {
         expect(inspected.sha256).toBe(digest);
     });
 
-    it('projects UT metadata through one-shot v1 and v2 handlers using fake ports', () => {
+    it.each(formats)('projects UT metadata to v1/v2 (descriptors: %s)', (descriptor) => {
         const fixture = makeZip([
             {
                 name: 'package.json',
                 data: '{"type":"module","main":"index.mjs"}',
+                descriptor,
                 ...pair(1794272800),
             },
         ]);
@@ -369,7 +375,7 @@ describe('synthetic ZIP32 paired UT extra', () => {
         expect(inspectZipManifest(scalar.bytes)).toEqual({ ok: false, code: 'manifest_invalid' });
     });
 
-    it.each([false, true])('treats PK-like payload as bytes (descriptors: %s)', (descriptor) => {
+    it.each(formats)('treats PK-like payload as bytes (descriptors: %s)', (descriptor) => {
         const binary = Buffer.from(
             '00504b0304504b0102504b0506504b0606504b0708504b06075554050001ffffffff00504bff',
             'hex',
@@ -536,7 +542,7 @@ describe('synthetic ZIP32 paired UT extra', () => {
         }
     });
 
-    it.each([false, true])('checks content integrity (descriptors: %s)', (descriptor) => {
+    it.each(formats)('checks content integrity (descriptors: %s)', (descriptor) => {
         const stored = makeZip([{ name: 'x', data: 'abc', descriptor, ...pair(0) }]);
         const corrupt = Buffer.from(stored.bytes);
         corrupt[stored.locals[0] + 30 + Buffer.byteLength('x') + 9] ^= 1;

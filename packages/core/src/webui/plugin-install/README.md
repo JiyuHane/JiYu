@@ -17,19 +17,21 @@ raw timestamp bytes match in its local and central headers. These bytes are
 checked for consistency, not interpreted as trusted dates.
 
 Regular files may set general-purpose bit 3 in both headers. The local CRC and
-both local sizes then must be zero. The payload must be followed immediately by
-exactly 16 bytes: the ZIP32 data-descriptor record marker (`0x08074b50`), CRC-32,
-compressed size and uncompressed size. Those three metadata words must match the
-central directory. The parser uses the recorded compressed length and the next
-local header or central directory boundary, not a search inside the payload.
-This is a narrow subset of
+both local sizes then must be zero. Immediately after the payload, a ZIP32 data
+descriptor can contain three 32-bit words (CRC-32, compressed size, uncompressed
+size), or those same words preceded by the record marker `0x08074b50`. The
+remaining space up to the next local header or the central directory must be
+exactly 12 or 16 bytes respectively. Only the 16-byte form requires a marker;
+an unmarked CRC equal to that value is still a CRC. The fields must match the
+central directory, and the payload is checked independently. The parser does
+not scan the payload or look for a later descriptor. This is a narrow subset of
 [PKWARE APPNOTE §§4.3.9 and 4.4.4](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT).
 The record marker is not a digital signature. Missing, misplaced or inconsistent
-data descriptors fail structural validation (`malformed`). Descriptors without
-that marker, ZIP64, other or duplicate extra fields, asymmetric extra fields,
-encryption, comments, unsupported creator metadata, path and case collisions,
-non-contiguous record layouts, and archives without files remain rejected. Many
-legitimate community releases still fall outside this profile.
+descriptors fail structural validation (`malformed`). ZIP64, other or duplicate
+extra fields, asymmetric extra fields, encryption, comments, unsupported creator
+metadata, path and case collisions, non-contiguous record layouts, and archives
+without files remain rejected. Many legitimate community releases still fall
+outside this profile.
 
 The primitive validates a private snapshot and all local and central records
 before processing any archive content, then decompresses in memory for inspection

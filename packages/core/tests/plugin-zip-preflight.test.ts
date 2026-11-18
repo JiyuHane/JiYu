@@ -610,7 +610,10 @@ describe('ZIP32 stored preflight', () => {
     });
 });
 
-describe('ZIP32 signed data descriptors', () => {
+describe('ZIP32 file data descriptors', () => {
+    const bareDescriptor = (marked: Buffer): Buffer => marked.subarray(4);
+    const descriptorForms = [true, bareDescriptor] as const;
+
     it('accepts stored version 10 and an ASCII UTF-8 name without scanning the payload', () => {
         const name = 'bytes.bin';
         const data = Buffer.from('00504b0708504b0708ff', 'hex');
@@ -634,10 +637,68 @@ describe('ZIP32 signed data descriptors', () => {
     });
 
     it.each([
-        ['an unsigned 12-byte descriptor', (signed: Buffer) => signed.subarray(4)],
-        ['a truncated descriptor', (signed: Buffer) => signed.subarray(0, -1)],
+        ['stored', 0],
+        ['raw-DEFLATE', 8],
+    ] as const)('accepts bare %s descriptors, including for empty files', (_label, method) => {
+        for (const data of [Buffer.from('abc'), Buffer.alloc(0)]) {
+            const payload = method === 8 ? zlib.deflateRawSync(data) : data;
+            const z = zip([{ name: 'x', method, data, payload, descriptor: bareDescriptor }]);
+            expect(preflightZip(z)).toEqual({
+                ok: true,
+                entries: [
+                    {
+                        path: 'x',
+                        kind: 'file',
+                        compressedSize: payload.length,
+                        actualSize: data.length,
+                        crc32: crc32(data),
+                    },
+                ],
+                totalSize: data.length,
+                sha256: createHash('sha256').update(z).digest('hex'),
+            });
+        }
+    });
+
+    it('uses physical record boundaries for mixed marked and bare descriptors', () => {
+        const z = zip([
+            { name: 'a', data: Buffer.from('first'), descriptor: bareDescriptor },
+            { name: 'b', method: 8, data: Buffer.from('second'), descriptor: true },
+            { name: 'c', data: Buffer.from('third'), descriptor: bareDescriptor },
+        ]);
+        // Swap the first two same-length central records without moving the local records.
+        const centralRecordSize = 46 + 1;
+        const first = cdOffset(z);
+        const second = first + centralRecordSize;
+        const third = second + centralRecordSize;
+        const firstCentral = Buffer.from(z.subarray(first, second));
+        z.copyWithin(first, second, third);
+        firstCentral.copy(z, second);
+        expect(preflightZip(z)).toMatchObject({
+            ok: true,
+            entries: [
+                { path: 'b', actualSize: 6 },
+                { path: 'a', actualSize: 5 },
+                { path: 'c', actualSize: 5 },
+            ],
+            totalSize: 16,
+        });
+    });
+
+    it('treats the marker value as a CRC when exactly 12 descriptor bytes remain', () => {
+        const data = Buffer.from([0xac, 0x0a, 0x7a, 0xd5]);
+        expect(crc32(data)).toBe(0x08074b50);
+        const z = zip([{ name: 'x', data, descriptor: bareDescriptor }]);
+        expect(preflightZip(z)).toMatchObject({
+            ok: true,
+            entries: [{ path: 'x', compressedSize: 4, actualSize: 4, crc32: 0x08074b50 }],
+        });
+    });
+
+    it.each([
+        ['a truncated ZIP32 descriptor', (signed: Buffer) => signed.subarray(0, -1)],
         [
-            'a widened descriptor',
+            'a ZIP64 descriptor',
             (signed: Buffer) => {
                 // ZIP64 layout with zero high words for both sizes.
                 const wide = Buffer.alloc(24);
@@ -647,37 +708,80 @@ describe('ZIP32 signed data descriptors', () => {
             },
         ],
         [
-            'a descriptor followed by padding',
+            'a ZIP32 descriptor followed by padding',
             (signed: Buffer) => Buffer.concat([signed, Buffer.alloc(1)]),
         ],
-    ] as const)('rejects %s at either record boundary', (_label, descriptor) => {
-        const entry = { name: 'x', data: Buffer.from('abc'), descriptor };
-        rejected(zip([entry]), 'malformed');
-        rejected(zip([entry, { name: 'after' }]), 'malformed');
+    ] as const)('rejects %s in either form at either record boundary', (_label, descriptor) => {
+        for (const marked of [true, false]) {
+            const entry = {
+                name: 'x',
+                data: Buffer.from('abc'),
+                descriptor: (signed: Buffer) => {
+                    const bytes = descriptor(signed);
+                    return marked ? bytes : bareDescriptor(bytes);
+                },
+            };
+            rejected(zip([entry]), 'malformed');
+            rejected(zip([entry, { name: 'after' }]), 'malformed');
+        }
+    });
+
+    it('requires the marker in a 16-byte descriptor', () => {
+        const z = zip([{ name: 'x', data: Buffer.from('abc'), descriptor: true }]);
+        z[cdOffset(z) - 16] ^= 1;
+        rejected(z, 'malformed');
     });
 
     it.each([
-        ['marker', 0],
-        ['CRC', 4],
+        ['CRC', 12],
         ['compressed size', 8],
-        ['uncompressed size', 12],
-    ] as const)('rejects an incorrect descriptor %s', (_field, offset) => {
-        const z = zip([{ name: 'x', data: Buffer.from('abc'), descriptor: true }]);
-        z[cdOffset(z) - 16 + offset] ^= 1;
-        rejected(z, 'malformed');
+        ['uncompressed size', 4],
+    ] as const)('rejects an incorrect descriptor %s', (_field, fromDescriptorEnd) => {
+        for (const descriptor of descriptorForms) {
+            const z = zip([{ name: 'x', data: Buffer.from('abc'), descriptor }]);
+            z[cdOffset(z) - fromDescriptorEnd] ^= 1;
+            rejected(z, 'malformed');
+        }
+    });
+
+    it.each([
+        ['CRC', 16, 12],
+        ['uncompressed size', 24, 4],
+    ] as const)(
+        'checks payload %s even when the bare descriptor matches the central directory',
+        (_field, centralField, fromDescriptorEnd) => {
+            for (const method of [0, 8]) {
+                const z = zip([
+                    { name: 'x', method, data: Buffer.from('abc'), descriptor: bareDescriptor },
+                ]);
+                const central = cdOffset(z);
+                z[central + centralField] ^= 1;
+                z[central - fromDescriptorEnd] ^= 1;
+                rejected(z, 'integrity');
+            }
+        },
+    );
+
+    it('requires DEFLATE to consume the entire declared payload with a bare descriptor', () => {
+        const data = Buffer.from('abc');
+        const payload = Buffer.concat([zlib.deflateRawSync(data), Buffer.alloc(1)]);
+        const z = zip([{ name: 'x', method: 8, data, payload, descriptor: bareDescriptor }]);
+        rejected(z, 'integrity');
     });
 
     it('does not scan for a matching descriptor outside the declared payload boundary', () => {
         const data = Buffer.from('abc');
         const payload = zlib.deflateRawSync(data);
 
-        for (const length of [payload.length - 1, payload.length + 1]) {
-            const z = zip([{ name: 'x', method: 8, data, payload, descriptor: true }]);
-            const central = cdOffset(z);
-            // The two length fields agree, but do not locate this descriptor.
-            z.writeUInt32LE(length, central + 20);
-            z.writeUInt32LE(length, central - 8);
-            rejected(z, 'malformed');
+        for (const descriptor of descriptorForms) {
+            for (const length of [payload.length - 1, payload.length + 1]) {
+                const z = zip([{ name: 'x', method: 8, data, payload, descriptor }]);
+                const central = cdOffset(z);
+                // The two length fields agree, but do not locate this descriptor.
+                z.writeUInt32LE(length, central + 20);
+                z.writeUInt32LE(length, central - 8);
+                rejected(z, 'malformed');
+            }
         }
     });
 
@@ -685,11 +789,14 @@ describe('ZIP32 signed data descriptors', () => {
         const localOnly = zip([{ name: 'x' }]);
         localOnly.writeUInt16LE(8, 6);
         rejected(localOnly, 'malformed');
-        const centralOnly = zip([{ name: 'x', descriptor: true }]);
-        centralOnly.writeUInt16LE(0, 6);
-        rejected(centralOnly, 'malformed');
-        centralOnly.writeUInt16LE(0, cdOffset(centralOnly) + 8);
-        rejected(centralOnly, 'malformed');
+
+        for (const descriptor of descriptorForms) {
+            const centralOnly = zip([{ name: 'x', descriptor }]);
+            centralOnly.writeUInt16LE(0, 6);
+            rejected(centralOnly, 'malformed');
+            centralOnly.writeUInt16LE(0, cdOffset(centralOnly) + 8);
+            rejected(centralOnly, 'malformed');
+        }
     });
 
     it.each([
@@ -699,23 +806,27 @@ describe('ZIP32 signed data descriptors', () => {
     ] as const)(
         'requires zero local %s even when it matches the descriptor',
         (_field, local, cd) => {
-            const z = zip([{ name: 'x', data: Buffer.from('abc'), descriptor: true }]);
-            z.writeUInt32LE(z.readUInt32LE(cdOffset(z) + cd), local);
-            rejected(z, 'malformed');
+            for (const descriptor of descriptorForms) {
+                const z = zip([{ name: 'x', data: Buffer.from('abc'), descriptor }]);
+                z.writeUInt32LE(z.readUInt32LE(cdOffset(z) + cd), local);
+                rejected(z, 'malformed');
+            }
         },
     );
 
     it('keeps flag, file type and DEFLATE version checks with descriptors', () => {
-        for (const flags of [1, 2, 4, 0x2000]) {
-            rejected(zip([{ name: 'x', method: 8, flags, descriptor: true }]), 'unsupported');
-        }
+        for (const descriptor of descriptorForms) {
+            for (const flags of [1, 2, 4, 0x2000]) {
+                rejected(zip([{ name: 'x', method: 8, flags, descriptor }]), 'unsupported');
+            }
 
-        rejected(zip([{ name: 'd/', descriptor: true }, { name: 'x' }]), 'unsupported');
-        rejected(zip([{ name: 'x', host: 3, mode: 0xa1ff, descriptor: true }]), 'unsupported');
-        const version = zip([{ name: 'x', method: 8, descriptor: true }]);
-        version.writeUInt16LE(10, 4);
-        version.writeUInt16LE(10, cdOffset(version) + 6);
-        rejected(version, 'unsupported');
+            rejected(zip([{ name: 'd/', descriptor }, { name: 'x' }]), 'unsupported');
+            rejected(zip([{ name: 'x', host: 3, mode: 0xa1ff, descriptor }]), 'unsupported');
+            const version = zip([{ name: 'x', method: 8, descriptor }]);
+            version.writeUInt16LE(10, 4);
+            version.writeUInt16LE(10, cdOffset(version) + 6);
+            rejected(version, 'unsupported');
+        }
     });
 
     it('keeps the declared file budget with matching descriptor sizes', () => {

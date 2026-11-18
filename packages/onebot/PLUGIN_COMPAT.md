@@ -180,9 +180,9 @@ Archive downloads, store installation, updates and online rollback are separate
 work; do not interpret catalog browsing or a local compatibility test as their
 completion. An internal [offline ZIP preflight](../core/src/webui/plugin-install/README.md)
 checks a limited ZIP32 stored/raw-DEFLATE subset and is not an installer. A
-single matching mtime-only `0x5455` extra field and a fixed ZIP32 file data
-descriptor with the record marker are supported under the documented checks.
-Other extra fields, unmarked or ZIP64 descriptors and non-ASCII paths remain
-outside the profile. The host and index can be tested with synthetic local
+single matching mtime-only `0x5455` extra field and fixed ZIP32 file data
+descriptors with or without the record marker are supported under the documented
+record-boundary and byte-integrity checks. Other extra fields, ZIP64 descriptors
+and non-ASCII paths remain outside the profile. The host and index can be tested with synthetic local
 plugins without running QQ. Real plugin and QQ interoperability require separate
 validation.
