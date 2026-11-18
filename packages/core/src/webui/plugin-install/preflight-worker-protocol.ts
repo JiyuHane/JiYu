@@ -1,11 +1,11 @@
 import { createHash } from 'node:crypto';
 import { types } from 'node:util';
 import { isMarkedAsUntransferable } from 'node:worker_threads';
-import { inspectZipManifest, preflightZip } from './zip-preflight.ts';
-import { readManifestWorkerResult } from './manifest-worker-result.ts';
+import { inspectZipManifest, inspectZipPluginEntry, preflightZip } from './zip-preflight.ts';
+import { readManifestWorkerResult, readPluginEntryWorkerResult } from './manifest-worker-result.ts';
 
-export { readManifestWorkerResult } from './manifest-worker-result.ts';
-export type { ManifestWorkerResult } from './manifest-worker-result.ts';
+export { readManifestWorkerResult, readPluginEntryWorkerResult } from './manifest-worker-result.ts';
+export type { ManifestWorkerResult, PluginEntryWorkerResult } from './manifest-worker-result.ts';
 
 const MAX_ARCHIVE = 32 * 1024 * 1024;
 const usedPorts = new WeakSet<object>();
@@ -66,6 +66,18 @@ export interface ManifestWorkerData {
 export function createManifestWorkerData(input: unknown): ManifestWorkerData {
     const { bytes } = createPreflightWorkerData(input);
     return { kind: 'zip-manifest', version: 2, bytes };
+}
+
+export interface PluginEntryWorkerData {
+    readonly kind: 'zip-plugin-entry';
+    readonly version: 3;
+    readonly bytes: ArrayBuffer;
+}
+
+/** Copy just the input view for a dedicated v3 Worker. */
+export function createPluginEntryWorkerData(input: unknown): PluginEntryWorkerData {
+    const { bytes } = createPreflightWorkerData(input);
+    return { kind: 'zip-plugin-entry', version: 3, bytes };
 }
 
 export interface PreflightWorkerPort {
@@ -165,10 +177,7 @@ export function createPreflightWorkerHandler(
     }));
 }
 
-/**
- * Manifest candidate only: no parent lifecycle controller, default factory or
- * production entry exists. The supplied synchronous adapter is trusted.
- */
+/** One-shot v2 manifest report, without a default factory or production entry. */
 export function createManifestWorkerHandler(
     port: unknown,
 ): (data: unknown) => PreflightHandlerStatus {
@@ -183,10 +192,28 @@ export function createManifestWorkerHandler(
     });
 }
 
+/** One-shot v3 entry classification; no plugin source is loaded or executed. */
+export function createPluginEntryWorkerHandler(
+    port: unknown,
+): (data: unknown) => PreflightHandlerStatus {
+    return createWorkerHandler(port, 'zip-plugin-entry', 3, (owned) => {
+        const bytes = new Uint8Array(owned);
+        const sha256 = createHash('sha256').update(bytes).digest('hex');
+        const result = inspectZipPluginEntry(bytes);
+        return readPluginEntryWorkerResult(
+            { kind: 'zip-plugin-entry-result', version: 3, sha256, result },
+            sha256,
+        );
+    });
+}
+
+type WorkerKind =
+    PreflightWorkerData['kind'] | ManifestWorkerData['kind'] | PluginEntryWorkerData['kind'];
+
 function createWorkerHandler(
     port: unknown,
-    kind: string,
-    version: number,
+    kind: WorkerKind,
+    version: 1 | 2 | 3,
     inspect: (owned: ArrayBuffer) => unknown,
 ): (data: unknown) => PreflightHandlerStatus {
     let handled = false;
@@ -231,7 +258,7 @@ function createWorkerHandler(
                 Reflect.ownKeys(buffer).length === 0 &&
                 getResizable !== undefined &&
                 typeof transfer === 'function' &&
-                (kind !== 'zip-manifest' ||
+                (kind === 'zip-preflight' ||
                     (typeof isMarkedAsUntransferable === 'function' &&
                         !isMarkedAsUntransferable(buffer))) &&
                 getResizable.call(buffer) === false &&

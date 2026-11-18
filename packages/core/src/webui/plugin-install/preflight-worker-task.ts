@@ -2,10 +2,11 @@ import { createHash } from 'node:crypto';
 import { addAbortListener, EventEmitter, getEventListeners } from 'node:events';
 import { performance } from 'node:perf_hooks';
 import { types } from 'node:util';
-import { readManifestWorkerResult } from './manifest-worker-result.ts';
+import { readManifestWorkerResult, readPluginEntryWorkerResult } from './manifest-worker-result.ts';
 import type {
     ZipEntryMetadata,
     ZipManifestResult,
+    ZipPluginEntryResult,
     ZipPreflightError,
     ZipPreflightResult,
 } from './zip-preflight';
@@ -97,6 +98,12 @@ export interface WorkerTaskHandle {
     readonly cleanup: Promise<'released' | 'unknown'>;
 }
 
+function checkCleanupTimeout(timeoutMs: number): void {
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 10 || timeoutMs > 10000) {
+        throw new RangeError('Invalid cleanup timeout');
+    }
+}
+
 /**
  * Internal adapter contract: factory owns startup and must emit only asynchronously;
  * the returned handle is exclusive and registration/removal hooks must not throw,
@@ -126,13 +133,7 @@ export class PreflightWorkerTask {
         private readonly cleanupTimeoutMs = 1000,
         private readonly clock: () => number = () => performance.now(),
     ) {
-        if (
-            !Number.isInteger(cleanupTimeoutMs) ||
-            cleanupTimeoutMs < 10 ||
-            cleanupTimeoutMs > 10000
-        ) {
-            throw new RangeError('Invalid cleanup timeout');
-        }
+        checkCleanupTimeout(cleanupTimeoutMs);
     }
 
     start(input: unknown, options: { timeoutMs: number; signal?: AbortSignal }): WorkerTaskHandle {
@@ -164,13 +165,7 @@ export class ManifestPreflightWorkerTask {
         private readonly cleanupTimeoutMs = 1000,
         private readonly clock: () => number = () => performance.now(),
     ) {
-        if (
-            !Number.isInteger(cleanupTimeoutMs) ||
-            cleanupTimeoutMs < 10 ||
-            cleanupTimeoutMs > 10000
-        ) {
-            throw new RangeError('Invalid cleanup timeout');
-        }
+        checkCleanupTimeout(cleanupTimeoutMs);
     }
 
     start(
@@ -188,7 +183,42 @@ export class ManifestPreflightWorkerTask {
     }
 }
 
-// Both facades declare these same private fields. The bridge is internal; calls
+export type PluginEntryWorkerTaskOutcome = TaskOutcome<ZipPluginEntryResult>;
+export type PluginEntryWorkerTaskHandle = TaskHandle<ZipPluginEntryResult>;
+
+/** V3-only result candidates with the same offline Worker lifetime contract. */
+export class PluginEntryPreflightWorkerTask {
+    private busy = false;
+
+    constructor(
+        private readonly workerFactory: (owned: ArrayBuffer) => PreflightWorker,
+        private readonly cleanupTimeoutMs = 1000,
+        private readonly clock: () => number = () => performance.now(),
+    ) {
+        checkCleanupTimeout(this.cleanupTimeoutMs);
+    }
+
+    start(
+        input: unknown,
+        options: { timeoutMs: number; signal?: AbortSignal },
+    ): PluginEntryWorkerTaskHandle {
+        const self = this;
+        type Bridge = {
+            busy: typeof self.busy;
+            workerFactory: typeof self.workerFactory;
+            cleanupTimeoutMs: typeof self.cleanupTimeoutMs;
+            clock: typeof self.clock;
+        };
+        return startWorkerTask(
+            self as unknown as Bridge,
+            input,
+            options,
+            (message, hash) => readPluginEntryWorkerResult(message, hash)?.result,
+        );
+    }
+}
+
+// All facades declare these same private fields. The bridge is internal; calls
 // remain property calls on the original facade so factory and clock retain this.
 interface TaskOwner {
     busy: boolean;

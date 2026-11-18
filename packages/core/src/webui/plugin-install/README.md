@@ -82,9 +82,10 @@ scope; this check treats those marker names conservatively regardless of case
 and does not parse nested manifests. `ok: true` means the ZIP and root manifest
 were inspected successfully, not that the entry is a candidate. A candidate does
 not establish the loader's final module format, importability, required exports,
-dependencies, filesystem behavior, or plugin compatibility. This API is not wired
-to any Worker protocol, installer, WebUI or plugin activation. The v1 and v2
-Worker result shapes are unchanged.
+dependencies, filesystem behavior, or plugin compatibility. The separate v3
+Worker protocol below can report these classifications. It is not connected to
+the installer, WebUI or plugin activation. Existing v1 and v2 result shapes are
+unchanged.
 
 Method 8 runs a small built-in capability probe after structural validation;
 probe failure returns `unsupported` while stored-only archives remain independent.
@@ -119,14 +120,15 @@ this preflight, establish plugin compatibility, or justify increasing the limits
 
 ## Worker lifecycle prototype
 
-`PreflightWorkerTask` and `ManifestPreflightWorkerTask` are internal controllers
-with explicitly injected Worker factories. Each instance has its own single
-slot; separate instances do not enforce a global concurrency limit. Neither has
-a default Worker entry or is connected to Core startup, the WebUI or an installer.
-Both validate and copy an input view before calling the factory. The ZIP v1
-controller binds a reported successful result to that snapshot's SHA-256; the
-manifest v2 controller checks its separate envelope against the snapshot hash
-for both success and failure. Both validate and freeze reported metadata. A
+`PreflightWorkerTask`, `ManifestPreflightWorkerTask` and
+`PluginEntryPreflightWorkerTask` are internal controllers with explicitly
+injected Worker factories. Each instance has its own single slot; separate
+instances do not enforce a global concurrency limit. None has a default Worker
+entry or is connected to Core startup, the WebUI or an installer. Each validates
+and copies an input view before calling its factory. The ZIP v1 controller binds
+a reported successful result to that snapshot's SHA-256; the separate manifest
+v2 and entry v3 envelopes are checked against the hash for both success and
+failure. Each controller validates and freezes reported metadata. A
 valid result is a candidate until an observed natural exit with code zero;
 aborts, errors and timeouts are final once selected. Once a Worker has been
 returned, the separate cleanup result is
@@ -187,16 +189,25 @@ treating it as public diagnostic data. ZIP request bytes themselves can include
 plaintext manifest content. Result validation occurs after structured cloning
 and does not impose a bound on a malicious sender's pre-validation allocation.
 
-The pure manifest validator alone is not a parent Worker controller: by itself
-it does not observe exit, detect a later duplicate message, or establish cleanup.
-`ManifestPreflightWorkerTask` supplies those lifecycle checks through the same
-internal state machine as v1, returning the validated manifest result only after
-an observed natural exit of zero. Both remain prototypes: no production Worker
-entry or factory is provided. The synchronous port wrapper must be trusted and
-exclusive, and Worker-side send or close errors must escape the Worker entry.
-Independent wrappers of the same endpoint, other copies of input bytes and
-runtime-managed memory remain outside the handler's proof. Tests use synthetic
-archives and synthetic Worker entries; they do not run or install plugins.
+The one-shot v3 protocol uses `{ kind: 'zip-plugin-entry', version: 3,
+bytes: ArrayBuffer }` and replies with `{ kind: 'zip-plugin-entry-result',
+version: 3, sha256, result }`. Its `result` is the fixed entry classification or a
+fixed ZIP/manifest failure. The validator checks the outer digest and the same
+inner digest on success, rejects unknown fields and manifest/entry combinations
+that the classifier cannot emit, and freezes a fresh projection. It never
+publishes entry paths or source. The separate request and response tags keep
+versions 1, 2 and 3 distinct. As with v2, v3 declines buffers explicitly marked
+as untransferable and consumes the accepted Worker-local buffer before parsing.
+
+The pure v2/v3 validators alone do not observe exit, detect a later duplicate
+message, or establish cleanup. The controller for each version supplies these
+checks through the same internal state machine as v1. These remain prototypes:
+no production Worker entry or factory is provided. The port wrapper must be
+synchronous, trusted and exclusive, and Worker-side send or close errors must
+escape the Worker entry. Distinct wrappers for the same endpoint, other copies
+of input bytes and runtime-managed memory remain outside the handler's proof.
+Tests use synthetic archives and Worker entries; they do not run or install
+plugins.
 
 The existing Core entry is not a preflight Worker bootstrap: its static application
 imports are evaluated before the entry-point branch, and Worker data not recognized
