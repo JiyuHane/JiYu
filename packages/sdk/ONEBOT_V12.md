@@ -516,6 +516,28 @@ these v12 data actions do not themselves upload to QQ or send image, voice or
 file messages. A separate [`send_message` image path](#sending-one-locally-uploaded-image-with-jiyu)
 can use an eligible current-generation handle. See the [server details](../onebot/ONEBOT_V12.md#local-data-uploads).
 
+## `upload_file_fragmented` stage types
+
+The SDK describes the three stages of
+[OneBot 12 `upload_file_fragmented`](https://12.onebot.dev/interface/file/actions/#upload_file_fragmented)
+with `OneBot12UploadFileFragmented{Prepare,Transfer,Finish}Params` and the
+corresponding `Response` types, all exported by `@harehane/sdk/v12`.
+
+| Stage | Request fields in addition to `stage` | Successful `data` |
+| --- | --- | --- |
+| `prepare` | `name: string`, `total_size: number` | `{ file_id: string }`, a staging ID |
+| `transfer` | `file_id: string` (staging ID), `offset: number`, `data: string` (Base64 bytes in JSON) | `null` (no result data) |
+| `finish` | `file_id: string` (staging ID), `sha256: string` (lowercase whole-file digest) | `{ file_id: string }`, the usable file ID |
+
+The two ID-bearing result shapes are also exported. Byte lengths and offsets
+use the JavaScript safe-integer subset of `int64`; these static types do not
+validate ranges, Base64, digest syntax or content. The failure branches retain
+generic JSON `data`. `call()` and `request()` remain generic; no upload loop,
+retry, digest calculation, or stage-specific response validation is added. An
+implementation must separately support this action. Jiyu's dispatcher still
+returns 10002 for it; the internal in-memory staging work is not a public
+upload path, and neither is a QQ media transfer.
+
 ## `get_file_fragmented` read-only types
 
 `@harehane/sdk/v12` exports the following optional TypeScript shapes for

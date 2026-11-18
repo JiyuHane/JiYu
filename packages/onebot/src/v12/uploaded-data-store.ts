@@ -4,6 +4,7 @@ import { isArrayBuffer, isProxy, isSharedArrayBuffer, isUint8Array } from 'node:
 
 /** Reserved local namespace, including malformed or expired upload handles. */
 export const V12_UPLOAD_TOKEN_PREFIX = 'jiyu-upload:v1:';
+export const V12_UPLOAD_DRAFT_TOKEN_PREFIX = 'jiyu-upload-draft:v1:';
 
 export type V12UploadResult =
     { kind: 'ok'; fileId: string } | { kind: 'invalid' | 'capacity' | 'unavailable' };
@@ -19,6 +20,16 @@ export type V12FragmentMetadataResult =
 export type V12FragmentChunkResult =
     { kind: 'ok'; data: string } | { kind: 'not_found' | 'unavailable' | 'invalid_range' };
 
+export type V12FragmentUploadPrepareResult =
+    { kind: 'ok'; draftId: string } | { kind: 'invalid' | 'capacity' | 'unavailable' };
+
+export type V12FragmentUploadTransferResult =
+    { kind: 'ok' } | { kind: 'invalid' | 'not_found' | 'invalid_range' | 'unavailable' };
+
+export type V12FragmentUploadFinishResult =
+    | { kind: 'ok'; fileId: string }
+    | { kind: 'invalid' | 'not_found' | 'incomplete' | 'unavailable' };
+
 const MAX_NAME_LENGTH = 4096;
 const MAX_FILE_BYTES = 256 * 1024;
 const MAX_BASE64_LENGTH = 4 * Math.ceil(MAX_FILE_BYTES / 3);
@@ -29,12 +40,22 @@ const TOKEN_TEXT_LENGTH = 43;
 const MAX_TOKEN_ATTEMPTS = 4;
 const TTL_MS = 600_000;
 
-type Entry = {
+type FileBytes = {
     name: string;
     bytes: Buffer;
     length: number;
-    sha256: string;
     createdAt: number;
+};
+
+type Entry = FileBytes & { kind: 'file'; sha256: string };
+type Draft = FileBytes & { kind: 'draft'; written: number };
+type Stored = Entry | Draft;
+
+type DraftAccess = {
+    entries: Map<string, Stored>;
+    revision: number;
+    now: number;
+    canWrite(): boolean;
 };
 
 // Capture the operations used on untrusted injected byte views and on private
@@ -44,6 +65,7 @@ const apply = Reflect.apply;
 const bufferFrom = Buffer.from;
 const bufferAlloc = Buffer.alloc;
 const bufferToString = Buffer.prototype.toString;
+const bufferWrite = Buffer.prototype.write;
 const hashUpdate = Hash.prototype.update;
 const hashDigest = Hash.prototype.digest;
 const mapGet = Map.prototype.get;
@@ -53,8 +75,8 @@ const mapClear = Map.prototype.clear;
 const mapEntries = Map.prototype.entries;
 const mapSize = Object.getOwnPropertyDescriptor(Map.prototype, 'size')!.get!;
 const mapIteratorNext = Object.getPrototypeOf(new Map().entries()).next as (
-    this: Iterator<[string, Entry]>,
-) => IteratorResult<[string, Entry]>;
+    this: Iterator<[string, Stored]>,
+) => IteratorResult<[string, Stored]>;
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
 const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
 const typedArrayByteLength = Object.getOwnPropertyDescriptor(
@@ -189,21 +211,22 @@ function wipeDefaultRandom(value: unknown): void {
  * The runtime owner controls its lifetime and must call close when revoking it.
  *
  * Limits apply to this instance's retained raw data and entry count, not process
- * RSS. TTL is 600,000 ms from the initial validated upload clock sample, not
- * commit; slow or reentrant work can leave an entry expired immediately after
- * success. Expiry is lazy: idle entries remain until another access or close.
+ * RSS. Draft reservations share these limits with published files. TTL is
+ * 600,000 ms from the initial validated upload or prepare clock sample, not
+ * commit or finish; a later access may immediately expire an entry after slow
+ * work. Expiry is lazy: idle entries remain until another access or close.
  * Store-owned buffers are wiped on expiry, close, and failed operations on a
  * best-effort basis. JavaScript strings, input Base64, returned copies, crypto
  * internals, and caller-owned injection buffers cannot be guaranteed erased.
- * Collision checks cover the current map only. A historical random collision
- * can theoretically make an expired handle string refer to new content. The
+ * Collision checks cover the current map only. An expired or consumed ID can
+ * theoretically recur, and another store may produce the same string. The
  * injected RNG is a trusted test seam; observed bytes cannot prove unpredictability.
  * Production uses node:crypto randomBytes.
  * Optional synchronous guards protect commit/disclosure at the caller's request;
  * the owner remains responsible for identity and authorization.
  */
 export class V12UploadedDataStore {
-    #entries: Map<string, Entry> | null = new Map();
+    #entries: Map<string, Stored> | null = new Map();
     #totalBytes = 0;
     #lastNow: number | null = null;
     #closed = false;
@@ -304,21 +327,9 @@ export class V12UploadedDataStore {
                 return { kind: 'invalid' };
             }
 
-            const hash = createHash('sha256');
+            const digest = this.#digest(bytes, revision);
 
-            if (!this.#current(revision)) {
-                return { kind: 'unavailable' };
-            }
-
-            apply(hashUpdate, hash, [bytes]);
-
-            if (!this.#current(revision)) {
-                return { kind: 'unavailable' };
-            }
-
-            const digest: unknown = apply(hashDigest, hash, ['hex']);
-
-            if (!this.#current(revision) || !isLowerSha256(digest)) {
+            if (digest === null) {
                 return { kind: 'unavailable' };
             }
 
@@ -339,89 +350,35 @@ export class V12UploadedDataStore {
                 return { kind: 'capacity' };
             }
 
-            for (let attempt = 0; attempt < MAX_TOKEN_ATTEMPTS; attempt += 1) {
-                let source: unknown;
-                let tokenBytes: Buffer | null = null;
-                let fileId: string | null = null;
+            const fileId = this.#newId(V12_UPLOAD_TOKEN_PREFIX, entries, revision);
 
-                try {
-                    source = apply(this.#random, undefined, [TOKEN_BYTES]);
-
-                    if (!this.#current(revision)) {
-                        return { kind: 'unavailable' };
-                    }
-
-                    tokenBytes = copyRandomBytes(source);
-
-                    if (!this.#current(revision) || !tokenBytes) {
-                        return { kind: 'unavailable' };
-                    }
-
-                    const token: unknown = apply(bufferToString, tokenBytes, ['base64url']);
-
-                    if (
-                        !this.#current(revision) ||
-                        typeof token !== 'string' ||
-                        token.length !== TOKEN_TEXT_LENGTH
-                    ) {
-                        return { kind: 'unavailable' };
-                    }
-
-                    const candidate = V12_UPLOAD_TOKEN_PREFIX + token;
-                    const existing: unknown = apply(mapGet, entries, [candidate]);
-
-                    if (!this.#current(revision)) {
-                        return { kind: 'unavailable' };
-                    }
-
-                    if (existing === undefined) {
-                        fileId = candidate;
-                    }
-                } finally {
-                    if (tokenBytes) {
-                        erase(tokenBytes);
-                    }
-
-                    if (this.#defaultRandom) {
-                        wipeDefaultRandom(source);
-                    }
-                }
-
-                if (!this.#current(revision) || this.#entries !== entries) {
-                    return { kind: 'unavailable' };
-                }
-
-                if (fileId === null) {
-                    continue;
-                }
-
-                if (bytes === null) {
-                    return { kind: 'unavailable' };
-                }
-
-                const entry: Entry = { name, bytes, length, sha256: digest, createdAt: now };
-                const result: V12UploadResult = { kind: 'ok', fileId };
-
-                // All temporary token cleanup precedes the final guard and commit.
-                if (canCommit !== undefined) {
-                    const allowed: unknown = apply(canCommit, undefined, []);
-
-                    if (allowed !== true) {
-                        return { kind: 'unavailable' };
-                    }
-                }
-
-                if (!this.#current(revision) || this.#entries !== entries) {
-                    return { kind: 'unavailable' };
-                }
-
-                apply(mapSet, entries, [fileId, entry]);
-                this.#totalBytes += length;
-                bytes = null; // Ownership transferred to the map.
-                return result;
+            if (fileId === null) {
+                return { kind: 'unavailable' };
             }
 
-            return { kind: 'unavailable' };
+            const entry: Entry = {
+                kind: 'file',
+                name,
+                bytes,
+                length,
+                sha256: digest,
+                createdAt: now,
+            };
+            const result: V12UploadResult = { kind: 'ok', fileId };
+
+            // All temporary token cleanup precedes the final guard and commit.
+            if (canCommit !== undefined && apply(canCommit, undefined, []) !== true) {
+                return { kind: 'unavailable' };
+            }
+
+            if (!this.#current(revision) || this.#entries !== entries) {
+                return { kind: 'unavailable' };
+            }
+
+            apply(mapSet, entries, [fileId, entry]);
+            this.#totalBytes += length;
+            bytes = null; // Ownership transferred to the map.
+            return result;
         } catch {
             return { kind: 'unavailable' };
         } finally {
@@ -429,6 +386,233 @@ export class V12UploadedDataStore {
                 erase(bytes);
             }
 
+            this.#busy = false;
+        }
+    }
+
+    /** Reserve the complete size; the draft ID is not usable as a file ID. */
+    prepareFragments(
+        name: string,
+        totalSize: number,
+        canCommit?: () => boolean,
+    ): V12FragmentUploadPrepareResult {
+        return this.#editDraft<V12FragmentUploadPrepareResult>(canCommit, (access) => {
+            if (
+                typeof name !== 'string' ||
+                name.length > MAX_NAME_LENGTH ||
+                typeof totalSize !== 'number' ||
+                !safeInteger(totalSize) ||
+                totalSize < 0 ||
+                totalSize > MAX_FILE_BYTES
+            ) {
+                return { kind: 'invalid' };
+            }
+
+            const { entries, revision, now, canWrite } = access;
+
+            if (
+                apply(mapSize, entries, []) >= MAX_ENTRIES ||
+                totalSize > MAX_TOTAL_BYTES - this.#totalBytes
+            ) {
+                return { kind: 'capacity' };
+            }
+
+            const draftId = this.#newId(V12_UPLOAD_DRAFT_TOKEN_PREFIX, entries, revision);
+
+            if (draftId === null) {
+                return { kind: 'unavailable' };
+            }
+
+            // Accept -0 as zero but keep the stored length canonical.
+            const length = totalSize === 0 ? 0 : totalSize;
+            const bytes = bufferAlloc(length);
+            let kept = false;
+
+            try {
+                const entry: Draft = {
+                    kind: 'draft',
+                    name,
+                    bytes,
+                    length,
+                    createdAt: now,
+                    written: 0,
+                };
+
+                if (!canWrite()) {
+                    return { kind: 'unavailable' };
+                }
+
+                apply(mapSet, entries, [draftId, entry]);
+                this.#totalBytes += length;
+                kept = true;
+                return { kind: 'ok', draftId };
+            } finally {
+                if (!kept) {
+                    erase(bytes);
+                }
+            }
+        });
+    }
+
+    /** Stage one nonempty chunk, exactly at the current cursor. */
+    transferFragment(
+        draftId: string,
+        offset: number,
+        data: string,
+        canCommit?: () => boolean,
+    ): V12FragmentUploadTransferResult {
+        return this.#editDraft<V12FragmentUploadTransferResult>(canCommit, (access) => {
+            const length = typeof data === 'string' ? decodedLength(data) : null;
+
+            if (length === null || length === 0) {
+                return { kind: 'invalid' };
+            }
+
+            const draft = this.#draft(access.entries, draftId);
+
+            if (!draft) {
+                return { kind: 'not_found' };
+            }
+
+            if (
+                typeof offset !== 'number' ||
+                !safeInteger(offset) ||
+                offset !== draft.written ||
+                length > draft.length - draft.written
+            ) {
+                return { kind: 'invalid_range' };
+            }
+
+            // Keep the checked chunk off the shared Buffer pool across the final guard.
+            const bytes = bufferAlloc(length);
+
+            try {
+                const written: unknown = apply(bufferWrite, bytes, [data, 0, length, 'base64']);
+
+                if (!this.#current(access.revision)) {
+                    return { kind: 'unavailable' };
+                }
+
+                const encoded: unknown = apply(bufferToString, bytes, ['base64']);
+
+                if (!this.#current(access.revision)) {
+                    return { kind: 'unavailable' };
+                }
+
+                if (written !== length || encoded !== data) {
+                    return { kind: 'invalid' };
+                }
+
+                if (!access.canWrite()) {
+                    return { kind: 'unavailable' };
+                }
+
+                apply(typedArraySet, draft.bytes, [bytes, offset]);
+                draft.written += length;
+                return { kind: 'ok' };
+            } finally {
+                erase(bytes);
+            }
+        });
+    }
+
+    /** Publish a complete, hash-matched draft and consume its staging handle. */
+    finishFragments(
+        draftId: string,
+        sha256: string,
+        canCommit?: () => boolean,
+    ): V12FragmentUploadFinishResult {
+        return this.#editDraft<V12FragmentUploadFinishResult>(canCommit, (access) => {
+            if (!isLowerSha256(sha256)) {
+                return { kind: 'invalid' };
+            }
+
+            const { entries, revision, canWrite } = access;
+            const draft = this.#draft(entries, draftId);
+
+            if (!draft) {
+                return { kind: 'not_found' };
+            }
+
+            if (draft.written !== draft.length) {
+                return { kind: 'incomplete' };
+            }
+
+            const digest = this.#digest(draft.bytes, revision);
+
+            if (digest === null) {
+                return { kind: 'unavailable' };
+            }
+
+            if (digest !== sha256) {
+                return { kind: 'invalid' };
+            }
+
+            const fileId = this.#newId(V12_UPLOAD_TOKEN_PREFIX, entries, revision);
+
+            if (fileId === null) {
+                return { kind: 'unavailable' };
+            }
+
+            const { name, bytes, length, createdAt } = draft;
+            const entry: Entry = { kind: 'file', name, bytes, length, sha256: digest, createdAt };
+
+            if (!canWrite()) {
+                return { kind: 'unavailable' };
+            }
+
+            // No callback between the insert and removal. The prepared buffer
+            // and its quota reservation move to the final ID without copying.
+            apply(mapSet, entries, [fileId, entry]);
+            apply(mapDelete, entries, [draftId]);
+            return { kind: 'ok', fileId };
+        });
+    }
+
+    #draft(entries: Map<string, Stored>, id: unknown): Draft | undefined {
+        if (
+            typeof id !== 'string' ||
+            id.length !== V12_UPLOAD_DRAFT_TOKEN_PREFIX.length + TOKEN_TEXT_LENGTH ||
+            !startsWith(id, V12_UPLOAD_DRAFT_TOKEN_PREFIX)
+        ) {
+            return undefined;
+        }
+
+        const entry = apply(mapGet, entries, [id]) as Stored | undefined;
+        return entry?.kind === 'draft' ? entry : undefined;
+    }
+
+    #editDraft<T>(
+        guard: (() => boolean) | undefined,
+        operation: (access: DraftAccess) => T,
+    ): T | { kind: 'unavailable' } {
+        const entries = this.#entries;
+
+        if (!entries || this.#closed || this.#busy || !this.#validOptions) {
+            return { kind: 'unavailable' };
+        }
+
+        this.#busy = true;
+        const revision = this.#revision;
+        const current = () => this.#current(revision) && this.#entries === entries;
+        const canWrite = () =>
+            current() && (guard === undefined || apply(guard, undefined, []) === true) && current();
+
+        try {
+            if (!canWrite()) {
+                return { kind: 'unavailable' };
+            }
+
+            const now = this.#accessTime(revision);
+
+            if (now === null) {
+                return { kind: 'unavailable' };
+            }
+
+            return operation({ entries, revision, now, canWrite });
+        } catch {
+            return { kind: 'unavailable' };
+        } finally {
             this.#busy = false;
         }
     }
@@ -460,13 +644,13 @@ export class V12UploadedDataStore {
                 return { kind: 'unavailable' };
             }
 
-            const entry = apply(mapGet, entries, [fileId]) as Entry | undefined;
+            const entry = apply(mapGet, entries, [fileId]) as Stored | undefined;
 
             if (!this.#current(revision)) {
                 return { kind: 'unavailable' };
             }
 
-            if (!entry) {
+            if (entry?.kind !== 'file') {
                 return { kind: 'not_found' };
             }
 
@@ -579,7 +763,11 @@ export class V12UploadedDataStore {
                 fileId.length === V12_UPLOAD_TOKEN_PREFIX.length + TOKEN_TEXT_LENGTH &&
                 isV12UploadToken(fileId)
             ) {
-                entry = apply(mapGet, entries, [fileId]) as Entry | undefined;
+                const stored = apply(mapGet, entries, [fileId]) as Stored | undefined;
+
+                if (stored?.kind === 'file') {
+                    entry = stored;
+                }
             }
 
             if (!this.#current(revision)) {
@@ -643,11 +831,11 @@ export class V12UploadedDataStore {
         }
 
         try {
-            const iterator = apply(mapEntries, entries, []) as Iterator<[string, Entry]>;
+            const iterator = apply(mapEntries, entries, []) as Iterator<[string, Stored]>;
 
             for (;;) {
                 const next = apply(mapIteratorNext, iterator, []) as IteratorResult<
-                    [string, Entry]
+                    [string, Stored]
                 >;
 
                 if (next.done) {
@@ -665,6 +853,84 @@ export class V12UploadedDataStore {
                 // The map is already detached and the store is permanently closed.
             }
         }
+    }
+
+    #digest(bytes: Buffer, revision: number): string | null {
+        const hash = createHash('sha256');
+
+        if (!this.#current(revision)) {
+            return null;
+        }
+
+        apply(hashUpdate, hash, [bytes]);
+
+        if (!this.#current(revision)) {
+            return null;
+        }
+
+        const digest: unknown = apply(hashDigest, hash, ['hex']);
+        return this.#current(revision) && isLowerSha256(digest) ? digest : null;
+    }
+
+    #newId(prefix: string, entries: Map<string, Stored>, revision: number): string | null {
+        for (let attempt = 0; attempt < MAX_TOKEN_ATTEMPTS; attempt += 1) {
+            let source: unknown;
+            let tokenBytes: Buffer | null = null;
+            let id: string | null = null;
+
+            try {
+                source = apply(this.#random, undefined, [TOKEN_BYTES]);
+
+                if (!this.#current(revision)) {
+                    return null;
+                }
+
+                tokenBytes = copyRandomBytes(source);
+
+                if (!this.#current(revision) || !tokenBytes) {
+                    return null;
+                }
+
+                const token: unknown = apply(bufferToString, tokenBytes, ['base64url']);
+
+                if (
+                    !this.#current(revision) ||
+                    typeof token !== 'string' ||
+                    token.length !== TOKEN_TEXT_LENGTH
+                ) {
+                    return null;
+                }
+
+                const candidate = prefix + token;
+                const existing: unknown = apply(mapGet, entries, [candidate]);
+
+                if (!this.#current(revision)) {
+                    return null;
+                }
+
+                if (existing === undefined) {
+                    id = candidate;
+                }
+            } finally {
+                if (tokenBytes) {
+                    erase(tokenBytes);
+                }
+
+                if (this.#defaultRandom) {
+                    wipeDefaultRandom(source);
+                }
+            }
+
+            if (!this.#current(revision) || this.#entries !== entries) {
+                return null;
+            }
+
+            if (id !== null) {
+                return id;
+            }
+        }
+
+        return null;
     }
 
     #current(revision: number): boolean {
@@ -692,10 +958,10 @@ export class V12UploadedDataStore {
         }
 
         this.#lastNow = value;
-        const iterator = apply(mapEntries, entries, []) as Iterator<[string, Entry]>;
+        const iterator = apply(mapEntries, entries, []) as Iterator<[string, Stored]>;
 
         for (;;) {
-            const next = apply(mapIteratorNext, iterator, []) as IteratorResult<[string, Entry]>;
+            const next = apply(mapIteratorNext, iterator, []) as IteratorResult<[string, Stored]>;
 
             if (next.done) {
                 break;

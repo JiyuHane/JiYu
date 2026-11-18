@@ -98,6 +98,60 @@ export type OneBot12UploadFileDataResponse =
     | (OneBot12ActionResponse & { status: 'ok'; data: OneBot12UploadFileDataResult })
     | (OneBot12ActionResponse & { status: 'failed'; data: OneBot12JsonValue });
 
+/** Static prepare parameters for the OneBot 12 candidate action upload_file_fragmented. */
+export interface OneBot12UploadFileFragmentedPrepareParams extends OneBot12JsonObject {
+    stage: 'prepare';
+    name: string;
+    /** Total byte count as a JSON int64 within JavaScript's safe-integer range; not validated by this type. */
+    total_size: number;
+}
+
+/** Transfer one fragment using the temporary file ID returned by prepare. */
+export interface OneBot12UploadFileFragmentedTransferParams extends OneBot12JsonObject {
+    stage: 'transfer';
+    file_id: string;
+    /** Byte offset as a JSON int64 within JavaScript's safe-integer range; not validated by this type. */
+    offset: number;
+    /** Fragment bytes encoded as a Base64 JSON string. */
+    data: string;
+}
+
+/** Finish an upload using the temporary file ID returned by prepare. */
+export interface OneBot12UploadFileFragmentedFinishParams extends OneBot12JsonObject {
+    stage: 'finish';
+    file_id: string;
+    /** Lowercase hexadecimal SHA-256 of the complete file, not of a fragment. */
+    sha256: string;
+}
+
+/** Temporary file ID for subsequent transfer and finish requests. */
+export interface OneBot12UploadFileFragmentedPrepareResult extends OneBot12JsonObject {
+    file_id: string;
+}
+
+/** Usable file ID returned by a supporting implementation after a successful finish. */
+export interface OneBot12UploadFileFragmentedFinishResult extends OneBot12JsonObject {
+    file_id: string;
+}
+
+/** Describes the response shape; the generic parser does not validate prepare fields. */
+export type OneBot12UploadFileFragmentedPrepareResponse =
+    | (OneBot12ActionResponse & { status: 'ok'; data: OneBot12UploadFileFragmentedPrepareResult })
+    | (OneBot12ActionResponse & { status: 'failed'; data: OneBot12JsonValue });
+
+/**
+ * A successful transfer has no result payload, represented here as `data: null`.
+ * The generic response parser does not enforce this shape.
+ */
+export type OneBot12UploadFileFragmentedTransferResponse =
+    | (OneBot12ActionResponse & { status: 'ok'; data: null })
+    | (OneBot12ActionResponse & { status: 'failed'; data: OneBot12JsonValue });
+
+/** Describes the response shape; the generic parser does not validate finish fields. */
+export type OneBot12UploadFileFragmentedFinishResponse =
+    | (OneBot12ActionResponse & { status: 'ok'; data: OneBot12UploadFileFragmentedFinishResult })
+    | (OneBot12ActionResponse & { status: 'failed'; data: OneBot12JsonValue });
+
 /** Parameters for the data subset of OneBot 12 get_file. */
 export interface OneBot12GetFileDataParams extends OneBot12JsonObject {
     file_id: string;

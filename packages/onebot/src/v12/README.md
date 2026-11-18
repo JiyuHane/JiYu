@@ -90,6 +90,38 @@ The listener retains at most 32 entries and 4 MiB (4,194,304) raw bytes; exhaust
 
 Before upload effects, the full UTF-8 upload success envelope, including its `file_id` and `echo`, must fit 1 MiB minus 14 bytes. A later data retrieval separately checks its own complete success envelope, including `name`, `data`, `sha256` and its current `echo`. This is a conservative single-frame budget for the default transport with an empty queue, not a delivery guarantee: smaller custom limits, pre-existing WebSocket output or a closed connection can still fail. A failed or lost response can leave the upload outcome unknown; do not automatically retry. See the [listener contract](../../ONEBOT_V12.md#local-data-uploads) for account and lifecycle details.
 
+**Internal fragmented-upload staging (not exposed by the dispatcher).**
+`V12UploadedDataStore` has synchronous `prepareFragments`, `transferFragment`
+and `finishFragments` methods. Prepare accepts the ordinary name limit and a
+nonnegative safe-integer byte length up to 256 KiB. It reserves the entire raw
+length and one entry against the existing combined 4 MiB/32-entry budget,
+without eviction, and returns a separate `jiyu-upload-draft:v1:` handle. Drafts
+are not readable by the store's ordinary data, metadata or range methods.
+Transfer accepts only a nonempty canonical Base64 chunk at the current byte
+cursor, within the reserved length. Overlaps, gaps and repeated writes are not
+accepted. An empty file requires no transfer. Finish checks completeness and
+a matching lowercase SHA-256 of the whole content, then replaces the draft with
+a normal `jiyu-upload:v1:` file handle using the same backing bytes and quota
+reservation. Invalid transfers, incomplete or mismatched finishes and denied
+commits do not advance the cursor or publish a file. A successful transfer or
+finish is not replayable; there is no explicit abort stage. An abandoned draft
+holds its reservation until expiry or close. ID lookup is local to one store;
+active-map collision checks do not guarantee global uniqueness or prevent
+recurrence of a consumed or expired draft ID.
+
+Each stage checks an optional owner-supplied lease before sampling the monotonic
+clock, and again just before committing. An early validation failure need not
+resample the lease. These checks do not establish an authorization boundary.
+The ten-minute lifetime starts at the prepare sample and is not extended by
+transfer, finish or reads. Expiry can
+remove drafts on any later store access, including an access that itself fails
+after sampling the clock. As with direct uploads, no guarantee is made about
+expiry crossing during a synchronous callback, actual process memory, or
+physical erasure of buffers and copies. Closing revokes access and attempts to
+clear both drafts and files. This is an in-process storage primitive; it makes
+no filesystem, transport, plugin or QQ calls. The `upload_file_fragmented`
+action remains unadvertised and returns 10002.
+
 For an accepted incoming image the runtime seals the exact observed URL as `jiyu-image:v1:` plus a canonical base64url AES-256-GCM payload. This is a local transient handle, **not** QQ encryption or a QQ signature. The URL must pass the same syntax checks and be at most 3,000 UTF-8 bytes; the complete handle is limited to 4,096 characters. The runtime uses an account-bound random key and unique per-key nonces, with at most 2²⁴ issuances per key. Successful redemption of one of these handles on that same active runtime constructs a core result `{name:'',url:<original string>}` without invoking the v11 action, refreshing the URL or contacting its host; transport delivery is subject to the output limits below. After common request validation, a missing key, altered, revoked or foreign handle maps at the core to 20001 without falling back to the v11 alias path; a detected crypto-provider setup/update failure maps there to 20002. An exception during authentication finalization cannot be distinguished from an invalid tag and maps at the core to 20001. Later transport handling may replace the response or close the connection as described below. This reserves the prefix: a pre-existing v11 alias beginning with it no longer works through v12 `get_file`, though v11 itself is unchanged. Same-runtime listener reopen and online-status changes retain the key. Permanent teardown detaches the issuer and attempts revocation as described below; a replacement runtime or restart creates its own issuer and key. Buffer clearing is best effort, not a guarantee about JavaScript or native crypto copies.
 
 Accepted voice records similarly use `jiyu-voice:v1:` plus a canonical base64url AES-256-GCM payload. The voice purpose, randomly generated key, AAD and nonce state are independent of the image issuer. The observed URL must pass the same best-effort syntax checks and be at most 3,000 UTF-8 bytes; the complete ID is at most 4,096 UTF-16 code units, and each voice key permits at most 2²⁴ issuances. Successful redemption on the same active runtime constructs a core result exactly `{name:'',url:<original observed string>}` without a v11 action, URL refresh, download or verification of the file; transport delivery is subject to the output limits below. No QQ source, file identity or file-byte authenticity is established. Same-runtime listener close/reopen and online-status changes retain the key. Permanent teardown detaches the issuer and attempts revocation as described below; a replacement runtime or restart creates its own issuer and key. Clearing key buffers is best effort. The voice prefix is reserved even for malformed or revoked IDs and never falls back to v11: a pre-existing v11 alias with that prefix is affected through v12 `get_file`, while v11 alias lookup itself remains unchanged.

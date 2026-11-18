@@ -289,6 +289,32 @@ describe('get_file_fragmented on the real V12 dispatcher with synthetic callback
         noDataProviders(f);
     });
 
+    it('keeps fragmented upload off the wire even with the local read and upload providers', async () => {
+        const f = fixture();
+        const supported = await f.dispatcher.handle(
+            { action: 'get_supported_actions', params: {} },
+            f.lease,
+        );
+        expect(supported.data).toContain('upload_file');
+        expect(supported.data).toContain('get_file_fragmented');
+        expect(supported.data).not.toContain('upload_file_fragmented');
+
+        for (const params of [
+            { stage: 'prepare', name: 'fixture.bin', total_size: 1 },
+            { stage: 'transfer', file_id: 'fixture-draft', offset: 0, data: 'AA==' },
+            { stage: 'finish', file_id: 'fixture-draft', sha256: '0'.repeat(64) },
+        ]) {
+            const result = await f.dispatcher.handle(
+                { action: 'upload_file_fragmented', params, echo: params.stage },
+                f.lease,
+            );
+            failed(result, 10002);
+            expect(result.echo).toBe(params.stage);
+        }
+
+        noDataProviders(f);
+    });
+
     it.each([
         'uploadDataFile',
         'getUploadedDataFile',
