@@ -1,8 +1,10 @@
-import { downloadOneBot12FragmentedFile } from '@harehane/sdk/v12';
+import { downloadOneBot12FragmentedFile, uploadOneBot12FragmentedFile } from '@harehane/sdk/v12';
 import type {
     OneBot12ActionResponse,
     OneBot12FragmentedDownloadOptions,
     OneBot12FragmentedDownloadResult,
+    OneBot12FragmentedUploadOptions,
+    OneBot12FragmentedUploadResult,
     OneBot12GetFileFragmentedPrepareParams,
     OneBot12GetFileFragmentedPrepareResponse,
     OneBot12GetFileFragmentedPrepareResult,
@@ -132,6 +134,32 @@ export async function readFragmentedFromPublishedSdk(http: OneBot12HttpClient): 
 
     // @ts-expect-error Applications must select an explicit allocation limit.
     void downloadOneBot12FragmentedFile(http, fileId, { chunkSize: 512 });
+}
+
+export async function uploadFragmentedFromPublishedSdk(http: OneBot12HttpClient): Promise<void> {
+    const source = new Uint8Array([0, 255]);
+    const options: OneBot12FragmentedUploadOptions = { maxBytes: source.byteLength, chunkSize: 1 };
+    const result: OneBot12FragmentedUploadResult = await uploadOneBot12FragmentedFile(
+        http,
+        'fixture.bin',
+        source,
+        options,
+    );
+
+    if (result.status === 'ok') {
+        const id: string = result.fileId;
+        const size: number = result.size;
+        void [id, size];
+    } else {
+        const stage: 'prepare' | 'transfer' | 'finish' = result.stage;
+        const failure: OneBot12ActionResponse = result.response;
+        void [stage, failure];
+        // @ts-expect-error A failed stage does not report a published ID.
+        void result.fileId;
+    }
+
+    // @ts-expect-error This helper does not read local paths.
+    void uploadOneBot12FragmentedFile(http, 'fixture.bin', 'local-path', options);
 }
 
 export const prepareParams: OneBot12GetFileFragmentedPrepareParams = {

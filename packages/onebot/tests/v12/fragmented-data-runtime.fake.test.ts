@@ -435,6 +435,137 @@ async function expectDraftUnreadable(f: Account, draft: string) {
 }
 
 describe('upload_file_fragmented through SDK, runtime and generation-local store', () => {
+    function expectUploadRequests(
+        f: Account,
+        expectedParams: (draft: string) => OneBot12JsonObject[],
+    ): string {
+        const requests = f.fakeFetch.mock.calls.map(([, init]) => JSON.parse(String(init?.body)));
+        // The second request is either the first transfer or the finish of an empty file.
+        const draft: unknown = requests[1]?.params?.file_id;
+
+        if (typeof draft !== 'string') {
+            throw new Error('synthetic upload draft ID missing');
+        }
+
+        expect(draft.startsWith(DRAFT_PREFIX)).toBe(true);
+        expect(requests).toEqual(
+            expectedParams(draft).map((params) => ({
+                action: FRAGMENT_UPLOAD,
+                params,
+                self: { platform: 'qq', user_id: f.uin },
+            })),
+        );
+        return draft;
+    }
+
+    it('publishes multiple binary fragments and an empty file through the public helper', async () => {
+        const { uploadOneBot12FragmentedFile } = await import('../../../sdk/src/v12/index.js');
+        const f = await account('10001');
+        const self = { platform: 'qq', user_id: f.uin };
+        const binary = new Uint8Array([0x7f, 0x00, 0xff, 0x80, 0x41, 0x0a, 0x7f]).subarray(1, 6);
+
+        for (const { name, bytes, sha256, fragments, base64 } of [
+            {
+                name: '上传🪶.bin',
+                bytes: binary,
+                sha256: createHash('sha256').update(binary).digest('hex'),
+                fragments: [
+                    { offset: 0, data: 'AP8=' },
+                    { offset: 2, data: 'gEE=' },
+                    { offset: 4, data: 'Cg==' },
+                ],
+                base64: 'AP+AQQo=',
+            },
+            {
+                name: 'empty.bin',
+                bytes: new Uint8Array(),
+                sha256: EMPTY_SHA256,
+                fragments: [],
+                base64: '',
+            },
+        ]) {
+            f.fakeFetch.mockClear();
+            const result = await uploadOneBot12FragmentedFile(f.client, name, bytes, {
+                maxBytes: bytes.length,
+                chunkSize: 2,
+                self,
+            });
+            const draft = expectUploadRequests(f, (fileId) => [
+                { stage: 'prepare', name, total_size: bytes.length },
+                ...fragments.map((fragment) => ({
+                    stage: 'transfer',
+                    file_id: fileId,
+                    ...fragment,
+                })),
+                { stage: 'finish', file_id: fileId, sha256 },
+            ]);
+
+            if (result.status !== 'ok') {
+                throw new Error(`synthetic upload failed at ${result.stage}`);
+            }
+
+            expect(result.fileId.startsWith(PREFIX)).toBe(true);
+            expect(result).toEqual({
+                status: 'ok',
+                fileId: result.fileId,
+                sha256,
+                size: bytes.length,
+            });
+            const echo = 'published';
+            const read = await f.client.request(
+                'get_file',
+                { type: 'data', file_id: result.fileId },
+                { self, echo },
+            );
+            expect(read).toEqual(okEnvelope({ name, data: base64, sha256 }, echo));
+            await expectDraftUnreadable(f, draft);
+        }
+
+        expect(f.api.handle).not.toHaveBeenCalled();
+    });
+
+    it('returns the first transfer failure without resending after listener replacement', async () => {
+        const { uploadOneBot12FragmentedFile } = await import('../../../sdk/src/v12/index.js');
+        const f = await account('10001');
+        const old = f.transport();
+        const request = f.client.request.bind(f.client);
+        const responses: Awaited<ReturnType<typeof request>>[] = [];
+        vi.spyOn(f.client, 'request').mockImplementation(async (...args) => {
+            const response = await request(...args);
+            responses.push(response);
+
+            if (responses.length === 2) {
+                // The first chunk was accepted; the next request reaches a fresh store.
+                await f.runtime.close();
+                await f.open();
+            }
+
+            return response;
+        });
+
+        const bytes = new TextEncoder().encode('hello');
+        const result = await uploadOneBot12FragmentedFile(f.client, NAME, bytes, {
+            maxBytes: bytes.length,
+            chunkSize: 2,
+            self: { platform: 'qq', user_id: f.uin },
+        });
+        expect(f.transport()).not.toBe(old);
+        expect(responses[1]).toMatchObject({ status: 'ok', retcode: 0, data: null });
+        expect(responses[2]).toMatchObject({
+            status: 'failed',
+            retcode: 20001,
+            data: null,
+            message: 'upload draft not found',
+        });
+        expect(result).toEqual({ status: 'failed', stage: 'transfer', response: responses[2] });
+        expectUploadRequests(f, (draft) => [
+            { stage: 'prepare', name: NAME, total_size: bytes.length },
+            { stage: 'transfer', file_id: draft, offset: 0, data: 'aGU=' },
+            { stage: 'transfer', file_id: draft, offset: 2, data: 'bGw=' },
+        ]);
+        expect(f.api.handle).not.toHaveBeenCalled();
+    });
+
     it('round-trips the public upload helpers and preserves an incomplete finish', async () => {
         const {
             prepareOneBot12FragmentedUpload,

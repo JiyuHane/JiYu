@@ -85,6 +85,11 @@ export {
     prepareOneBot12FragmentedUpload,
     transferOneBot12FragmentedUpload,
 } from './file-fragmented-upload.js';
+export { uploadOneBot12FragmentedFile } from './file-fragmented-upload-file.js';
+export type {
+    OneBot12FragmentedUploadOptions,
+    OneBot12FragmentedUploadResult,
+} from './file-fragmented-upload-file.js';
 export { OneBot12ClientError } from './client-types.js';
 export type { OneBot12ClientOptions, OneBot12RequestOptions } from './client-types.js';
 export { OneBot12HttpClient } from './http-client.js';

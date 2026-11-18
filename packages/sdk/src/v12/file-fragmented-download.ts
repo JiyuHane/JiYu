@@ -1,34 +1,19 @@
-import { abortable, OneBot12ClientError, requestDeadline } from './client-types.js';
-import type { OneBot12RequestOptions } from './client-types.js';
+import { OneBot12ClientError } from './client-types.js';
 import { prepareOneBot12FileFragment, transferOneBot12FileFragment } from './file-fragmented.js';
 import type { OneBot12FileFragmentRequester } from './file-fragmented.js';
-import { parseOneBot12ActionRequest } from './protocol.js';
-import type { OneBot12ActionResponse, OneBot12Self } from './types.js';
+import {
+    createFragmentedOperation,
+    exceedsFragmentBudget,
+    invalidFragmentOptions,
+    isSha256,
+    readFragmentedSettings,
+} from './file-fragmented-operation.js';
+import type { FragmentedTransferOptions } from './file-fragmented-operation.js';
+import type { OneBot12ActionResponse } from './types.js';
 
-const MAX_BYTES = 8 * 1024 * 1024;
-const MAX_CHUNK = 256 * 1024;
-const DEFAULT_CHUNK = 64 * 1024;
-const MAX_TRANSFERS = 256;
-const DEFAULT_TIMEOUT_MS = 30_000;
-const OPTIONS = ['maxBytes', 'chunkSize', 'timeoutMs', 'signal', 'self', 'expectedSha256'] as const;
-
-type OptionKey = (typeof OPTIONS)[number];
-type DownloadSettings = Required<
-    Pick<OneBot12FragmentedDownloadOptions, 'maxBytes' | 'chunkSize' | 'timeoutMs'>
-> &
-    Omit<OneBot12FragmentedDownloadOptions, 'maxBytes' | 'chunkSize' | 'timeoutMs'>;
-
-export interface OneBot12FragmentedDownloadOptions {
-    /** Required allocation limit for decoded bytes, from 0 through 8 MiB. */
-    maxBytes: number;
-    /** Range size from 1 byte through 256 KiB; defaults to 64 KiB. */
-    chunkSize?: number;
+export interface OneBot12FragmentedDownloadOptions extends FragmentedTransferOptions {
     /** Optional independently known lowercase hexadecimal SHA-256. */
     expectedSha256?: string;
-    self?: OneBot12Self;
-    signal?: AbortSignal;
-    /** Deadline shared by all requests and verification, default 30 seconds. */
-    timeoutMs?: number;
 }
 
 export type OneBot12FragmentedDownloadResult =
@@ -38,77 +23,6 @@ export type OneBot12FragmentedDownloadResult =
           stage: 'prepare' | 'transfer';
           response: OneBot12ActionResponse & { status: 'failed' };
       };
-
-function isSha256(value: unknown): value is string {
-    return typeof value === 'string' && value.length === 64 && /^[a-f0-9]+$/.test(value);
-}
-
-function isIntegerIn(value: unknown, min: number, max: number): value is number {
-    return typeof value === 'number' && Number.isSafeInteger(value) && value >= min && value <= max;
-}
-
-function readSettings(fileId: unknown, value: unknown): DownloadSettings {
-    try {
-        if (
-            typeof fileId !== 'string' ||
-            fileId.length === 0 ||
-            !value ||
-            typeof value !== 'object'
-        ) {
-            throw new TypeError();
-        }
-
-        const prototype: unknown = Object.getPrototypeOf(value);
-
-        if (prototype !== Object.prototype && prototype !== null) {
-            throw new TypeError();
-        }
-
-        const parts = Object.getOwnPropertyDescriptors(value);
-
-        for (const key of Reflect.ownKeys(parts)) {
-            if (
-                typeof key !== 'string' ||
-                !OPTIONS.some((allowed) => allowed === key) ||
-                !parts[key]?.enumerable ||
-                !('value' in parts[key])
-            ) {
-                throw new TypeError();
-            }
-        }
-
-        const read = (key: OptionKey): unknown =>
-            Object.hasOwn(parts, key) ? parts[key].value : undefined;
-        const maxBytes = read('maxBytes');
-        const chunk = read('chunkSize');
-        const chunkSize = chunk === undefined ? DEFAULT_CHUNK : chunk;
-        const timeout = read('timeoutMs');
-        const timeoutMs = timeout === undefined ? DEFAULT_TIMEOUT_MS : timeout;
-        const expectedSha256 = read('expectedSha256');
-        const signal = read('signal');
-        const suppliedSelf = read('self');
-
-        if (
-            !isIntegerIn(maxBytes, 0, MAX_BYTES) ||
-            !isIntegerIn(chunkSize, 1, MAX_CHUNK) ||
-            !isIntegerIn(timeoutMs, 1, 2_147_483_647) ||
-            (expectedSha256 !== undefined && !isSha256(expectedSha256)) ||
-            (signal !== undefined && !(signal instanceof AbortSignal))
-        ) {
-            throw new TypeError();
-        }
-
-        // Keep the account selector stable across stages, including JSON extensions.
-        const { self } = parseOneBot12ActionRequest({
-            action: 'get_file_fragmented',
-            params: { stage: 'prepare', file_id: fileId },
-            ...(suppliedSelf === undefined ? {} : { self: suppliedSelf }),
-        });
-        return { maxBytes, chunkSize, timeoutMs, expectedSha256, signal, self };
-    } catch {
-        throw new OneBot12ClientError('invalid_options', 'Invalid fragmented download options');
-    }
-}
 
 function copyChunk(encoded: string, into: Uint8Array): void {
     try {
@@ -139,55 +53,20 @@ export async function downloadOneBot12FragmentedFile(
     fileId: string,
     options: OneBot12FragmentedDownloadOptions,
 ): Promise<OneBot12FragmentedDownloadResult> {
-    const { maxBytes, chunkSize, expectedSha256, self, signal, timeoutMs } = readSettings(
-        fileId,
-        options,
-    );
-    const subtle = globalThis.crypto?.subtle;
-
-    if (
-        !subtle ||
-        typeof subtle.digest !== 'function' ||
-        typeof atob !== 'function' ||
-        typeof btoa !== 'function' ||
-        (self !== undefined && typeof structuredClone !== 'function')
-    ) {
-        throw new OneBot12ClientError(
-            'invalid_options',
-            'Fragmented download runtime APIs are unavailable',
-        );
+    if (typeof fileId !== 'string' || fileId.length === 0) {
+        throw invalidFragmentOptions('download');
     }
 
-    const deadline = requestDeadline(timeoutMs, signal);
-    const requestOptions = (): OneBot12RequestOptions =>
-        self === undefined
-            ? { signal: deadline.signal }
-            : { signal: deadline.signal, self: structuredClone(self) };
-
-    async function step<T>(run: () => Promise<T>): Promise<T> {
-        if (deadline.signal.aborted) {
-            throw deadline.failure();
-        }
-
-        const value = await abortable(run(), deadline.signal, deadline.failure);
-
-        if (deadline.signal.aborted) {
-            throw deadline.failure();
-        }
-
-        return value;
-    }
-
+    const prepare = { stage: 'prepare', file_id: fileId } as const;
+    const settings = readFragmentedSettings(options, 'download', prepare);
+    const { chunkSize, expectedSha256 } = settings;
+    const operation = createFragmentedOperation(settings, 'download');
     let staging: Uint8Array | undefined;
     let verified = false;
 
     try {
-        const metadata = await step(() =>
-            prepareOneBot12FileFragment(
-                transport,
-                { stage: 'prepare', file_id: fileId },
-                requestOptions(),
-            ),
+        const metadata = await operation.step(() =>
+            prepareOneBot12FileFragment(transport, prepare, operation.requestOptions()),
         );
 
         if (metadata.status === 'failed') {
@@ -203,7 +82,7 @@ export async function downloadOneBot12FragmentedFile(
             );
         }
 
-        if (size > maxBytes || Math.ceil(size / chunkSize) > MAX_TRANSFERS) {
+        if (exceedsFragmentBudget(size, settings)) {
             throw new OneBot12ClientError(
                 'limit',
                 'Fragmented download exceeds the transfer budget',
@@ -222,11 +101,11 @@ export async function downloadOneBot12FragmentedFile(
 
         for (let offset = 0; offset < size;) {
             const length = Math.min(size - offset, chunkSize);
-            const fragment = await step(() =>
+            const fragment = await operation.step(() =>
                 transferOneBot12FileFragment(
                     transport,
                     { stage: 'transfer', file_id: fileId, offset, size: length },
-                    requestOptions(),
+                    operation.requestOptions(),
                 ),
             );
 
@@ -238,19 +117,8 @@ export async function downloadOneBot12FragmentedFile(
             offset += length;
         }
 
-        const digest = await step(async () => {
-            try {
-                return await subtle.digest('SHA-256', bytes);
-            } catch {
-                throw new OneBot12ClientError(
-                    'protocol',
-                    'Fragmented download digest calculation failed',
-                );
-            }
-        });
-        const actualSha256 = Array.from(new Uint8Array(digest), (byte) =>
-            byte.toString(16).padStart(2, '0'),
-        ).join('');
+        const actualSha256 = await operation.sha256(bytes);
+        operation.check();
 
         if (actualSha256 !== sha256) {
             throw new OneBot12ClientError(
@@ -262,7 +130,7 @@ export async function downloadOneBot12FragmentedFile(
         verified = true;
         return { status: 'ok', name, sha256: actualSha256, bytes };
     } finally {
-        deadline.cleanup();
+        operation.cleanup();
 
         if (!verified) {
             staging?.fill(0);

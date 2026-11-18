@@ -584,6 +584,56 @@ abort stage. If a response is lost, do not automatically retry: the stage may
 already have changed state. This is a local temporary upload, not a QQ media
 transfer. See the [server contract](../onebot/ONEBOT_V12.md#local-fragmented-uploads).
 
+### Opt-in bounded upload
+
+`uploadOneBot12FragmentedFile` combines the three stages explicitly, starting
+from caller-owned bytes. The `Uint8Array` view must have a fixed-length,
+non-shared, attached `ArrayBuffer`. Only the selected span is copied, before
+any await; later changes to the input do not change the upload. The name is a
+label of at most 4,096 UTF-16 code units, not a filesystem path. Empty names
+and empty files are allowed. There is no filesystem or QQ media access.
+
+```ts
+import { uploadOneBot12FragmentedFile } from '@harehane/sdk/v12';
+
+const result = await uploadOneBot12FragmentedFile(client, 'fixture.bin', bytes, {
+    maxBytes: 256 * 1024,
+    timeoutMs: 15_000,
+});
+if (result.status === 'ok') {
+    const { fileId, sha256, size } = result; // ID from finish, digest and size of the input snapshot
+    void [fileId, sha256, size];
+} else {
+    const { stage, response } = result; // first business failure, unchanged JSON contents
+    void [stage, response];
+}
+```
+
+`maxBytes` is required (0 through 8 MiB). `chunkSize` defaults to 64 KiB
+and may be set from 1 byte through 256 KiB. The helper rejects an input that
+would need more than 256 transfers before reserving a draft. Jiyu still limits
+files to 256 KiB and applies its account/listener quota and expiry. The helper
+computes SHA-256 with Web Crypto before `prepare`, then sends exact canonical
+padded Base64 ranges in sequence, waiting for each acknowledgement. For an
+empty file it skips `transfer`. `finish` gets the whole-file digest, and only
+its successful response supplies the returned ID. These checks do not verify
+that an arbitrary server stored the file or make it a QQ media ID.
+
+The helper requires Web Crypto (a secure context in browsers) and `btoa`, and
+`structuredClone` when selecting `self`. It snapshots the account selector and
+uses a shared positive `timeoutMs` (default 30 seconds) and optional `signal`
+from digest calculation through finish; individual transport defaults are
+unchanged. It stops at the first business or local failure. Transport
+rejections propagate unless the shared deadline has already selected
+cancellation. There is no automatic retry, fallback, resume, or remote rollback.
+A timeout, abort or malformed response does not prove the preceding operation
+had no effect. A lost finish response can leave an uploaded file, and an
+abandoned draft can hold its quota until expiry or listener retirement. Local
+memory bounds cover the private decoded snapshot and number of transfers;
+encoded, transport and runtime copies are separate. The helper clears its own
+snapshot on exit, not caller buffers or other copies. This is not a streaming
+upload or a hard bound on execution time or memory usage.
+
 ## `get_file_fragmented` read-only types
 
 `@harehane/sdk/v12` exports the following optional TypeScript shapes for
