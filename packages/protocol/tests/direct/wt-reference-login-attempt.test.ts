@@ -36,26 +36,24 @@ const fetchBody = () =>
             { tag: 0xd1, value: encodeWtQrD1({ qrUrl: 'https://example.invalid/qr' }) },
         ]),
     ]);
-const pollBody = (code: number, uin = 123n) =>
-    code
-        ? header(code)
-        : Buffer.concat(
-              [
-                  header(0),
-                  Buffer.from('000000000000000000000000', 'hex'),
-                  encodeWtTlv([
-                      { tag: 0x1e, value: key },
-                      { tag: 0x19, value: Uint8Array.of(5) },
-                      { tag: 0x18, value: Uint8Array.of(6) },
-                  ]),
-              ].map((b, i) => {
-                  if (i === 1) {
-                      b.writeBigInt64BE(uin);
-                  }
 
-                  return b;
-              }),
-          );
+const pollBody = (code: number, uin = 123n) => {
+    if (code) {
+        return header(code);
+    }
+
+    const identity = Buffer.alloc(12);
+    identity.writeBigInt64BE(uin);
+    return Buffer.concat([
+        header(0),
+        identity,
+        encodeWtTlv([
+            { tag: 0x1e, value: key },
+            { tag: 0x19, value: Uint8Array.of(5) },
+            { tag: 0x18, value: Uint8Array.of(6) },
+        ]),
+    ]);
+};
 
 function parse(frame: Uint8Array) {
     const b = Buffer.from(frame);
@@ -80,9 +78,9 @@ function parse(frame: Uint8Array) {
     pos += sso.readUInt16BE(pos);
     const reserved = Buffer.from(read());
     const oicq = Buffer.from(sso.subarray(sso.readUInt32BE(0) + 4));
-    const point = Buffer.from(oicq.subarray(48, 73));
+    const point = Buffer.from(oicq.subarray(50, 75));
     const shared = peer.deriveTeaKey(point);
-    const business = Buffer.from(qqTeaDecrypt(oicq.subarray(73, -1), shared));
+    const business = Buffer.from(qqTeaDecrypt(oicq.subarray(75, -1), shared));
     return {
         account,
         seq: sso.readUInt32BE(4),
@@ -333,7 +331,7 @@ describe('reference one-socket attempt (synthetic only)', () => {
             999n,
         ]);
         expect(received.every((r) => r.point.equals(received[0].point))).toBe(true);
-        expect(received.every((r) => r.oicq.subarray(28, 44).equals(Buffer.alloc(16, 7)))).toBe(
+        expect(received.every((r) => r.oicq.subarray(30, 46).equals(Buffer.alloc(16, 7)))).toBe(
             true,
         );
         expect(received.map((r) => r.oicq)).toEqual(signed);

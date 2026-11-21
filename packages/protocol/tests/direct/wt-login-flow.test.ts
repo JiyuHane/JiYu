@@ -80,8 +80,8 @@ function fixture() {
             expect(requestBody).toEqual(Buffer.from(signed));
             expect(requestBody.readUInt16BE(5)).toBe(0x810);
             expect(requestBody.readUInt32BE(9)).toBe(123456);
-            const shared = peer.deriveTeaKey(requestBody.subarray(48, 73));
-            const requestBusiness = Buffer.from(qqTeaDecrypt(requestBody.subarray(73, -1), shared));
+            const shared = peer.deriveTeaKey(requestBody.subarray(50, 75));
+            const requestBusiness = Buffer.from(qqTeaDecrypt(requestBody.subarray(75, -1), shared));
             const entries = decodeWtTlv(requestBusiness.subarray(2));
             expect(entries.find((e) => e.tag === 0x106)?.value).toEqual(Uint8Array.of(4));
             expect(entries.find((e) => e.tag === 0x16a)?.value).toEqual(Uint8Array.of(5));
@@ -197,8 +197,8 @@ describe('one-shot WT login transaction (synthetic peer)', () => {
             expect(f.subarray(pos + 4, end).toString()).toBe(account);
             const plain = Buffer.from(qqTeaDecrypt(f.subarray(end), new Uint8Array(16)));
             const req = plain.subarray(plain.readUInt32BE(0) + 4);
-            const shared = createWtEcdh(scalar(2)).deriveTeaKey(req.subarray(48, 73));
-            const login = qqTeaDecrypt(req.subarray(73, -1), shared);
+            const shared = createWtEcdh(scalar(2)).deriveTeaKey(req.subarray(50, 75));
+            const login = qqTeaDecrypt(req.subarray(75, -1), shared);
             expect(decodeWtTlv(login.subarray(2)).find((x) => x.tag === 0x106)?.value).toEqual(
                 Uint8Array.of(4),
             );
@@ -269,7 +269,7 @@ describe('one-shot WT login transaction (synthetic peer)', () => {
                 const p = Buffer.from(qqTeaDecrypt(f.subarray(end), new Uint8Array(16)));
                 const req = p.subarray(p.readUInt32BE(0) + 4);
                 return makeResponse(
-                    createWtEcdh(scalar(2)).deriveTeaKey(req.subarray(48, 73)),
+                    createWtEcdh(scalar(2)).deriveTeaKey(req.subarray(50, 75)),
                     mutation,
                 );
             };
@@ -305,7 +305,7 @@ describe('one-shot WT login transaction (synthetic peer)', () => {
                 const end = pos + f.readUInt32BE(pos);
                 const p = Buffer.from(qqTeaDecrypt(f.subarray(end), new Uint8Array(16)));
                 const req = p.subarray(p.readUInt32BE(0) + 4);
-                return makeResponse(createWtEcdh(scalar(2)).deriveTeaKey(req.subarray(48, 73)), {
+                return makeResponse(createWtEcdh(scalar(2)).deriveTeaKey(req.subarray(50, 75)), {
                     business,
                 });
             };

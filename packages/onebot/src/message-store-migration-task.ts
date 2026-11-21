@@ -32,9 +32,42 @@ export function createMessageStoreMigrationTask(
     let cancelled = false;
     let finished = false;
     let failureReported = false;
+    let started = false;
+    let cancellationPosted = false;
+    let exited = false;
+    let workerFailure: unknown;
+    let resolveStopped!: () => void;
+    let rejectStopped!: (error: unknown) => void;
+    const stopped = new Promise<void>((resolve, reject) => {
+        resolveStopped = resolve;
+        rejectStopped = reject;
+    });
+    // Legacy callers may ignore cancel's return value. Keep its failure observable
+    // to awaiters without turning those callers into unhandled-rejection sources.
+    void stopped.catch(() => undefined);
+
+    const requestCancellation = (): void => {
+        if (worker && !exited && !cancellationPosted) {
+            // Preserve synchronous postMessage failures for existing callers.
+            // A later call may retry posting; cancellation still fences events.
+            worker.postMessage('cancel');
+            cancellationPosted = true;
+            worker.unref();
+        }
+    };
 
     return {
         start(callbacks: DatabaseMigrationCallbacks): void {
+            if (cancelled) {
+                return;
+            }
+
+            if (started) {
+                throw new Error('database migration task already started');
+            }
+
+            started = true;
+
             const reportFailure = (error: Error): void => {
                 if (cancelled || failureReported) {
                     return;
@@ -50,11 +83,19 @@ export function createMessageStoreMigrationTask(
             };
             const entryPath = process.argv[1];
             const sourceEntry = /\.(?:cts|mts|ts|tsx)$/.test(entryPath);
-            worker = createWorker(sourceEntry ? sourceWorkerBootstrap(entryPath) : entryPath, {
-                workerData: data,
-                eval: sourceEntry,
-                execArgv: sourceEntry ? [] : process.execArgv,
-            });
+
+            try {
+                worker = createWorker(sourceEntry ? sourceWorkerBootstrap(entryPath) : entryPath, {
+                    workerData: data,
+                    eval: sourceEntry,
+                    execArgv: sourceEntry ? [] : process.execArgv,
+                });
+            } catch (error) {
+                // Construction failed before a worker acquired any resources.
+                resolveStopped();
+                throw error;
+            }
+
             worker.on('message', (message: MessageStoreMigrationWorkerMessage) => {
                 if (cancelled) {
                     return;
@@ -89,8 +130,24 @@ export function createMessageStoreMigrationTask(
                     reportFailure(new Error(message.message));
                 }
             });
-            worker.once('error', reportFailure);
+            worker.once('error', (error) => {
+                workerFailure = error;
+                reportFailure(error);
+            });
             worker.once('exit', (code) => {
+                exited = true;
+
+                // Neither an unref nor a complete progress message establishes
+                // retirement: the worker's finally/close must reach actual exit.
+                if (workerFailure !== undefined || code !== 0) {
+                    rejectStopped(
+                        workerFailure ??
+                            new Error(`database migration worker exited with code ${code}`),
+                    );
+                } else {
+                    resolveStopped();
+                }
+
                 if (!cancelled && !finished) {
                     reportFailure(
                         new Error(
@@ -99,16 +156,25 @@ export function createMessageStoreMigrationTask(
                     );
                 }
             });
+
+            if (cancelled) {
+                requestCancellation();
+            }
         },
         beginMigration(): void {
             if (!cancelled) {
                 worker?.postMessage('start');
             }
         },
-        cancel(): void {
+        cancel(): Promise<void> {
             cancelled = true;
-            worker?.postMessage('cancel');
-            worker?.unref();
+
+            if (!started) {
+                resolveStopped();
+            }
+
+            requestCancellation();
+            return stopped;
         },
     };
 }

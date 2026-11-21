@@ -87,8 +87,8 @@ function parseRequest(frame: Uint8Array) {
     read();
     const command = read().toString();
     const oicq = sso.subarray(sso.readUInt32BE(0) + 4);
-    const shared = peer.deriveTeaKey(oicq.subarray(48, 73));
-    const business = Buffer.from(qqTeaDecrypt(oicq.subarray(73, -1), shared));
+    const shared = peer.deriveTeaKey(oicq.subarray(50, 75));
+    const business = Buffer.from(qqTeaDecrypt(oicq.subarray(75, -1), shared));
     const kind = oicq.readUInt16BE(5) === 0x810 ? 0x810 : business.readUInt16BE(21);
     return { account, command, sequence: sso.readUInt32BE(4), shared, kind };
 }

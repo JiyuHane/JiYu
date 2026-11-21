@@ -1,22 +1,29 @@
 # Independent QQ protocol research
 
 This directory's `src/direct` modules are **experimental protocol building
-blocks**, not an alternative login mode. Jiyu, based on SnowLuma, still requires
-its existing QQ process and Hook session. The transport uses a caller-supplied
-connected socket; these modules do not establish a verified QQ session,
-calculate QQ signatures, persist an online ticket lifecycle, or connect to the
-OneBot runtime. The experimental attempt owner temporarily holds synthetic or
-caller-validated login material in memory. Tests use
-offline vectors and loopback peers. A successful unit test is not evidence of
-QQ login or delivery. The separate Android AArch64 `libfekit.so` sample and
+blocks**, not the default account backend. Jiyu, based on SnowLuma, preserves
+its existing QQ-process/Hook integration, OneBot runtime and default WebUI.
+The separate, explicitly started [direct-login tool](<../../tools/direct-qq-login/README.md>)
+has exercised real Linux QR login, registration and heartbeats without a QQ desktop
+process or Hook. Its [local native signing worker](<../../tools/local-qq-sign/README.md>)
+still relies on the specified official Linux component; it is not an independent
+pure TypeScript signing algorithm. Protocol constructors consume a caller-supplied
+connected stream rather than opening sockets themselves.
+Opt-in encrypted ticket storage and a distinct saved-D2 registration owner are
+specified below; storage success and local decoding alone do not establish a
+live account. Tests use offline vectors, loopback peers and synthetic subprocesses.
+A successful unit test is not evidence of QQ login or delivery. The separate Android AArch64 `libfekit.so` sample and
 its bounded signing-related investigation are documented in
 [QQ_SIGNATURE_RESEARCH.md](./QQ_SIGNATURE_RESEARCH.md); that sample is not the
 Linux `wrapper.node` identified below.
 
 Evidence in this document is separated into **target-static** (bytes and
 instructions from the specified QQ build), **reference-static** (source from a
-separately identified implementation), and **synthetic** (locally generated
-vectors or loopback interactions). A finding in one category does not establish
+separately identified implementation), **synthetic** (locally generated vectors
+or loopback interactions), and **target-runtime** (executing the pinned component
+with explicitly described inputs). The local signing checks below combine
+synthetic inputs with actual target execution; they do not establish a QQ
+service accepting those outputs. A finding in one category does not establish
 the others.
 
 ## Target and evidence
@@ -219,18 +226,230 @@ objects as BE16 and calls each object's virtual slot `+0x10` in that order.
 pointer to `0x8865bb0`; the inspected encryption path reads four 32-bit words
 from that pointer. At least 16 readable bytes are therefore a precondition of
 that path. The observed call sequence does not establish a local length check;
-an earlier call and other invariants were not ruled out. The `0x016e` value
-contains a copied global string whose first initialization is empty; subsequent
+an earlier call and other invariants were not ruled out. In the inspected caller,
+`0x34fe18a–0x34fe1cf` loads `session+0x298` and `+0x2a0`, subtracts the former
+from the latter, places the resulting pointer and length at the call stack and
+calls `0x3469090`. Its prologue and `0x34691ad–0x34691ee` recover those stack
+arguments; under preserved-register and stack-slot assumptions, `0x34692e4`
+saves the pointer and `0x3469245` saves the length for the later call. At
+`0x3469397–0x34693a4` those saved values are supplied to `0x3468790`; the
+inspected `0x346881f–0x3468830` call passes the pointer as the third argument of
+`0x8865bb0`. These observations alone do not identify who populated the original
+span or prove its business role.
+
+A further bounded inspection finds that `0x34fe100` first calls `0x34fe6a0`
+with the same receiver. If the receiver's `+0x2c8` byte is zero, that function
+allocates and zeroes 16 bytes and calls `0x3479670` with the buffer and length
+16. The inspected `0x3479670` path opens `/dev/urandom` and uses a loop around
+an imported `read` symbol, retrying `EINTR`; it can also leave early on errors
+or a nonpositive read. The observed caller does not check a success result for
+that fill. It next calls `0x34ff570` with the same 16-byte pointer; nearby
+strings label the latter `CreateTGTGTSig`. In its inspected continuation,
+`0x34ff7f2–0x34ff860` forwards the saved pointer and length in stack arguments
+when calling `0x3504d80`; the latter's effects on the buffer are not established.
+If `+0x2c8` is still zero at the later check,
+allocation and copying succeed, saved pointers remain intact and the indicated
+branch is reached, `0x34fe7dc–0x34fe817` allocates a new 16-byte vector at
+`session+0x298`, copies the buffer into it and sets its end pointer to begin
+plus 16. If the byte was nonzero on initial entry, this initialization is
+skipped. Multiple reads, calls, write failures, concurrent changes and other
+writers prevent treating these static instructions as observed randomness, a
+complete key lifecycle or proof that the QR response supplies this value. The
+separate output from `0x34ff570` is also used on this path. In the inspected
+`0x34ff570 → 0x3504d80` call, the supplied 16-byte pointer and length become
+the callee's seventh and eighth arguments; with the stack and pointer values
+intact, `0x3504e5e–0x3504e71` appends that span to an intermediate stream.
+The ninth and tenth arguments describe a separately produced vector returned by
+`0x3504ca0`; `0x3504f6a–0x3504f89` passes that vector's start pointer as the
+third argument to `0x8865bb0`, rather than directly forwarding the supplied
+16-byte argument. Equality or aliasing of the underlying ranges is unknown. No
+separate key length is passed at that call. On the selected successful initialization path the
+resulting vector is subsequently copied to `session+0x2b0`, while the original
+16-byte buffer is separately copied to `session+0x298`, subject to the earlier
+stated mutation and lifetime assumptions. The two argument positions have distinct
+observed roles in this inner call; this does not prove their runtime values or
+cryptographic authenticity.
+
+On a bounded normal path, `0x3504ca0` constructs a 24-byte input from an
+explicit source span and a 64-bit argument: for source length at most 24 it
+copies the source and zero-fills unused space, then overwrites bytes 16–23 with
+the 64-bit argument in big-endian order. The resulting first 16 bytes are the
+source prefix, zero-padded if needed; source bytes after the sixteenth are
+overwritten. Longer copies exceed the 24-byte local array and are not modeled.
+It calls `0x8b46000` on exactly 24 bytes and copies the 16-byte result to the
+vector whose pointer reaches the encryption call above. The static digest
+implementation uses the MD5 initial state, the 64 MD5 round constants and
+rotation counts in order, the expected padding and bit-length layout and a
+16-byte result. These observations strongly support an MD5 candidate, but each
+round's input index and Boolean operation have not been fully established as
+equivalent. The local `deriveTargetWtTgtgtKeyCandidate` hashes that constructed
+24-byte input using Node's MD5 implementation; its source length cap, integer
+checks and snapshotting are local policy. It does not establish target runtime
+values, derive an SSO signature or validate a real login.
+
+A separate bounded inspection of `0x3504d80` identifies the normal-success
+intermediate plaintext serialization before the `0x8865bb0` call. Let `S` be
+its second argument. Under stable valid inputs and successful stream writes,
+it emits BE16(4); BE32 of its third argument; BE32 fields at `S+0x04`, `+0x08`
+and `+0x0c`; BE64 at `S+0x50`; BE32 of its fourth argument and `S+0x14`; one
+byte at `S+0x18`; the fifth/sixth and seventh/eighth argument spans as raw
+bytes; BE32(0); one byte at `S+0x19`; the raw vector at `S+0x20`; and BE32
+fields at `S+0x10` and `S+0x00`. If the string at `S+0x38` is nonempty, it
+then appends BE16 of its low length bits followed by the raw bytes; an empty
+string adds no prefix. The fixed portion has 48 bytes before any raw spans or
+optional tail. The target ignores several helper results and its helper length
+handling is not equivalent to the local candidate's stricter bounds.
+`encodeTargetWtTgtgtPlainCandidate` takes these fields explicitly, and
+`encodeTargetWtTgtgtEncryptedCandidate` composes it with the above MD5-based
+candidate and the existing local QQ-TEA model. At `0x346912e–0x346919f`, the
+inspected next-stage construction assigns tag `0x0106`, copies its input span
+into an object with vptr `0x8e7f808`, and later uses the same relocated writer
+`0x35051e0` as `0x0144`. Its normal-success output is BE16(`0x0106`), BE16 of
+the appended byte count and those bytes. The local
+`encodeTargetWtLoginNode0106` accepts an explicit span and rejects lengths above
+65535 rather than reproducing the target's truncated length backfill. All these
+are offline, conditional models and do not establish runtime fields, an SSO
+signature, peer identity or service acceptance.
+
+Within `0x34ff570`, the inspected `0x34ff681–0x34ff78b` window also selects
+several fields from a receiver state word. With stable receiver fields and
+successful string and logging operations, state zero selects `S+0x00 = 1` and
+uses the receiver's `+0x1a8` word both at `S+0x50` and as the separate
+`0x3504ca0` word. State one selects `S+0x00 = 1`, takes the derivation word
+from `+0x2f0` and uses that value at `S+0x50` when nonzero; when it is zero,
+the selected `S+0x50` falls back to `+0x1a8`, while the derivation word remains
+zero under the stable-field assumption. State one copies the receiver's
+`+0x1b0` string into the optional tail. State two sets `S+0x00 = 3`, with both
+selected words zero; other observed numeric states use `S+0x00 = 1` and zero
+words. The inspected non-state-one tail is empty. The offline
+`selectTargetWtTgtgtStateCandidate` models this local selection from explicit
+inputs, not the meaning or runtime value of the state.
+
+The offline `encodeTargetWtInitialTwoNodesCandidate` conditionally combines
+`0x0106` and `0x0144` using one caller-supplied 16-byte snapshot for both the
+TGTGT plaintext argument and the inner `0x0144` key. This correspondence models
+only the initial `+0x2c8 = 0` branch above, assuming the original buffer
+remains unchanged from the raw7 read through the session copy, and that the
+session copy remains unchanged and valid until the later inner-key read. Its
+plaintext, derived key, four-fragment result and 16-byte key copy are prepared sequentially
+before invoking either caller-supplied random source. The inputs must stay stable
+until copied; this is not an atomic snapshot, and only the bytes consumed by the
+key candidate contribute to its derived result. Its ciphertext-size bound is a
+local policy. Neither model establishes target behavior, target MD5 equivalence,
+or live login.
+
+The `0x016e` value contains a copied global string whose first initialization is empty; subsequent
 writes and the value at send time are not established by that initializer. One
 bounded static path copies an input object's string at `J+0x60` through
 `owner+0x170` into that global string. Identifying that as the eventual node
 value requires the copy to happen first, all calls to return normally, and no
-intervening or aliased writes; `J`'s business identity remains unknown. A
-separate getter produces `Linux` for a field in the third node, not for the
-`0x016e` string. These observations do not identify the sender instance or
-prove that this branch executes. The key's business identity, actual input
-bytes, the two session-owned node types and complete transformation remain
-unknown.
+intervening or aliased writes; `J`'s business identity remains unknown. On the
+inspected construction path, `0x3469211–0x346922c` installs vptr `0x8e7f850`
+and tag `0x016e`; `0x346925f–0x346926d` moves a 24-byte string representation
+into the object's `+0x10` region. The vptr's `+0x10` slot at `0x8e7f860` has
+an `R_X86_64_RELATIVE` relocation with addend `0x35053c0`. That writer reads
+its tag, reserves a two-byte length, selects the short or long string's byte
+span and appends it when nonempty, then writes back the appended count's low
+16 bits. Under valid stable storage and successful stream operations, it emits
+BE16(`0x016e`), BE16(byte count), followed by those raw bytes; failures and
+length truncation differ from the local helper's stricter policy. The offline
+`encodeTargetWtLoginNode016e` accepts caller-supplied raw string bytes; it does
+not infer their encoding or the target's actual runtime value.
+
+For the second pointer, `0x3468279–0x34682da` constructs an object with vptr
+`0x8e80030` and stores it in a temporary structure at `+0x10`; the inspected
+`0x3500ac1–0x3500ad8` path constructs and transfers that structure to
+`session+0x1f0`, and `0x35035b4–0x35035c4` transfers the pointer at `+0x10`.
+The vptr's `+0x10` slot has an `R_X86_64_RELATIVE` relocation with addend
+`0x3506630`. Its writer emits tag `0x0147`, backfilled BE16 length, one BE32
+word and two byte strings, each with a BE16 length. It independently clamps
+both string lengths to 32 bytes and appends their byte prefixes, even if that
+splits a multibyte text encoding. The construction copies the word and two
+strings from fields corresponding to `session+0x18`, `+0x50` and `+0x68`.
+These associations require successful construction, transfer, stable pointers
+and no intervening replacement. The target ignores stream-helper results. The
+local `encodeTargetWtLoginNode0147` models normal successful output with
+caller-supplied raw fields and does not identify their business values.
+
+The same temporary structure's `+0x40` object is constructed at
+`0x346842a–0x34684dd` and transferred into `session+0x230` by the inspected
+`0x350366e–0x350367e` path. Its vptr `0x8e7fe80` has a `+0x10` relocation
+with addend `0x35061f0`. That writer emits tag `0x0128`, a backfilled BE16
+length, a BE16 object word followed by seven individual object bytes, a
+BE16-length-prefixed string, a BE16-length-prefixed vector, and a trailing
+zero word. `0x34692b6–0x34692fa` constructs the string `Linux` and transfers
+it into this object's string slot before the inspected writer sequence; the
+trailing NUL of the short string is not part of its length. With successful
+construction and writes, no later mutation or replacement, the constructed
+nine-byte zero prefix and its 16-byte vector imply a `0x24`-byte body when the
+Linux string is present. At `0x3468415–0x3468427`, the constructor calls
+`0x34faba0` then `0x34fabe0`; `0x3468486–0x346848e` stores the two returned
+register words into that vector in x86-64 little-endian order. `0x34fabe0`
+tail-jumps to `0x8868a90`, whose inspected return reads two global words; nearby
+target log strings refer to a machine-guid array, file reads and random
+creation. One bounded initialization branch calls `0x8868c20`, which builds two
+processed strings and, if at least one is nonempty, calls `0x8b45610`, feeds
+their nonempty byte sequences in order through `0x8b45630`, then calls
+`0x8b45e70` and copies the 16-byte output into the global storage. The inspected
+update sequence adds no separator or string terminator. One source is derived
+from a machine-id read; the second can come from parsed/transformed machine
+information or a separate interface-candidate branch. It is not established as
+raw file content. Both empty inputs lead to a different fallback path. The
+static digest evidence is MD5-like as described above; the offline
+`deriveTargetMachineGuidDigestCandidate` models only this nonempty branch from
+explicitly supplied processed bytes, not file reads, interface discovery or
+fallback. None of these observations establishes actual target bytes, persistence
+state or a successful runtime read. Another call to the getter occurs in TGTGT
+construction, but equality across calls remains conditional on stable state.
+Both length helpers truncate their prefixes to 16 bits while potentially appending
+more bytes, and the writer ignores helper errors. The local
+`encodeTargetWtLoginNode0128` takes explicit byte fields and rejects oversize
+inputs as a separate policy. These are static conditional observations, not
+runtime output or proof of server acceptance.
+
+The `0x0124` factory selection reaches `0x350822c`, which allocates a `0x70`-byte
+object, installs vptr `0x8e7fd60` and zeroes the remaining object fields. Its
+`+0x10` slot at `0x8e7fd70` is an `R_X86_64_RELATIVE` relocation with addend
+`0x3505fe0`. The inspected writer emits the tag and a backfilled 16-bit length,
+then four length-prefixed byte strings at object offsets `+0x08`, `+0x20`,
+`+0x40` and `+0x58`, with the word at `+0x38` between the second and third,
+and a trailing zero word. Each string helper writes the low 16 length bits but
+can append the full low 32-bit length; the writer ignores helper results.
+Under successful allocation and writes, stable pointers, no intervening or
+aliased field modifications, and normal short-empty-string interpretation,
+the freshly zeroed node therefore emits tag `0x0124`, length `12` and twelve
+zero payload bytes. These are conditional static conclusions, not observed
+runtime bytes; string meanings and nonempty values remain unknown. The local
+`encodeTargetWtLoginNode0124` instead accepts four explicit raw byte strings
+and a word, rejecting oversized fields or payloads as a local policy. These
+observations do not identify the sender instance or prove that this branch executes.
+The input field values, other paths that might replace these objects, and the
+complete transformation remain unknown. The offline `encodeTargetWtInnerEncryptedCandidate` composes the
+existing four-writer candidate with the existing QQ-TEA model using an explicitly
+supplied 16-byte key and random-prefix callback. It returns ciphertext only;
+its inputs, random-byte generation and runtime behavior have not been established
+as the target's, and the composition does not construct a `0x0144` node. The
+implementation clears its own key and plaintext snapshots on a best-effort basis;
+the existing QQ-TEA implementation and JavaScript runtime may retain intermediate
+copies. Synthetic vectors are not evidence of actual QQ interoperability.
+
+Further bounded static inspection follows the normal construction path beyond
+that call. `0x3469385` stores tag `0x0144` in a new object; after `0x3468790`
+returns, `0x34693d0–0x34693e0` transfers its three-pointer output vector into
+object offsets `+0x10`, `+0x18` and `+0x20`. On the new-key branch,
+`0x346946c–0x3469472` associates that object with tree key `0x0144`; the
+existing-key branch has separate behavior. The object's vptr comes from
+`0x8e7f808`; its `+0x10` slot at `0x8e7f818` is declared by an
+`R_X86_64_RELATIVE` relocation with addend `0x35051e0`. The original eight
+file bytes at offset `0x8e7d818` are zero: the relocated view is not a literal
+file pointer. At `0x35051e0`, the writer reads the object's tag, reserves a
+16-bit length, appends the object vector and backfills the appended length's
+low 16 bits. With valid, stable pointers and normal successful stream writes,
+its result is BE16(`0x0144`), BE16(appended byte count), then those bytes. It
+ignores some helper results and does not reject lengths exceeding 65535. The
+separate offline `encodeTargetWtLoginNode0144` models only normal successful
+output and rejects oversized values as a local policy; it does not establish the
+runtime key, execution path, or whether the service accepts the result.
 
 `0x3467d50` first checks for nine required tags, then visits them in this order:
 `0106, 0144, 0116, 0142, 0145, 0018, 0141, 0177, 0191`. Only after all are
@@ -403,14 +622,560 @@ inspected success-length formatter associates them with the candidate names
 token, extra and sign as described above. The names do not by themselves prove
 cryptographic semantics or compatibility with another implementation.
 
-In the inspected `0x6856284` window, the caller return address is supplied to
-`dladdr`; its `0x68563e0` call passes the 32-bit value to `%d` decimal
-formatting, which interprets those bits as a signed integer. This alone does not
-identify the value as an SSO sequence. The windows at `0x6856444`, `0x6856461`,
+In the inspected `0x6856284` window, `[rsp+0x1a8]` addresses the saved return
+address after six pushes and the `sub rsp,0x178` prologue; it is supplied to
+`dladdr` at `0x68562d5`. Its result is stored at `[rsp+0x1c]` and checked at
+`0x685639a`. Separately, the formatted 32-bit value is the function's fourth
+integer argument (`ecx`), stored at `[rsp+0x18]` at `0x6856298` and reloaded as
+`r8d` at `0x68563d9`. The two adjacent dword slots are distinct. The format string
+is `%d` under the ELF segment mapping described below; with the normal C++ ABI
+and dynamic bindings it represents this bit pattern as a signed decimal integer.
+The pointer loaded from `[0x91533a0]` is a function pointer, not the integer
+radix 10. The argument's upstream meaning remains a candidate: the observed
+caller passes its fifth integer argument, and one candidate virtual call site
+loads a request object's first dword, but complete runtime object identity and
+whether that value is a sequence are not established. The windows at `0x6856444`, `0x6856461`,
 and `0x68564af` call internal targets `0x68418ac`,
 `0x683fa74`, and `0x6830c58` respectively. Later inspected copy sites read the
 same stack slots into output regions `+0x200`, `+0x100`, and `+0x00`,
-corresponding to the candidate sign, extra, and token slots. Associating the
+corresponding to the candidate sign, extra, and token slots. At the
+orchestrator prologue `0x68562de–0x68562fe`, the output base `rbx` has its
+`+0x200`, `+0x100` and `+0x00` slot pointers saved to stack before dispatch,
+confirming a single 0x300-byte result structure with the sign, extra and token
+slots at those offsets and their low length bytes written to `+0x2ff`, `+0x1ff`
+and `+0xff`. That structure is a caller-provided out-parameter: at the
+prologue `0x6856295` the base `rbx` is moved from `r8`, the fifth integer
+argument, and the inspected call site `0x352329a` sets `r8` with `lea r8,[rsp+0x58]`
+into its own `sub rsp,0x358` frame (`0x58 + 0x300 = 0x358`). That caller is
+identified by its own rodata references and failure log at `0x29ff080` as
+`MSFSecuritySignCallback` in `msf_security_sign_callback.cc`, with the message
+`MSFSign failed, module_id:{}` and the name `MSFSign`; the bytes of those
+strings were confirmed at their file offsets. The caller at entry `0x3523110`
+saves four arguments at the prologue (`r12d=r8d`, `r14=rcx`, `r13=rdx`,
+`r15=rsi`), so `MSFSign`'s inputs are: the command-name `std::string` from the
+callback's second argument (`r15`, with the libc++ SSO selection at
+`0x3523278–0x3523284` choosing `[r15+0x10]` or `lea [r15+1]`) passed as
+`MSFSign` arg1 (`rdi`); the signed body from the callback's third argument, a
+`{begin,end}` descriptor (`r13`), passed as arg2 (`rsi = [r13]`) with length
+arg3 (`edx = [r13+8] - esi`); and the callback's fifth 32-bit
+argument (`r12d`) passed as arg4 (`ecx`). An earlier reading mislabeled this
+last value `module_id`; the failure logger does not consume that value. The command name and body are passed
+as separate arguments here; whether `MSFSign` concatenates them internally
+before signing is not established. The callback's fourth argument (`r14`) is the
+result object, filled only after a successful return, not an input. On the success branch
+(`test eax,eax; je 0x3523301`) the three slots are assigned into the callback's
+result object `r14` as `std::string` token/extra/sign at `r14+0x00/+0x18/+0x30`,
+using the length low bytes at structure `+0xff/+0x1ff/+0x2ff`. The diagnostic
+labels and RTTI associate `0x6856284` with `MSFSign` and a three-string callback
+result. They do not alone prove the cryptographic role of every producer path or
+exclude diagnostic processing deeper in those callees. The incorrect
+`__to_xstring` template reading is corrected below using per-segment mapping.
+
+The inspected entry `0x3523110` is a candidate virtual callback: an
+`R_X86_64_RELATIVE` relocation (addend `0x3523110`) installs it in vtable slot
+`0x8e80f48`. A bounded byte-pattern scan found no direct `call`, `jmp` or
+address-taking `lea` to the entry, but does not rule out other indirect uses or
+prove the runtime identity at any particular call site. That vtable's typeinfo
+slot `0x8e80f30` relocates to the typeinfo object `0x8e80f60`, whose name
+pointer relocates to `0xcba64c`, where the RTTI name reads
+`N2nt8internal23MSFSecuritySignCallbackE` (`nt::internal::MSFSecuritySignCallback`),
+with base `N3msf8embedder8security20SecuritySignCallbackE`
+(`msf::embedder::security::SecuritySignCallback`); the two preceding vtable
+slots `0x8e80f38→0x35248f0` and `0x8e80f40→0x3524980` are sibling virtual
+methods. The instance's vptr `0x8e80f38` is installed by the constructor
+`0x351fb20`, which is invoked at `0x3526f2b`, `0x3528ac2`, `0x354ce6d` and
+`0x354e57b`. The actual runtime identity of a callback at a given virtual call
+site and the registration API remain unproved. The conditional caller-side
+copies and their association with the candidate callback are described below;
+the exact mapping of the result strings into an outbound frame is not recovered. The `dynsym` exports demangle as
+`MSF::MSFSDK::sendPacket(unique_ptr<MSFRequest>)` (`0x670dd20`),
+`MSF::MSFSDK::pack(unique_ptr<MSFRequest>)` (`0x670e0c0`) and
+`MSF::MSFSDK::getClientSecurity(std::string const&, std::string const&)`
+(`0x670f020`). The entry of `pack` checks string-like members at
+`+0x98/+0xb0/+0xc8` and, on the inspected path, also copies members
+`+0xf8/+0x110/+0x128` into a temporary object passed to `0x676c540`. Its
+constructed `MSF::protocol::SsoSecureInfo` child and serialization are identified
+below; the complete outbound request and runtime dispatch remain unproved. In
+`sendPacket`, a zero first dword causes `lock xadd` against a counter followed
+by a write back to the request, and a virtual call is made through an object at
+`[0x9178fa8]`. Calling the dword a sequence and the object a transport singleton
+is a candidate interpretation, not a demonstrated network transaction. `SendMsfRequestInternal` at `0x35505a0`
+(reached via its empty-callback log string `SendMsfRequestInternal
+security_sign_callback_ is null, cmd={} seq={}` at `0xb591a7`, referenced by
+`lea r9,[0xb591a7]` at `0x3550736`) holds the callback pointer at `this+0x70`.
+On the non-empty path it virtual-dispatches `call [vtable+0x20]` (a predicate),
+then `call [vtable+0x10]` with `rcx = lea [rsp+0x40]` as the three-string result
+buffer and `r8d = [rbp]` as an unclassified request dword. It then copies the
+three strings via helper `0x29a76e0` from `rsp+0x70/+0x40/+0x58` into request
+members `rbp+0xf8/+0x110/+0x128`. If this virtual call resolves to the
+candidate callback described above and the fields survive unmodified, the
+respective candidate names are sign/token/extra; the virtual target and dynamic
+object identity are not proven solely by the call site. `SendMsfRequestInternal` allocates this request as a
+single `0x140`-byte object (`mov edi,0x140; call 0x8e10060`), zeroes it, and
+populates its members directly before the sign callback: `rbp+0x00` dword is
+set from the function's second argument; a `std::string` at `rbp+0x50` is copied
+from the third argument via `0x29a76e0` (candidate command); a `std::string` at
+`rbp+0x38` is copied from the object field `r12+0x240`; `rbp+0x20` receives a
+copy or fallback selected from `r12+0x228`, while a temporary result produced by
+`0x3551410` is moved into `rbp+0x80`. Small scalars are set at
+`rbp+0x10`/`+0x18`. `0x3551410` is a length-prefix framer:
+given a `{begin,end}` buffer it computes `len = end - begin`, reserves via
+`0x35a8da0`, then appends `len + 4` as a four-byte big-endian prefix (the four
+`0x35a9100` single-byte appends consume `sar 0x18`, `shr 0x10`, `shr 8`, then
+the low byte) and finally the raw payload bytes via `0x29a1b70`. It therefore
+produces `BE32(payloadLen + 4) || payload`, the classic MSF/SSO
+length-self-inclusive field framing for this particular copied buffer. It is not
+proof of a complete network envelope.
+
+The call at `0x3550e5d` to `0x355ce90` was previously misidentified here as a
+request dispatcher. Its arguments include mapped strings `MSFCore_Service_Log`,
+`msfcore_service.cc`, `SendMsfRequestInternal` and a formatted request log,
+which instead support a logging helper. The r2 raw-mapping string comment
+`"...ocket pool, needn't to Join"` refers to the wrong file offset. At
+`0x3550e7d` a PLT entry whose relocation names `MSF::MSFSDK::sharedInstance()`
+is called; at `0x3550e98` another PLT entry whose relocation names
+`MSF::MSFSDK::sendPacket(unique_ptr<MSFRequest>)` is called with a pointer to
+the stack-held request owner. The real runtime bindings, target and network
+behavior are not observed. The addresses `0x355ce90` and `0x355f100` do not
+establish the writer of request members `+0x98/+0xb0/+0xc8`.
+
+Separately, `pack` dereferences its input owner and validates the three
+string-like members at request `+0x98/+0xb0/+0xc8`. On its inspected normal path,
+`0x670e201–0x670e293` also copies request members `+0xf8/+0x110/+0x128` to the
+local object at `rsp+0xb8/+0xd0/+0xe8`; it passes that object as `rdx` to
+`0x676c540` at `0x670e2ca`. On the nonempty paths of the latter function,
+`0x676c692–0x676c753` applies presence-bit ORs `1/2/4` and uses helper
+`0x57f7340` on local members `+0xb8/+0xd0/+0xe8` into a constructed object's
+`+0x18/+0x20/+0x28`, respectively. These offsets are memory layout, not wire
+tags; the independent constructor/serializer inspection below establishes the
+inner field numbers. Linking those values back to the candidate callback
+additionally requires the same request object to reach `pack`, the relevant
+branches to run, and no intervening mutation. Writers of the separately checked
+request members, complete envelope construction, runtime reachability and the
+complete signing algorithm remain unknown.
+
+The offline [presence-mask candidate](<src/direct/target-sign-presence-candidate.ts>)
+models only the three conditional OR operations: a nonempty sign/token/extra
+view contributes bit `1/2/4`, respectively. Its explicit initial mask preserves
+all existing bits, including for empty inputs; the model does not assume that a
+native constructor clears the flag byte. It reads view lengths, not contents,
+and implements neither native copies nor wire encoding. The names and their
+upstream association retain the callback/object-identity conditions above.
+
+A further bounded audit identifies the 0x30-byte object, rather than inferring
+protobuf from its shape. The constructor call at `0x676c5d8` enters `0x67c27d0`;
+`0x67c27e1–0x67c27e8` installs vptr `0x9032700`. ELF `R_X86_64_RELATIVE`
+records give the following independently checked chain:
+
+- `0x90326f8` (vptr minus 8) points to RTTI `0x9033168`.
+- RTTI name pointer `0x9033170` points to `0xfe102f`, the raw string
+  `N3MSF8protocol13SsoSecureInfoE` (`MSF::protocol::SsoSecureInfo`).
+- Its base RTTI is `0x8fc8580`, with name at `0xef2eef` identifying
+  `google::protobuf::MessageLite`.
+- vptr slot `+0x60`, at `0x9032760`, points to serialization body `0x67c2cd0`.
+  Its relocation record is at file offset `0x589898`.
+
+That body reads the presence word at `this+0x10` and writes these actual bytes:
+
+| Presence bit | Object string slot | Tag write VA | Tag byte | Field / wire type |
+| --- | --- | --- | --- | --- |
+| `1` | `+0x18` | `0x67c2d45` | `0a` | 1 / 2 |
+| `2` | `+0x20` | `0x67c2db4` | `12` | 2 / 2 |
+| `4` | `+0x28` | `0x67c2e23` | `1a` | 3 / 2 |
+
+The short-field paths write a one-byte length and copy that many bytes through
+the `memcpy` PLT. Lengths above 127 or insufficient writer space take shared
+helper `0x5810470`, called with field number 1, 2 or 3; at `0x5810498` that
+helper computes `fieldNumber * 8 + 2`. The construction visits fields in order
+1, 3, 2, but this serializer emits them in order 1, 2, 3. A correctly mapped
+log format at `0xb85ab5` calls their lengths `secSigLen`, `secDeviceTokenLen`
+and `secExtraLen`; these are diagnostic labels, not recovered signing algorithms.
+
+Empty-value behavior has two distinct layers. At `0x67c27eb` the constructor
+clears eight bytes beginning at `+0x10`, so its presence bits start at zero on
+this normal construction path. The builder sets bits only for nonempty strings;
+if all three are empty, its path at `0x676cb83` deletes the child and skips
+installation. In contrast, the generic serializer emits `0a00`, `1200` or
+`1a00` for a valid zero-length string whose bit is already set. It can also
+append retained bytes via the branch starting at `0x67c2ec5`. The existing
+reserve encoder models the nonempty-only builder subset, not arbitrary parsed
+`SsoSecureInfo` objects or their retained unknown fields.
+
+The parent binding is independently visible too. The parent at `rsp+0x68` in
+`0x676c540` is constructed by `0x67bf400`; its vptr is `0x9032680`. RELATIVE
+relocations link the RTTI at `0x9033150` to name VA `0xfe1010`, identifying
+`MSF::protocol::ReserveFields`. Its vtable `+0x48` and `+0x60` slots resolve to
+size routine `0x67c1890` and serializer `0x67c0ba0`, respectively. The helper
+`0x58133d0` calls the size slot at `0x58133ee` and the serializer slot at
+`0x58134e3` to produce a caller-owned string.
+
+On the nonempty-child path, `0x676c88b` sets bit 0 of byte `[rsp+0x79]`
+(parent `+0x11`) and `0x676c890` stores the child at `[rsp+0xd8]` (parent
+`+0x70`). The parent serializer at `0x67c1225` tests the equivalent presence
+word mask `0x100`. At `0x67c1236` it loads that child, and `0x67c123a` writes
+word `0x01c2` little-endian: bytes `c2 01`, the protobuf tag for **field 24,
+wire type 2**. It then writes the child's cached size from `+0x14`, using
+`0x5810800` if the size exceeds 127, and calls child serializer `0x67c2cd0` at
+`0x67c126b`. The parent size path at `0x67c1a8d–0x67c1aab` calls the child size
+routine and accounts for its length prefix and the two-byte outer tag. These
+are static normal-path observations, conditional on intact objects, matching
+vptrs and no intervening replacement or mutation.
+
+The inspected caller-side handoff is `0x676c951–0x676c95b` into `0x58136d0`
+with the parent and an output string; that wrapper calls `0x58133d0` at
+`0x58136eb`. The resulting bytes are moved at `0x676c960–0x676c98b` into
+member `+0xe0` of a separate 0x100-byte object constructed by `0x67b49c0`.
+The call at `0x676ca12–0x676ca1d` reaches its virtual writer `0x67b4f50`
+under the inspected vtable, where the selected path copies those member bytes
+into another writer. The next wrapping stage called via `0x67b2410` has
+virtual target `0x67b4440` under the inspected vtable; its normal and special
+wrapping branches are distinguished below. The produced string is moved to the
+caller's result at `0x676ca35–0x676ca58`. This traces a conditional byte handoff,
+not a demonstrated network write.
+
+This `MessageLite` implementation is distinct from the `CPBMessageOpti` route
+at `0x666a1d0` described above. Both inspected implementations place the three
+inner fields under field 24, but matching field numbers does not establish a
+shared object, caller, complete byte stream or runtime execution path.
+
+**SDK header prefix differs from the earlier CPB-derived head.** The separate
+0x100-byte object's constructor `0x67b49c0` sets mode `+0xf8` to 12 and word
+`+0x10` to `0x20027635`. On the inspected path `0x676c8ad–0x676c8b5` calls
+`0x67b4c30` with 1, setting byte `+0x14` to 1. The mode-12 branch of
+`0x67b4f50` starts at `0x67b4fc2` and writes four BE32 words: the result of
+`0x67b4c80`, then object words `+0x08`, `+0x0c`, `+0x10`. Its next twelve bytes
+at `0x67b504b–0x67b508a` are:
+
+```text
+object[0x14] || G[0..8] || object[0x15] || low8(object[0x16] << 2)
+G = writable global at VA 0x91790b8
+```
+
+Before copying, it stores the latter two values into `G+9` and `G+10`. Thus the
+first byte of that block is 1 on this initialized normal path, whereas the
+existing `encodeTargetSso12Head` CPB-derived model intentionally writes zero at
+head offset 16. The constructor clears `+0x15` but the inspected constructor
+does not initialize `+0x16`; writable `G[0..8]` is not a runtime constant just
+because its initial segment storage is zero-filled. Keep these implementations
+distinct instead of changing the older encoder to fit the new branch.
+
+A second constructor, `0x67b4a50`, uses the same vptr but explicitly sets
+`+0x16=1` at `0x67b4a69`, leaves `+0x15` unwritten in the inspected constructor,
+and takes its mode from ESI. Direct calls were found at `0x674396e` and
+`0x6745afa`. They do not change the fact that the current `0x676c8a8` path calls
+`0x67b49c0`, which initializes `+0x15` instead of `+0x16`. No whole-object
+zeroing was observed between that path's allocation and construction.
+
+G lies in `.bss` (`SHT_NOBITS`, start `0x9161180`, size `0x4abe8`), beyond the
+last load segment's file-backed end `0x9161150`. Standard ELF loading establishes
+its initial zero bytes, not their value at serialization time. A bounded scan
+of selected RIP-relative instruction families across RX
+`[0x299e300,0x8e13400)`, related RELA/dynsym entries, nearby initialization
+functions and scalar writes in `[0x67b49c0,0x67b5bb0)` found no additional direct
+write to G's first nine bytes. It did find the known `G+9/G+10` stores. The
+nearby initializer `0x67b1cd0` writes through `0x91790ab`, and a pointer store
+at `0x67b5c9b` targets `0x91790b0`, both stopping before G. This is not complete
+alias analysis; indirect/base-plus-offset/wide writes remain possible. Keep
+both the nine-byte prefix and the current path's `field16` explicit.
+
+After that mixed block, the mode-12 writer appends these fields in order:
+
+| SDK object member | Encoding |
+| --- | --- |
+| `+0x20` | `BE32(length+4) || bytes` |
+| `+0x50` | `BE32(length+4) || bytes` |
+| `+0x68` | `BE32(length+4) || bytes` |
+| `+0x98` | `BE32(length+4) || bytes` |
+| `+0xb0` | `BE32(length+4) || bytes` |
+| `+0xc8` | `BE16((length+2) & 0xffff) || bytes` |
+| `+0xe0` | `BE32(length+4) || bytes` (serialized reserve) |
+
+Under ordinary non-overflowing lengths, `0x67b4c80`'s selected branch at
+`0x67b4ce5` computes `54 + sum(lengths of those seven strings)`, including
+the leading length word but excluding the business bytes that follow. The
+layout matches the earlier head's field widths, not its native object layout
+or mixed-prefix values. The old head encoder's u16 oversize rejection remains
+a local policy rather than an emulation of native truncation.
+
+The separate
+[SDK mixed-head candidate](<src/direct/target-msf-sso12-head-candidate.ts>)
+exports `encodeTargetMsfSso12HeadCandidate`. It requires all three u32 words,
+explicit `field14`, `field15`, `field16`, a nine-byte `globalPrefix9`, and the
+seven byte fields named after their offsets. It reuses the old head codec for
+its identical length-delimited field layout, then replaces only bytes 16–27.
+All nine global bytes remain caller-supplied; there is no implicit zero-filled
+global or fabricated value for the uninitialized native field. The API encodes
+only H, not the subsequent body, compression, encryption or the normal wrapper.
+The older `encodeTargetSso12Head` API and its zero-first-byte profile are intact.
+
+**Trimmed heads for modes 13 and 21.** The writer's actual relative jump table
+at `0xfdfc18` maps both of these modes to `0x67b4f86`; mode 12 maps to
+`0x67b4fc2`, while mode 20 has a distinct entry at `0x67b50aa`. The shared
+trimmed entry writes only:
+
+```text
+H = BE32(L) || LP4(object+0x50) || LP4(object+0x68) || LP4(object+0xe0)
+L = 16 + length(field50) + length(field68) + length(fieldE0)
+```
+
+The length helper has its own relative table at `0xfdfbf0`, mapping 13/21 to
+`0x67b4cae`. Its selected string lengths are added with a fixed 16-byte term
+at `0x67b4e13–0x67b4e17`, independently matching the writer. The field prefixes
+are written at `0x67b511a`, `0x67b518e` and `0x67b520b`; the last raw copy joins
+`0x67b56ce–0x67b56e4`, then the common body path. This is not the mode-12 head
+with its mixed bytes zeroed: the sequence/app words, mixed block and four
+other variable fields are absent from this head. Body bytes are not counted
+in L; all three empty strings produce a 16-byte head.
+
+The [trimmed-head candidate](<src/direct/target-msf-trimmed-head-candidate.ts>)
+exports `encodeTargetMsfTrimmedHeadCandidate({field50, field68, fieldE0})`.
+It reuses the existing self-inclusive field encoder, checks an exact own-data
+plain/null-prototype record, rejects invalid/shared/detached/out-of-bounds
+views and applies a local 16 MiB total cap before framing allocations. It
+returns independent storage and clears its temporary framed fields best
+effort. The [trimmed-head tests](<tests/direct/target-msf-trimmed-head-candidate.test.ts>)
+cover fixed bytes, all empty combinations, field boundaries, ownership,
+hostile metadata, validation and cleanup. Synthetic compositions exercise the
+real QQ-TEA and Base mode-13/21 encoders without selecting any live protocol
+mode, key or session.
+
+Native mode selection still requires state: `0x675a4c0` is identified by
+correctly mapped strings as `MSFPacketHeaderTrimer.cpp::shouldTrim`. Its
+ordinary return paths produce only 0 or 1 (`0x675a71a–0x675a725` and
+`0x675a857–0x675a867`), but it can update per-key flags and clear stored state.
+Thus the builder's `12 + S + 8*(incoming_r8d & 1)` yields 12, 13, 20 or 21
+under those observed return paths; this does not authorize choosing trimmed
+mode before its native prerequisites are satisfied. The new API encodes only
+the given trimmed structure, not the state machine or the distinct mode-20
+untrimmed head.
+
+**Untrimmed mode 20.** The remaining writer-table entry at `0x67b50aa`
+starts with the inclusive length and the dword at object `+0x08`, both BE32.
+It then calls `0x299f000` with the dword at `+0x0c`, framing the resulting
+text before the five byte fields:
+
+```text
+D = ASCII(decimal(signed_i32_bits(field0c)))
+H = BE32(L) || BE32(field08) || LP4(D) || LP4(field20) || LP4(field50)
+    || LP4(field68) || LP4(field98) || LP4(fieldE0)
+L = 32 + length(D) + sum(lengths of the five byte fields)
+```
+
+The conversion is signed, not an unsigned decimal approximation. Its negative
+branch at `0x299f0cb–0x299f0d5` writes `'-'`, negates EAX and rejoins the
+magnitude formatter. The formatter at `0x299f150` uses decimal thresholds,
+100/10000/100000000 grouping and the two-digit table at `0xcbe8c0`; that table
+was independently checked against all `00` through `99` pairs. Thus raw
+`0x80000000` becomes `-2147483648` and `0xffffffff` becomes `-1`. The output
+terminator is not part of the framed string.
+
+The length function's mode-20 entry is `0x67b4d6b`; it runs the same conversion,
+adds the five field lengths and adds 32 at `0x67b4f30–0x67b4f40`. Writer prefix
+sites are `0x67b52b8`, `0x67b53db`, `0x67b570a`, `0x67b577a`, `0x67b57f3` and
+`0x67b5878`. After the final raw copy, `0x67b58db–0x67b58ec` releases the
+conversion temporary and joins the shared body path. There is no mode-12
+mixed block, numeric `+0x10` word, or B0/C8 field in this head.
+
+The [mode-20 head candidate](<src/direct/target-msf-sso20-head-candidate.ts>)
+exports `encodeTargetMsfSso20HeadCandidate`. Its seven required fields are the
+two raw u32 bit patterns and five opaque byte views. The local API accepts
+`field0c` as u32 and applies signed interpretation only during encoding; it
+does not coerce negative/string/object inputs into a bit pattern. Its minimum
+is 33 bytes: even zero contributes one ASCII digit. It uses the existing LP4
+encoder, validates all views, checks a local 16 MiB total before field framing,
+returns owned storage and clears owned decimal/framing temporaries best effort.
+The [32 mode-20 tests](<tests/direct/target-msf-sso20-head-candidate.test.ts>)
+cover signed boundaries, fixed bytes, field widths, isolation, size gates,
+cleanup and a real-implementation QQ-TEA/Base20 composition with explicit inputs.
+
+The pre-transform head layouts for modes 12, 13, 20 and 21 now each have an
+offline model. This does not select any of them automatically, implement the
+native state machine, or establish real packet acceptance. All remain separate
+from compression, encryption, Base flags, credentials and transport binding.
+
+At `0x67b58ec` onward, a nonempty string at `+0x80` is appended unchanged;
+an empty one takes `0x67b5920–0x67b593b`, appending `00 00 00 04`. Thus this
+writer is not evidence that every nonempty body receives another length prefix.
+A nonzero byte `+0x1c` selects `compressBound`/`compress2` at
+`0x67b596d–0x67b59dd`; the inspected constructor clears that byte. Finally,
+`0x67b59f8–0x67b59fe` calls `0x67b5a30`. With nonzero `+0x18` and nonempty
+string `+0x38`, it configures `MSFCCrypt` from that string and encrypts the
+writer's accumulated output through `0x67de280`, replacing the output on the
+inspected successful path. The key setter `0x67deca0` copies only when its
+supplied length is 16; other lengths return without an error or clearing.
+Constructor `0x67de220` and configuration helper `0x67decb0` set bytes `+8/+9`
+but do not initialize the key region `+0x0a..+0x19`. Consequently a nonempty
+but non-16-byte key does not select a known zero-key fallback: key-region
+contents remain unknown, even if the caller proceeds into the transformation.
+The observed caller sets `+0x18=1` and copies the separately checked request
+`+0xc8` string to `+0x38`. Actual key bytes, runtime path selection and dynamic
+object continuity remain unverified; the assembled head is not automatically
+the final plaintext network payload.
+
+**Selected encryption kernel, static correspondence.** The block function at
+`0x67de5f0–0x67de716` takes an 8-byte input in RDI, a 16-byte key in RSI and an
+8-byte output in RDX. Its input bytes form two big-endian u32 words; four key
+loads and `bswap` instructions at `0x67de61c–0x67de634` form big-endian K0–K3.
+`0x67de637` sets the loop counter to 16; `0x67de63d` initializes the sum to
+`0x9e3779b9`. The loop uses these u32-wrapping updates, with logical right shifts:
+
+```text
+L = L + (((R << 4) + K0) XOR (R + sum) XOR ((R >>> 5) + K1))
+R = R + (((L << 4) + K2) XOR (L + sum) XOR ((L >>> 5) + K3))
+```
+
+The first update is established at `0x67de66f–0x67de6a2`, the second at
+`0x67de6bb–0x67de6d0`. The loop adds delta at its end and decrements the counter
+at `0x67de6e1–0x67de6ea`. This is 16 cycles / 32 half-updates, using sums
+`delta*1` through `delta*16`; it agrees with the source's sum increment at the
+start of each cycle, despite the different instruction placement. Stores at
+`0x67de6f0–0x67de708` write both resulting words big-endian. Under valid input,
+key and output buffers, this matches the encryption branch of `teaBlock` in
+[qq-tea.ts](<src/direct/qq-tea.ts>), not its unaudited native decryption counterpart.
+No native function was executed or used as a runtime test oracle.
+
+The containing `0x67de280` branch with `context[8] == 0` also matches the
+reference's padding and two feedback chains for non-overflowing nonnegative
+input lengths n. It sets `p = (8 - ((n + 10) % 8)) % 8`, then feeds the block
+routine this padded byte sequence:
+
+```text
+((R0 & 0xf8) | p) || R1..Rp || R(p+1)..R(p+2) || input[0..n) || zero[7]
+```
+
+Here R denotes the target's processed random bytes, not necessarily the low
+byte of its raw PRNG return. Header/padding/salt construction is established
+at `0x67de2e1–0x67de3be`, input copying at `0x67de4e0–0x67de4f7`, and the
+seven-byte zero tail at `0x67de51d–0x67de571`; stages may cross a block boundary.
+The output length is `n+p+10`. Before the first block, `0x67de361` clears the
+previous-state word and points R12 at it. For successive padded blocks Pi:
+
+```text
+M_i = P_i XOR C_(i-1)
+C_i = F(M_i, K) XOR M_(i-1)
+C_0 = M_0 = zero[8]       # initial state, before the first block
+F = the 16-cycle big-endian block transform above
+```
+
+`0x67de3c7–0x67de3dd` mixes with the previous ciphertext and calls F;
+`0x67de3e2–0x67de41d` XORs the previous mixed block into its output;
+`0x67de420–0x67de438` updates both prior states. The body and trailer repeat
+this at `0x67de460–0x67de4d2` and `0x67de573–0x67de5d8`. The leaf reads input
+and key without changing them when its output is independent.
+
+The three random-byte sites resolve a PLT entry at `0x8e11830` through GOT
+`0x9160368` to declared symbol `rand`; live binding was not observed. For its
+standard nonnegative signed-32-bit return x, the multiply/shift sequence at
+`0x67de2e8–0x67de2ff` reduces to `low8(x % 65534)`, **not** simply `low8(x)`.
+The other two sites use the same reduction. One derivation uses
+`q = floor(0x80010003*x / 2^47)` and `low8(x+2*q)`: the multiplier excess is
+65530, and `65530*(2^31-1) < 2^47`, bounding q to `floor(x/65534)` throughout
+that input domain. A separate pure-integer check covered all 98,309 distinct
+quotient-boundary samples and the inequality; it did not execute sample code.
+For example, x=65533/65534/65535 yields 253/0/1. There are `p+3` native PRNG
+calls, unlike the local codec's single `randomSource(p+3)` call. The local
+secure default RNG remains unchanged.
+
+Thus **conditional static byte equivalence** with `qqTeaEncrypt` is established
+for this branch when the initialized 16-byte key and processed random-prefix
+bytes are equal, lengths do not overflow, and all input/key/output/state memory
+is valid and free from destructive aliasing. The native routine has no observed
+capacity argument/check: output must hold `n+p+10` bytes, and the four-byte
+output-count slot must be writable. It clears that count at `0x67de369–0x67de36e`
+and advances it by eight per block. Nonzero `context[8]` returns without that
+initialization; no read of `context[9]` was seen within this selected routine.
+Those are bounded direct-access findings, not claims about arbitrary aliases
+or external callbacks. This does not establish live ciphertext equality,
+default RNG equivalence, a real session key, or the native decryption path.
+
+The [encrypted-payload candidate](<src/direct/target-msf-sso12-payload-candidate.ts>)
+composes the existing mixed-head and QQ-TEA implementations for this restricted
+uncompressed/encryption-enabled branch. `encodeTargetMsfSso12PayloadCandidate`
+takes `head`, `body80`, a required 16-byte `key38`, and an optional synthetic
+`randomSource`. It encrypts `H || body80`, substituting `00 00 00 04` only when
+body80 is empty; nonempty body bytes receive no additional prefix. It snapshots
+all plaintext and key material before calling a supplied RNG. Invalid key
+lengths fail locally instead of emulating the native uninitialized-key behavior.
+
+The result is encrypted B for the normal wrapper below, not a whole frame.
+Its 16 MiB limit applies to ciphertext including QQ-TEA padding; outer framing
+needs additional space and has its own cap. This wrapper clears its owned key,
+head and plaintext buffers best effort, including on callback failure; the
+underlying codec's internal allocations are not covered by that guarantee.
+Built-ins must remain intact throughout the call, as with its dependencies.
+This does not implement compression, alternate flags, session-key derivation,
+signing, account discovery, production wiring or any transport operation.
+
+**CRequestBase normal outer wrapper.** RTTI identifies vptr `0x9032168` as
+`MSF::CRequestBase` (name at VA/file `0xfdfc40`). Its `+0x10` slot resolves to
+writer `0x67b4440`, and `+0x18` to length function `0x67b4920`. Write
+`LP4(X) = BE32(|X| + 4) || X`, let `P = u32(this+8)`, `A = string(this+0x10)`,
+`B = string(this+0x28)` and `U = string(this+0x68)`. For `this[0xa0] == 0`, the
+inspected supported modes write:
+
+```text
+BE32(L)
+BE32(P | (this[0xa1] != 0 ? 0x40000000 : 0))
+u8(this[0x0c])
+mode-specific field
+u8(this[0x60])
+LP4(U)
+B
+```
+
+| Modes P | Mode-specific field | Total self-inclusive length L |
+| --- | --- | --- |
+| 12, 20 | `LP4(A)` | `18 + |A| + |U| + |B|` |
+| 13, 21 | `BE32(u32(this+0xa4))` | `18 + |U| + |B|` |
+
+`0x67b4451` calls the length slot; `0x67b4454–0x67b4470` writes its result
+big-endian. The mode dispatch uses the table at VA/file `0xfdfba0`; A's branch
+begins at `0x67b44e2`, the integer branch at `0x67b44f3`. The final ordinary
+branch `0x67b4622–0x67b4661` appends B as supplied, without a new length prefix
+or an encryption call. Other modes take different paths and are not generalized
+as valid packets here. The type byte is an object member, not a command-name
+classification inside this writer. The constructor defaults it to 2, but the
+inspected `0x676c9e0` caller subsequently writes 1. That caller constructs mode
+12 at `0x676c9c8`; the constructor clears `+0xa0/+0xa1` at `0x6745d89`.
+The inspected setters then copy A through `0x67b4410`, and the nested object
+through `0x67b2750` (including its byte to `+0x60` and string to `+0x68`). These
+setters do not change the two cleared flags. This identifies the normal branch
+on the inspected stable-object path, not every possible caller or runtime state.
+
+**Separate special wrapper, not implemented by the normal model.** Nonzero
+`this[0xa0]` selects `0x67b4680`. It overwrites the already-built header H's
+first word with a PRNG-derived value, constructs `Q = BE32(|H|+4) || H`, and
+passes Q to `MSF::MSFCCrypt` at `0x67de280`. The configured key is a 16-byte
+static string reached through pointer `0x9155938` (RELATIVE record at file
+`0x81fd10`, pointee VA/file `0xba174c`), not a caller-selected key. It rebuilds
+`BE32(5+|C|+|B|) || u8(0x80 | (rand() & 0x7f)) || C || B`. B is appended
+*after* this encryption and is not part of Q. The selected encryption branch
+has the conditional static correspondence described above; this still does not
+implement the special wrapper's framing, PRNG state or runtime behavior.
+
+Consequently, `encodeTargetServiceRequest` remains the earlier route's separate
+model: it encrypts `head || busi` with an explicit key and classifies two source
+command names. Applying those operations to `CRequestBase` would invent behavior.
+B's upstream construction/encryption and real branch selection remain separate
+questions; no live server accepted any bytes in this audit.
+
+The separate offline
+[normal-wrapper candidate](<src/direct/target-msf-request-base-candidate.ts>)
+exports `encodeTargetMsfRequestBaseCandidate`. It requires exactly seven own
+data fields: `mode`, `flagA1`, `field0c`, `field60`, `field68`, `field28`, plus
+`field10` for modes 12/20 or `fieldA4` for modes 13/21. The raw-byte fields keep
+their offset-based names because the model does not establish account, command
+or key semantics. In particular, `field28` is already constructed caller-owned
+payload; the helper neither encrypts it nor prepends another length to it.
+`flagA1` is an explicit byte and any nonzero value sets mode bit `0x40000000`.
+Special `flagA0`, other modes, mismatched branch fields, accessors, shared or
+invalid views are rejected. Its 16 MiB cap and strict input shape are local
+policies. The helper does not change the old service encoder or production
+Bridge wiring.
+
+The offline `assembleTargetSignStructureCandidate` models only the
+fixed copy layout from three caller-supplied slot byte strings; it implements no
+signing algorithm and does not establish the runtime slot values. Associating the
 calls with those copies requires the intermediate values to survive the
 intervening control flow without replacement or aliasing. In bounded linear
 samples from each callee entry, `0x68418ac` saves the command, decimal 32-bit
@@ -434,11 +1199,79 @@ whose inspected entry byte is `c3` (`ret`); the call alone is not evidence that
 a notification was registered or processed. None of these static observations
 is a live invocation or a successful signature.
 
+Additional bounded windows in the candidate token path show why the output
+cannot yet be replaced with a single known global string. At `0x6836d43–0x6836d63`
+the code calls `0x6885046` with a pointer derived from `0x917b860` and a local
+string, saving the returned pointer at `[rbp-0x590]`. A separately selected state
+at `0x6836fa0–0x6836fd9` uses that object's `+0x48` pointer and `+0x50` length
+to construct another local string. A later inspected state at
+`0x683aff9–0x683b007` assigns that local string to the result candidate; the
+complete path between these states, object lifetime and absence of intervening
+mutation remain unknown. In an independent bounded inspection, `0x6885046`
+traverses a binary tree using `0x6875528` to compare byte-string keys; it tracks
+a lower-bound candidate and performs the reverse comparison before returning an
+exact-match candidate. An empty tree or missing key returns its embedded
+sentinel at the input object's `+0x08`, not a null pointer. The comparator uses
+a `memcmp`-named PLT entry for the common prefix and then compares lengths.
+The lookup returns a borrowed pointer; neither a stable tree nor the lifetime of
+its nodes is established. In a separate bounded inspection, the lookup key passed
+at `0x6836d4a` is the `std::string` built at `0x6830c80–0x6830c9a`: `0x683f8ae`
+is a control-flow-flattened Meyers singleton getter whose only return loads the
+fixed global object `0x917b530`, and `0x68119f6` copies the NUL-terminated C
+string pointed to by that object's `+0x60` field. That storage lies past the
+file's end in a runtime-initialized region, so the key is a runtime value set
+when the singleton is constructed, not a shipped literal or a hardcoded command
+name; its actual bytes remain unknown without the out-of-window constructor.
+Within the inspected window no instruction rewrites the key's stack storage
+between construction and use, though aliased writes cannot be fully excluded
+under the flattened control flow. Elsewhere, the same stack slots
+are reused across phases for different global-derived pointers; they must not
+be treated as one persistent alias. The caller's `0x68564e1–0x68564fc` copy
+uses its local result pointer and length for output `+0x00`, storing the low
+length byte at `+0xff`. This link still depends on normal returns, valid
+pointers, dynamic bindings and no destructive aliasing. It is not a recovered
+token formula or runtime observation.
+
 Further static windows in `0x68418ac` support a conditional MD5 intermediate
 candidate. The caller's `0x68563b4–0x68563e0` path formats an unidentified
-32-bit value with `%d` and passes a stack string at `0x6856439`. The formatting
-string is the three original bytes `25 64 00`; the value is not established as
-an SSO sequence. Two distinct state checks precede the inspected digest path:
+32-bit value (`r8d` from `[rsp+0x18]`) through the `0x8e12140` formatter and
+passes the resulting string as the third argument (`rdx`,
+`lea rdx,[rsp+0x140]` at `0x6856439`) to `0x68418ac`. The `lea` instruction at
+VA `0x68563d2` has bytes `48 8d 0d c3 65 36 fa` and resolves to format-string
+VA `0xbbc99c`. The ELF read-only `PT_LOAD` maps this VA to file offset
+`0xbbc99c`, where the bytes are `25 64 00` (`%d`). The executable `PT_LOAD`,
+by contrast, uses VA = file offset + `0x1000`. Applying that executable-segment
+offset to the read-only segment erroneously reads file offset `0xbbb99c`
+(`6c 2c 20 7b 7d 00`, `"l, {}"`); earlier document revisions made exactly that
+mapping error. VA `0xbbd99c` is not the `%d` format string either. Radare2
+comments from a uniform `-m 0x1000` raw mapping must not be used to resolve
+read-only strings without the appropriate `PT_LOAD` translation.
+
+For this sample, translate a file-backed VA with the segment containing it,
+using `fileOffset = p_offset + VA - p_vaddr` and checking the `p_filesz` bound:
+
+| Segment flags | `p_vaddr` | `p_offset` | `p_filesz` |
+| --- | --- | --- | --- |
+| R | `0x0` | `0x0` | `0x299d2cc` |
+| RX | `0x299e300` | `0x299d300` | `0x6475100` |
+| RW | `0x8e14400` | `0x8e12400` | `0x33f2f0` |
+| RW | `0x91546f0` | `0x91516f0` | `0xca60` |
+
+The formatter `0x8e12140` resolves through its GOT slot `0x91607f0` to the
+libstdc++ `__gnu_cxx::__to_xstring` specialization, and `[0x91533a0]` resolves
+via a `GLOB_DAT` relocation to `vsnprintf`; `edx = 16` is its buffer-size
+argument. That GOT VA maps to file offset `0x91513a0`, whose raw qword is zero
+before relocation. The erroneously uniform raw mapping instead reads offset
+`0x91523a0`, whose qword is ten; it is not evidence of a radix argument.
+Subject to the normal ABI and dynamic bindings, `%d` renders the input bit
+pattern as signed decimal. A bounded trace of the digest shows that
+`0x68419b9` loads the data pointer from the third argument's string object and
+`0x68419c1` loads its low 32-bit length. The offline
+`targetSignedDecimalMd5Candidate` models signed-decimal MD5 for explicitly
+supplied bits, but complete reachability, object lifetime, MD5 path equivalence,
+final signer semantics and actual target output remain unverified. Other
+branches and uses of the command and body arguments are not excluded. Two distinct
+state checks precede the inspected digest path:
 `0x6843265–0x684327e` tests byte `+1` of the object returned by `0x684bd56`,
 and `0x68433ec–0x684340a` tests dword `+0xa0` of the object returned by
 `0x683f8ae`. The candidate path requires respectively a nonzero byte and a
@@ -451,9 +1284,9 @@ string pointer and low 32 bits of its length. The padding path saves the origina
 64-bit bit count, chooses `56 − n` or `120 − n` bytes for
 `n = (oldBits >> 3) & 63`, and copies a block whose first byte is `80` followed
 by 63 zero bytes. Its VA is `0x9156390`, with original file offset `0x9153390`.
-A signed int32 `%d` string is nonempty and has at most 11 ASCII bytes; assuming
-the formatted object, pointers and buffers remain consistent, this case fits
-one final padded block. The `0x6845167–0x684521b` loop assembles its 64 bytes
+A formatted signed-decimal integer string is nonempty and has at most 11 ASCII
+bytes; assuming the formatted object, pointers and buffers remain consistent,
+this case fits one final padded block. The `0x6845167–0x684521b` loop assembles its 64 bytes
 into 16 little-endian words.
 
 For the first tail-block copy at `0x6845220–0x6845b1a`, all 64 compression steps were
@@ -462,8 +1295,12 @@ round Boolean functions, state dependencies and four-word feed-forward match
 the MD5 compression function. A separate disassembly of the 700 instruction
 records and a comparison with original ELF bytes agreed on their addresses,
 bytes and decoded opcodes. This is a bounded **linear-window** result, not a
-whole-function control-flow proof. The second tail copy beginning at
-`0x6845bb9` and unexamined steps of the full-block copy remain unknown.
+whole-function control-flow proof. The subsequent independent mapping audit
+reproduced the matches for all 64 round constants and rotations in
+`0x6845220–0x6845b19`; that narrower recheck did not independently prove every
+message-word selection, Boolean operation or feed-forward dependency claimed
+by the earlier comparison. The second tail copy beginning at `0x6845bb9` and
+unexamined steps of the full-block copy remain unknown.
 
 The `0x6846699–0x6846796` window serializes four state words into 16 bytes,
 and `0x6846887–0x684695b` copies and passes that interval to a PLT target whose
@@ -471,17 +1308,31 @@ and `0x6846887–0x684695b` copies and passes that interval to a PLT target whos
 specialization. Dynamic export metadata also identifies the caller's
 `__to_xstring`-style formatting helper (REA Evidence
 `ev_44f6b2a8375b0ed7b4c9f7af2dc21fef36d6ca6afb989f0e19e875dcd522d82d`);
-actual runtime PLT binding remains unknown. Pointer identity, absence of
-intervening replacement or destructive aliasing, normal completion and the
-result's downstream use are all still conditions, not observed runtime facts.
+actual runtime PLT binding remains unknown. A further bounded trace follows the
+result object: `0x6846887–0x6846923` copies 16 bytes into the half-open range
+passed at `0x684694b–0x684695b` for construction into the callee's incoming
+result object. The selected return state reaches `0x684bd19` and returns that
+object if its canary check passes. At `0x685641c–0x6856444` the caller supplies
+its stack object at `+0x100`; after two intervening calls, `0x68564b4–0x68564d9`
+loads that object's pointer and length, calls a PLT entry whose ELF JUMP_SLOT
+names `memcpy` with the destination saved from output `+0x200`, and stores the
+length's low byte at output `+0x2ff`. The inspected copy has no visible local
+length clamp. If the constructed range remains intact, intervening calls and
+aliases do not replace it, the checked branches complete normally and the PLT
+entries use the expected bindings, this path copies 16 raw bytes and records
+length `0x10`. Those conditions and actual branch execution are not observed.
 
 The offline [signed-decimal MD5 candidate](src/direct/target-signed-decimal-md5-candidate.ts)
 accepts an unsigned 32-bit bit pattern, formats it as a signed decimal integer
 and returns the 16 raw MD5 bytes. Its fixed-vector tests exercise only this pure
-calculation, not the target. It is not wired into a signer and does not establish
-that the target returns these bytes, that they reach a particular result slot,
-that the supplied ZIP implements this path, or that real QQ accepts them. No
-target native code was executed to establish these observations.
+calculation, not the target. It is not wired into a signer; the conditional
+static connection above does not prove an actual target result, that the supplied
+ZIP implements this path, or that real QQ accepts the output. The offline
+`placeTargetSignedDecimalMd5SlotCandidate` conditionally projects that 16-byte
+candidate into a caller-supplied 0x300-byte structure, preserving all other
+bytes except its length slot; it does not decide whether the target gates hold
+or produce the other fields. No target native code was executed to establish
+these observations.
 
 In `0x683fa74`, separate bounded decoding windows recover three command
 constants: `trpc.o3.ecdh_access.EcdhAccess.SsoEstablishShareKey`,
@@ -537,6 +1388,22 @@ inspected subsequent states `0x49c4fd2e` and `0x2031f10d`, `0x6d051a2`
 cleans the local string and the stack-canary-success path returns at
 `0x6d051f1`. The command-mismatch, nonempty-body and all-zero-block paths are
 not resolved by this branch.
+
+A further bounded trace follows the helper result through its caller on one
+additional conditional path. `0x684011f–0x684012d` moves the returned string
+to a local object, then inspected outer-result operations append the bytes
+`0x0a`, `0x20`, and the 32 raw bytes. If the two subsequently checked auxiliary
+strings have zero length, the indicated return states complete normally and no
+intervening alias or concurrent mutation changes the string, the result is 34
+bytes: `0a 20 || G[0x28:0x48]`. The caller at `0x685650a–0x6856527` copies
+that candidate into output `+0x100`; `0x685678b–0x6856794` stores its length's
+low byte at output `+0x1ff`. With the same assumptions, that byte is `0x22`.
+These are conditional static observations for the described matched-command,
+empty-body, nonzero-global branch, not evidence that the actual global, command,
+auxiliary fields or runtime execution satisfy the conditions. The offline
+`placeTargetO3EmptyExtraSlotCandidate` projects only this asserted local branch
+from caller-supplied bytes; it does not select commands, model other branches or
+implement a complete signer.
 
 The named entries above are observations from this ELF's `.rela.plt`
 `R_X86_64_JUMP_SLOT` records: indices `0x10` and `0x12` name `memcmp` and
@@ -1580,11 +2447,34 @@ remain to be recovered and independently verified.
   policies, not target limits. Inputs must remain stable until snapshotted; the
   output belongs to the caller and cleanup is best effort. This helper does not
   invoke target writers, encrypt, sign, send, authenticate or establish login.
-- `src/direct/target-wt-login-node.ts` encodes the two observed node forms
-  `0x016a` and `0x0318` from explicitly supplied opaque bytes. A node includes
-  its BE16 tag and BE16 value length but no entry count. Its per-value limit is
-  a local policy; a later enclosing frame may impose a smaller bound. This does
-  not establish that either node is sent in a login request.
+- `src/direct/target-wt-inner-encrypted-candidate.ts` composes the four-writer
+  candidate with local QQ-TEA and an explicitly supplied key and random source.
+  Its output is only a local conditional candidate, not a discovered key, a
+  signature or proof that the target produces identical ciphertext.
+- `src/direct/target-wt-login-node.ts` encodes the observed normal-success node
+  forms `0x0106`, `0x016a`, `0x0318`, `0x0144` and `0x016e` from explicitly supplied raw bytes.
+  A node includes its BE16 tag and BE16 value length but no entry count. Its
+  per-value limit is a local policy; a later enclosing frame may impose a smaller
+  bound. This does not establish that any node is sent in a login request.
+- `src/direct/target-wt-node-0124-candidate.ts` models the selected `0x0124`
+  writer's four explicit raw byte strings and 16-bit word on its normal-success
+  path. Its range checks are local policy, and it does not discover field
+  identities or claim the target supplied any particular values.
+- `src/direct/target-wt-node-0147-candidate.ts` and
+  `src/direct/target-wt-node-0128-candidate.ts` model the inspected inner-node
+  writers from explicitly supplied values. The former truncates both strings to
+  32 bytes as observed; the latter rejects oversize values as local policy.
+- `src/direct/target-machine-guid-digest-candidate.ts` models one nonempty
+  processed-byte digest branch with a local MD5 candidate. It neither reads
+  host identity files nor models target fallback or interface discovery.
+- `src/direct/target-wt-tgtgt-key-candidate.ts` is a bounded MD5-based candidate
+  for the separately inspected `0x3504ca0` derivation, not a verified SSO signer
+  or proof that any supplied input matches the target.
+- `src/direct/target-wt-tgtgt-plain-candidate.ts` models the examined `0x3504d80`
+  normal-success plaintext sequence from explicit raw fields; the matching
+  `target-wt-tgtgt-encrypted-candidate.ts` composes that sequence, the key
+  candidate and local QQ-TEA. Their length and failure rules are local policies;
+  neither establishes target equivalence or live login.
 - `src/direct/target-wt-local-data.ts` additionally composes the existing local
   QQ-TEA encoder with that field layout using explicit caller-supplied key,
   plaintext and padding bytes. It does not model the target's random generator
@@ -3190,6 +4080,648 @@ without encryption. These are [reference implementation observations](https://gi
 not verified facts about the supplied QQ build. Current standalone code does not
 complete the registration or heartbeat lifecycle.
 
+## MSF security-sign chain (static summary)
+
+This consolidates bounded static observations and conditional links; it does
+not establish that one real request traverses the whole chain.
+
+- Callback identity: RTTI and relocations associate vtable `0x8e80f38` and entry
+  `0x3523110` with `nt::internal::MSFSecuritySignCallback`, derived from
+  `msf::embedder::security::SecuritySignCallback`. Runtime registration and
+  the identity at a specific virtual call remain conditional.
+- Invocation: `SendMsfRequestInternal` (`0x35505a0`) loads a callback pointer
+  from `this+0x70` and invokes virtual slots `+0x20` and `+0x10`. The latter
+  receives an output buffer and the request's first dword. Interpreting that
+  call as the candidate callback requires its runtime vtable to match.
+- Orchestrator: the direct call at `0x352329a` enters `0x6856284`, named by
+  diagnostics as `MSFSign`. Its observed output copies use a 0x300-byte region
+  with candidate token/extra/sign slots at `+0x00/+0x100/+0x200` and low length
+  bytes at `+0xff/+0x1ff/+0x2ff`. The three producer paths remain conditional.
+- Result marshalling: the request receives strings at `+0xf8/+0x110/+0x128`
+  from the callback result's `+0x30/+0x00/+0x18`. Given the candidate layout,
+  those are sign/token/extra, respectively.
+- Request handoff: `0x355ce90` is a logging helper, not the request dispatcher.
+  The subsequent PLT calls at `0x3550e7d` and `0x3550e98` name
+  `MSF::MSFSDK::sharedInstance()` and `sendPacket(unique_ptr<MSFRequest>)`.
+- Pack-side copies: the separate `pack` path copies request fields
+  `+0xf8/+0x110/+0x128` into local `+0xb8/+0xd0/+0xe8`. Its call to
+  `0x676c540` conditionally copies the nonempty strings into a constructed
+  object's `+0x18/+0x20/+0x28` and ORs presence bits `1/2/4`. Constructor,
+  RTTI and serializer inspection independently identify that object as
+  `MSF::protocol::SsoSecureInfo`: `0x67c2cd0` emits fields 1/2/3 as
+  length-delimited bytes. Parent `MSF::protocol::ReserveFields` serializer
+  `0x67c0ba0` places that child under field 24 (`c2 01`). These are serializer
+  observations, not an inference from memory offsets or presence flags. The
+  writer of request `+0x98/+0xb0/+0xc8` and the complete live send path remain
+  unestablished.
+- Field framing: `0x3551410` frames a payload as `BE32(len+4) || payload`
+  (length self-inclusive, big-endian), modeled offline by
+  `encodeTargetMsfLengthPrefixedFieldCandidate`.
+
+**Queued send versus the separate pack API.** The inspected request construction
+in `0x35505a0` initially clears the string storage covering `+0xc8`, then
+`0x35507bf–0x35507c9` stores qword `0x100000000` at `+0x10`, setting the
+request type at `+0x14` to 1. This is conditional on later callbacks/aliases not
+changing the request; it does not characterize every MSFRequest constructor.
+
+`sendPacket` at `0x670dd20` stores the original request at closure `+8`.
+A RELATIVE slot `0x902c478` associates its candidate call target with
+`0x67128e0`. That routine branches on request type. At `0x6712b19–0x6712b1c`,
+a type other than 2 skips the type-2 credential checks. The subsequent normal
+queue path copies selected members into a local object T:
+
+| Request string | Local T string |
+| --- | --- |
+| `+0x50` | `+0x10` |
+| `+0x20` | `+0x38` |
+| `+0x38` | `+0x50` |
+| `+0x80` | `+0x70` |
+| `+0x68` | `+0x88` |
+
+The three signature fields are copied separately. The inspected copy windows
+`0x6712c7e–0x6712e63` do not copy request `+0x98/+0xb0/+0xc8` into T. The
+last call is virtual slot `+0x20` of the object reached through global
+`0x9177dd0`, not a demonstrated call to `pack`.
+
+The initializer at `0x670d682–0x670d6a6` stores the result of `0x67116e0`
+into that global. The factory allocates a 0x278-byte control/object block,
+constructs the object at allocation `+0x18` with `0x673f160`, and stores that
+embedded-object pointer and the control-block pointer into its output pair.
+The constructor installs vptr `0x902e940`; its RELATIVE RTTI link
+`0x902e938 → 0x902ec58`, with name at `0xfdc2ec`, identifies
+`MSF::MSFPacketModule`. No later derived-vptr store was observed in the inspected
+factory. If this remains the live object, slot `0x902e960` resolves the queue
+call to `0x6742a40`, named `MsfSendPacket` by correctly mapped diagnostics.
+
+The query described next is an overload check, not a credential lookup. The
+entry tests T `+0x38` (logged as `uin`) and the incoming bit-2/bit-3 flags from
+request `+0x0c`. It calls
+`0x6769d20` with receiver `+0x1d0`, command T `+0x10` and a temporary string.
+A successful lookup takes `0x6742bcf–0x6742c12`, logs
+`cmd is overload in server, so reject to send[cmd:%s,seqId:%d]` from true VA
+`0xb8599d`, and selects code 10. It does not supply a key to the send path.
+The error virtual call at `0x6742c82` uses vptr `+0xd8` (candidate slot
+`0x902ea18 → 0x67538b0`) with arguments beginning `(receiver,4,code,T,0,0)`.
+
+The overload container has an exact-command hash table at `C+0` and another
+table at `C+0x28`, where `C=receiver+0x1d0`. The selected node layout is
+`next@0`, `hash@8`, `command@0x10`, `expiry@0x28`, output flag `@0x2c`, and
+optional text `@0x30`. The main-table test at `0x6769d78–0x6769d7c` is signed
+32-bit `expiry > low32(time(NULL))`. A live entry returns true regardless of
+whether its output flag requests copying the text; an expired entry is erased.
+Thus this query can mutate the overload table and is not a key fetch.
+
+The related updater `0x6769410` skips four leading bytes of its input `+0x70`
+string and calls `0x676a2b0`, consuming 0x40-byte parsed records. In the inspected
+write branch, TTL is limited to 1–1800 seconds; expiry is the low-32-bit sum of
+current time and TTL. Patterns ending in `.*` are placed in the second table
+after dropping `*`. Full wildcard semantics are not established: the fallback
+query visibly searches a dotted prefix, then supplies the original command to
+a subsequent lookup/insertion helper. The updater's caller and parser field
+tags remain untraced; no overload-policy implementation was added.
+
+Other observed early decisions select code 1 after the conditional network
+check, or code 3 for an empty `uin` field when virtual `+0x38` returns true.
+The latter resolves to candidate `0x67430f0`: it searches receiver `+0x178`
+with `0x3525cf0` and returns whether no node was found. The membership values
+and complete delivery-policy behavior are not inferred from these tests alone.
+Paths reaching `0x6742bba–0x6742bc0` call virtual `+0xd0`, with candidate slot
+`0x902ea10 → 0x6753f90`. Other paths may enqueue or return earlier; the queue
+entry is not evidence that every request reaches this final call.
+
+The ordinary `0x6753f90` continuation moves selected T fields into a new
+0x1a8-byte object P, retaining offsets such as `+0x10/+0x38/+0x50/+0x70/+0x88`
+and `+0xb8/+0xd0/+0xe8`, and clears the moved source storage. P `+0x38` here
+comes from request `+0x20`; it is not the key string at `+0x38` of the separate
+head object constructed by the pack API. Some metadata is also changed:
+`0x6754248–0x675425d` conditionally increments signed P `+0x114` when it is at
+most 30, then copies it to `+0x118`; `0x6754398–0x6754438` clamps signed byte
+`+0x12e` to 0–5. A later branch may set `+0x178=1`. Their business meanings
+remain unassigned.
+
+At `0x67545aa` it consults virtual `+0x38`. On the branch needing the additional
+state check, `0x67545b5–0x67545c9` calls `0x6725690` through the object at global
+`0x9177e20`, using `&P[0x38]` and the sign-extended scalar at P `+0x30` as
+inputs. A non-null return permits `0x6753d20(receiver,P)`; no member of that
+return record is passed as this call's key. The branch without the requirement
+also reaches `0x6753d20`. When the check fails, P is instead placed in the
+receiver `+0x48` container and scheduling helper `0x6751030` is invoked. Its
+constructed callback has candidate RELATIVE slot `0x902f470 → 0x67594c0`.
+
+Before registration, a conditional path in `0x6753d20` copies P's `+0x28`
+subobject with `0x67b2630`; if the command test `0x67b2370` permits it,
+`0x6753dab` calls virtual `+0x30` on the object at global `0x9177e18`, passing
+that temporary. The matching constructed target is an additional gray-check
+request producer, described below, not the original P's encryptor or signer.
+A later virtual `+0x38` test can instead select the `(4,3,P)` error path and
+destroy P. Those branches must not be skipped when reconstructing the call chain.
+
+**Conditional gray-check side request.** At `0x670d8d8–0x670d8f4`, a 0x88-byte
+object is allocated, constructed by `0x6729300`, and stored at `0x9177e18`.
+Its vptr `0x902dac0` has RTTI `0x902db10`, name `0xfdab60`, identifying
+`MSF::CSecurityModule`; slot `0x902daf0` resolves `+0x30` to `0x67299d0`.
+Correctly mapped diagnostics name this method `DoAppGrayCheck` in
+`SecurityModule.cpp`. A matching-input test through `0x67b2790` can return
+early. Otherwise, the inspected path builds an object with `0x6729ba0`,
+serializes it with `0x672c4a0`, and prefixes the resulting bytes with their
+inclusive big-endian four-byte length.
+
+It allocates a separate 0x1a8-byte request, constructs it with `0x67b31f0`,
+sets its sequence via `0x673f140`, copies the input identity subobject to
+`+0x28`, and stores the framed body at `+0x70`. Its command at `+0x10` comes
+from RELATIVE slot `0x9155818 → 0xa20b4f`: `GrayUinPro.Check`. The call at
+`0x6729b3b` submits this new object through the packet module's virtual
+`+0x78`, candidate slot `0x902e9b8 → 0x6743230`. This identifies an extra
+request under the matching object/branch conditions; it does not serialize
+or authenticate the original queued packet, nor establish server acceptance.
+On the inspected channel branch in `0x6743230`, `0x67432d7` calls
+`CreateRequestBase` with R8D zero, ESI from the selected P `+0x130` value, and
+EDX from a selected connection's virtual `+0x70` result. A non-null returned
+Base is serialized via its virtual `+0x10` at `0x6743326`. Those observations
+still leave the channel-selection conditions and wire delivery unverified.
+
+The continuing path at `0x6753ece–0x6753ed4` reaches `0x6744210(receiver,P)`.
+If P `+0x38` is empty, `0x6744243–0x674424e` assigns the literal `"0"` from
+true VA `0x88c26e`. That entry then wraps P and passes the wrapper to
+`0x6750da0` with receiver `+0x60` and P `+0x108`, not an observed serialization
+call. A `MessageSvc.PbSendMsg` command match also calls slots `+0x10` and `+0`
+on the objects at globals `0x9177e60` and `0x9177e70`. These are further
+registration/queue leads, not evidence that `0x6744210` is the packet builder.
+The selected pull-consumer and builder are now connected below; the caller
+that drives this consumer and the final transport still remain to be traced.
+A bounded RX scan for direct E8/E9 calls to `0x676c540` identified `0x670e2ca`
+in the separate pack API; it did not establish a queue-to-pack connection.
+The exported pack symbol is present, but no symbol-based PLT relocation for
+it was found in this image. These limited scans do not exclude other indirect
+or external use.
+
+**Queue identity and selected consumer.** The wrapper built by `0x675b220`
+has `W+0=P`, `W+8=0` and dword `W+0x10=0`. The insertion helper `0x6750da0`
+organizes the receiver `+0x60` container into 0x38-byte groups keyed at group
+`+0x30`, matching P `+0x108`. It stores W in segmented pointer slots, with
+512 pointers per block, creates and sorts groups when necessary, and
+increments the total at receiver `+0x78`. None of these insertion operations
+is itself a packet send.
+
+The packet-module vtable has RELATIVE slot `0x902ea88 → 0x6747530` at
+`+0x148`. This method reads the same receiver `+0x60` container and obtains
+two group-selection bounds from the caller-supplied object's virtual
+`+0x80/+0x88`. It supplies a predicate with vptr `0x902efc0` to `0x6747310`.
+The predicate slot `0x902eff0 → 0x6756520` first tests packet-module virtual
+`+0x38` with P's command. A false result accepts directly; otherwise it
+requires a non-null `0x6725690` result from the same registry, UIN and signed
+type inputs described below. When a slot qualifies, the helper removes and
+returns that W via `0x6755760`, decrementing the total. Its no-match path
+instead returns the value at global `0x91781b0`; that value has not been proven
+always NULL at runtime.
+
+For a selected non-null W, `0x6747617–0x6747644` dereferences it to the same
+P. The method stores the supplied object's virtual `+0` result in P `+0x130`
+and calls `0x67436a0` with W, that result, a virtual `+0x70` result, and a
+stack-supplied mode flag. If a Base object is returned, `0x6747657–0x674768c`
+uses an output adapter with vptr `0x902ed00` and invokes Base virtual `+0x10`,
+writing to the caller-provided output. Thus the selected queue-to-builder-to-
+serialization path is linked at the W/P identity level. It does not establish
+who invokes `+0x148` at runtime, the live object bindings or downstream socket
+transmission; empty and failed-builder branches remain separate paths.
+
+Do not substitute the timer consumer for this path. The callback chain
+`0x67594c0 → 0x6751d10 → 0x6742fb0`, with a predicate resolving to
+`0x6759580`, is identified by correctly mapped diagnostics as
+`OnCheckRequestTimeout`. It reads W/P, changes P `+0x114` and handles timeout
+conditions; it is not the selected pull-and-serialize method above.
+
+For request type 2, `0x6712b22–0x6712b80` and `0x6712f30–0x6712f4e`
+require already-nonempty `+0x98/+0xb0/+0xc8/+0x20`. Calls through
+`0x67252d0 → 0x6724ce0 → 0x6723dd0` pass the existing `+0xc8` value onward;
+`0x6723e28–0x6723e2f` copies it into a temporary `+0x68`, with a later candidate
+state-node destination at `+0x90`. This is a conditional **request-to-state**
+direction; it does not by itself derive credentials. The correctly mapped log
+string at `0xbbc9d0` labels the length as `d2key:%d`; the label and nonempty
+checks do not establish a 16-byte length. Separate send-side consumption is
+now traced below.
+
+**Shared state identity and returned record.** The type-2 caller loads the
+object at `0x9177e20` at `0x6712f69–0x6712f70` before `0x6712f7f → 0x67252d0`.
+The ordinary send gate loads that same global at `0x67545b5–0x67545bc` before
+`0x67545c4 → 0x6725690`. Both paths access the object's `+0x30` tree through
+`0x6725fb0`; this is an object-identity and data-flow link, not a match of
+unrelated offsets.
+
+The outer tree compares UIN strings lexicographically by raw bytes. At its
+matching node, `+0x38` holds an inner ordered tree keyed by signed integer.
+The query returns inner-node `+0x28`, the record body. If the integer key is
+absent, only selector `-1` falls back to the nonempty inner tree's first item;
+other misses return NULL. The setter normalizes selector `-1` to `0` before
+insertion. The verified record fields are:
+
+| Returned record | Source in the type-2 request |
+| --- | --- |
+| string `+0x00` | string `+0x38` |
+| string `+0x18` | string `+0x98` |
+| string `+0x30` | string `+0xb0` |
+| integer `+0x48` | selected type integer |
+| string `+0x68` | string `+0xc8` |
+
+The setter allocates a 0xe0-byte inner node at `0x6724f8a` and moves the
+record into node `+0x28` at `0x672502e–0x672503d`. The move at
+`0x67257fb–0x6725824` includes string `+0x68`, establishing
+`inner node+0x90 == returned record+0x68` for this layout. The presence-only
+call at `0x67545c4` still does not inspect that field.
+
+**Actual client credential notifications, independent of type 2.** Two
+additional entry points reach the same registry from real client call sites,
+not just from the exported SDK interface. The caller object is identified as
+`nt::MSFCoreService` by RTTI `0x8e82c40 → 0x8e830e0 → 0xcbbfa3` and type name
+`N2nt14MSFCoreServiceE`.
+
+The login path is:
+
+```text
+SessionInit @ 0x354db50: incoming RDX object, string at +0x120
+  → hex decode @ 0x354de3f → 0x8bc0600
+  → this+0x288, moved at 0x354de44–0x354de75
+  → caller temporary string at stack +0x20
+  → call 0x354e521 → PLT 0x8e10b20
+  → MSFSDK::notifyLoginSuccess @ 0x670e3c0
+  → callback capture+0x70 → 0x67134a0
+  → 0x6724990 → 0x6724ce0 → record+0x68
+```
+
+The PLT binding uses GOT `0x915fce0`, with its symbol-bearing relocation at
+file offset `0x851480`. The caller passes type **0** at `0x354e517`. Importantly,
+the original field is **hexadecimal text**, not bytes copied directly into
+the key. Decoder `0x8bc0600` produces `floor(input_length/2)` bytes. At
+`0x8bc06c0–0x8bc06d3`, it combines lookup values for `input[2*i]` and
+`input[2*i+1]` as the high/low nibbles. Table `0x124ce58` maps ASCII digits
+and both cases of A–F to 0–15. Hence 32 valid hexadecimal characters produce
+16 bytes; neither that input length nor valid text is proven for all callers.
+This is decoding, not a cryptographic derivation or recovery of the producer.
+
+The refresh path is distinct:
+
+```text
+UpdateSignaureInfo @ 0x35545a0: incoming R8 byte container
+  → begin/end loaded at 0x3554a36/0x3554a39, raw byte copy
+  → caller temporary string at stack +0x20
+  → call 0x3554c4f → PLT 0x8e10b80
+  → MSFSDK::notifyRefreshSign @ 0x670e760
+  → callback capture+0x70 → 0x6713850
+  → 0x67252d0 → 0x6724ce0 → record+0x68
+```
+
+The corresponding GOT is `0x915fd10`, relocation file offset `0x851510`; this
+caller also passes type **0**. The correctly mapped diagnostic at `0xb06d6d`
+is `UpdateSignaureInfo account:{} uid:{} a2:{} d2:{} d2_key:{}`. The last
+container is therefore labeled `d2_key` by the client, rather than by an
+offset-based guess. This path copies its bytes without the login path's hex
+decoder.
+
+Both SDK methods read their last string parameter from entry-stack `+8`,
+copy it to a temporary `+0x68`, then into callback capture `+0x70`:
+`0x670e42c–0x670e4b2` for login and `0x670e7cc–0x670e852` for refresh.
+The observed callback-construction paths require global byte `0x9177d58 == 1`.
+These are conditional static chains: the callbacks, registry entries and
+later queries still require matching object/state lifetimes. The next
+unresolved producers are the writer of `SessionInit`'s input string `+0x120`
+and the producer of `UpdateSignaureInfo`'s R8 byte container. Their origin in
+WTLogin and their actual runtime lengths have not been established.
+
+**Upstream virtual-call boundary.** For the observed MSFCoreService address
+point `0x8e82c48`, slot `+0x90` resolves to `SessionInit @ 0x354db50`, and
+slot `+0xf0` (`0x8e82d38`) resolves to `UpdateSignaureInfo @ 0x35545a0`.
+Installation at `0x355c8f6–0x355c8fd` writes this vptr to the object. RTTI
+`0x8e830f8 → 0x8e81cb8`, with the name at `0xcbb844`, identifies its main
+base as `nt::IMSFInterface`; this does not identify SessionInit's RDX type.
+Bounded direct E8/E9 scans found no direct calls to either target in the
+inspected executable section. This directs further work toward virtual or
+other indirect calls; it is not an unreachability proof.
+
+One conditional refresh-shaped caller was found at `0x34a4d90`. It uses the
+incoming value, or falls back to `this+0x300` when that value is zero; if both
+are zero it takes an `uin is empty` callback path. For the current-value
+case it clears three local strings at `+0x1c8/+0x1e0/+0x1f8`. With a non-null
+receiver from `this+0x90`, `0x34a4ef8–0x34a4f15` allocates exactly sixteen
+bytes and explicitly fills them with zero, then `0x34a4f46–0x34a4f5e` invokes
+receiver virtual `+0xf0` with the converted identity string, two empty byte
+containers and that sixteen-zero-byte container.
+
+Only if this receiver has the observed MSFCoreService binding does that call
+reach the refresh method above. Its identity/lifecycle and the containing
+function's upstream caller remain unproven. The clears and empty/zero inputs
+support a reset or initialization candidate, not successful-session credential
+production. No default key or nonzero D2-key derivation is inferred from it.
+
+Further typed entry points remain candidates, not connected producers. Two
+lambda type names at `0xbd3215/0xbd32f3` refer to
+`NTWrapperSession::internalStartNT(nt::im_core::SessionConfig const&)`.
+A separate `NTSessionBase::Init` path at `0x55e71d0` reaches a virtual
+`+0x160` call at `0x55e747a`; if its receiver uses the observed SessionForNt
+vtable `0x8e15b50`, that slot resolves to `0x29c8fa0`. Neither path has been
+linked to `0x354db50`, and SessionConfig has not been established as the RDX
+object type. Candidate `0x29fd310` belongs to a StartRefreshLoginTicket
+callback and `0x34b0168` to listener dispatch, but neither receiver has been
+proven to be the relevant IMSFInterface. None supplies evidence for the
+`+0x120` writer or for nonzero key production.
+
+The type-2 request constructor remains separate and unproven. A bounded E8
+scan targeting `sendPacket` and its PLT found only the already-known type-1
+call at `0x3550e98`. Five ordinary `mov [reg+0x14],2` encoding candidates and
+23 `movabs 0x0000000200000000` candidates did not establish another
+MSFRequest constructor in their inspected windows. This is not an exhaustive
+absence result: it omits other instruction forms, indirect calls and external
+modules. Neither notification route above depends on treating those
+unidentified objects as MSFRequest instances.
+
+**Send-side key consumption.** The separate builder at `0x67436a0`, named
+`CreateRequestBase` by diagnostics, queries the same registry at `0x6743bf1`
+and keeps the returned record in R14. It constructs a head through
+`0x674396e → 0x67b4a50`, not the default constructor used by SDK `pack`.
+At `0x6743e6f` it tests the packet module's command predicate at virtual `+0x40`.
+Given the observed vptr, `0x902e980 → 0x6743110` compares the command exactly
+against three initial string pointers: `Heartbeat.Alive`, `Heartbeat.Ping`
+and `Client.CorrectTime` (`0x9155838/0x9155840/0x9155848`). The resulting
+branches are:
+
+| Branch condition | head `+0x18` / Base `+0x0c` | Observed key/framing choice |
+| --- | --- | --- |
+| Command predicate true | `0 / 0` | Encryption disabled; head `+0x98` cleared |
+| Predicate false, low byte of incoming ESI nonzero, record present | `1 / 1` | Base `+0x10` gets record `+0x30`; head `+0x38` gets record `+0x68` |
+| Predicate false, low byte of incoming ESI zero | `2 / 2` | head `+0x38` explicitly initialized to sixteen zero bytes |
+
+The record-key path is instruction-level: `0x6743ea9` enables the head,
+`0x6743eb1` sets the Base tag, `0x6743eb6–0x6743ebd` copies the outer field,
+and `0x6743ec2–0x6743ecd` copies record `+0x68` into head `+0x38`. The zero-key
+path is `0x6743eeb–0x6743f03`. This closes a conditional chain from the
+already-provided type-2 request `+0xc8`, through the stored record, to the
+send head's key input. It does not identify who generated the original value,
+prove a 16-byte record key, or make the zero-key branch a fallback for invalid
+nonempty keys.
+
+Mode and prefix selection are also conditional. At this call site the mode
+passed to the alternate constructor is
+`12 + S + 8*(incoming_r8d & 1)`, where S is the 0/1 result of the conditional
+`0x675a4c0` (`shouldTrim`) call, otherwise zero. The four resulting modes are
+12, 13, 20 and 21; the mode must not be hardcoded to 12 without the caller's
+conditions. The builder writes head `+0x15` from a global connection
+object's virtual `+0x48` result, retaining unsigned values below 4 and using
+zero otherwise (`0x6743a25–0x6743a3d`). The constructor's `+0x16=1` may be
+cleared at `0x67439b4` when incoming EDX differs from 4 and the object at
+`0x9177de0` returns 1 from virtual `+0x30`.
+
+At `0x6744007–0x6744033`, the builder constructs an output wrapper targeting
+Base `+0x28` and invokes head virtual `+0x10` into it. It destroys the head
+and returns the CRequestBase object at `0x67440b1–0x67440c5`; that return alone
+is not a network send. A nearby field consumer at `0x674636a` belongs to
+`CreateNetworkResponseSO`, so its record `+0x68` access is receive-side evidence
+and is not substituted for the send-side copy above.
+
+The caller/populator of SDK `pack`'s `+0xc8` input remains unclosed. The selected
+ordinary queue route now reaches `CreateRequestBase` and its writers, rather
+than demonstrating a call through `pack → 0x676c540`. Shared head serialization
+does not make the two constructors' mode, prefix or credential selection
+identical. The encrypted-payload API still models only the explicit mode-12
+subset; the other head APIs model H for modes 13/20/21, not an entire
+transformed payload. None implements the native dispatcher, registry lookup,
+dynamic flag selection, credential generation or transport.
+
+Remaining unknowns in this chain: the three producers' exact cryptographic
+algorithms (their bodies are control-flow-flattened; the `sign` producer shows
+an MD5-like compression over a single `__to_xstring`/`vsnprintf`-formatted
+decimal of a 32-bit argument, which is not a proven signer); the signed body's
+own upstream content; whether `MSFSign` concatenates command and body
+internally; the identity of the gating states and the 32-bit argument; SDK
+`pack` caller fields; the ordinary path's actual mode/flags and original
+credential production; and the final binding to live transport. The conditional
+record-to-key and queue-to-serializer links above do not supply those missing
+values. No target step was executed; none establishes real QQ acceptance.
+
+### Static-audit regression checks
+
+The earlier mapping audit passed 40 Protocol tests (including 19 presence-mask
+tests) and 17 in-memory Core session tests. The presence tests cover all eight
+empty/nonempty combinations against all 256 initial masks, foreign-realm views,
+shared/detached/out-of-bounds rejection, and input-accessor isolation. The Core
+regression also corrected a test's access to `Bridge.empty` through the narrower
+public `BridgeInterface`; the listener now verifies readiness by sending through
+that public interface. No runtime Bridge implementation was changed by this fix.
+
+Commands run from the repository root with the pinned Node/pnpm versions:
+
+```sh
+pnpm --filter @snowluma/protocol exec vitest run tests/direct/target-sign-presence-candidate.test.ts tests/direct/target-signed-decimal-md5-candidate.fake.test.ts tests/direct/target-sign-structure-result-candidate.test.ts tests/direct/target-sign-structure-integration.test.ts
+pnpm --filter @snowluma/core exec vitest run tests/bridge-direct-session.fake.test.ts --silent
+pnpm typecheck
+pnpm lint
+git diff --check
+```
+
+These focused tests and the workspace type/lint checks passed. The full test
+suite, release build and live QQ interoperability were not exercised by this
+audit. The target ELF was only read, not loaded or executed. Passing the local
+models does not establish the target's runtime bindings or server acceptance.
+
+The subsequent serializer audit added a
+[17-case cross-component regression](<tests/direct/target-sign-reserve-integration.test.ts>)
+without adding another production encoder. It compares the existing structure
+assembler, named-slot extractor, status-gated native-slot decoder, presence-mask
+model and CPB-derived reserve encoder, using the real Proton transform. Fixed
+hex vectors cover all eight empty/nonempty combinations; 127/128/255-byte
+payloads cross length-varint boundaries. It also checks view offsets, unused
+slot bytes, independent output ownership, failed-status gating and the difference
+between preserving an arbitrary initial mask and encoding nonempty fields.
+This is model consistency, not execution of the newly identified MessageLite
+serializer or proof that both native routes are used by a live connection.
+
+The five-file focused run below passed 85 tests; the independent strict test
+compilation also passed. Protocol's normal tsconfig includes only source files,
+so the latter deliberately checks the newly added test too:
+
+```sh
+pnpm --filter @snowluma/protocol exec vitest run tests/direct/target-sign-reserve-integration.test.ts tests/direct/target-sign-presence-candidate.test.ts tests/direct/target-msf-sign-output.fake.test.ts tests/direct/target-sso12-sign-slots.fake.test.ts tests/direct/target-sso12-reserve.test.ts
+pnpm --filter @snowluma/protocol exec tsc --ignoreConfig --noEmit --strict --noUnusedLocals --noUnusedParameters --noImplicitReturns --noFallthroughCasesInSwitch --noImplicitOverride --target ES2022 --module ESNext --moduleResolution bundler --esModuleInterop --skipLibCheck --resolveJsonModule --lib ES2022 --types node tests/direct/target-sign-reserve-integration.test.ts
+```
+
+The next wrapper audit added
+[37 normal-wrapper cases](<tests/direct/target-msf-request-base-candidate.test.ts>),
+including fixed vectors for all four modes, self-inclusive lengths, unchanged
+payload append, exact size-cap boundaries, invalid inputs, detached/shared/OOB
+views, captured-intrinsic behavior and cleanup after an injected failure. Its
+comparison with the old service encoder feeds that encoder's synthetic ciphertext
+as the new wrapper's opaque B field: it establishes an expressible outer-byte
+subset, not equivalent encryption algorithms or native paths.
+
+The six-file combined run passed **101 tests**. Its independent strict test
+compilation also passed; `ESNext` library declarations cover the resizable-buffer
+test cases, while production sources still pass the repository configuration.
+The parent run used Node 24.22.1 and pnpm 11.25.0. Workspace `pnpm typecheck`
+and `pnpm lint` also passed, retaining the pre-existing Core/OneBot typecheck
+cycle warning. The two new files passed formatting checks, and all eleven local
+documentation links resolved. Full workspace tests and release builds were not
+run in this pass; no QQ execution, native target loading, Hook, real connection,
+commit or push was performed.
+
+```sh
+pnpm typecheck
+pnpm lint
+pnpm --filter @snowluma/protocol exec vitest run tests/direct/target-msf-request-base-candidate.test.ts tests/direct/target-sso12-head.test.ts tests/direct/target-service-business.test.ts tests/direct/target-service-request.test.ts tests/direct/target-service-integration.test.ts tests/direct/target-sign-reserve-integration.test.ts
+pnpm --filter @snowluma/protocol exec tsc --ignoreConfig --noEmit --strict --noUnusedLocals --noUnusedParameters --noImplicitReturns --noFallthroughCasesInSwitch --noImplicitOverride --target ES2022 --module ESNext --moduleResolution bundler --esModuleInterop --skipLibCheck --resolveJsonModule --lib ESNext --types node tests/direct/target-msf-request-base-candidate.test.ts
+```
+
+The SDK mixed-head pass added
+[21 tests](<tests/direct/target-msf-sso12-head-candidate.test.ts>): a fixed
+nonzero-prefix vector, comparison preserving the old CPB profile, every possible
+`field16` byte, seven field positions, empty/maximum-size cases, input validation
+and actual reserve/head/normal-wrapper composition. The composition deliberately
+feeds an untransformed synthetic head as B; it does not claim that a live server
+would accept those bytes or that the native encryption stage was run.
+
+The seven-file run below passed **131 tests**, including the unchanged QQ-TEA
+reference suite. The new test file also passed its explicit strict compilation.
+The QQ-TEA test vectors are existing independent reference vectors, not captures
+or execution results from the supplied Linux target. Workspace typechecking and
+lint, both new files' formatting checks and fourteen local documentation links
+also passed. The Core/OneBot typecheck cycle warning is unchanged. This pass did
+not run full workspace tests, release builds, QQ, Hook or live network sessions.
+
+```sh
+pnpm typecheck
+pnpm lint
+pnpm --filter @snowluma/protocol exec vitest run tests/direct/target-msf-sso12-head-candidate.test.ts tests/direct/target-msf-request-base-candidate.test.ts tests/direct/target-sso12-head.test.ts tests/direct/target-service-request.test.ts tests/direct/target-service-integration.test.ts tests/direct/target-sign-reserve-integration.test.ts tests/direct/qq-tea.test.ts
+pnpm --filter @snowluma/protocol exec tsc --ignoreConfig --noEmit --strict --noUnusedLocals --noUnusedParameters --noImplicitReturns --noFallthroughCasesInSwitch --noImplicitOverride --target ES2022 --module ESNext --moduleResolution bundler --esModuleInterop --skipLibCheck --resolveJsonModule --lib ESNext --types node tests/direct/target-msf-sso12-head-candidate.test.ts
+```
+
+The encrypted-payload pass added
+[21 composition tests](<tests/direct/target-msf-sso12-payload-candidate.test.ts>):
+fixed pre-encryption bytes, empty/raw body behavior, all alignment positions,
+real normal-wrapper composition, independent output storage, input mutation or
+detachment during the RNG, invalid keys/views/records, ciphertext budgeting,
+error sanitization and owned-buffer cleanup after callback failure.
+
+The eight-file combined run passed **152 tests**. The new test's explicit strict
+compilation passed after adding a runtime ArrayBuffer check before transferring
+fixture buffers; production types were not weakened. The actual existing codec
+implementations and Proton configuration were retained. Workspace `pnpm typecheck`
+and `pnpm lint` passed, with the same pre-existing typecheck cycle warning. Both
+new files passed quality/format checks and all sixteen local document links
+resolved. These are synthetic composition tests, not native differential
+execution or a live login attempt. Full workspace tests and release builds were
+not run; the old head/QQ-TEA sources and production wiring were unchanged.
+
+```sh
+pnpm typecheck
+pnpm lint
+pnpm --filter @snowluma/protocol exec vitest run tests/direct/target-msf-sso12-payload-candidate.test.ts tests/direct/target-msf-sso12-head-candidate.test.ts tests/direct/target-msf-request-base-candidate.test.ts tests/direct/target-sso12-head.test.ts tests/direct/target-service-request.test.ts tests/direct/target-service-integration.test.ts tests/direct/target-sign-reserve-integration.test.ts tests/direct/qq-tea.test.ts
+pnpm --filter @snowluma/protocol exec tsc --ignoreConfig --noEmit --strict --noUnusedLocals --noUnusedParameters --noImplicitReturns --noFallthroughCasesInSwitch --noImplicitOverride --target ES2022 --module ESNext --moduleResolution bundler --esModuleInterop --skipLibCheck --resolveJsonModule --lib ESNext --types node tests/direct/target-msf-sso12-payload-candidate.test.ts
+```
+
+The subsequent queued-send investigation changed this document only. It
+rechecked the supplied ELF's hash, PT_LOAD address translations, key RELATIVE
+slots and selected instruction windows, and reran the same eight-file suite:
+**152/152 passed**. The sixteen local links and `git diff --check` were checked
+again. It did not rerun full workspace type/lint/build checks, alter production
+routing, or execute the target client, Hook, account sessions or network I/O.
+
+The registry/key-selection follow-up added one explicit-zero-key regression
+to the payload suite: **22 payload tests; 153/153 across the same eight files**.
+It checks real encryption/decryption with a caller-supplied sixteen-zero-byte
+key, distinguishes it from the nonzero fixture key, and retains rejection of
+an empty key. It does not add automatic key selection or a default key.
+The changed test passed explicit strict TypeScript compilation, quality lint,
+formatting checks, and the complete workspace typecheck/lint commands. The
+sixteen local links and whitespace diff check also passed. Full workspace
+tests and release builds were not run; no production source was changed and
+no target client, Hook, account session or network I/O was executed.
+
+**Trimmed-head and credential-bridge follow-up:** the new suite has **17
+passing tests**; the expanded ten-file regression is **184/184**. The increase
+over the previous 153-test set is 17 new trimmed-head tests plus fourteen
+existing LP4 tests added to this regression selection. The new cases exercise
+the fixed 24-byte head vector,
+all empty-field combinations, total and per-field boundaries, aggregate cap
+rejection before framing, cross-realm shared-buffer rejection, temporary
+cleanup, and synthetic real-implementation QQ-TEA/Base compositions for both
+13 and 21. A separate read-only source review found no concrete defect; the
+aggregate-cap and foreign shared-buffer cases were added after that review.
+
+The final source and test passed quality/format checks and explicit strict
+compilation. Full workspace typecheck and lint passed, retaining the existing
+Core/OneBot dependency-cycle warning. All eighteen local Markdown links and
+`git diff --check` passed. Full workspace tests and release builds were not
+run. No client, Hook, account session, target native function or network
+connection was executed. Static table checks and byte-layout tests do not
+establish credential generation or server acceptance.
+
+```text
+pnpm --filter @snowluma/protocol exec vitest run tests/direct/target-msf-trimmed-head-candidate.test.ts tests/direct/target-msf-length-prefixed-field-candidate.test.ts tests/direct/target-msf-sso12-payload-candidate.test.ts tests/direct/target-msf-sso12-head-candidate.test.ts tests/direct/target-msf-request-base-candidate.test.ts tests/direct/target-sso12-head.test.ts tests/direct/target-service-request.test.ts tests/direct/target-service-integration.test.ts tests/direct/target-sign-reserve-integration.test.ts tests/direct/qq-tea.test.ts
+pnpm --filter @snowluma/protocol exec tsc --ignoreConfig --noEmit --strict --noUnusedLocals --noUnusedParameters --noImplicitReturns --noFallthroughCasesInSwitch --noImplicitOverride --target ES2022 --module ESNext --moduleResolution bundler --esModuleInterop --skipLibCheck --resolveJsonModule --lib ESNext --types node tests/direct/target-msf-trimmed-head-candidate.test.ts
+pnpm typecheck
+pnpm lint
+pnpm exec eslint packages/protocol/src/direct/target-msf-trimmed-head-candidate.ts packages/protocol/tests/direct/target-msf-trimmed-head-candidate.test.ts
+pnpm exec eslint --config eslint.format.config.ts packages/protocol/src/direct/target-msf-trimmed-head-candidate.ts packages/protocol/tests/direct/target-msf-trimmed-head-candidate.test.ts
+pnpm exec prettier --check packages/protocol/src/direct/target-msf-trimmed-head-candidate.ts packages/protocol/tests/direct/target-msf-trimmed-head-candidate.test.ts
+git diff --check
+```
+
+**Mode-20 follow-up:** the new head suite adds **32 passing tests**; the
+expanded eleven-file regression is **216/216**. It includes fixed bytes,
+signed-decimal boundaries through INT32_MIN, sequence-bit preservation,
+per-field and aggregate size limits, decimal-width-sensitive limits, hostile
+views/records, temporary cleanup and a synthetic QQ-TEA/Base20 composition.
+The digit-pair table was checked directly from the sample, without executing
+the native formatter. An independent read-only source review found no concrete
+layout, input-isolation or cleanup defect under the stated assumptions.
+
+Explicit strict test compilation, full workspace typecheck/lint and scoped
+quality/format checks passed. The existing Core/OneBot dependency-cycle warning
+remains. All twenty local document links and `git diff --check` passed. The
+full workspace test suite and release build were not run; no QQ client, Hook,
+account session, target-native function or network connection was executed.
+
+```text
+pnpm --filter @snowluma/protocol exec vitest run tests/direct/target-msf-sso20-head-candidate.test.ts tests/direct/target-msf-trimmed-head-candidate.test.ts tests/direct/target-msf-length-prefixed-field-candidate.test.ts tests/direct/target-msf-sso12-payload-candidate.test.ts tests/direct/target-msf-sso12-head-candidate.test.ts tests/direct/target-msf-request-base-candidate.test.ts tests/direct/target-sso12-head.test.ts tests/direct/target-service-request.test.ts tests/direct/target-service-integration.test.ts tests/direct/target-sign-reserve-integration.test.ts tests/direct/qq-tea.test.ts
+pnpm --filter @snowluma/protocol exec tsc --ignoreConfig --noEmit --strict --noUnusedLocals --noUnusedParameters --noImplicitReturns --noFallthroughCasesInSwitch --noImplicitOverride --target ES2022 --module ESNext --moduleResolution bundler --esModuleInterop --skipLibCheck --resolveJsonModule --lib ESNext --types node tests/direct/target-msf-sso20-head-candidate.test.ts
+pnpm typecheck
+pnpm lint
+pnpm exec eslint packages/protocol/src/direct/target-msf-sso20-head-candidate.ts packages/protocol/tests/direct/target-msf-sso20-head-candidate.test.ts
+pnpm exec eslint --config eslint.format.config.ts packages/protocol/src/direct/target-msf-sso20-head-candidate.ts packages/protocol/tests/direct/target-msf-sso20-head-candidate.test.ts
+pnpm exec prettier --check packages/protocol/src/direct/target-msf-sso20-head-candidate.ts packages/protocol/tests/direct/target-msf-sso20-head-candidate.test.ts
+git diff --check
+```
+
+## Target QR-login command surface (verified strings)
+
+The supplied build's own strings confirm, as direct observations rather than
+reference inference, that it contains the WTLogin/QR machinery: command tokens
+`wtlogin64.trans_emp` (`0x883394`), `wtlogin.trans_emp` (`0x9f3a1b`),
+`wtlogin.qrlogin` (`0xab65a5`), `wtlogin.exchange_emp` (`0xa80273`),
+`wtlogin64.login`/`wtlogin.login`, `wtlogin.register`, `wtlogin.exchange`,
+`wtlogin.device_lock`, `wtlogin64.name2uin`, `StatSvc.register` (`0x928e6c`),
+`SsoInfoSync` (`0xa6368c`), `Heartbeat.Alive` (`0xa5864a`) and
+`ConfigPushSvc.GetIpDirect` (`0x976625`), plus the ECDH-access commands
+`trpc.o3.ecdh_access.EcdhAccess.SsoSecureA2Establish`/`SsoSecureA2Access`/
+`SsoEstablishShareKey`. Internal source-path strings name the owning modules:
+`wtlogin_ecdh_session.cc`, `wtlogin_ecdh_key.cc`, `wtlogin_session_tgtgt.cc`,
+`wtlogin_resp_tlv_process.cc`, `wtlogin_pkg.cc`, `qrcode_login_session.cc`,
+`qrcode_login_request_impl.cc`, `qrcode_tlvs.cc` and `qrcode_cmd.cc`, with a
+build identity `nt.wtlogin.0.0.1` and log strings such as
+`Quick login to get qrcode pic. decoder.qr_url: {},query_time: {}, expire_time:
+{}` and `Start to poll qrcode avatar`. This establishes that the QR-login command
+names and module layout exist in this build and broadly align with the reference
+flow's command surface; it does not recover their subcommand values, TLV layouts,
+key-exchange parameters or signing, which remain the work below.
+
+The string `qrcode_cmd.cc` is referenced by `lea rsi,[0xa2af7f]` at
+`0x345370c`. The nearby `lea r8,[0x8c3504]` at `0x345371a` refers to the
+literal `QRCode CMD0x12 Decode result code: {}`. These static references suggest
+an associated decoder/logging path, but they do not independently establish
+runtime reachability, a transmitted subcommand or whether `0x12` is QR polling.
+Other strings in the same read-only segment mention ECDH key generation and
+`ptlogin_socket write ssl_hello`; their proximity in the file does not tie them
+to the QR path or prove which transport, curve or envelope a QR request uses.
+Neither the target's QR-generation nor polling subcommand is established solely
+by these strings; the `0x31`/`0x12` values above remain reference observations.
+
 ## Work remaining for direct operation
 
 1. Establish the selected build's actual login, key exchange, key lifecycle,
@@ -3205,14 +4737,569 @@ complete the registration or heartbeat lifecycle.
    Its request builder advances past 21 bytes without explicitly initializing
    them; their value is unknown.
 2. Recover and verify the TCP service envelope, request/response sequence
-   association, reconnect and unsolicited event handling.
+   association, reconnect and unsolicited event handling. The inspected
+   `MSF::MSFSDK::sendPacket` (`0x670dd20`) path conditionally uses `lock xadd`
+   and updates the request's first dword; a sequence allocator is a candidate
+   interpretation. `MSF::MSFSDK::pack` (`0x670e0c0`) copies request strings into
+   a local object and calls `0x676c540`. Its `ReserveFields`/`SsoSecureInfo`
+   serialization and conditional handoff into outer member `+0xe0` are described
+   above. The mode-12 head at `0x67b4f50` has a distinct mixed prefix and a
+   final optional compression/encryption stage; `0x67b4440`'s normal wrapper
+   appends the already-built payload rather than encrypting it again. The new
+   mixed-head model preserves that header distinction. The selected `context[8]==0`
+   encryption branch is now statically matched to the reference under explicit
+   key, memory, length and random-byte assumptions; actual key/prefix selection,
+   other cipher branches, native decryption and special-path execution remain open.
+   The logging call at `0x355ce90` is not a dispatcher, and format strings do not
+   establish template-driven serialization. Dynamic bindings, actual envelope
+   bytes and the end-to-end network path remain open.
 3. Establish the signing inputs and signing implementation for the required
    commands; an external signing API contract alone is not the algorithm. The
    [reference signing whitelist](https://github.com/LagrangeDev/Lagrange.Core/blob/fe789c4a23796fbc82fa09e70a9c44c8a5cf2948/Lagrange.Core/Common/BotSignProvider.cs)
    includes key exchange, `wtlogin.trans_emp`, `wtlogin.login`, and
-   `SsoInfoSync`; it does not establish this build's signing behavior.
+   `SsoInfoSync`; it does not establish this build's signing behavior. Static
+   reversing of the selected build has identified the orchestrator `0x6856284`
+   as this build's `MSFSign` (called from `MSFSecuritySignCallback` in
+   `msf_security_sign_callback.cc`), which fills a caller-provided 0x300-byte
+   out-parameter with token at `+0x00`, extra at `+0x100` and sign at `+0x200`,
+   each length low byte at `+0xff`/`+0x1ff`/`+0x2ff`, from callees `0x6830c58`,
+   `0x683fa74` and `0x68418ac`, then returns the three fields as `std::string`
+   token/extra/sign in the callback result object. Its inputs are also
+   observed at the `0x3523110` caller: a string argument, the bytes selected by
+   a `{begin,end}` descriptor, and a 32-bit value reach the direct call at
+   `0x352329a`. RTTI identifies the candidate callback type as
+   `nt::internal::MSFSecuritySignCallback` with base
+   `msf::embedder::security::SecuritySignCallback`. A separate caller at
+   `0x35505a0` invokes a virtual slot through `this+0x70` and copies the three
+   results to request members `+0xf8/+0x110/+0x128`, conditionally named
+   sign/token/extra. Linking that invocation, its request owner and the later
+   `pack` path requires unresolved runtime identity and no intervening mutation.
+   Independent serializers now establish fields 1/2/3 inside outer field 24;
+   this conclusion comes from tag-writing instructions, not the presence bits
+   alone. Complete algorithms, the body's upstream content, command/body
+   composition, full envelope encoding and live acceptance remain unverified. The offline
+   `assembleTargetSignStructureCandidate`, `placeTargetSignedDecimalMd5SlotCandidate`
+   and `placeTargetO3EmptyExtraSlotCandidate` model only that fixed byte layout
+   and the two conditional slot writes; they are cross-checked against each other
+   but still require, as unknowns: the actual sign value (the `0x68418ac` path
+   shows an MD5-like compression over a single formatted string of a 32-bit
+   argument under two state gates and is not a proven full signer; its formatter
+   is `__gnu_cxx::__to_xstring` over `vsnprintf` with `%d` at correctly mapped
+   VA/file offset `0xbbc99c`, so the bare-decimal
+   `targetSignedDecimalMd5Candidate` models the conditional signed-decimal
+   intermediate but is not demonstrated byte-equivalent to the complete target
+   path), the real extra bytes beyond the
+   inspected empty-body `0a 20 || G[0x28:0x48]` branch, the runtime token lookup
+   key (a singleton `+0x60` field resolved at construction, bytes unknown), the
+   identity of the gating states and the formatted 32-bit value, and whether the supplied
+   file-signature ZIP implements this callback. None of these establishes a
+   byte-exact signer or that a real QQ server accepts the output.
 4. Implement and test account-isolated session lifecycle and a real
    `PacketSender` adapter; integrate with Bridge without inventing a QQ PID.
 5. Independently compare encoded bytes with the target build and verify an
    actual user account session and delivery. Keep credentials and captures out
    of the repository.
+
+## Local signer and live-login integration work
+
+The operator selected a locally implemented signing service rather than a
+public signing endpoint. The new path has two distinct parts:
+
+- [Python worker and deployment contract](../../tools/local-qq-sign/README.md):
+  a separately started Linux process calls the fixed build's native entry.
+  It is an independently written loader/protocol, **not** an independent
+  reimplementation of the signing algorithm. No QQ desktop, process injection,
+  public signing endpoint or HTTP listener is used by this worker.
+- [Node process adapter](./src/direct/local-qq-sign-worker.ts): an explicit
+  subprocess owner implements the existing signing callback, with a bounded
+  single-in-flight queue, whole-request deadlines, checked worker identity
+  declaration and actual child-close observation. The declaration is not remote
+  attestation. An initially anonymous UIN `0` may bind once to the confirmed
+  positive UIN while idle; later cross-account use fails.
+
+Neither part is automatically started by Core. The existing default Hook path,
+OneBot v11 behavior, Jiyu identity and default WebUI remain in place. Native
+component invocation is a separate evidence category from both pure algorithm
+reconstruction and a QQ server accepting a signed request.
+
+### Native ABI and input provenance
+
+The selected DEB and ELF digests were rechecked before extracting only the
+required local component inputs. The package metadata again declares
+`3.2.35-54395`, `buildVersion=54395`, `platform=linux`, `eleArch=x64`, and
+`appid.linux=537391511`. That last property alone does not establish every
+WT/SSO profile field.
+
+| Input | SHA-256 |
+| --- | --- |
+| Main ELF | `dc5209e20002735e31a20c9cded0a807d1db4779277dec66c9221ea28a870328` |
+| Bundled Bugly library | `b4c78ae60326e7c68b9f026d5c43a8db1ad19ab4069a11a3468a498b9ee8599d` |
+| Bundled vips C++ library | `994c562dc1242f07ce62c0c918bd4e49eebf5bb7a0e34726892a4c79ddab3399` |
+| Bundled crbase library | `5c4ef5b297291301eb40c4ae48d31083830132b146bac3c21a68e080ec71fc8e` |
+| Bundled x86-64 unwind library | `ffd57d6f0a4e902278f2f33d88247b7661f7bd03bd300733db3193d51cd98f7b` |
+| Bundled base unwind library | `7466ebba89873fa3a959ae0a14c824140df82a8ebba40bc1c3808acbc5eab76b` |
+| Bundled ssh2 library | `b18f774efaf7e074338133ec9ae93dd3a94fb33ff2aa1eedbf4d5b45172d8e23` |
+| Package metadata | `68f4d6c83c396ca90fde51af1fdf4eafb40b20bd7151bc187c4128194d5afa7f` |
+
+The first dynamic-load attempt returned `dlopen-failed`; a separate bounded
+loader diagnostic identified missing `libcrbase.so`. This was a staging error:
+looking only at the main ELF's direct dependencies omitted dependencies of
+Bugly. A recursive `DT_NEEDED` inventory recovered the four additional bundled
+libraries above from the same pinned DEB, not substitute system implementations.
+The resulting closure contains seven bundled ELFs (including the main ELF) and
+16 system-library names. All seven file hashes and all 16 system-library loads
+were then checked before repeating the native test.
+
+A fresh aligned disassembly of the caller at `0x3523110` confirms the five
+SysV inputs at `0x352329a`: command pointer, body pointer, 32-bit body length,
+32-bit value and output pointer. The worker preserves that fourth argument's
+u32 bits and names it `sequence`, matching the external service contract. The
+target is `0x6856284`. The callee's `[rsp+0x1a8]` is the saved return address, not
+a sixth argument.
+
+Subsequent static review corrected the earlier `module_id` attribution: the
+complete format at rodata `0xa2b404` is `MSFSign failed, module_id:{} data:{}`.
+The call sequence at `0x35232a5–0x35232e5` supplies a command-string copy and the
+body length to that logger, not `r12d`. Its formatter consumes the first as a
+libc++ string and the second as an integer. Thus `module_id` labels the command
+here, not the native call's fourth argument.
+
+Independent upstream data flow supports the sequence interpretation:
+`SendMsfRequestInternal` retains its second argument at `0x35505bb`, labels
+that value `seq` in another diagnostic, stores it in the request's first dword
+at `0x35507b7–0x35507bc`, and reloads it into `r8d` at `0x3550814` before virtual
+dispatch. If that dispatch selects the identified callback, it becomes
+`r12d`, then `ecx` at the native call. Both examined standalone implementations
+also pass request sequence, not a fixed zero: [Micuks sign.py](https://github.com/Micuks/ntqq-sign-server/blob/a2f4346e3a25f4a39a42ef3e618da2a019a9f983/sign.py#L276-L281)
+and [nimeng main.rs](https://github.com/nimeng1299/SignServer/blob/c0b515853d6f8de5b28c757d4cdccb8e145f8dc9/src/main.rs#L63-L70).
+This supports retaining the current sequence contract; it does not by itself
+prove the specific live QR packet's complete field mapping or server acceptance.
+
+The loader verifies the entire ELF digest and the file-backed executable
+range before loading, then obtains the load bias through `dlinfo` for that exact
+handle. It uses the already verified file descriptor and no offset scanner.
+The helper's no-op registration symbol does not implement a QQ/N-API host.
+The executable and dependencies still execute native code; per-process
+isolation, fixed output framing and canaries are not a proof about all native
+side effects. Library lifetime ends with the dedicated process rather than an
+unverified in-process unload.
+
+### Correct first-login reference chain
+
+The current
+[Core V2 reference state machine](https://github.com/LagrangeDev/Lagrange.Core/blob/e1bd4baa16fa86ef000154e3eecb7816a29b63a7/Lagrange.Core/Internal/Logic/WtExchangeLogic.cs)
+uses the following initial-QR path:
+
+```text
+wtlogin.trans_emp / OICQ 0x812 / code2d 0x31
+  -> poll code2d 0x12 with the same ECDH/random-key context
+  -> confirmed UIN, temporary A1, NoPicSig, TgtgtKey
+  -> wtlogin.login / OICQ 0x810 / subcommand 0x09
+  -> decrypt the ticket block and obtain D2, D2Key, A2, A1, UID
+  -> SsoInfoSync using D2/D2Key
+  -> online only after the registration business result succeeds
+```
+
+KeyExchange/EasyLogin is the cached-A1 recovery branch, not the empty-session
+QR entry. The reference signs the complete service payload (the OICQ envelope)
+before wrapping SSO. Its QR and login requests use protocol 12 with encryption
+type 2 and a zero TEA key; registration switches to D2 encryption. These are
+[reference packet-construction facts](https://github.com/LagrangeDev/Lagrange.Core/blob/e1bd4baa16fa86ef000154e3eecb7816a29b63a7/Lagrange.Core/Internal/Context/PacketContext.cs),
+not evidence that this target build accepts the same profile.
+
+Two similarly named fields have different meanings: the local QR context's
+`ssoVersion: string` maps to the reference's full `CurrentVersion`, whereas
+QR fetch fields' `ssoVersion: number` maps to its numeric SSO version. The
+[reference SSO writer](https://github.com/LagrangeDev/Lagrange.Core/blob/e1bd4baa16fa86ef000154e3eecb7816a29b63a7/Lagrange.Core/Internal/Packets/Struct/SsoPacker.cs)
+and [reference app profiles](https://github.com/LagrangeDev/Lagrange.Core/blob/e1bd4baa16fa86ef000154e3eecb7816a29b63a7/Lagrange.Core/Common/BotAppInfo.cs)
+show the distinction. The latter currently declares Linux `3.2.26-46494`, not
+this sample's build; its numeric fields must not silently overwrite the sample.
+
+The 21-byte code2d reserved field and 12-byte login TLV 0x124 are `Skip` regions
+in that reference. Its `Skip` merely advances a position, so the source does
+not prove a fixed value for either region. Explicit zero filling is a local
+deterministic policy, not a captured server-approved default.
+
+### Validation checkpoint
+
+- Parent rerun: `python -B -m unittest discover -s tools/local-qq-sign -p test_worker.py`
+  passed **92/92** fake-backend/FFI tests. Importing and these tests do not load
+  the target, invoke its signing function, or send login traffic.
+- Parent rerun: the new Node adapter's **49/49** real-subprocess fixture tests,
+  the existing reserve builder's **23/23** tests and its **1/1** integration test
+  passed together (**73 tests across 3 files**). The subprocesses in these tests
+  are synthetic Node workers, not the QQ native component.
+- Explicit strict TypeScript compilation included both the new source and test
+  file and passed. Full workspace `pnpm typecheck` and `pnpm lint` passed; the
+  pre-existing Core/OneBot typecheck dependency-cycle warning remains. Full
+  workspace tests and release builds were not run for this checkpoint.
+- Local link checks passed for this document and the worker guide,
+  and `git diff --check` passed.
+- The native-input staging step rechecked the source DEB and main ELF digests,
+  preserved the original inputs, and recorded the three dependency/metadata
+  digests above.
+- The separate local Linux environment passed its dependency checks, compiler
+  execution and stop/restart checks: Debian 12 x86-64, Python 3.11.2, GCC 12.2,
+  glibc 2.36, using QEMU TCG. WSL, BIOS and Windows optional features were not
+  changed. The main session owns the live guest; a child-session job was found
+  absent at handoff and was replaced by a main-session-owned start of the same
+  verified overlay, followed by another complete dependency check.
+- The Python suite also passed **92/92 on Linux**, and the small host-symbol
+  helper compiled successfully there.
+- **Actual native execution passed** under a non-root UID in a network namespace
+  containing only loopback. The exact verified ELF was loaded and called for
+  `wtlogin.trans_emp` (sequence 1, four synthetic body bytes),
+  `wtlogin64.trans_emp` (sequence 2, four bytes), and `wtlogin.login`
+  (sequence 4, eight bytes). Each returned **48 sign bytes, zero token bytes and
+  zero extra bytes**. An intervening NUL-containing command was rejected without
+  a native call. Ready framing, all four response IDs, nonempty sign checks and
+  process exit code 0 passed; the run took 5.346 seconds including startup.
+- **The real Node-to-native path also passed**: the new process adapter launched
+  SSH to that same local guest, used the network-isolated Python worker, queued
+  the two QR command variants, bound an idle synthetic UIN from `0` to `10001`,
+  rejected further use of `0`, and signed a login command. All three native
+  results again had lengths `48 / 0 / 0`. Explicit close observed the SSH child's
+  actual `close` with `SIGKILL`; a subsequent guest process check found no
+  remaining worker processes. This is not a claim that killing an arbitrary
+  local child always terminates its descendants.
+- These body bytes and the UIN above are **synthetic inputs**, not a real login.
+  A nonempty native result does not prove that the command's body, profile,
+  sequence mapping or signature is acceptable to QQ. In particular, the empty
+  token/extra fields are observations for these inputs, not assumed universal
+  requirements.
+- These native-only tests did not obtain a QR or confirm an account. Later live
+  reference/probe observations are recorded below; delivery and receiving still
+  require separate end-to-end validation.
+
+### Explicit runner and first service observations
+
+The separate [direct login probe](../../tools/direct-qq-login/README.md) now
+composes the existing WT/multiplex owner, one observed TCP connection, the
+local signing adapter and explicit candidate configuration. Importing/building
+it does not log in. It preserves the same connection and keys from fetching
+through registration, waits for acquisitions and actual resource closure, and
+never sends a message automatically. This is not a Core/WebUI/OneBot backend
+integration. Its short online hold has no heartbeat scheduler yet.
+
+The candidate's target-metadata fields and reference-derived assumptions are
+separately labeled. Linux PC reserve `msgType` and `ntCoreVersion` are omitted,
+not filled with Android's 32/100. The fixed Core default whitelist contains all
+three configured commands: `wtlogin.trans_emp`, `wtlogin.login` and
+`trpc.msg.register_proxy.RegisterProxy.SsoInfoSync`; neither UIN zero nor
+EncryptEmpty bypasses that classification. See the [fixed whitelist](https://github.com/LagrangeDev/Lagrange.Core/blob/e1bd4baa16fa86ef000154e3eecb7816a29b63a7/Lagrange.Core/Common/BotSignProvider.cs#L540-L598)
+and [call site](https://github.com/LagrangeDev/Lagrange.Core/blob/e1bd4baa16fa86ef000154e3eecb7816a29b63a7/Lagrange.Core/Internal/Context/PacketContext.cs#L49-L63).
+
+The first live fetch reached a connected QQ gateway but ended without a QR.
+A second fresh attempt, with bounded transport diagnostics but otherwise the
+same candidate, recorded one write call / 619 socket write bytes, **zero
+socket read bytes and zero complete response frames**, then `raw-cancelled`
+at the WT transaction deadline. The native signing worker had started, and
+resource closure completed. Two further single-attempt checks used the other
+IPv4 address returned by the same gateway's DNS, and the wrapper directory as
+the native process working directory, respectively. Both again recorded
+`619 / 0` write/read bytes and no complete response. The host clock was also
+within two seconds of the QQ website's HTTPS Date header. These are no-response
+observations, not server rejection codes or proof that the signature was
+rejected. No phone confirmation was requested. The protocol-12 outer and inner frame field order was compared
+again with the fixed reference; no discrepancy was established by that check.
+
+The added diagnostics keep only a closed vocabulary of close reasons and
+numeric counters, not bodies or credentials. Node write counters may include
+locally queued bytes and do not prove remote receipt. Both the outer WT deadline
+and the inner raw deadline exist; either may settle first, so a silent peer can
+produce `raw-cancelled` or `raw-timeout`. The probe regression suite now passes
+**12/12**, including this diagnostic case and the previous same-connection,
+registration-failure, cancellation and drain tests. Strict probe typechecking,
+quality lint, formatting and the Proton-enabled build also pass.
+
+A narrowed optional `ServiceFrameDecoder` limit was added for this connection:
+its default stays 16 MiB, while the probe requests 2 MiB and rejects an oversized
+length prefix before frame allocation. The six relevant existing protocol
+suites pass **190/190**, including new limit boundaries, plus explicit source/test
+strict typechecking and targeted lint. Those initial no-response experiments
+alone did not establish live QR fetching, account login or interoperability.
+
+### Differential reference execution: outbound width and QR terminator
+
+A separately built, pinned Core reference client using the same candidate profile,
+GUID and local Linux signing process obtained a real QR response: 627 outbound
+bytes, 975 inbound bytes, SSO return code zero and a 604-byte QR PNG. It closed
+without polling, account confirmation, login, registration or messaging. The
+reference build and its instrumentation remain private research artifacts, not
+copied implementation code in the shipped protocol.
+
+Comparing actual encoder output located a concrete outbound defect. The OICQ
+fixed request header is **28 bytes**, not 26: the reference writes a four-byte
+`retryTime` after the two-byte client version. The previous implementation left
+only two bytes before its ECDH head. The shared encoder now explicitly writes
+uint32 zero at offset 24, starts the encryption head at 28 and includes the two
+bytes in the total length. This fixes both 0x810 and 0x812 outbound frames, not
+the asymmetric inbound header. Independent complete-header and length-limit
+regressions were added; the 32 affected WT/fixture-consumer test files passed
+557 tests, and the runner's then-current 12 tests passed.
+
+There is also a separate explained protobuf presence difference: the reference
+encodes empty UID (three bytes), token and extra (two bytes each); the existing
+Proton schema omits these defaults. With only the OICQ width fixed, Jiyu's own
+619-byte request received a 975-byte response, so those seven omitted bytes are
+not the cause of the original no-response result. No blanket protobuf-presence
+change was made.
+
+The next failure was reproduced inside Jiyu's own response parser. A debugger
+attached only to that standalone Node process, not a QQ desktop process, observed
+`RangeError: trailing WT TLV bytes`. A bounded inspection at that exception found
+count=3, inputLength=727, consumed=726 and exactly one remaining byte, `0x03`.
+This provides runtime evidence for the previously unresolved Code2d terminator.
+
+The generic Code2d decoder continues to preserve its raw remainder, and the TLV
+decoder still requires exact consumption. Instead, the explicit attempt slice
+callback now also receives an optional final decoded byte. The Linux probe policy
+requires `0x03` before excluding exactly that one byte for fetch/poll; it preserves
+the existing login-body range. Its synthetic replies now model this marker, and
+missing, wrong or duplicate marker cases are covered rather than accepted by a
+permissive TLV decoder. After that correction, Jiyu obtained a real QR and a
+waiting-scan poll response (two writes/two frames). The same complete path was then
+run inside Linux with Node 24.22.1 and a directly spawned local native signer:
+1078 bytes written, 1190 read, with successful QR/poll parsing before intentional
+cancellation. Neither bootstrap experiment authenticated an account.
+
+### First phone confirmation and login TLV dictionary semantics
+
+A subsequent user-operated Linux session reached actual phone confirmation and
+received a state-zero login response. Its TLV 0x119 decrypted successfully, but
+the local login decoder rejected a repeated tag inside the decrypted TLV list.
+The session closed before registration; this is not an online or delivery result.
+
+The pinned Core `ProtocolHelper.TlvUnPack` explicitly assigns `tlv[tag] = data`
+while reading in order. Its rule is deterministic last-value-wins, not rejection
+of all duplicates. The login-local projection now follows that dictionary rule,
+wiping each replaced owned value. The generic TLV decoder still validates the
+entire block before projection. A malformed final credential value is rejected;
+the decoder never falls back to an earlier value that happens to parse. QR TLV
+rules are unchanged. Subsequent user-confirmed Linux runs completed ticket
+projection, UID extraction and the exact successful registration response, and
+emitted `online`.
+
+The fixed reference has distinct `InfoSyncPush` and `PushParams` startup
+notification services. After adding these to the explicit push-command set,
+a live Linux run received both, completed `SsoHeartBeat` successfully and received
+an exact `Heartbeat.Alive` response. A metadata-only diagnostic then identified
+the next rejected frame as `ConfigPushSvc.PushReq`, protocol 13 with D2
+encryption. No account key or message body was needed for that diagnosis.
+
+The [fixed command/protocol mapping](<src/direct/wt-reference-push-commands.ts>)
+now accepts the first three notifications only with protocol 12 and the observed
+configuration notification with protocol 12 or 13. All retain the same D2,
+account, key-state, raw-association, queue and body limits; unknown commands are
+not accepted generically. Configuration bytes are delivered opaquely only to
+an opted-in callback, not interpreted as chat or automatically acknowledged.
+The fixed Core reference has no corresponding handler and its default
+unhandled-service path logs without disconnecting or sending a default reply;
+that source behavior does not establish whether a particular server response
+requires acknowledgement. The configuration fix has passed offline regressions;
+sustained operation and the requested friend/message action remain live
+validation steps, not established by the successful heartbeat alone.
+
+### Experimental Linux outbound friend requests
+
+The registered [multiplex owner](<src/direct/wt-multiplex-reference.ts>) now exposes
+`friendRequest`. This is a low-level opt-in API; it does not introduce a OneBot v11
+action, replace the default WebUI, or create a second connection. The fixed
+commands are `OidbSvcTrpcTcp.0x7c1_1` (settings) and
+`OidbSvcTrpcTcp.0x7c2_5` (application). Both must be explicitly included in the
+local signer's command policy. This is the native Linux V2 protobuf route, not
+the older Android JCE `friendlist.addFriend` route.
+
+[Request codecs](<src/direct/linux-friend-request.ts>) use unsigned 64-bit UINs and
+the native UIN envelope mode. Query version is fixed at 1, matching the supplied
+Linux client's `getBuddySetting` object and the native uint32 tag-1 setter.
+Sources remain caller-explicit. The native Node input path materializes omitted
+`addSetting`, `groupId` and `cardSwitch` as **present zero values**; the request
+codec now preserves those defaults instead of omitting tags 3, 5 and 20.
+Other optional fields preserve explicit zero, false and empty values, while
+missing values stay absent; unknown device fields and fabricated UID
+conversions are not used. [Response codecs](<src/direct/linux-friend-response.ts>) retain field
+presence, signed business results and repeated UTF-8 questions. Opaque response
+buffers have explicit ownership and disposal; owner results expose only their
+presence and lengths.
+
+Static decoding of the matching Linux client's V8 caches established these
+specific UI conventions:
+
+- For ordinary numeric-UIN search, the source pair is **1 / 3**. The client
+  explicitly uses its `WINDOWS` table even in this Linux package. Its `qid` table
+  key is selected by the non-phone branch, not by a separate QID identity check.
+- Settings are passed through into `addFriendSetting`: AllEveryone=0,
+  NeedVerify=1, RefuseEveryone=2, NeedAnswerQuestion=3,
+  NeedAnswerQuestionAndAudit=4, AfterAnswerQuestionCorrectly=100,
+  FriendAlready=101 and RefuseFameFrd=102. These are decoded assignments, not
+  values inferred from string order.
+- The query UI checks the **outer native callback result**, not its inner
+  `rsp.result`. Accordingly, the owner preserves the query's inner result but
+  does not require it to equal zero.
+- The application UI's success branch requires outer success, a response
+  object, `rsp.errorCode===0` and `rsp.result===0`. This is an application-result
+  test, not proof that the recipient saw or accepted the request.
+- The native-call object uses `myAllowFlag=1` and `showMyCard=1` (wire
+  `cardSwitch`, tag 20). The latter must be explicit when following the UI;
+  the Node missing-argument default is 0, not 1. An explicitly empty verification
+  form yields empty answer text and group 0; the normal populated desktop form
+  may instead construct a nickname greeting. The API does not invent that
+  greeting or enable `autoSend`. The five examined caches do not establish
+  `autoSend` semantics. Their friend-call object omits token/sig/srcFlag rather
+  than initializing these fields to empty or zero.
+
+The [finite owner workflow](<src/direct/wt-reference-friend-flow.ts>) accepts:
+
+```ts
+// The caller supplies the chosen target and operation intent.
+const settings = await owner.friendRequest({
+    mode: 'inspect',
+    peerUin: TARGET_UIN, // bigint, never a signed-32-bit coercion
+    sourceId: 1,
+    sourceSub: 3,
+    timeoutMs: 20_000,
+    maxResponseBodyBytes: 65_536,
+});
+```
+
+`inspect` performs only the settings query. `apply` additionally requires explicit
+`expectedSetting` and `application` fields and **requeries under the same gate**.
+It stops without an application on an OIDB error, nonzero inner error code,
+missing/mismatched setting, conflicting returned peer UIN or nonempty questions.
+It never treats `isContactFriend` as proof of existing QQ friendship. The
+application fields are not automatically derived from arbitrary setting values.
+
+Both steps share one deadline bounded by the lease, with fresh child-run
+identities and fixed step/command bindings. Signer-provided commands do not
+select the route. A write with an uncertain outcome is not retried. Public
+results are `settings`, `not-applied` or `application-response`; transport
+failures preserve the stage, attempted flag and write state. `application-response`
+means a correlated response was decoded, including possible business errors,
+not that friendship exists. Push callbacks are deferred across the whole gate,
+and final cleanup/revocation checks precede result delivery.
+
+The initial focused integration matrix passed **74 files / 1544 tests**, including 66
+codec and 56 friend-workflow tests; the latter reproduce the erroneous query
+inner-result gate before its correction. These are offline results.
+
+A subsequent explicit Linux test sent **one** application on the authenticated
+connection. Both the fresh settings check and a later read-only check returned
+setting 0. The application response had explicit result 0, errorCode 0,
+friendSetting 0, myAllowFlag 1, groupId 0, and present-but-empty sig and verify.
+No chat was sent. However, the operator reported that neither a received
+application nor the target in the sender's friend list was visible. Therefore
+**that initial response did not establish end-to-end friend addition**; it is not
+promoted to a completed friendship. A later explicitly requested attempt and
+recipient confirmation are recorded below.
+
+The recovered UI classifies setting-0 success as a direct add, but that is local
+UI categorization, not an independent membership query. Its success callback
+does not issue a second application. The settings endpoint does not replace a
+friend-roster query. No application was replayed to diagnose this discrepancy.
+
+The same live session accepted `ConfigPushSvc.PushReq` on protocol 13 and
+completed 39 Alive replies before a later `frame-rejected` closure. The original
+diagnostic stopped after its first 32 non-login frames and did not retain the
+closing frame; this is not evidence that the closure caused the earlier
+friend-state discrepancy. Private diagnostics now retain the latest 32
+non-login frame-header records rather than stopping permanently at the first
+32 records. The regression uses synthetic
+frames, including late rejection and mismatched heartbeat headers, without QQ
+traffic.
+
+A subsequent **read-only** Linux session captured the actual rejected command:
+`ConfigPushSvc.PushReq`, protocol 12, D2, with the registered account binding
+matching the outstanding request. The former protocol-13-only mapping rejected
+this variant. The fixed command now accepts 12 and 13 in both routing and body
+decoding, while the other three push commands remain protocol-12-only. A
+red-first synthetic reproduction, 59 command/ownership tests, the 74-file
+1551-test integration matrix, 29 real-loopback runner tests and strict test-file
+typechecking passed for this transport change. This explains that session's
+closure; it does not establish the cause of the missing friendship.
+
+The diagnostic's rolling window now records every non-WT header. The private
+classifier projection has no business `retCode`, so the observer does not infer
+a healthy heartbeat from a missing value. A production-shaped synthetic run
+with 140 frames retains the latest 32 and the final rejection, with 12 checks
+passing and no QQ traffic.
+
+The operator subsequently requested exactly one additional application, with
+account persistence enabled first. That request received `result=1/errorCode=170`
+and the server text “好友添加请求已发送，需对方确认。”. The operator then
+confirmed that the recipient **received and accepted it**. No chat was sent and
+no further application was replayed. The private diagnostic's `nativeUiAccepted`
+zero/zero predicate was false; it was not a delivery or friendship predicate.
+
+After that acceptance, the observed connection closed on the exact known
+`trpc.msg.olpush.OlPushService.MsgPush` command using protocol 13, D2, while
+registered and with no pending request. This newly observed variant is distinct
+from the previous ConfigPush fix. The exact MsgPush command now accepts both
+12 and 13, while InfoSyncPush and PushParams still require 12. Account, D2/key,
+raw-frame, body, queue and lifecycle constraints are unchanged. A red-first
+reproduction failed 12 of 129 mux/restored cases before the mapping fix; the
+subsequent complete matrix passed **64 files / 1289 tests**. The tool suite passed
+**288 tests**, including QR registration and idle restored-owner MsgPush13 delivery.
+
+### Opt-in credential checkpoint and separate restored owner
+
+The [persisted-session codec](<src/direct/wt-persisted-session.ts>) defines the
+version-1 binary DTO `{ version, uin, uid, guid, tickets: { d2, d2Key, a1, a2 } }`.
+Its encode/decode/clone operations validate canonical positive uint32 UINs,
+strict UTF-8, fixed 16-byte GUID/D2Key and bounded nonempty tickets. They copy
+borrowed inputs; `disposeWtPersistedSession` erases owned byte arrays. A decoded
+DTO is not a proven live QQ identity. It is never a fake QR confirmation.
+
+The existing [reference session](<src/direct/wt-reference-session.ts>) accepts an
+optional `checkpoint: { timeoutMs, save(snapshot, context) }`. The snapshot is an
+independent borrowed copy. The callback runs only after the real registration
+response and key-capability commit, and must finish before success is exposed.
+While it waits, public state remains `login-register` or `restore-register`.
+The callback receives a session-scoped `AbortSignal` and `isCurrent()` guard;
+the old, completed QR-attempt signal is not reused. Close, failure and deadline
+expiry revoke the guard and erase the borrowed snapshot. External storage must
+copy what it owns, honor the guard and implement its own durable I/O barrier.
+No callback is installed by default.
+
+`createWtRestoredMultiplexReference(stream, options)` creates a **new** owner,
+origin, reservation and connection lease. `options.transportUin` must equal
+`options.session.persisted.uin`. The session options include the DTO,
+`profile: { subAppId, version }`, registration metadata, transaction and restore
+timeouts, signal, reserved-header builder and raw-response verifier. Its
+`restoreAndRegister()` performs the existing SsoInfoSync exchange using the saved
+D2/D2Key/A2 and the UID from the DTO. Only a correlated successful registration
+activates the shared send/heartbeat/Alive/friend-request gate. The returned owner
+has no QR fetch/poll/login methods; failed restore does not fall back to QR,
+renew A1, replay a write or erase stored credentials.
+
+The [Node tool adapter](<../../tools/direct-qq-login/account-persistence.ts>) and
+[Linux vault](<../../tools/direct-qq-login/account-vault.ts>) implement optional
+storage, not the protocol package. The vault uses authenticated AES-256-GCM,
+independent key and data roots, account/profile/device binding, process flock,
+revision CAS, temporary-file fsync, atomic rename and directory fsync. Normal
+close preserves ciphertext. It reports commit uncertainty rather than treating
+rename alone as a completed durable save. The [tool guide](<../../tools/direct-qq-login/README.md#加密账号保存与显式恢复>)
+documents explicit save/restore flags and stable-data requirements; the original
+JSON configuration and memory-only call remain valid.
+
+Initial protocol validation for this addition passed **64 files / 1247 synthetic
+tests**, including 20 DTO and 28 restored/checkpoint lifecycle cases. The cases
+cover two accounts, genuine codec exchanges, rejected registration, no fake QR
+provenance, post-restore activity, callback races and owned-buffer cleanup.
+Strict protocol typechecking explicitly included the new tests. Separate Node
+vault and adapter tests exercise file/guard/CAS behavior, including actual Linux
+process locks and crash points. These are distinct from real QQ verification. A subsequent real QR registration
+completed the guarded encrypted checkpoint before online and before the second
+friend application. The private ciphertext and separate key files had the
+expected ownership and 0600 modes.
+
+**Saved-ticket restoration against QQ subsequently passed live validation** in
+a fresh Node process and fresh local signing process. The observed sequence was
+store open/load, connect, restore/register, and online: no QR fetch/confirmation
+and no friend application or chat replay. SsoHeartBeat and 25 consecutive Alive
+replies succeeded, along with configuration/synchronization pushes. The account
+selector matched the prior login and the encrypted record remained byte-identical.
+The new process held the vault lock while online; explicit close released it,
+left the encrypted account data intact and ended both processes. The diagnostic
+reported zero exceptions and child exit 0. This tests one real restore, not an
+unlimited credential lifetime, automatic A1 renewal or permanent online service.

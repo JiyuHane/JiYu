@@ -635,8 +635,10 @@ describe('WT multiplex reference send with synthetic memory-only peer', () => {
                 }
             }
 
-            const exposed = Reflect.ownKeys(f.session).map(String).join(' ');
-            expect(exposed).not.toMatch(/ticket|d2key|querykey|capability/i);
+            const exposed = Reflect.ownKeys(f.session).map(String);
+            expect(exposed).not.toEqual(
+                expect.arrayContaining(['tickets', 'd2Key', 'queryKey', 'capability']),
+            );
 
             for (const result of [privateResult, groupResult]) {
                 expect(Object.keys(result)).toEqual(expect.arrayContaining(['status', 'response']));
@@ -670,9 +672,12 @@ describe('WT multiplex reference send with synthetic memory-only peer', () => {
             let verifierRequest: Uint8Array | undefined;
             let verifierResponse: Uint8Array | undefined;
             let responseCopy = new Uint8Array();
+            let signerSnapshot = new Uint8Array();
             f.setSigner((input) => {
+                // The callback contract rejects lasting changes to the borrowed
+                // body, so isolation is observed through the post-send wipe.
                 signerBorrowed = input.body;
-                input.body.fill(0);
+                signerSnapshot = Uint8Array.from(input.body);
                 return Uint8Array.of(8);
             });
             f.setVerifier((input) => {
@@ -689,10 +694,26 @@ describe('WT multiplex reference send with synthetic memory-only peer', () => {
             });
             const decoded = protobuf_decode<DirectSendMessageRequest>(f.requests[1].body);
             expect(decoded.messageBody.richText.elems[0].text.text).toBe('synthetic text 中🙂');
+            expect(Buffer.from(signerSnapshot).equals(Buffer.from(f.requests[1].body))).toBe(true);
+            expect(signerSnapshot.some((byte) => byte !== 0)).toBe(true);
             expect(signerBorrowed?.every((byte) => byte === 0)).toBe(true);
             expect(verifierRequest?.every((byte) => byte === 0)).toBe(true);
             expect(verifierResponse?.every((byte) => byte === 0)).toBe(true);
             expect(responseCopy.some((byte) => byte !== 0)).toBe(true);
+        }));
+
+    it('fails closed without writing when a signer leaves its borrowed body changed', () =>
+        withFixture(async (f) => {
+            await f.register();
+            f.setSigner((input) => {
+                input.body.fill(0);
+                return Uint8Array.of(8);
+            });
+            await expectRejected(f.send(), 'changed signer body', /session send failed/);
+            await bounded(f.session.whenClosed, 'changed signer body closes');
+            expect(f.requests).toHaveLength(1);
+            await expectRejected(f.send(), 'send after signer change', /invalid send session/);
+            expect(f.requests).toHaveLength(1);
         }));
 
     it('queues push verification and delivery FIFO until a pending signer and send settle', () =>

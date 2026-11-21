@@ -332,7 +332,7 @@ export function setup(settings: Settings = {}) {
             timeoutMs: 1500,
             attemptTimeoutMs: 7000,
             getTimestamp: () => 10,
-            buildWtReserved: () => new Uint8Array(),
+            buildWtReserved: async () => new Uint8Array(),
             verifyRaw: () => true,
             verifyContext: ({ requestUin, responseUin }) => responseUin === requestUin,
             sliceBusiness: ({ bodyLength }) => ({ start: 0, end: bodyLength }),

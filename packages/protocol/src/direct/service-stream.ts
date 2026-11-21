@@ -8,6 +8,17 @@ export class ServiceFrameDecoder {
     private frameUsed = 0;
     private failed = false;
 
+    /** A caller may narrow the wire limit; check the prefix before allocating its frame. */
+    constructor(private readonly maxFrameBytes: number = MAX_SERVICE_FRAME_BYTES) {
+        if (
+            !Number.isInteger(maxFrameBytes) ||
+            maxFrameBytes < 14 ||
+            maxFrameBytes > MAX_SERVICE_FRAME_BYTES
+        ) {
+            throw new RangeError('invalid service frame limit');
+        }
+    }
+
     /** Whether an incomplete frame or length prefix is currently retained. */
     get hasPartial(): boolean {
         return this.prefixUsed !== 0 || this.frame !== null;
@@ -76,7 +87,7 @@ export class ServiceFrameDecoder {
 
                 const length = new DataView(this.prefix.buffer).getUint32(0);
 
-                if (length < 14 || length > MAX_SERVICE_FRAME_BYTES) {
+                if (length < 14 || length > this.maxFrameBytes) {
                     this.failed = true;
                     throw new Error('invalid service frame length');
                 }

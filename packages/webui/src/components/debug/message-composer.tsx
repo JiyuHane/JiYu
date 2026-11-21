@@ -55,9 +55,15 @@ function TargetPicker({
     );
 }
 
-export function MessageComposer({ accounts }: { accounts: QQInfo[] }) {
+export function MessageComposer({
+    accounts,
+    preferredUin,
+}: {
+    accounts: QQInfo[];
+    preferredUin?: string | null;
+}) {
     const api = useApi();
-    const [uin, setUin] = useState('');
+    const [uin, setUin] = useState(preferredUin ?? '');
     const [kind, setKind] = useState<'group' | 'friend'>('group');
     const [target, setTarget] = useState('');
     const [segs, setSegs] = useState<Seg[]>([]);
@@ -75,8 +81,8 @@ export function MessageComposer({ accounts }: { accounts: QQInfo[] }) {
     const groupId = kind === 'group' ? target : '';
 
     const send = async () => {
-        if (!uin) {
-            setResult({ error: '请选择账号' });
+        if (!uin || !accounts.some((account) => account.uin === uin)) {
+            setResult({ error: '请选择在线账号' });
             return;
         }
 

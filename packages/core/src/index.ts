@@ -18,6 +18,14 @@ import { workerData } from 'node:worker_threads';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BridgeManager } from './bridge/manager';
+import { createDirectAccountDriver } from './direct/direct-account-driver';
+import { loadManagedDirectConfig } from './direct/managed-config';
+import {
+    createUnavailableManagedDirectAccountService,
+    ManagedDirectAccountService,
+    type ManagedDirectAccountDriver,
+} from './direct/managed-service';
+import type { DirectAccountService } from './direct/service-contract';
 import { createNotificationManager } from './notifications/manager';
 import { createStateWiring } from './webui/state-wiring';
 import { initWebUI } from './webui/server';
@@ -50,6 +58,57 @@ function installProcessGuards(): void {
     });
 }
 
+async function disposeCreatedDirectDrivers(
+    drivers: readonly ManagedDirectAccountDriver[],
+    cause: unknown,
+): Promise<never> {
+    const settled = await Promise.allSettled(drivers.map((driver) => driver.dispose()));
+    const failures = settled.flatMap((result) =>
+        result.status === 'rejected' ? [result.reason] : [],
+    );
+
+    if (failures.length > 0) {
+        throw new AggregateError(
+            [cause, ...failures],
+            'managed direct account initialization failed',
+        );
+    }
+
+    throw cause;
+}
+
+async function createManagedDirectAccountService(
+    bridgeManager: BridgeManager,
+    oneBotManager: OneBotManager,
+): Promise<DirectAccountService> {
+    if (process.platform !== 'linux') {
+        return createUnavailableManagedDirectAccountService('unsupported-platform');
+    }
+
+    const configFile = process.env.JIYU_DIRECT_QQ_CONFIG?.trim();
+
+    if (!configFile) {
+        return createUnavailableManagedDirectAccountService('not-configured');
+    }
+
+    const accounts = await loadManagedDirectConfig(configFile);
+    const drivers: ManagedDirectAccountDriver[] = [];
+
+    try {
+        for (const account of accounts) {
+            drivers.push(
+                await createDirectAccountDriver(account, { bridgeManager, oneBotManager }),
+            );
+        }
+
+        const service = new ManagedDirectAccountService(drivers);
+        log.info('managed Linux direct accounts configured: count=%d', accounts.length);
+        return service;
+    } catch (error) {
+        return disposeCreatedDirectDrivers(drivers, error);
+    }
+}
+
 async function main() {
     const runtimeConfig = loadRuntimeConfig();
     await configureFileTransport({
@@ -78,6 +137,7 @@ async function main() {
     // `processes` / `qq-list` / `connections` invalidations into a bus the
     // /api/state/stream SSE handler subscribes to (no REST polling required).
     const stateWiring = createStateWiring(bridgeManager);
+    const directService = await createManagedDirectAccountService(bridgeManager, oneBotManager);
     const hookManager = new HookManager({
         bridgeManager,
         autoLoadOnDiscovery,
@@ -117,6 +177,7 @@ async function main() {
                     tlsEnabled: runtimeConfig.webuiTls?.enabled,
                     trustProxy: runtimeConfig.trustProxy,
                     stateBus: stateWiring.bus,
+                    directService,
                     updateRoot,
                     restart: () => {
                         void shutdown('update', RESTART_EXIT_CODE);
@@ -142,6 +203,30 @@ async function main() {
         log.warn(`Shutting down (${signal})...`);
         let exitCode = requestedExitCode;
 
+        // Close HTTP admission first, then stop each direct owner while its exact
+        // OneBot generation and Bridge ingress are still available for retirement.
+        try {
+            if (stopWebUI) {
+                await stopWebUI();
+            }
+        } catch (error) {
+            exitCode = 1;
+            log.error(
+                'WebUI shutdown failed: %s',
+                error instanceof Error ? (error.stack ?? error.message) : String(error),
+            );
+        }
+
+        try {
+            await directService.dispose();
+        } catch (error) {
+            exitCode = 1;
+            log.error(
+                'managed direct account shutdown failed: %s',
+                error instanceof Error ? (error.stack ?? error.message) : String(error),
+            );
+        }
+
         try {
             await oneBotManager.dispose();
         } catch (error) {
@@ -158,18 +243,6 @@ async function main() {
             exitCode = 1;
             log.error(
                 'notification shutdown failed: %s',
-                error instanceof Error ? (error.stack ?? error.message) : String(error),
-            );
-        }
-
-        try {
-            if (stopWebUI) {
-                await stopWebUI();
-            }
-        } catch (error) {
-            exitCode = 1;
-            log.error(
-                'WebUI shutdown failed: %s',
                 error instanceof Error ? (error.stack ?? error.message) : String(error),
             );
         }

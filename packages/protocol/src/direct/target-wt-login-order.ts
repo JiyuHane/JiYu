@@ -33,7 +33,7 @@ export interface TargetWtLoginOpaqueNode {
     bytes: Uint8Array;
 }
 
-/** Only these independently inspected nodes take an unencoded raw value. */
+/** This ordering helper accepts unencoded raw values for these two tags only. */
 export interface TargetWtLoginKnownNode {
     tag: 0x318 | 0x16a;
     kind: 'raw';
@@ -106,9 +106,11 @@ function snapshot(value: unknown): Uint8Array {
  *
  * Required and optional inputs represent separate already-constructed node
  * trees. A caller's `opaque` bytes are complete writer outputs for its stated
- * tag; this function cannot verify their format or association. The two known
- * tags 0x0318 and 0x016a instead require `raw` values and use their examined
- * standalone writers. Empty opaque output is accepted as a caller assertion.
+ * tag; this function cannot verify their format or association. Within this
+ * helper, tags 0x0318 and 0x016a require `raw` values and use their examined
+ * standalone writers. The independently modeled 0x0144 writer can be called
+ * separately and its result passed here as `opaque`. Empty opaque output is
+ * accepted as a caller assertion.
  * Duplicates, unsupported tags, wrong tree/kind, accessors, proxies and unsafe
  * views are rejected by local policy. A 16 MiB aggregate cap is also local.
  *

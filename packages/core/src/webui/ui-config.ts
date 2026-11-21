@@ -272,6 +272,7 @@ const DEFAULT_OVERVIEW_MOBILE: UiLayoutItem[] = [
 const DEFAULT_NAV_ITEMS: UiLayoutItem[] = [
     { id: '/', visible: true },
     { id: '/processes', visible: true },
+    { id: '/accounts', visible: true },
     { id: '/config', visible: true },
     { id: '/logs', visible: true },
     { id: '/settings', visible: true },

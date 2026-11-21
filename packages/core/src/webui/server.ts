@@ -35,7 +35,7 @@ import {
     resolveRuntimeEnvOverrides,
 } from '@snowluma/common/runtime';
 import { execSync } from 'child_process';
-import { randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import {
     chmodSync,
     existsSync,
@@ -111,6 +111,17 @@ import { registerStorageRoutes } from './storage-routes';
 import { createCommunityIndexService } from './plugin-index';
 import { createLocalPluginCatalog } from './plugin-local';
 import { registerLocalPluginRoutes } from './plugin-routes';
+import {
+    DirectServiceError,
+    type DirectAccountService,
+    type DirectRequestScope,
+} from '../direct/service-contract';
+import {
+    directFailureResponse,
+    directResponsePolicy,
+    isDirectRequestPath,
+    registerDirectRoutes,
+} from './direct-routes';
 import { LogStorageSettingsManager } from './storage-settings';
 import {
     clearAvatarSessionCookie,
@@ -637,6 +648,7 @@ export async function initWebUI(
         stateBus?: StateBus;
         restart?: () => void;
         updateRoot?: string;
+        directService?: DirectAccountService;
     } = {},
 ): Promise<{ port: number; stop: () => Promise<void> }> {
     const webuiTarget = resolveWebuiTarget(process.env.SNOWLUMA_WEBUI_TARGET);
@@ -734,6 +746,20 @@ export async function initWebUI(
     const sseResponse = (c: Context, start: Parameters<typeof createSseResponse>[1]) =>
         createSseResponse(c.req.raw.signal, start, shutdownStreams.signal);
     app.use('*', webuiSecurityHeaders);
+    app.use('/api/*', directResponsePolicy);
+    const directScopes = new WeakMap<Request, DirectRequestScope>();
+    // The retained closure references session identity, not its plaintext token.
+    const makeDirectScope = (owner: string, info: SessionInfo): DirectRequestScope =>
+        Object.freeze({
+            owner,
+            expiresAt: info.expiresAt,
+            isCurrent: () =>
+                !shutdownStreams.signal.aborted &&
+                !consentGatePending &&
+                !info.mustChangePassword &&
+                Date.now() < info.expiresAt &&
+                [...sessionTokens.values()].includes(info),
+        });
     registerLoginRequestSecurity(app);
     const storageManagement = new StorageManagementService({
         dataDir: 'data',
@@ -809,13 +835,17 @@ export async function initWebUI(
         const token = extractWebuiSessionToken(c.req.raw);
 
         if (!token) {
-            return c.json({ status: 'failed', message: 'Unauthorized' }, 401);
+            return isDirectRequestPath(reqPath)
+                ? directFailureResponse(c, new DirectServiceError('scope-expired'))
+                : c.json({ status: 'failed', message: 'Unauthorized' }, 401);
         }
 
         const info = sessionTokens.get(token);
 
         if (!info || Date.now() > info.expiresAt) {
-            return c.json({ status: 'failed', message: 'Token expired or invalid' }, 401);
+            return isDirectRequestPath(reqPath)
+                ? directFailureResponse(c, new DirectServiceError('scope-expired'))
+                : c.json({ status: 'failed', message: 'Token expired or invalid' }, 401);
         }
 
         // Consent gate (before the password gate): block everything outside the
@@ -823,6 +853,10 @@ export async function initWebUI(
         // `consentGatePending` is memoized (see below) so this is a Set lookup, not
         // a disk read, on the hot path.
         if (consentGatePending && !CONSENT_ALLOWLIST.has(reqPath)) {
+            if (isDirectRequestPath(reqPath)) {
+                return directFailureResponse(c, new DirectServiceError('consent-required'));
+            }
+
             return c.json(
                 {
                     status: 'failed',
@@ -834,6 +868,10 @@ export async function initWebUI(
         }
 
         if (info.mustChangePassword && !MUST_CHANGE_ALLOWLIST.has(reqPath)) {
+            if (isDirectRequestPath(reqPath)) {
+                return directFailureResponse(c, new DirectServiceError('password-change-required'));
+            }
+
             return c.json(
                 { status: 'failed', message: '请先修改密码', mustChangePassword: true },
                 403,
@@ -841,6 +879,15 @@ export async function initWebUI(
         }
 
         c.set('sessionToken' as never, token);
+
+        if (isDirectRequestPath(reqPath)) {
+            const owner = createHash('sha256')
+                .update('jiyu-webui-direct-scope\0')
+                .update(token)
+                .digest('hex');
+            directScopes.set(c.req.raw, makeDirectScope(owner, info));
+        }
+
         c.res = await traceAuthenticatedWebuiMutation(c.req.raw, async () => {
             await next();
             return c.res;
@@ -1308,6 +1355,10 @@ export async function initWebUI(
     // authenticated request explicitly asking for the catalog fetches it.
     const communityPluginIndex = createCommunityIndexService();
     registerLocalPluginRoutes(app, oneBotManager, createLocalPluginCatalog());
+    registerDirectRoutes(app, {
+        service: listener.directService,
+        getScope: (request) => directScopes.get(request),
+    });
     app.get('/api/plugins/index', async (c) => {
         const force = c.req.query('refresh') === '1';
         return c.json(await communityPluginIndex.get(force));

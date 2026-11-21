@@ -249,7 +249,7 @@ describe('v12 instance integration on loopback', () => {
         }
     });
 
-    it('fans out only after pipeline suppression and preserves v11 on unsupported self events', async () => {
+    it('fans out supported self events once after pipeline suppression', async () => {
         const port = await freePort();
         const f = await fixture('10001', port);
         const client = connect(port);
@@ -279,6 +279,16 @@ describe('v12 instance integration on loopback', () => {
         await f.internals.dispatchEvent(self, 'send');
         await f.internals.dispatchEvent(self, 'bridge');
         expect(debug).toHaveBeenCalledTimes(2);
+        expect(await client.next()).toMatchObject({
+            type: 'message',
+            detail_type: 'private',
+            user_id: '10001',
+            message_id: '-10',
+            'qq.target_id': '20001',
+            self: { platform: 'qq', user_id: '10001' },
+            message: [{ type: 'text', data: { text: 'hi' } }],
+            alt_message: 'hi',
+        });
         client.ws.send(JSON.stringify({ action: 'get_status', params: {}, echo: 'after-self' }));
         expect(await client.next()).toMatchObject({ echo: 'after-self', status: 'ok' });
     });

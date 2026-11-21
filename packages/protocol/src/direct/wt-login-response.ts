@@ -42,19 +42,25 @@ function wipe(buffers: Iterable<Uint8Array>): void {
 }
 
 function entries(input: Uint8Array): WtTlvEntry[] {
+    // Keep the generic codec's complete-block validation, then apply the login-local
+    // dictionary semantics: the last value wins, with first-occurrence tag order.
+    // https://github.com/LagrangeDev/Lagrange.Core/blob/e1bd4baa16fa86ef000154e3eecb7816a29b63a7/Lagrange.Core/Utility/ProtocolHelper.cs#L7-L22
     const result = decodeWtTlv(input);
-    const seen = new Set<number>();
 
     try {
+        const latest = new Map<number, WtTlvEntry>();
+
         for (const entry of result) {
-            if (seen.has(entry.tag)) {
-                throw new Error('duplicate WT login TLV tag');
+            const previous = latest.get(entry.tag);
+
+            if (previous) {
+                wipe([previous.value]);
             }
 
-            seen.add(entry.tag);
+            latest.set(entry.tag, entry);
         }
 
-        return result;
+        return [...latest.values()];
     } catch (error) {
         wipe(result.map((entry) => entry.value));
         throw error;

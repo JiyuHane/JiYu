@@ -132,6 +132,21 @@ function slots(manager: OneBotManager) {
     return (manager as unknown as { instances: Map<string, OneBotInstance> }).instances;
 }
 
+function installAccount(manager: OneBotManager, fixture: Awaited<ReturnType<typeof account>>) {
+    // Preserve explicit online-state control while matching startSession's captured
+    // instance/bridge binding; starting the real lifecycle would emit online here.
+    const state = manager as unknown as {
+        instances: Map<string, OneBotInstance>;
+        instanceBindings: Map<string, { bridge: BridgeInterface; instance: OneBotInstance }>;
+    };
+    const { instance, peer } = fixture;
+    state.instances.set(instance.uin, instance);
+    state.instanceBindings.set(instance.uin, {
+        bridge: peer as unknown as BridgeInterface,
+        instance,
+    });
+}
+
 function caught(action: () => void): unknown {
     try {
         action();
@@ -151,7 +166,7 @@ describe('OneBot v12 receive health notification (in-memory transport)', () => {
         const f = await account('10001', bridge());
         const manager = new OneBotManager();
         const session = source();
-        slots(manager).set('10001', f.instance);
+        installAccount(manager, f);
         manager.bind(session.value);
         f.internal.v12Online = true;
         const client = connect(f.options);
@@ -183,8 +198,8 @@ describe('OneBot v12 receive health notification (in-memory transport)', () => {
         const manager = new OneBotManager();
         const first = source();
         const second = source();
-        slots(manager).set('10001', a.instance);
-        slots(manager).set('10002', b.instance);
+        installAccount(manager, a);
+        installAccount(manager, b);
         manager.bind(first.value);
         a.internal.v12Online = true;
         b.internal.v12Online = true;
@@ -216,7 +231,7 @@ describe('OneBot v12 receive health notification (in-memory transport)', () => {
         const f = await account('10001', bridge());
         const manager = new OneBotManager();
         const session = source();
-        slots(manager).set('10001', f.instance);
+        installAccount(manager, f);
         manager.bind(session.value);
         const old = session.listener;
         f.internal.v12Online = true;
@@ -374,7 +389,7 @@ describe('OneBot v12 receive health notification (in-memory transport)', () => {
         const manager = new OneBotManager();
         const session = source();
         manager.bind(session.value);
-        slots(manager).set('10001', f.instance);
+        installAccount(manager, f);
         const client = connect(f.options);
         f.peer.receiveHealthy = false;
         session.listener.receiveHealthChanged!('10001', f.peer as unknown as BridgeInterface);
@@ -428,7 +443,7 @@ describe('OneBot v12 receive health notification (in-memory transport)', () => {
         const manager = new OneBotManager();
         const session = source();
         manager.bind(session.value);
-        slots(manager).set('10001', f.instance);
+        installAccount(manager, f);
         f.internal.v12Online = true;
         const previous = connect(f.options);
         let nextRuntime!: V12Runtime;
@@ -491,7 +506,7 @@ describe('OneBot v12 receive health notification (in-memory transport)', () => {
         const manager = new OneBotManager();
         const session = source();
         manager.bind(session.value);
-        slots(manager).set('10001', f.instance);
+        installAccount(manager, f);
         f.internal.v12Online = true;
         const contexts: Array<number | undefined> = [];
         const release = f.options.subscribe(() => contexts.push(currentRequestId()));
@@ -510,13 +525,13 @@ describe('OneBot v12 receive health notification (in-memory transport)', () => {
         const manager = new OneBotManager();
         const session = source();
         manager.bind(session.value);
-        slots(manager).set('10001', old.instance);
+        installAccount(manager, old);
         old.internal.v12Online = true;
         const oldClient = connect(old.options);
         session.listener.closed!('10001', old.peer as unknown as BridgeInterface, 1);
         expect(manager.getInstance('10001')).toBeNull();
         await vi.waitFor(() => expect(old.dispatch).toHaveBeenCalledOnce());
-        slots(manager).set('10001', replacement.instance);
+        installAccount(manager, replacement);
         replacement.internal.v12Online = true;
         const nextClient = connect(replacement.options);
         replacement.peer.receiveHealthy = false;
@@ -538,7 +553,7 @@ describe('OneBot v12 receive health notification (in-memory transport)', () => {
         const manager = new OneBotManager();
         const session = source();
         manager.bind(session.value);
-        slots(manager).set('10001', f.instance);
+        installAccount(manager, f);
         const logs: string[] = [];
         const stop = subscribeLogs((entry) => logs.push(entry.message));
         const failure = vi.spyOn(f.instance, 'receiveHealthChanged').mockImplementation(() => {

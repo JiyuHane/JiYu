@@ -92,7 +92,7 @@ describe('reference PC OICQ 0x810 framing', () => {
         // the complete header is manually derived from WtLogin and BinaryPacket.
         const actual = Buffer.from(encodeWtPcLoginOicqRequest(login()));
         expect(actual.toString('hex')).toBe(
-            '02005a1f41081000000506070803870000000002000077880000' +
+            '02005c1f410810000005060708038700000000020000778800000000' +
                 '0101000102030405060708090a0b0c0d0e0f01020019' +
                 '03db4ff10ec057e9ae26b07d0280b7f4341da5d1b1eae06c7d' +
                 '2ca8df5e470d27345d036004e01c70be03',
@@ -100,11 +100,46 @@ describe('reference PC OICQ 0x810 framing', () => {
         expect(actual.readUInt16BE(1)).toBe(actual.length);
         expect(
             qqTeaDecrypt(
-                actual.subarray(73, -1),
+                actual.subarray(75, -1),
                 Buffer.from('eac0f2871a65d3e4712830f89e57f02a', 'hex'),
             ),
         ).toEqual(Uint8Array.of(0, 1, 2));
     });
+
+    it.each([0, 0x7788, 0xffff])(
+        'keeps the independent 28-byte fixed header and uint32 retryTime for version %i',
+        (clientVersion) => {
+            // Fixed Core e1bd4baa... WtLogin.cs:349-365 writes AppClientVersion as
+            // ushort at 22, then Write(0) as int32 at 24, then the encryption head.
+            // Literal lengths/fields below do not come from a production decoder.
+            const packets = [
+                {
+                    packet: Buffer.from(encodeWtPcLoginOicqRequest({ ...login(), clientVersion })),
+                    prefix: '02005c1f410810000005060708038700000000020000',
+                    firstHeadBytes: '0101',
+                },
+                {
+                    packet: Buffer.from(encodeWtCode2dRequest({ ...base(), clientVersion })),
+                    prefix: '0200711f410812000005060708034500000000020000',
+                    firstHeadBytes: '00029988',
+                },
+            ];
+
+            for (const { packet, prefix, firstHeadBytes } of packets) {
+                const expected = Buffer.from(
+                    prefix + clientVersion.toString(16).padStart(4, '0') + '00000000',
+                    'hex',
+                );
+                expect(expected.length).toBe(28);
+                expect(packet.subarray(0, 28)).toEqual(expected);
+                expect(packet.readUInt16BE(22)).toBe(clientVersion);
+                expect(packet.readUInt32BE(24)).toBe(0);
+                expect(packet.subarray(28, 28 + firstHeadBytes.length / 2).toString('hex')).toBe(
+                    firstHeadBytes,
+                );
+            }
+        },
+    );
 
     it('keeps input slices, return bytes and factory public key isolated', () => {
         const input = login();
@@ -133,7 +168,7 @@ describe('reference PC OICQ 0x810 framing', () => {
         keyBacking.fill(0xff);
         peerBacking.fill(0xff);
         expect(Uint8Array.from(packet)).toEqual(output);
-        expect(Buffer.from(packet).subarray(48, 73)).toEqual(Buffer.from(input.ecdh.publicKey));
+        expect(Buffer.from(packet).subarray(50, 75)).toEqual(Buffer.from(input.ecdh.publicKey));
         packet.fill(0);
         expect(bodyBacking).toEqual(Buffer.alloc(bodyBacking.length, 0xff));
     });
@@ -149,10 +184,10 @@ describe('reference PC OICQ 0x810 framing', () => {
         };
 
         const packet = Buffer.from(encodeWtPcLoginOicqRequest(input));
-        expect(packet.subarray(28, 44)).toEqual(key);
+        expect(packet.subarray(30, 46)).toEqual(key);
         expect(
             qqTeaDecrypt(
-                packet.subarray(73, -1),
+                packet.subarray(75, -1),
                 Buffer.from('eac0f2871a65d3e4712830f89e57f02a', 'hex'),
             ),
         ).toEqual(Uint8Array.of(0, 1, 2));
@@ -163,18 +198,27 @@ describe('reference PC OICQ 0x810 framing', () => {
         const empty = Buffer.from(
             encodeWtPcLoginOicqRequest({ ...request, body: new Uint8Array() }),
         );
-        expect(empty.length).toBe(90);
+        expect(empty.length).toBe(92);
         expect(
-            qqTeaDecrypt(empty.subarray(73, -1), request.ecdh.deriveTeaKey(request.peerPublicKey)),
+            qqTeaDecrypt(empty.subarray(75, -1), request.ecdh.deriveTeaKey(request.peerPublicKey)),
         ).toEqual(new Uint8Array());
         const packet = Buffer.from(
             encodeWtPcLoginOicqRequest({ ...request, body: new Uint8Array(65446) }),
         );
-        expect(packet.length).toBe(65530);
-        expect(packet.readUInt16BE(1)).toBe(65530);
+        expect(packet.length).toBe(65532);
+        expect(packet.readUInt16BE(1)).toBe(65532);
+        let paddingCalls = 0;
         expect(() =>
-            encodeWtPcLoginOicqRequest({ ...request, body: new Uint8Array(65447) }),
+            encodeWtPcLoginOicqRequest({
+                ...request,
+                body: new Uint8Array(65447),
+                randomSource: (length) => {
+                    paddingCalls++;
+                    return fixtureRandom(length);
+                },
+            }),
         ).toThrow(/length/);
+        expect(paddingCalls).toBe(0);
         expect(() =>
             encodeWtPcLoginOicqRequest({ ...request, body: new Uint8Array(65536) }),
         ).toThrow(/body/);
@@ -244,7 +288,7 @@ describe('reference PC OICQ 0x810 framing', () => {
         for (const packet of [first, second]) {
             expect(
                 qqTeaDecrypt(
-                    packet.subarray(73, -1),
+                    packet.subarray(75, -1),
                     request.ecdh.deriveTeaKey(request.peerPublicKey),
                 ),
             ).toEqual(request.body);
@@ -255,18 +299,18 @@ describe('reference PC OICQ 0x810 framing', () => {
 describe('reference OICQ 0x812 framing', () => {
     it('encodes independently specified request fields and inclusive lengths', () => {
         const packet = Buffer.from(encodeWtCode2dRequest(base()));
-        expect(packet.subarray(0, 30).toString('hex')).toBe(
-            '02006f1f4108120000050607080345000000000200007788000000029988',
+        expect(packet.subarray(0, 32).toString('hex')).toBe(
+            '0200711f41081200000506070803450000000002000077880000000000029988',
         );
         expect(packet.readUInt16BE(1)).toBe(packet.length);
         expect(packet.at(-1)).toBe(3);
         // MiraiGo TEA oracle with the hand-encoded payload below, fixed F8 prefix.
-        expect(packet.subarray(30, -1).toString('hex')).toBe(
+        expect(packet.subarray(32, -1).toString('hex')).toBe(
             '1ac2675390c20356da758bd889bc65bfd1503c07daf6d8c2ed711d455847f0e3' +
                 'b6a5abe430019adcbc1626f6fcf03489dbb53bfe0013c3366c444e8c55b9400c' +
                 '774f4436b3003b0961d19837e989d2ae',
         );
-        const payload = Buffer.from(qqTeaDecrypt(packet.subarray(30, -1), key));
+        const payload = Buffer.from(qqTeaDecrypt(packet.subarray(32, -1), key));
         // Hand-written source-derived layout: body length excludes its 2-byte prefix;
         // inner 0x2e length counts from 02 marker through the trailing 03.
         expect(payload.toString('hex')).toBe(
@@ -291,12 +335,12 @@ describe('reference OICQ 0x812 framing', () => {
             };
             const packet = Buffer.from(encodeWtCode2dRequest(request));
             expect(packet[14]).toBe(method);
-            expect(packet.subarray(26, 48).toString('hex')).toBe(
+            expect(packet.subarray(28, 50).toString('hex')).toBe(
                 '0101000102030405060708090a0b0c0d0e0f01020019',
             );
-            expect(packet.subarray(48, 73)).toEqual(Buffer.from(alice.publicKey));
+            expect(packet.subarray(50, 75)).toEqual(Buffer.from(alice.publicKey));
             const payload = Buffer.from(
-                qqTeaDecrypt(packet.subarray(73, -1), bob.deriveTeaKey(alice.publicKey)),
+                qqTeaDecrypt(packet.subarray(75, -1), bob.deriveTeaKey(alice.publicKey)),
             );
             expect(payload.subarray(0, 17).toString('hex')).toBe(
                 '0100401122334400000072000391929300',
@@ -333,13 +377,21 @@ describe('reference OICQ 0x812 framing', () => {
             head: { type: 'session' as const, ticket: new Uint8Array() },
         };
         const packet = encodeWtCode2dRequest(largest);
-        expect(packet.length).toBe(65533);
+        expect(packet.length).toBe(65535);
         expect(new DataView(packet.buffer, packet.byteOffset, packet.byteLength).getUint16(1)).toBe(
-            65533,
+            65535,
         );
         expect(() => encodeWtCode2dRequest({ ...largest, body: new Uint8Array(65433) })).toThrow(
             /length/,
         );
+        // The 28-byte header leaves no room for one extra session-ticket byte.
+        // A 26-byte regression would incorrectly fit this same request into u16.
+        expect(() =>
+            encodeWtCode2dRequest({
+                ...largest,
+                head: { type: 'session', ticket: Uint8Array.of(1) },
+            }),
+        ).toThrow(/length/);
     });
 
     it('decodes independent ciphertext with the context-specific 0 and 3 keys', () => {

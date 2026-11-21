@@ -13,6 +13,7 @@ import {
     Sparkles,
     SlidersHorizontal,
     Terminal,
+    Users,
 } from 'lucide-react';
 import { motion, Reorder, useDragControls } from 'motion/react';
 import { Link, useRouterState } from '@tanstack/react-router';
@@ -36,6 +37,7 @@ export interface NavItem {
 export const NAV_ITEMS: NavItem[] = [
     { to: '/', label: '总览', icon: LayoutDashboard, description: '主机与服务状态' },
     { to: '/processes', label: '进程注入', icon: PlugZap, description: '加载 / 卸载 / 登录' },
+    { to: '/accounts', label: '直连账号', icon: Users, description: '扫码 / 恢复 / 续票' },
     { to: '/config', label: '节点配置', icon: Settings, description: 'OneBot 协议端点' },
     { to: '/logs', label: '日志', icon: Terminal, description: '实时事件流' },
     { to: '/debug', label: '调试', icon: Bug, description: '测试台与实时活动' },

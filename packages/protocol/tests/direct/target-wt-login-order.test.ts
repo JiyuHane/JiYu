@@ -1,5 +1,6 @@
 import { runInNewContext } from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
+import { encodeTargetWtLoginNode0144 } from '../../src/direct/target-wt-login-node';
 import {
     encodeTargetWtLoginOrder,
     type TargetWtLoginNode,
@@ -52,6 +53,16 @@ describe('conditional target WT login writer order', () => {
             '000102030405060708feed0003180000016a000200ff',
         );
         expect(hex(encodeTargetWtLoginOrder(required(), []))).toBe('000102030405060708');
+    });
+
+    it('places an explicitly encoded synthetic 0144 node in the required order', () => {
+        const entries = required();
+        const node = encodeTargetWtLoginNode0144(Uint8Array.of(0xa1, 0xb2, 0xc3));
+        entries[1].bytes = node;
+        const result = encodeTargetWtLoginOrder(entries.reverse(), []);
+        expect(hex(result)).toBe('0001440003a1b2c302030405060708');
+        node.fill(0);
+        expect(hex(result)).toBe('0001440003a1b2c302030405060708');
     });
 
     it('accepts opaque bytes without inventing or validating an unobserved prefix', () => {

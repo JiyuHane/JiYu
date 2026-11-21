@@ -425,33 +425,41 @@ describe('traceAuthenticatedWebuiMutation', () => {
         }
     });
 
-    it.each(['/api/config/12345?source=test', '/api/system/backup/import'])(
-        'does not capture credentials for %s in TRACE',
-        async (pathname) => {
-            const entries: LogEntry[] = [];
-            setLogLevel('trace');
-            const unsubscribe = subscribeLogs((entry) => entries.push(entry));
-            const token = 'secret-token-for-v12';
-            const request = new Request(`http://127.0.0.1${pathname}`, {
-                method: 'POST',
-                headers: { authorization: `Bearer ${token}` },
-                body: JSON.stringify({ v12: { accessToken: token } }),
-            });
-            const clone = vi.spyOn(request, 'clone');
+    it.each([
+        '/api/config/12345?source=test',
+        '/api/system/backup/import',
+        '/api/direct',
+        '/api/direct/accounts/main/start',
+        '/api/direct/accounts/main/stop',
+        '/api/direct/accounts/main/renew',
+        '/api/direct/operations/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/cancel',
+        '/api/direct/unknown?token=private',
+        '/api/direct/accounts/ma%69n/start',
+        '/api/%64irect/accounts/main/start',
+    ])('does not capture credentials for %s in TRACE', async (pathname) => {
+        const entries: LogEntry[] = [];
+        setLogLevel('trace');
+        const unsubscribe = subscribeLogs((entry) => entries.push(entry));
+        const token = 'secret-token-for-v12';
+        const request = new Request(`http://127.0.0.1${pathname}`, {
+            method: 'POST',
+            headers: { authorization: `Bearer ${token}` },
+            body: JSON.stringify({ v12: { accessToken: token } }),
+        });
+        const clone = vi.spyOn(request, 'clone');
 
-            try {
-                const response = await traceAuthenticatedWebuiMutation(
-                    request,
-                    async () => new Response(JSON.stringify({ v12: { accessToken: token } })),
-                );
-                expect(await response.text()).toContain(token);
-                expect(clone).not.toHaveBeenCalled();
-                expect(mutationTrace(entries)).toEqual([]);
-            } finally {
-                unsubscribe();
-            }
-        },
-    );
+        try {
+            const response = await traceAuthenticatedWebuiMutation(
+                request,
+                async () => new Response(JSON.stringify({ v12: { accessToken: token } })),
+            );
+            expect(await response.text()).toContain(token);
+            expect(clone).not.toHaveBeenCalled();
+            expect(mutationTrace(entries)).toEqual([]);
+        } finally {
+            unsubscribe();
+        }
+    });
 
     it.each([
         ['GET', '/api/config/12345'],

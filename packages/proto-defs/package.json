@@ -36,6 +36,10 @@
       "types": "./src/direct-send-message.ts",
       "default": "./src/direct-send-message.ts"
     },
+    "./linux-friend": {
+      "types": "./src/linux-friend.ts",
+      "default": "./src/linux-friend.ts"
+    },
     "./wt-qr": {
       "types": "./src/wt-qr.ts",
       "default": "./src/wt-qr.ts"

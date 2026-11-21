@@ -124,7 +124,7 @@ describe('BridgeManager close generations (synthetic memory only)', () => {
             const dispose = vi.spyOn(old, 'dispose').mockReturnValue(oldClose.promise);
             let observedIdentity: unknown;
             let observedDisposeCalls = -1;
-            let observedPid = -1;
+            let observedPid: number | null = -1;
             f.manager.subscribeSessions({
                 closed: (_uin, bridge, pid) => {
                     observedIdentity = bridge.identity;

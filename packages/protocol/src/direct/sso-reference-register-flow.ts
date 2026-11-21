@@ -646,7 +646,11 @@ async function registerFlow(
                 const outer = decodeServiceResponse(candidate, key);
 
                 try {
-                    if (outer.protocol !== 12 || outer.encryption !== 'd2' || outer.uin !== uin) {
+                    if (
+                        outer.protocol !== 12 ||
+                        (outer.encryption !== 'd2' && outer.encryption !== 'zero') ||
+                        outer.uin !== uin
+                    ) {
                         throw new Error('invalid envelope');
                     }
 

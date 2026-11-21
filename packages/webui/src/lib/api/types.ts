@@ -231,6 +231,7 @@ export interface PluginDisplaySidecar {
     entries: Array<{ index: number; kind: 'plainText' }>;
 }
 export interface ApiClient {
+    directAccounts: import('./direct-accounts').DirectAccountsApi;
     plugins: {
         index(refresh?: boolean, signal?: AbortSignal): Promise<CommunityIndexResult>;
         local(uin: string, signal?: AbortSignal): Promise<LocalPluginsResult>;

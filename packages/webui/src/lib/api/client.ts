@@ -57,6 +57,7 @@ import {
 import { localStorageTokenStore } from './token-store';
 import { readSseJson } from './sse';
 import { WEBUI_SESSION_HEADER, webuiSessionHeaders } from './session-headers';
+import { createDirectAccountsApi } from './direct-accounts';
 
 const DEFAULT_TOKEN_KEY = 'snowluma_token';
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -167,6 +168,7 @@ class HttpApiClient implements ApiClient {
     private lastLogStatus: StreamStatus = 'closed';
 
     // namespaced surfaces are bound up-front so callers can destructure
+    readonly directAccounts: ApiClient['directAccounts'];
     readonly plugins: ApiClient['plugins'];
     readonly processes: ApiClient['processes'];
     readonly config: ApiClient['config'];
@@ -185,6 +187,10 @@ class HttpApiClient implements ApiClient {
         this.tokenStore = opts.tokenStore ?? localStorageTokenStore(DEFAULT_TOKEN_KEY);
         this.currentToken = this.tokenStore.load();
         this.onUnauthorized = opts.onUnauthorized;
+        this.directAccounts = createDirectAccountsApi(
+            (url, init) => this.request(url, init),
+            () => this.currentToken,
+        );
 
         this.plugins = {
             index: async (refresh, signal) =>

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IdentityService } from '@snowluma/protocol/identity-service';
+import type { BridgeInterface } from '@snowluma/core/bridge-interface';
 import { Bridge } from '../../../core/src/bridge/bridge';
 import { BridgeManager } from '../../../core/src/bridge/manager';
 import { OneBotInstance } from '../../src/instance';
@@ -124,10 +125,16 @@ describe('BridgeManager to OneBot v12 health integration (no I/O)', () => {
         const bBridge = core.getBridge('10002')!;
         const a = await account('10001', aBridge);
         const b = await account('10002', bBridge);
-        const instances = (manager as unknown as { instances: Map<string, OneBotInstance> })
-            .instances;
-        instances.set('10001', a.instance);
-        instances.set('10002', b.instance);
+        // Mirror startSession's captured owner without triggering network startup:
+        // this fixture controls the online/offline transition explicitly below.
+        const state = manager as unknown as {
+            instances: Map<string, OneBotInstance>;
+            instanceBindings: Map<string, { bridge: BridgeInterface; instance: OneBotInstance }>;
+        };
+        state.instances.set('10001', a.instance);
+        state.instanceBindings.set('10001', { bridge: aBridge, instance: a.instance });
+        state.instances.set('10002', b.instance);
+        state.instanceBindings.set('10002', { bridge: bBridge, instance: b.instance });
         manager.bind(core);
         await a.instance.emitBotStatus('online');
         await b.instance.emitBotStatus('online');

@@ -60,15 +60,17 @@ export function ActionTester({
     accounts,
     docs,
     presetAction,
+    preferredUin,
 }: {
     accounts: QQInfo[];
     docs: DebugActionDoc[];
     presetAction?: { name: string; nonce: number };
+    preferredUin?: string | null;
 }) {
     const api = useApi();
     const tasks = useDebugTasks();
 
-    const [uin, setUin] = useState('');
+    const [uin, setUin] = useState(preferredUin ?? '');
     const [actionName, setActionName] = useState('');
     const [fields, setFields] = useState<Record<string, string>>({});
     const [paramMode, setParamMode] = useState<'form' | 'json'>('form');
@@ -149,7 +151,7 @@ export function ActionTester({
     };
 
     const runInvoke = async () => {
-        if (!uin) {
+        if (!uin || !accounts.some((account) => account.uin === uin)) {
             setResult({ error: '请选择账号' });
             return;
         }

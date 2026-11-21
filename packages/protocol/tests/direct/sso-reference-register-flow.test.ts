@@ -233,6 +233,16 @@ describe('single synthetic reference registration', () => {
         expect(options.login.tickets.d2Key).toEqual(key);
         expect(socket.destroyed).toBe(true);
     });
+    it('accepts the associated Linux response encrypted with the fixed zero key', async () => {
+        const socket = await setup((peer) => peer.write(reply({ flag: 2 })));
+        expect(await referenceRegister(config(socket))).toEqual({
+            kind: 'response',
+            sequence: 0xf0000001,
+            value: 'success',
+            writeState: 'written',
+        });
+    });
+
     it.each(['false', 'throw'] as const)(
         'does not decode when verifier returns %s',
         async (mode) => {

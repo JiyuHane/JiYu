@@ -176,6 +176,111 @@ describe('raw response barrier with in-memory synthetic frames', () => {
         }
     });
 
+    it('handles an already released explicit continuation without deadlock', async () => {
+        const f = fixture({
+            holdFollowingFrames: () => ({ untilReleased: Promise.resolve() }),
+        });
+        const work = f.client.transactRaw(request());
+
+        try {
+            await f.wrote.promise;
+            f.client.feed(Buffer.concat([frame(1, 17), frame(2, 53)]));
+            expect(await work).toMatchObject({ kind: 'response', value: 'accepted' });
+            await vi.waitFor(() => expect(f.delivered).toEqual([53]));
+            expect(f.classified).toEqual([1, 2]);
+        } finally {
+            f.client.close();
+        }
+    });
+
+    it('settles an explicit continuation response before releasing coalesced frames', async () => {
+        const released = deferred<void>();
+        const abort = new AbortController();
+        const events: string[] = [];
+        const f = fixture({
+            holdFollowingFrames: () => Object.freeze({ untilReleased: released.promise }),
+            classify: (bytes) => {
+                events.push(bytes[4] === 1 ? 'response' : `classify:${bytes[8]}`);
+                return route(bytes);
+            },
+            onPush: (_bytes, item) => events.push(`push:${item.id}`),
+        });
+        const work = f.client.transactRaw(request({ signal: abort.signal }));
+
+        try {
+            await f.wrote.promise;
+            f.client.feed(Buffer.concat([frame(1, 17), frame(2, 51)]));
+            expect(await work).toEqual({
+                kind: 'response',
+                sequence: 17,
+                value: 'accepted',
+                writeState: 'written',
+            });
+            expect(events).toEqual(['response']);
+            abort.abort();
+            await turn();
+            expect(f.client.closed).toBe(false);
+            expect(events).toEqual(['response']);
+            released.resolve();
+            await turn();
+            expect(events).toEqual(['response', 'classify:51', 'push:51']);
+        } finally {
+            released.resolve();
+            f.client.close();
+        }
+    });
+
+    it('keeps explicit-continuation following frames inside the shared capacity bound', async () => {
+        const released = deferred<void>();
+        const f = fixture({
+            maxFrames: 2,
+            holdFollowingFrames: () => ({ untilReleased: released.promise }),
+        });
+        const work = f.client.transactRaw(request());
+
+        try {
+            await f.wrote.promise;
+            f.client.feed(Buffer.concat([frame(1, 17), frame(2, 53)]));
+            expect(await work).toMatchObject({ kind: 'response', value: 'accepted' });
+            f.client.feed(Buffer.concat([frame(2, 54), frame(2, 55)]));
+            expect(await f.client.whenClosed).toMatchObject({
+                kind: 'protocol-error',
+                code: 'invalid-stream',
+            });
+            released.resolve();
+            await turn();
+            expect(f.classified).toEqual([1]);
+            expect(f.delivered).toEqual([]);
+        } finally {
+            released.resolve();
+            f.client.close();
+        }
+    });
+
+    it('wipes and never restarts an explicit continuation queue after close', async () => {
+        const released = deferred<void>();
+        const f = fixture({
+            holdFollowingFrames: () => ({ untilReleased: released.promise }),
+        });
+        const work = f.client.transactRaw(request());
+
+        try {
+            await f.wrote.promise;
+            f.client.feed(Buffer.concat([frame(1, 17), frame(2, 52)]));
+            expect(await work).toMatchObject({ kind: 'response', value: 'accepted' });
+            expect(f.classified).toEqual([1]);
+            f.client.close();
+            await f.client.whenClosed;
+            released.resolve();
+            await turn();
+            expect(f.classified).toEqual([1]);
+            expect(f.delivered).toEqual([]);
+        } finally {
+            released.resolve();
+            f.client.close();
+        }
+    });
+
     it.each(['absent', 'false'] as const)(
         'keeps following push concurrent with a pending write when policy is %s',
         async (mode) => {

@@ -46,6 +46,8 @@ export class Bridge implements BridgeInterface {
     readonly identity: IdentityService;
     /** Insertion order tracks login recency; the newest connection sends packets. */
     private readonly connections = new Map<number, ProcessConnection>();
+    /** Sender of a direct (non-hook) session. Never coexists with a PID connection. */
+    private directSender_: { client: PacketSender; receiveHealthy: boolean } | null = null;
     readonly events = new BridgeEventBus();
     readonly apis: ApiHub;
     private readonly pipeline: IncomingPacketPipeline;
@@ -463,6 +465,7 @@ export class Bridge implements BridgeInterface {
             this.directIngress_?.stop();
             this.settleRosterWarmup({ friendsLoaded: false, groupsLoaded: false });
             this.connections.clear();
+            this.directSender_ = null;
             this.onlineClients_ = null;
         } catch (error) {
             setupFailed = true;
@@ -502,6 +505,12 @@ export class Bridge implements BridgeInterface {
     }
 
     bindPid(pid: number, client: PacketSender): void {
+        if (this.directSender_) {
+            throw new Error(
+                `Bridge is owned by a direct session and cannot bind PID=${pid}: UIN=${this.identity.uin}`,
+            );
+        }
+
         const previous = this.activeConnection;
         const existing = this.connections.get(pid);
         this.connections.delete(pid);
@@ -552,8 +561,49 @@ export class Bridge implements BridgeInterface {
     hasPid(pid: number): boolean {
         return this.connections.has(pid);
     }
+
+    /**
+     * @internal Explicit composition only. Attaches the outbound sender of a direct
+     * (non-hook) session; such a Bridge has no PID. The caller owns the sender's
+     * lifecycle and asserts that it is logged in as this Bridge's account.
+     */
+    attachDirectSender(client: PacketSender): void {
+        if (this.disposePromise_) {
+            throw new Error('Bridge is disposed');
+        }
+
+        if (this.directSender_) {
+            throw new Error('Direct sender already attached');
+        }
+
+        if (this.connections.size > 0) {
+            throw new Error(
+                `Bridge is bound to a QQ process and cannot attach a direct sender: UIN=${this.identity.uin}`,
+            );
+        }
+
+        // Like a new PID login, it stays healthy until its owner reports a failure.
+        this.directSender_ = { client, receiveHealthy: true };
+        this.maybeStartRosterWarmup();
+    }
+
+    /** @internal Idempotent. Requests already handed to the sender are not cancelled. */
+    detachDirectSender(): void {
+        this.directSender_ = null;
+    }
+
+    /** @internal */
+    setDirectReceiveHealthy(healthy: boolean): void {
+        if (!this.directSender_) {
+            throw new Error(
+                'Bridge receive-health invariant violated: no direct sender is attached',
+            );
+        }
+
+        this.directSender_.receiveHealthy = healthy;
+    }
     get empty(): boolean {
-        return this.connections.size === 0;
+        return this.connections.size === 0 && this.directSender_ === null;
     }
     private get activeConnection(): ProcessConnection | undefined {
         return [...this.connections.values()].at(-1);
@@ -562,7 +612,10 @@ export class Bridge implements BridgeInterface {
         return this.activeConnection?.pid ?? null;
     }
     get receiveHealthy(): boolean {
-        return [...this.connections.values()].some((connection) => connection.receiveHealthy);
+        return (
+            [...this.connections.values()].some((connection) => connection.receiveHealthy) ||
+            this.directSender_?.receiveHealthy === true
+        );
     }
     setPidReceiveHealthy(pid: number, healthy: boolean): void {
         const connection = this.connections.get(pid);
@@ -726,9 +779,9 @@ export class Bridge implements BridgeInterface {
         body: Uint8Array,
         timeoutMs = packetTimeoutMs(),
     ): Promise<SendPacketResult> {
-        const connection = this.activeConnection;
+        const client = this.activeConnection?.client ?? this.directSender_?.client;
 
-        if (!connection) {
+        if (!client) {
             return runWithTraceRequest(() => {
                 const startedAt = Date.now();
                 runtimeLog.trace(() => [
@@ -761,7 +814,7 @@ export class Bridge implements BridgeInterface {
         }
 
         const startedAt = Date.now();
-        const result = await connection.client.sendPacket(serviceCmd, Buffer.from(body), timeoutMs);
+        const result = await client.sendPacket(serviceCmd, Buffer.from(body), timeoutMs);
         const elapsed = Date.now() - startedAt;
         const respLen = result.responseData ? result.responseData.length : 0;
 

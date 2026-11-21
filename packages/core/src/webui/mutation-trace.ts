@@ -53,7 +53,8 @@ function shouldTraceMutation(request: Request): boolean {
     return (
         !TRACE_EXCLUDED_PATHS.has(pathname) &&
         !/^\/api\/config\/[^/]+\/?$/u.test(pathname) &&
-        !/^\/api\/plugins\/local(?:\/|$)/u.test(pathname)
+        !/^\/api\/plugins\/local(?:\/|$)/u.test(pathname) &&
+        !/^\/api\/direct(?:\/|$)/u.test(pathname)
     );
 }
 

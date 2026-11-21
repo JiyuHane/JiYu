@@ -80,18 +80,27 @@ describe('WT login response owned buffer cleanup', () => {
     missing.pop();
     const cases = [
         {
-            name: 'duplicate outer tags',
-            input: body(1, duplicate),
-            error: /duplicate/,
+            name: 'malformed error after duplicate outer tags',
+            input: body(1, [
+                ...duplicate,
+                { tag: 0x146, value: Buffer.from('00000000ffff0000', 'hex') },
+            ]),
+            error: /invalid WT login error string length/,
             layers: 1,
             tickets: 0,
         },
         {
-            name: 'duplicate inner tags',
-            input: success(encodeWtTlv([...tlvs(), ...duplicate])),
-            error: /duplicate/,
+            name: 'bad final D2 key after duplicate inner tags',
+            input: success(
+                encodeWtTlv([
+                    ...tlvs(),
+                    ...duplicate,
+                    { tag: 0x305, value: new Uint8Array(15).fill(0x94) },
+                ]),
+            ),
+            error: /invalid WT login D2 key length/,
             layers: 2,
-            tickets: 0,
+            tickets: 2,
         },
         {
             name: 'malformed error146',
@@ -158,8 +167,8 @@ describe('WT login response owned buffer cleanup', () => {
             }
 
             expect(owned.layers).toHaveLength(2);
-            expect(result.outerTlvs).toBe(owned.layers[0]);
-            expect(result.innerTlvs).toBe(owned.layers[1]);
+            expect(result.outerTlvs).toEqual(owned.layers[0]);
+            expect(result.innerTlvs).toEqual(owned.layers[1]);
             expect(result.innerTlvs).toEqual(expectedInner);
             expect(Buffer.from(result.outerTlvs[0].value)).toEqual(input.subarray(9));
             expect(owned.tickets()).toEqual(Object.values(result.tickets));
@@ -331,7 +340,7 @@ describe('WT 0x810/9 response business body', () => {
         );
     });
 
-    it('rejects malformed inner blocks and duplicate tags in either layer', () => {
+    it('rejects malformed inner blocks even when otherwise valid tags repeat', () => {
         for (let i = 0; i < inner.length; i++) {
             expect(() => decodeWtLoginResponse(success(inner.subarray(0, i)), key)).toThrow();
         }
@@ -343,14 +352,137 @@ describe('WT 0x810/9 response business body', () => {
             { tag: 0x7777, value: Uint8Array.of(1) },
             { tag: 0x7777, value: Uint8Array.of(2) },
         ];
-        expect(() => decodeWtLoginResponse(body(1, duplicate), key)).toThrow(/duplicate/);
+        const repeated = encodeWtTlv([...tlvs(), ...duplicate]);
         expect(() =>
-            decodeWtLoginResponse(success(encodeWtTlv([...tlvs(), ...duplicate])), key),
-        ).toThrow(/duplicate/);
+            decodeWtLoginResponse(success(Buffer.concat([repeated, Buffer.of(3)])), key),
+        ).toThrow(/trailing/);
+        expect(() => decodeWtLoginResponse(success(repeated.subarray(0, -1)), key)).toThrow(
+            /truncated/,
+        );
         expect(() =>
-            decodeWtLoginResponse(success(encodeWtTlv([...tlvs(), tlvs()[0]])), key),
-        ).toThrow(/duplicate/);
+            decodeWtLoginResponse(Buffer.concat([body(1, duplicate), Buffer.of(3)]), key),
+        ).toThrow(/trailing/);
     });
+
+    it('keeps the last unknown value in either layer without changing the generic TLV codec', () => {
+        const repeated = [
+            { tag: 0x7777, value: Uint8Array.of(1) },
+            { tag: 0x8888, value: Uint8Array.of(2) },
+            { tag: 0x7777, value: Uint8Array.of(3) },
+            { tag: 0x543, value: Uint8Array.of(4) },
+            { tag: 0x543, value: Uint8Array.of(5) },
+        ];
+        const expected = [repeated[2], repeated[1], repeated[4]];
+        expect(decodeWtTlv(encodeWtTlv(repeated))).toEqual(repeated);
+        expect(decodeWtLoginResponse(body(1, repeated), key)).toMatchObject({
+            status: 'nonzero',
+            outerTlvs: expected,
+        });
+        const result = decodeWtLoginResponse(success(encodeWtTlv([...tlvs(), ...repeated])), key);
+        expect(result.status).toBe('tickets');
+
+        if (result.status !== 'tickets') {
+            throw new Error('unexpected status');
+        }
+
+        expect(result.innerTlvs).toEqual([...tlvs(), ...expected]);
+        expect(new Set(result.innerTlvs.map((entry) => entry.tag)).size).toBe(
+            result.innerTlvs.length,
+        );
+    });
+
+    it('decrypts only the final outer T119 and never falls back to an earlier valid one', () => {
+        const valid = encrypted(inner);
+        const invalid = Uint8Array.of(0x91);
+        const decrypt = vi.spyOn(teaCodec, 'qqTeaDecrypt');
+
+        try {
+            expect(
+                decodeWtLoginResponse(
+                    body(0, [
+                        { tag: 0x119, value: invalid },
+                        { tag: 0x119, value: valid },
+                    ]),
+                    key,
+                ).status,
+            ).toBe('tickets');
+            expect(decrypt).toHaveBeenCalledTimes(1);
+            decrypt.mockClear();
+            expect(() =>
+                decodeWtLoginResponse(
+                    body(0, [
+                        { tag: 0x119, value: valid },
+                        { tag: 0x119, value: invalid },
+                    ]),
+                    key,
+                ),
+            ).toThrow();
+            expect(decrypt).toHaveBeenCalledTimes(1);
+        } finally {
+            decrypt.mockRestore();
+        }
+    });
+
+    it('uses only the final error146 while preserving its priority over T119 and state', () => {
+        const malformed = Uint8Array.of(0x91);
+        const first = Buffer.from('00000001000161000162', 'hex');
+        const final = Buffer.from('00000002000178000179', 'hex');
+        const base = [{ tag: 0x119, value: encrypted(inner) }];
+
+        for (const earlier of [malformed, first]) {
+            expect(
+                decodeWtLoginResponse(
+                    body(0, [
+                        ...base,
+                        { tag: 0x146, value: earlier },
+                        { tag: 0x146, value: final },
+                    ]),
+                    key,
+                ),
+            ).toMatchObject({ status: 'error', error: { code: 2, title: 'x', message: 'y' } });
+        }
+
+        expect(() =>
+            decodeWtLoginResponse(
+                body(0, [...base, { tag: 0x146, value: final }, { tag: 0x146, value: malformed }]),
+                key,
+            ),
+        ).toThrow(/truncated WT login error TLV/);
+    });
+
+    it.each([
+        ['d2', 0x143, Uint8Array.of(0x91, 0x92), new Uint8Array()],
+        ['d2Key', 0x305, new Uint8Array(16).fill(0x93), new Uint8Array(15).fill(0x94)],
+        ['a2', 0x10a, Uint8Array.of(0x95, 0x96), new Uint8Array()],
+        ['a1', 0x106, Uint8Array.of(0x97, 0x98), new Uint8Array()],
+    ] as const)(
+        'uses the final %s ticket, even when it invalidates an earlier value',
+        (name, tag, valid, invalid) => {
+            const accepted = decodeWtLoginResponse(
+                success(encodeWtTlv([...tlvs(), { tag, value: invalid }, { tag, value: valid }])),
+                key,
+            );
+            expect(accepted.status).toBe('tickets');
+
+            if (accepted.status !== 'tickets') {
+                throw new Error('unexpected status');
+            }
+
+            expect(accepted.innerTlvs).toHaveLength(4);
+            expect(accepted.tickets[name]).toEqual(valid);
+            expect(accepted.tickets[name]).not.toBe(
+                accepted.innerTlvs.find((entry) => entry.tag === tag)?.value,
+            );
+            expect(() =>
+                decodeWtLoginResponse(
+                    success(
+                        encodeWtTlv([...tlvs(), { tag, value: valid }, { tag, value: invalid }]),
+                    ),
+                    key,
+                ),
+            ).toThrow(name === 'd2Key' ? /D2 key length/ : /missing or empty/);
+        },
+    );
 
     it('enforces nonempty core tickets and an exactly 16-byte D2 key', () => {
         for (let i = 0; i < 4; i++) {

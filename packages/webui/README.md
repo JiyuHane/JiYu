@@ -68,6 +68,14 @@ target startup, theme ownership, host messaging or scoped styles.
   visible developer page for safely replaying this wizard and exercising the
   page-level crash screen; replayed consent and passwords are never persisted.
 
+## Managed Linux direct accounts
+
+When Core is explicitly configured with managed Linux accounts, `/accounts` shows their
+QR, restore, renewal, liveness, and OneBot readiness state. The page uses serial polling,
+pauses while the tab is hidden, and revokes QR object URLs when an operation or component
+ends. Sending still uses the existing Debug composer and OneBot v11 action path; the page
+does not add a second messaging API. See the [Core configuration and lifecycle guide](../core/DIRECT_ACCOUNTS.md).
+
 ## Authentication behind a reverse proxy
 
 Authenticated WebUI requests send the session token in `X-SnowLuma-Token`, leaving

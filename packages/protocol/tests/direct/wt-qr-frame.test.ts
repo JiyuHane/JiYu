@@ -25,10 +25,10 @@ function unpackOicq(packet: Uint8Array, ecdh: ReturnType<typeof createWtEcdh>, p
     expect(oicq.readUInt16BE(1)).toBe(oicq.length);
     expect(oicq.readUInt16BE(5)).toBe(0x812);
     expect(oicq[14]).toBe(0x87);
-    const publicLength = oicq.readUInt16BE(46);
+    const publicLength = oicq.readUInt16BE(48);
     expect(publicLength).toBe(25);
-    expect(oicq.subarray(48, 48 + publicLength)).toEqual(Buffer.from(ecdh.publicKey));
-    const encrypted = oicq.subarray(48 + publicLength, oicq.length - 1);
+    expect(oicq.subarray(50, 50 + publicLength)).toEqual(Buffer.from(ecdh.publicKey));
+    const encrypted = oicq.subarray(50 + publicLength, oicq.length - 1);
     const plaintext = Buffer.from(qqTeaDecrypt(encrypted, ecdh.deriveTeaKey(peer)));
     const inner = plaintext.subarray(14);
     expect(inner[4]).toBe(2);
@@ -128,8 +128,8 @@ describe('WT QR request composition', () => {
             qrSig: Uint8Array.of(0xaa, 0xbb, 0xcc),
         });
         const { oicq, plaintext, inner } = unpackOicq(result, context.ecdh, context.peerPublicKey);
-        expect(oicq.subarray(0, 26).toString('hex')).toBe(
-            '0200aa1f410812000005060708038700000000020000b59e0000',
+        expect(oicq.subarray(0, 28).toString('hex')).toBe(
+            '0200ac1f410812000005060708038700000000020000b59e00000000',
         );
         expect(plaintext.subarray(0, 14).toString('hex')).toBe('0000480102030400000072000000');
         expect(inner.toString('hex')).toBe(
@@ -380,8 +380,8 @@ describe('WT QR request composition', () => {
                 '0000010203040003aabbcc00000000000000000000000000' +
                 '03',
         );
-        expect(parsed.oicq.subarray(0, 26).toString('hex')).toBe(
-            '0200aa1f410812000005060708038700000000020000b59e0000',
+        expect(parsed.oicq.subarray(0, 28).toString('hex')).toBe(
+            '0200ac1f410812000005060708038700000000020000b59e00000000',
         );
         expect(parsed.account).toBe('72623859790382856');
         expect(parsed.header.toString('hex')).toBe(
@@ -465,7 +465,7 @@ describe('WT QR request composition', () => {
         expect(parsed.guid).toBe(Buffer.from(before.guid).toString('hex'));
         expect(parsed.version).toBe('3.2.26');
         expect(parsed.oicq).toEqual(Buffer.from(signed));
-        expect(parsed.oicq.subarray(28, 44)).toEqual(Buffer.from(originalKey));
+        expect(parsed.oicq.subarray(30, 46)).toEqual(Buffer.from(originalKey));
         expect(parsed.inner.subarray(9, 30)).toEqual(Buffer.from(originalUnknown));
         expect(parsed.inner.subarray(47, -1)).toEqual(
             Buffer.from(encodeWtQrPollBody({ appId: 1600001615, qrSig: before.qrSig })),

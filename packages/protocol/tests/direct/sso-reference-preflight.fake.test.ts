@@ -258,7 +258,7 @@ describe('capability signal preflight (synthetic)', () => {
             if (
                 clientReturned &&
                 !hits &&
-                /Performance\.now[^\n]*\n\s*at sendTextCore \(/.test(stack)
+                /Performance\.now[^\n]*\n\s*at exchangeCore \(/.test(stack)
             ) {
                 hits++;
                 stateAtClock = referenceKeyState(f.token);

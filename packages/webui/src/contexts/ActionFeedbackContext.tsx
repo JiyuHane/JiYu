@@ -39,6 +39,8 @@ export interface ActionFeedbackHandle {
     update: (patch: Partial<ActivityInput>) => void;
     succeed: (patch?: Partial<ActivityInput>) => void;
     fail: (detail: string, patch?: Partial<ActivityInput>) => void;
+    /** Release an observer's activity without declaring the background operation finished. */
+    detach: () => void;
 }
 
 interface ActionFeedbackValue {
@@ -185,6 +187,12 @@ export function ActionFeedbackProvider({ children }: { children: ReactNode }) {
             const ownsSurface = () => activeId.current === id;
 
             return {
+                detach: () => {
+                    if (ownsSurface()) {
+                        activeId.current = null;
+                        dismissActivity();
+                    }
+                },
                 update: (patch) => {
                     if (ownsSurface()) {
                         update(patch);
@@ -216,7 +224,7 @@ export function ActionFeedbackProvider({ children }: { children: ReactNode }) {
                 },
             };
         },
-        [start, update, succeed, fail, pushNotice],
+        [start, update, succeed, fail, pushNotice, dismissActivity],
     );
 
     const runAction = useCallback(

@@ -87,6 +87,7 @@ describe('OICQ secp192k1 ECDH', () => {
         for (const length of [0, 1, 23, 25, 32]) {
             expect(() => createWtEcdh(new Uint8Array(length))).toThrow(/scalar/);
         }
+
         expect(() => createWtEcdh(new Uint8Array(24))).toThrow(/scalar/);
         expect(() => createWtEcdh(order)).toThrow(/scalar/);
         expect(() => createWtEcdh(Buffer.alloc(24, 0xff))).toThrow(/scalar/);
@@ -111,6 +112,7 @@ describe('OICQ secp192k1 ECDH', () => {
             Buffer.concat([Buffer.from([2]), Buffer.alloc(24, 0xff)]),
             Buffer.concat([Buffer.from([6]), generator.subarray(1)]),
         ];
+
         for (const point of invalid) {
             expect(() => alice.sharedSecret(point)).toThrow();
             expect(() => alice.deriveTeaKey(point)).toThrow();
@@ -164,11 +166,11 @@ describe('OICQ secp192k1 ECDH', () => {
         );
         expect(signedBody).toBeDefined();
         const oicq = Buffer.from(signedBody!);
-        expect(oicq.readUInt16BE(46)).toBe(25);
-        const transmitted = oicq.subarray(48, 73);
+        expect(oicq.readUInt16BE(48)).toBe(25);
+        const transmitted = oicq.subarray(50, 75);
         expect(transmitted).toEqual(compressedGenerator);
         const decoded = Buffer.from(
-            qqTeaDecrypt(oicq.subarray(73, -1), bob.deriveTeaKey(transmitted)),
+            qqTeaDecrypt(oicq.subarray(75, -1), bob.deriveTeaKey(transmitted)),
         );
         expect(decoded.readUInt32BE(14)).toBe(1234);
         expect(decoded.readUInt16BE(21)).toBe(0x12);

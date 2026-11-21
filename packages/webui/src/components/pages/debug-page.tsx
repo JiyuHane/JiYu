@@ -13,13 +13,14 @@ import { LiveActivity } from '@/components/debug/live-activity';
 import { ApiBrowser } from '@/components/debug/api-browser';
 import { SkeletonSwap } from '@/components/interior/skeleton-swap';
 import { useApi } from '@/lib/api';
-import type { DebugActionDoc, QQInfo } from '@/types';
+import type { DebugActionDoc } from '@/types';
+import { useAppState } from '@/contexts/AppStateContext';
 
 type Tab = 'tester' | 'compose' | 'activity' | 'api';
 
 export function DebugPage() {
     const api = useApi();
-    const [accounts, setAccounts] = useState<QQInfo[]>([]);
+    const { qqList: accounts, resources, selectedUin } = useAppState();
     const [docs, setDocs] = useState<DebugActionDoc[]>([]);
     const [ready, setReady] = useState(false);
     const [loadError, setLoadError] = useState<string | null>(null);
@@ -27,19 +28,34 @@ export function DebugPage() {
     const [preset, setPreset] = useState<{ name: string; nonce: number } | undefined>();
 
     useEffect(() => {
+        let active = true;
+
         void (async () => {
             try {
-                const [qq, acts] = await Promise.all([api.qqList(), api.debug.actions()]);
-                setAccounts(qq);
-                setDocs(acts.actions);
+                const acts = await api.debug.actions();
+
+                if (active) {
+                    setDocs(acts.actions);
+                }
             } catch (error) {
                 console.error('load debug tools', error);
-                setLoadError(error instanceof Error ? error.message : '加载开发者工具失败');
+
+                if (active) {
+                    setLoadError(error instanceof Error ? error.message : '加载开发者工具失败');
+                }
             } finally {
-                setReady(true);
+                if (active) {
+                    setReady(true);
+                }
             }
         })();
+
+        return () => {
+            active = false;
+        };
     }, [api]);
+    const dataReady = ready && resources.qqList.ready;
+    const dataError = loadError ?? resources.qqList.error;
 
     const tryAction = (name: string) => {
         setPreset((p) => ({ name, nonce: (p?.nonce ?? 0) + 1 }));
@@ -95,25 +111,25 @@ export function DebugPage() {
                 />
             </motion.header>
 
-            {loadError && (
+            {dataError && (
                 <div
                     role="alert"
                     className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
                 >
-                    {loadError}
+                    {dataError}
                 </div>
             )}
 
             <SkeletonSwap
-                ready={ready}
+                ready={dataReady}
                 reserve={224}
                 lines={8}
                 lineHeight={28}
                 barHeight={11}
                 label="开发者工具数据"
-                className={ready ? 'skeleton-swap-fluid' : ''}
+                className={dataReady ? 'skeleton-swap-fluid' : ''}
             >
-                {ready ? (
+                {dataReady ? (
                     <>
                         {/* Tester / compose / activity stay MOUNTED and toggle via CSS so the
                 live feed's SSE never drops (it must capture events fired from other
@@ -121,10 +137,15 @@ export function DebugPage() {
                 ApiBrowser has no state worth preserving and is heavy (~520 rows), so
                 it mounts on demand. */}
                         <div className={cn(tab !== 'tester' && 'hidden')}>
-                            <ActionTester accounts={accounts} docs={docs} presetAction={preset} />
+                            <ActionTester
+                                accounts={accounts}
+                                docs={docs}
+                                presetAction={preset}
+                                preferredUin={selectedUin}
+                            />
                         </div>
                         <div className={cn(tab !== 'compose' && 'hidden')}>
-                            <MessageComposer accounts={accounts} />
+                            <MessageComposer accounts={accounts} preferredUin={selectedUin} />
                         </div>
                         <div className={cn(tab !== 'activity' && 'hidden')}>
                             <LiveActivity />

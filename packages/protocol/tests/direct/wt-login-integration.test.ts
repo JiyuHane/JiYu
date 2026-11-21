@@ -100,23 +100,23 @@ describe('offline PC login body and OICQ composition', () => {
             }),
         );
         const cipherLength = Math.ceil((expectedBody.length + 10) / 8) * 8;
-        expect(oicq.length).toBe(74 + cipherLength);
+        expect(oicq.length).toBe(76 + cipherLength);
         expect(oicq.readUInt16BE(1)).toBe(oicq.length);
-        expect(oicq.subarray(0, 26).toString('hex')).toBe(
+        expect(oicq.subarray(0, 28).toString('hex')).toBe(
             '02' +
                 oicq.length.toString(16).padStart(4, '0') +
-                '1f41081000000102030403870000000002000012340000',
+                '1f410810000001020304038700000000020000123400000000',
         );
         expect(oicq.at(-1)).toBe(3);
-        expect(oicq.subarray(26, 28)).toEqual(Buffer.from([1, 1]));
-        expect(oicq.subarray(28, 44)).toEqual(randomKey);
-        expect(oicq.readUInt16BE(44)).toBe(0x102);
-        expect(oicq.readUInt16BE(46)).toBe(25);
-        const clientPoint = oicq.subarray(48, 73);
+        expect(oicq.subarray(28, 30)).toEqual(Buffer.from([1, 1]));
+        expect(oicq.subarray(30, 46)).toEqual(randomKey);
+        expect(oicq.readUInt16BE(46)).toBe(0x102);
+        expect(oicq.readUInt16BE(48)).toBe(25);
+        const clientPoint = oicq.subarray(50, 75);
         expect(clientPoint).toEqual(Buffer.from(client.publicKey));
         const peerKey = peer.deriveTeaKey(clientPoint);
         expect(peerKey).toEqual(client.deriveTeaKey(peer.publicKey));
-        const decoded = qqTeaDecrypt(oicq.subarray(73, -1), peerKey);
+        const decoded = qqTeaDecrypt(oicq.subarray(75, -1), peerKey);
         expect(Buffer.from(decoded)).toEqual(expectedBody);
         expect(Buffer.from(decoded.subarray(0, 4)).toString('hex')).toBe('0009000f');
         const entries = decodeWtTlv(decoded.subarray(2));
@@ -180,8 +180,8 @@ describe('offline PC login body and OICQ composition', () => {
         for (const packet of [first, second]) {
             const frame = Buffer.from(packet);
             const payload = qqTeaDecrypt(
-                frame.subarray(73, -1),
-                peer.deriveTeaKey(frame.subarray(48, 73)),
+                frame.subarray(75, -1),
+                peer.deriveTeaKey(frame.subarray(50, 75)),
             );
             expect(Buffer.from(payload)).toEqual(expectedBody);
             const entries = decodeWtTlv(payload.subarray(2));

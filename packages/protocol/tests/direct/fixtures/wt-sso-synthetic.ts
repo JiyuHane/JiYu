@@ -24,26 +24,24 @@ export const fetchBody = () =>
             { tag: 0xd1, value: encodeWtQrD1({ qrUrl: 'https://example.invalid/qr' }) },
         ]),
     ]);
-export const pollBody = (code: number, uin = 123n) =>
-    code
-        ? header(code)
-        : Buffer.concat(
-              [
-                  header(0),
-                  Buffer.from('000000000000000000000000', 'hex'),
-                  encodeWtTlv([
-                      { tag: 0x1e, value: key },
-                      { tag: 0x19, value: Uint8Array.of(5) },
-                      { tag: 0x18, value: Uint8Array.of(6) },
-                  ]),
-              ].map((b, i) => {
-                  if (i === 1) {
-                      b.writeBigInt64BE(uin);
-                  }
 
-                  return b;
-              }),
-          );
+export const pollBody = (code: number, uin = 123n) => {
+    if (code) {
+        return header(code);
+    }
+
+    const identity = Buffer.alloc(12);
+    identity.writeBigInt64BE(uin);
+    return Buffer.concat([
+        header(0),
+        identity,
+        encodeWtTlv([
+            { tag: 0x1e, value: key },
+            { tag: 0x19, value: Uint8Array.of(5) },
+            { tag: 0x18, value: Uint8Array.of(6) },
+        ]),
+    ]);
+};
 
 export function parseWt(frame: Uint8Array) {
     const b = Buffer.from(frame);
@@ -68,9 +66,9 @@ export function parseWt(frame: Uint8Array) {
     pos += sso.readUInt16BE(pos);
     const reserved = Buffer.from(read());
     const oicq = Buffer.from(sso.subarray(sso.readUInt32BE(0) + 4));
-    const point = Buffer.from(oicq.subarray(48, 73));
+    const point = Buffer.from(oicq.subarray(50, 75));
     const shared = peer.deriveTeaKey(point);
-    const business = Buffer.from(qqTeaDecrypt(oicq.subarray(73, -1), shared));
+    const business = Buffer.from(qqTeaDecrypt(oicq.subarray(75, -1), shared));
     return {
         account,
         seq: sso.readUInt32BE(4),

@@ -193,7 +193,8 @@ function encodeOicqEnvelope(request: EnvelopeRequest): Uint8Array {
     }
 
     const cipherLength = Math.ceil((payload.length + 10) / 8) * 8;
-    const length = 27 + head.length + cipherLength;
+    // Fixed outbound header is 28 bytes, including the four-byte retryTime at 24..27.
+    const length = 29 + head.length + cipherLength;
 
     if (length > 0xffff) {
         throw new RangeError('OICQ request exceeds length limit');
@@ -210,8 +211,9 @@ function encodeOicqEnvelope(request: EnvelopeRequest): Uint8Array {
     packet[14] = encryption.method;
     packet[19] = 2;
     packet.writeUInt16BE(request.clientVersion, 22);
-    packet.set(head, 26);
-    packet.set(cipher, 26 + head.length);
+    packet.writeUInt32BE(0, 24); // retryTime, not uint16
+    packet.set(head, 28);
+    packet.set(cipher, 28 + head.length);
     packet[length - 1] = 3;
     return packet;
 }

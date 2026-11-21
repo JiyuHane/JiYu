@@ -48,7 +48,16 @@ export interface DatabaseMigrationCallbacks {
 export interface DatabaseMigrationTask {
     start(callbacks: DatabaseMigrationCallbacks): void;
     beginMigration(): void;
-    cancel(): void;
+    /** Synchronous tasks own no work after return; asynchronous tasks resolve only
+     *  after their worker and storage handles have actually closed. */
+    cancel(): void | Promise<void>;
+}
+
+interface SessionRetirement {
+    started: boolean;
+    closed: boolean;
+    pending: Set<Promise<void>>;
+    failures: Map<object, unknown>;
 }
 
 /** A peer that never finishes a close handshake must not keep the next
@@ -139,6 +148,13 @@ export class OneBotManager {
     >();
     private readonly pendingLifecycle = new Set<Promise<void>>();
     private readonly retiringInstances = new Set<OneBotInstance>();
+    // A Bridge is the generation token. Weak ownership retains completed results
+    // for its callers without keeping every historical session alive forever.
+    private readonly sessionRetirements = new WeakMap<
+        BridgeInterface,
+        Map<string, SessionRetirement>
+    >();
+    private readonly instanceRetirements = new WeakMap<OneBotInstance, SessionRetirement>();
 
     private readonly lifecycleFailures: Array<{
         label: string;
@@ -301,8 +317,49 @@ export class OneBotManager {
         return this.instances.get(uin) ?? null;
     }
 
+    /** Return only the currently published instance owned by this exact Bridge. */
+    getInstanceForSession(uin: string, bridge: BridgeInterface): OneBotInstance | null {
+        if (this.disposed) {
+            return null;
+        }
+
+        const binding = this.instanceBindings.get(uin);
+        return binding?.bridge === bridge && this.instances.get(uin) === binding.instance
+            ? binding.instance
+            : null;
+    }
+
     getInstances(): OneBotInstance[] {
         return [...this.instances.values()];
+    }
+
+    /** Observe the exact generation after its close notification (or manager
+     * disposal). This never starts cleanup and never treats a replacement
+     * deadline/forceRelease as completed retirement. Unknown/live sessions reject. */
+    async waitForSessionRetirement(uin: string, bridge: BridgeInterface): Promise<void> {
+        const retirement = this.sessionRetirements.get(bridge)?.get(uin);
+
+        if (!retirement?.closed) {
+            throw new Error(`OneBot session has not been closed: UIN=${uin}`);
+        }
+
+        // close/cancel hooks can query reentrantly before the outer close frame
+        // has registered its disposal. Let all synchronous frames publish first.
+        await Promise.resolve();
+
+        while (retirement.pending.size > 0) {
+            await Promise.all(retirement.pending);
+        }
+
+        const failures = [...new Set(retirement.failures.values())];
+
+        if (failures.length === 1) {
+            throw failures[0];
+        }
+
+        if (failures.length > 1) {
+            throw new AggregateError(failures, `OneBot session retirement failed: UIN=${uin}`);
+        }
     }
 
     /** Live OneBot adapter status for active accounts plus failed retiring
@@ -382,20 +439,68 @@ export class OneBotManager {
             return this.disposePromise;
         }
 
+        const retirements = new Set<SessionRetirement>();
+
+        for (const [uin, binding] of this.instanceBindings) {
+            const retirement = this.retirementFor(uin, binding.bridge);
+            this.instanceRetirements.set(binding.instance, retirement);
+            retirements.add(retirement);
+        }
+
+        for (const [uin, pending] of this.pendingStarts) {
+            retirements.add(this.retirementFor(uin, pending.bridge));
+        }
+
+        for (const [uin, migration] of this.databaseMigrations) {
+            retirements.add(this.retirementFor(uin, migration.bridge));
+        }
+
+        for (const instance of this.retiringInstances) {
+            const retirement = this.instanceRetirements.get(instance);
+
+            if (retirement) {
+                retirements.add(retirement);
+            }
+        }
+
+        for (const retirement of retirements) {
+            retirement.closed = true;
+        }
+
+        try {
+            const attempt = this.disposeSessions();
+
+            for (const retirement of retirements) {
+                retirement.failures.delete(this);
+            }
+
+            return attempt;
+        } catch (error) {
+            // Unsubscribe, quiesce and injected cancellation can throw before
+            // the asynchronous attempt exists. Such a frame is not retirement.
+            for (const retirement of retirements) {
+                retirement.failures.set(this, error);
+            }
+
+            throw error;
+        }
+    }
+
+    private disposeSessions(): Promise<void> {
         this.disposed = true;
         this.sessionBinding = null;
         this.unsubscribeSessions?.();
         this.unsubscribeSessions = null;
 
-        const migrations = [...this.databaseMigrations.values()];
+        const migrations = [...this.databaseMigrations];
         this.databaseMigrations.clear();
 
-        for (const migration of migrations) {
+        for (const [uin, migration] of migrations) {
             if (migration.retryTimer) {
                 clearTimeout(migration.retryTimer);
             }
 
-            migration.task.cancel();
+            this.cancelMigration(uin, migration.bridge, migration.task);
         }
 
         for (const instance of this.instances.values()) {
@@ -412,15 +517,39 @@ export class OneBotManager {
         this.instances.clear();
         this.instanceBindings.clear();
 
+        const priorLifecycle = [...this.pendingLifecycle];
+        const targets = [...this.retiringInstances];
+        const disposing = targets.map((instance) => {
+            const retirement = this.instanceRetirements.get(instance);
+            const prior = retirement ? [...retirement.pending] : priorLifecycle;
+            const operation = (async () => {
+                // A different account's startup/drain must not hold this account's
+                // barrier. Legacy injected instances without an owner keep the
+                // original manager-wide ordering.
+                await Promise.all(prior);
+
+                if (!this.retiringInstances.has(instance)) {
+                    if (retirement?.failures.has(instance)) {
+                        throw retirement.failures.get(instance);
+                    }
+
+                    return;
+                }
+
+                await instance.dispose();
+            })();
+            return retirement ? this.watchRetirement(retirement, operation, instance) : operation;
+        });
+        const outcomes = Promise.allSettled(disposing);
+
         const attempt = (async () => {
-            // Let already-tracked startup/session-close work settle first. Rejected
-            // operations are recorded by trackLifecycle and their instances remain
-            // in retiringInstances for the retry below.
-            await Promise.all(this.pendingLifecycle);
+            // Handle late work published by synchronous lifecycle reentry, too.
+            while (this.pendingLifecycle.size > 0) {
+                await Promise.all(this.pendingLifecycle);
+            }
 
             let failures = this.lifecycleFailures.splice(0);
-            const targets = [...this.retiringInstances];
-            const settled = await Promise.allSettled(targets.map((instance) => instance.dispose()));
+            const settled = await outcomes;
 
             for (let index = 0; index < settled.length; index += 1) {
                 const instance = targets[index];
@@ -479,11 +608,85 @@ export class OneBotManager {
         return attempt;
     }
 
+    private retirementFor(uin: string, bridge: BridgeInterface): SessionRetirement {
+        let sessions = this.sessionRetirements.get(bridge);
+
+        if (!sessions) {
+            sessions = new Map();
+            this.sessionRetirements.set(bridge, sessions);
+        }
+
+        let retirement = sessions.get(uin);
+
+        if (!retirement) {
+            retirement = { started: false, closed: false, pending: new Set(), failures: new Map() };
+            sessions.set(uin, retirement);
+        }
+
+        return retirement;
+    }
+
+    private watchRetirement<T>(
+        retirement: SessionRetirement,
+        operation: Promise<T>,
+        owner: object = operation,
+    ): Promise<T> {
+        const watched = operation.then(
+            () => {
+                retirement.failures.delete(owner);
+            },
+            (error: unknown) => {
+                retirement.failures.set(owner, error);
+            },
+        );
+        retirement.pending.add(watched);
+        void watched.then(() => {
+            retirement.pending.delete(watched);
+        });
+        return operation;
+    }
+
+    private cancelMigration(
+        uin: string,
+        bridge: BridgeInterface,
+        task: DatabaseMigrationTask,
+    ): void {
+        const retirement = this.retirementFor(uin, bridge);
+
+        try {
+            const stopped = task.cancel();
+
+            if (stopped) {
+                this.trackLifecycle(
+                    `database worker shutdown UIN=${uin}`,
+                    this.watchRetirement(retirement, stopped, task),
+                );
+            }
+        } catch (error) {
+            retirement.failures.set(task, error);
+            throw error;
+        }
+    }
+
     private onSessionStarted(uin: string, bridge: BridgeInterface): void {
         if (this.disposed || this.instances.has(uin) || this.pendingStarts.has(uin)) {
             return;
         }
 
+        let retirement = this.retirementFor(uin, bridge);
+
+        if (retirement.closed) {
+            if (retirement.started) {
+                return;
+            }
+
+            // A close for an unowned Bridge must not poison its later genuine
+            // start (for example a stale mutable instance.bridge in an adapter).
+            this.sessionRetirements.get(bridge)!.delete(uin);
+            retirement = this.retirementFor(uin, bridge);
+        }
+
+        retirement.started = true;
         const retiring = [...this.retiringInstances].filter((instance) => instance.uin === uin);
 
         if (retiring.length > 0) {
@@ -500,7 +703,14 @@ export class OneBotManager {
     }
 
     private prepareDatabase(uin: string, bridge: BridgeInterface): void {
-        if (this.disposed || this.instances.has(uin) || this.databaseMigrations.has(uin)) {
+        const retirement = this.retirementFor(uin, bridge);
+
+        if (
+            this.disposed ||
+            retirement.closed ||
+            this.instances.has(uin) ||
+            this.databaseMigrations.has(uin)
+        ) {
             return;
         }
 
@@ -511,6 +721,12 @@ export class OneBotManager {
             rowsPerSecond: null as number | null,
             retryTimer: null as NodeJS.Timeout | null,
         };
+
+        if (this.disposed || retirement.closed) {
+            this.cancelMigration(uin, bridge, migration.task);
+            return;
+        }
+
         this.databaseMigrations.set(uin, migration);
 
         const startTask = (): void => {
@@ -543,7 +759,7 @@ export class OneBotManager {
                     error instanceof Error ? (error.stack ?? error.message) : String(error),
                 );
 
-                task.cancel();
+                this.cancelMigration(uin, bridge, task);
 
                 if (!retryable || migration.retryTimer) {
                     return;
@@ -556,7 +772,14 @@ export class OneBotManager {
                         return;
                     }
 
-                    migration.task = this.createDatabaseMigrationTask(uin);
+                    const replacement = this.createDatabaseMigrationTask(uin);
+
+                    if (this.disposed || this.databaseMigrations.get(uin) !== migration) {
+                        this.cancelMigration(uin, bridge, replacement);
+                        return;
+                    }
+
+                    migration.task = replacement;
                     migration.state = migration.state.usable
                         ? { ...migration.state, phase: 'migrating', usable: true, error: undefined }
                         : preparingMigrationState();
@@ -576,6 +799,10 @@ export class OneBotManager {
                             this.startSession(uin, bridge);
                         } catch (error) {
                             handleFailure(error, 'session startup');
+                            return;
+                        }
+
+                        if (!isCurrent()) {
                             return;
                         }
 
@@ -612,7 +839,7 @@ export class OneBotManager {
                         migration.state = migrationPublicState(status, migration.rowsPerSecond);
 
                         if (status.phase === 'complete') {
-                            task.cancel();
+                            this.cancelMigration(uin, bridge, task);
                         }
                     },
 
@@ -627,12 +854,25 @@ export class OneBotManager {
     }
 
     private startSession(uin: string, bridge: BridgeInterface): void {
-        if (this.disposed || this.instances.has(uin)) {
+        const retirement = this.retirementFor(uin, bridge);
+
+        if (this.disposed || retirement.closed || this.instances.has(uin)) {
             return;
         }
 
         const config = loadOneBotConfig(uin, { persistDefaults: true });
         const instance = this.createInstance(uin, bridge, config, loadGlobalSettings());
+        this.instanceRetirements.set(instance, retirement);
+
+        if (this.disposed || retirement.closed) {
+            this.retiringInstances.add(instance);
+            this.trackLifecycle(
+                `network shutdown UIN=${uin}`,
+                this.watchRetirement(retirement, this.emitOfflineThenDispose(instance), instance),
+                [instance],
+            );
+            return;
+        }
 
         const activePid = bridge.activePid;
 
@@ -650,35 +890,38 @@ export class OneBotManager {
 
         this.trackLifecycle(
             `network startup UIN=${uin}`,
-            instance.waitUntilNetworkReady().then(async (result) => {
-                if (result.applied) {
-                    log.info(
-                        'network startup applied: UIN=%s adapters=%d',
-                        uin,
-                        result.statuses.length,
-                    );
-                } else {
-                    log.warn(
-                        'network startup degraded: UIN=%s failures=%d',
-                        uin,
-                        result.errors.length,
-                    );
-                }
+            this.watchRetirement(
+                retirement,
+                instance.waitUntilNetworkReady().then(async (result) => {
+                    if (result.applied) {
+                        log.info(
+                            'network startup applied: UIN=%s adapters=%d',
+                            uin,
+                            result.statuses.length,
+                        );
+                    } else {
+                        log.warn(
+                            'network startup degraded: UIN=%s failures=%d',
+                            uin,
+                            result.errors.length,
+                        );
+                    }
 
-                if (this.disposed || this.instances.get(uin) !== instance) {
-                    return;
-                }
+                    if (this.disposed || this.instances.get(uin) !== instance) {
+                        return;
+                    }
 
-                try {
-                    await instance.emitBotStatus('online');
-                } catch (error) {
-                    log.warn(
-                        'bot_status online failed: UIN=%s: %s',
-                        uin,
-                        error instanceof Error ? (error.stack ?? error.message) : String(error),
-                    );
-                }
-            }),
+                    try {
+                        await instance.emitBotStatus('online');
+                    } catch (error) {
+                        log.warn(
+                            'bot_status online failed: UIN=%s: %s',
+                            uin,
+                            error instanceof Error ? (error.stack ?? error.message) : String(error),
+                        );
+                    }
+                }),
+            ),
         );
 
         void this.armLoginHistorySync(uin, instance, bridge);
@@ -725,9 +968,15 @@ export class OneBotManager {
             return;
         }
 
+        const retirement = this.retirementFor(uin, bridge);
+        retirement.closed = true;
         const bindingAtEntry = this.instanceBindings.get(uin);
         const pendingAtEntry = this.pendingStarts.get(uin);
         const migrationAtEntry = this.databaseMigrations.get(uin);
+
+        if (bindingAtEntry?.bridge === bridge) {
+            this.instanceRetirements.set(bindingAtEntry.instance, retirement);
+        }
 
         // Different generations can coexist in these slots. Detach only the
         // matching snapshots before cancel, which may synchronously reenter.
@@ -745,7 +994,7 @@ export class OneBotManager {
                 clearTimeout(migrationAtEntry.retryTimer);
             }
 
-            migrationAtEntry.task.cancel();
+            this.cancelMigration(uin, bridge, migrationAtEntry.task);
         }
 
         if (
@@ -765,7 +1014,11 @@ export class OneBotManager {
         this.retiringInstances.add(bindingAtEntry.instance);
         this.trackLifecycle(
             `network shutdown UIN=${uin}`,
-            this.emitOfflineThenDispose(bindingAtEntry.instance),
+            this.watchRetirement(
+                retirement,
+                this.emitOfflineThenDispose(bindingAtEntry.instance),
+                bindingAtEntry.instance,
+            ),
             [bindingAtEntry.instance],
         );
         log.info('session closed: UIN=%s', uin);
@@ -801,7 +1054,11 @@ export class OneBotManager {
 
         // Map rejection here so a dispose() that fails after the deadline still
         // has a handler. The race may already have moved on.
-        const releasing = instance.dispose().then(
+        const retirement = this.instanceRetirements.get(instance);
+        const disposal = instance.dispose();
+        const releasing = (
+            retirement ? this.watchRetirement(retirement, disposal, instance) : disposal
+        ).then(
             () => 'released' as const,
             (error: unknown) => ({ failed: error }),
         );

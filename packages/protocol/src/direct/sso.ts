@@ -210,7 +210,20 @@ export function decodeSsoResponse(bytes: Uint8Array, maxBodyBytes?: number): Sso
         trailing = outer.rest();
 
         if (trailing.length !== 0) {
-            throw new Error('unexpected trailing SSO data');
+            const declared =
+                trailing.length >= 4
+                    ? new DataView(trailing.buffer, trailing.byteOffset, 4).getUint32(0)
+                    : -1;
+
+            // Linux SsoInfoSync has been observed with one canonical empty, inclusive-length
+            // field after the body. Accept only that exact extension; arbitrary suffixes stay
+            // rejected rather than being silently ignored like a permissive parent reader.
+            if (trailing.length !== 4 || declared !== 4) {
+                const zero = trailing.every((value) => value === 0);
+                throw new Error(
+                    `unexpected trailing SSO data (length=${trailing.length}, declared=${declared}, zero=${zero})`,
+                );
+            }
         }
 
         const sequence = header.readInt32();

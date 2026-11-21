@@ -1,8 +1,32 @@
 import { addAbortListener } from 'node:events';
-import { isProxy } from 'node:util/types';
+import { isProxy, isUint8Array } from 'node:util/types';
+import { createLogger } from '@snowluma/common/logger';
 import { encodeDirectSendMessageRequest } from './send-message-request';
+import { isWtReferencePushProtocol, isWtReferencePushCommand } from './wt-reference-push-commands';
 import type { SsoSendTextOutcome } from './sso-reference-send-text-flow';
-import type { RawMultiplexPushRoute } from './raw-multiplex-client';
+import {
+    prepareReferenceFriendInput,
+    disposePreparedReferenceFriendInput,
+    referenceFriendStepCommand,
+    WtReferenceFriendError,
+    type WtReferenceFriendInput,
+    type WtReferenceFriendResult,
+    type PreparedReferenceFriendInput,
+    type ReferenceFriendProgress,
+} from './wt-reference-friend-flow';
+import {
+    prepareReferencePacketInput,
+    disposePreparedReferencePacket,
+    disposeReferencePacketResult,
+    WtReferencePacketError,
+    type WtReferencePacketInput,
+    type WtReferencePacketResult,
+    type ReferencePacketProgress,
+} from './wt-reference-packet-flow';
+import type {
+    RawMultiplexPushRoute,
+    RawMultiplexResponseContinuation,
+} from './raw-multiplex-client';
 import {
     createRawMultiplexStream,
     type RawMultiplexByteStream,
@@ -13,10 +37,15 @@ import { SSO_HEARTBEAT_COMMAND, SSO_INFO_SYNC_COMMAND } from './sso-register';
 import { SSO_REFERENCE_ALIVE_COMMAND } from './sso-reference-alive-flow';
 import {
     createWtReferenceSessionWithCapability,
+    createWtRestoredSessionWithCapability,
     type WtReferenceSession,
     type WtReferenceSessionOptions,
+    type WtRefreshTicketsOptions,
+    type WtRestoredSession,
+    type WtRestoredSessionOptions,
 } from './wt-reference-session';
 import {
+    armReferenceTicketRefreshContinuation,
     createReferenceKeyCapability,
     consumeReferenceBusinessFailure,
     decodeReferenceFrame,
@@ -28,14 +57,32 @@ import {
     takeReferenceSessionSend,
     type ReferenceSessionSendHandle,
     type ReferenceSessionSendInput,
+    referenceActiveFriendStep,
+    type ReferenceFriendStep,
+    referenceActivePacketOperation,
+    type ReferencePacketOperation,
 } from './wt-reference-session-private';
 import type { Sso12CloseReason, Sso12RawClient } from './sso12-packet-client';
+import { cloneWtPersistedSession, disposeWtPersistedSession } from './wt-persisted-session';
+import { NATIVE_KEY_EXCHANGE_COMMAND } from './nt-native-key-exchange';
+import { NATIVE_TICKET_REFRESH_COMMAND } from './nt-native-ticket-codec';
 
-const PUSH_COMMAND = 'trpc.msg.olpush.OlPushService.MsgPush';
 const MAX_TIMER = 0x7fffffff;
+const log = createLogger('Direct.WT');
 const nativeFill = Uint8Array.prototype.fill;
+const signalAborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted')!.get!;
 type PushMeta = Readonly<{ uin: string; sequence: number; command: string }>;
-type Operation = 'fetch' | 'poll' | 'login-register' | 'heartbeat' | 'alive' | 'send-text';
+type Operation =
+    | 'fetch'
+    | 'poll'
+    | 'login-register'
+    | 'restore-register'
+    | 'heartbeat'
+    | 'alive'
+    | 'refresh-tickets'
+    | 'send-text'
+    | 'friend-request'
+    | 'request-packet';
 
 /** Snapshot only own data properties before any owner, clock, or callback is touched. */
 function sendRecord(value: unknown, keys: readonly string[]): Record<string, unknown> {
@@ -68,6 +115,74 @@ function sendRecord(value: unknown, keys: readonly string[]): Record<string, unk
     }
 
     return snapshot;
+}
+
+function snapshotRefreshOptions(input: unknown): WtRefreshTicketsOptions | undefined {
+    if (input === undefined) {
+        return undefined;
+    }
+
+    if (!input || typeof input !== 'object' || isProxy(input)) {
+        throw new TypeError('invalid ticket refresh options');
+    }
+
+    const prototype = Object.getPrototypeOf(input) as unknown;
+    const keys = Reflect.ownKeys(input);
+    const snapshot: { signal?: AbortSignal; timeoutMs?: number } = Object.create(null) as {
+        signal?: AbortSignal;
+        timeoutMs?: number;
+    };
+
+    if ((prototype !== Object.prototype && prototype !== null) || keys.length > 2) {
+        throw new TypeError('invalid ticket refresh options');
+    }
+
+    for (const key of keys) {
+        const descriptor = Object.getOwnPropertyDescriptor(input, key);
+
+        if (
+            typeof key !== 'string' ||
+            !['signal', 'timeoutMs'].includes(key) ||
+            !descriptor ||
+            !('value' in descriptor)
+        ) {
+            throw new TypeError('invalid ticket refresh options');
+        }
+
+        if (key === 'signal') {
+            snapshot.signal = descriptor.value as AbortSignal | undefined;
+        } else {
+            snapshot.timeoutMs = descriptor.value as number | undefined;
+        }
+    }
+
+    if (
+        snapshot.timeoutMs !== undefined &&
+        (!Number.isSafeInteger(snapshot.timeoutMs) ||
+            snapshot.timeoutMs < 1 ||
+            snapshot.timeoutMs > MAX_TIMER)
+    ) {
+        throw new TypeError('invalid ticket refresh options');
+    }
+
+    if (
+        snapshot.signal !== undefined &&
+        (isProxy(snapshot.signal) ||
+            typeof snapshot.signal !== 'object' ||
+            snapshot.signal === null ||
+            Object.getPrototypeOf(snapshot.signal) !== AbortSignal.prototype ||
+            Object.hasOwn(snapshot.signal, 'aborted') ||
+            Object.hasOwn(snapshot.signal, 'addEventListener') ||
+            Object.hasOwn(snapshot.signal, 'removeEventListener'))
+    ) {
+        throw new TypeError('invalid ticket refresh options');
+    }
+
+    if (snapshot.signal !== undefined && signalAborted.call(snapshot.signal)) {
+        throw new Error('ticket refresh stopped');
+    }
+
+    return Object.freeze(snapshot);
 }
 
 function snapshotSendInput(input: unknown): ReferenceSessionSendInput {
@@ -143,11 +258,39 @@ export interface WtMultiplexReference extends WtReferenceSession {
     readonly whenClosed: Promise<Sso12CloseReason>;
     /** Synthetic reference response projection, not evidence of message delivery. */
     sendText(input: ReferenceSessionSendInput): Promise<SsoSendTextOutcome>;
+    /** Inspect performs only the fixed Linux settings query. Apply requeries under one
+     * gate after SSO/OIDB success, error=0/absent, an explicit matching expected setting,
+     * and no questions. The query body's result is retained, not used as a gate: the
+     * Linux UI checks the outer callback result instead. This conservative policy does
+     * not automatically map settings to application fields; both sources and fields
+     * stay caller-explicit.
+     * The timeout is shared across both steps; write uncertainty is never retried.
+     * A response does not establish friendship or recipient acceptance. */
+    friendRequest(input: WtReferenceFriendInput): Promise<WtReferenceFriendResult>;
+    /** Six fixed SSO12/D2 commands only, serialized with every other owner operation. */
+    requestPacket(input: WtReferencePacketInput): Promise<WtReferencePacketResult>;
+}
+
+export interface WtRestoredMultiplexReferenceOptions extends Omit<
+    WtMultiplexReferenceOptions,
+    'session'
+> {
+    session: WtRestoredSessionOptions;
+}
+
+export interface WtRestoredMultiplexReference extends WtRestoredSession {
+    readonly whenClosed: Promise<Sso12CloseReason>;
+    sendText(input: ReferenceSessionSendInput): Promise<SsoSendTextOutcome>;
+    friendRequest(input: WtReferenceFriendInput): Promise<WtReferenceFriendResult>;
+    /** Six fixed SSO12/D2 commands only, serialized with every other owner operation. */
+    requestPacket(input: WtReferencePacketInput): Promise<WtReferencePacketResult>;
 }
 
 /**
  * Owns an already-established injected stream. No connection is created or probed.
- * V2's known push service command is prioritized over sequence-only response routing:
+ * The fixed known push services are prioritized over sequence-only response routing.
+ * See wt-reference-push-commands for the complete list and Core service references;
+ * the original MsgPush routing reference is:
  * https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Services/Message/PushMessageService.cs
  * https://github.com/LagrangeDev/LagrangeV2/blob/7011cdf87368cc0fb77273c1508e779a52328165/Lagrange.Core/Internal/Context/PacketContext.cs
  * These static facts, local classification and QQ-TEA framing do not authenticate a peer.
@@ -170,6 +313,136 @@ export function createWtMultiplexReference(
     stream: RawMultiplexByteStream,
     options: WtMultiplexReferenceOptions,
 ): WtMultiplexReference {
+    return createMultiplexReference(stream, options);
+}
+
+function restoredRecord(input: unknown, allowed: readonly string[]): Record<string, unknown> {
+    if (!input || typeof input !== 'object' || isProxy(input)) {
+        throw new TypeError('invalid restored options');
+    }
+
+    const prototype = Object.getPrototypeOf(input) as unknown;
+    const keys = Reflect.ownKeys(input);
+
+    if ((prototype !== Object.prototype && prototype !== null) || keys.length > allowed.length) {
+        throw new TypeError('invalid restored options');
+    }
+
+    const output: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+
+    for (const key of keys) {
+        const descriptor = Object.getOwnPropertyDescriptor(input, key);
+
+        if (
+            typeof key !== 'string' ||
+            !allowed.includes(key) ||
+            !descriptor ||
+            !('value' in descriptor)
+        ) {
+            throw new TypeError('invalid restored options');
+        }
+
+        output[key] = descriptor.value;
+    }
+
+    return output;
+}
+
+/** Local import only. The new stream is registered only by an explicit restoreAndRegister call.
+ * The caller must authenticate its stored account/device/profile binding before importing it. */
+export function createWtRestoredMultiplexReference(
+    stream: RawMultiplexByteStream,
+    options: WtRestoredMultiplexReferenceOptions,
+): WtRestoredMultiplexReference {
+    const root = restoredRecord(options, [
+        'exclusiveConnected',
+        'transportUin',
+        'session',
+        'initialSequence',
+        'maxFrameBytes',
+        'maxBufferedBytes',
+        'maxFrames',
+        'maxPushFrames',
+        'maxPushBytes',
+        'maxWriteBufferBytes',
+        'leaseTimeoutMs',
+        'verifyPushRaw',
+        'onPush',
+        'maxPushBodyBytes',
+        'onPushBody',
+    ]);
+    const session = restoredRecord(root.session, [
+        'persisted',
+        'profile',
+        'registration',
+        'timeoutMs',
+        'restoreTimeoutMs',
+        'signal',
+        'buildRegisterReserved',
+        'verifyRegisterRaw',
+        'checkpoint',
+        'renewalCheckpoint',
+    ]);
+    session.profile = restoredRecord(session.profile, ['subAppId', 'version']);
+    session.registration = restoredRecord(session.registration, [
+        'version',
+        'deviceName',
+        'deviceType',
+        'vendorOs',
+        'random',
+    ]);
+
+    if (session.checkpoint !== undefined) {
+        session.checkpoint = restoredRecord(session.checkpoint, [
+            'timeoutMs',
+            'save',
+            'invalidate',
+        ]);
+    }
+
+    if (session.renewalCheckpoint !== undefined) {
+        session.renewalCheckpoint = restoredRecord(session.renewalCheckpoint, [
+            'timeoutMs',
+            'save',
+            'invalidate',
+        ]);
+    }
+
+    const persisted = cloneWtPersistedSession(session.persisted);
+
+    try {
+        if (root.transportUin !== persisted.uin) {
+            throw new TypeError('restored account mismatch');
+        }
+
+        session.persisted = persisted;
+        root.session = session;
+        return createMultiplexReference(
+            stream,
+            root as unknown as WtRestoredMultiplexReferenceOptions,
+            true,
+        );
+    } finally {
+        disposeWtPersistedSession(persisted);
+    }
+}
+
+function createMultiplexReference(
+    stream: RawMultiplexByteStream,
+    options: WtMultiplexReferenceOptions,
+    restored?: false,
+): WtMultiplexReference;
+function createMultiplexReference(
+    stream: RawMultiplexByteStream,
+    options: WtRestoredMultiplexReferenceOptions,
+    restored: true,
+): WtRestoredMultiplexReference;
+
+function createMultiplexReference(
+    stream: RawMultiplexByteStream,
+    options: WtMultiplexReferenceOptions | WtRestoredMultiplexReferenceOptions,
+    restored = false,
+): WtMultiplexReference | WtRestoredMultiplexReference {
     const started = performance.now();
     const {
         exclusiveConnected,
@@ -218,10 +491,14 @@ export function createWtMultiplexReference(
 
     const leaseDeadline = started + leaseTimeoutMs;
     const signal = sessionOptions.signal;
-    const profileUin = sessionOptions.profile.uin;
-    const qrCommand = sessionOptions.profile.qrCommand;
-    const loginCommand = sessionOptions.profile.loginCommand;
-    const wtSigner = sessionOptions.buildWtReserved;
+    const qrSessionOptions = restored ? undefined : (sessionOptions as WtReferenceSessionOptions);
+    const restoredSessionOptions = restored
+        ? (sessionOptions as WtRestoredSessionOptions)
+        : undefined;
+    const profileUin = restoredSessionOptions?.persisted.uin ?? qrSessionOptions!.profile.uin;
+    const qrCommand = qrSessionOptions?.profile.qrCommand;
+    const loginCommand = qrSessionOptions?.profile.loginCommand;
+    const wtSigner = qrSessionOptions?.buildWtReserved;
     const registerSigner = sessionOptions.buildRegisterReserved;
     const registerVerifier = sessionOptions.verifyRegisterRaw;
     const token = createReferenceKeyCapability();
@@ -232,18 +509,23 @@ export function createWtMultiplexReference(
               command: string;
               protocol: 12 | 13;
               encryption: 'zero' | 'd2' | 'none';
-              hold: boolean;
+              hold: boolean | RawMultiplexResponseContinuation;
+              friendStep?: ReferenceFriendStep;
+              packetOperation?: ReferencePacketOperation;
           }
         | undefined;
     const currentExpected = () => expected;
+    let friendVerified: typeof expected;
+    const currentFriendVerified = () => friendVerified;
     let mux: RawMultiplexStreamClient | undefined;
     let lease: RawSessionLease | undefined;
-    let owner: WtReferenceSession | undefined;
+    let owner: WtReferenceSession | WtRestoredSession | undefined;
     let sendHandle: ReferenceSessionSendHandle | undefined;
     let operation: Operation | undefined;
     let busy = false;
     let sendGate = false;
     let sendVerified = false;
+    let refreshVerifiedStage: 0 | 1 | 2 = 0;
     let stopped = false;
     let externallyStopped = false;
     let registered = false;
@@ -269,7 +551,12 @@ export function createWtMultiplexReference(
     let activeBody: Uint8Array | undefined;
     const verificationCopies = new Set<Uint8Array>();
     let abortListener: ReturnType<typeof addAbortListener> | undefined;
-    const queue: Array<{ frame: Uint8Array; size: number; meta: PushMeta }> = [];
+    const queue: Array<{
+        frame: Uint8Array;
+        size: number;
+        meta: PushMeta;
+        decoded?: { body: Uint8Array; retCode: number };
+    }> = [];
 
     const wipe = (value: Uint8Array | undefined): void => {
         try {
@@ -301,6 +588,8 @@ export function createWtMultiplexReference(
         generation++;
         registered = false;
         expected = undefined;
+        friendVerified = undefined;
+        refreshVerifiedStage = 0;
         sendHandle = undefined;
         revokeReferenceKey(token);
         wipe(activeCopy);
@@ -314,6 +603,7 @@ export function createWtMultiplexReference(
 
         for (const item of queue.splice(0)) {
             wipe(item.frame);
+            wipe(item.decoded?.body);
         }
 
         queuedBytes = 0;
@@ -408,27 +698,93 @@ export function createWtMultiplexReference(
         let command: string;
         let protocol: 12 | 13 = 12;
         let encryption: 'zero' | 'd2' | 'none' = 'd2';
-        let hold = false;
+        let hold: boolean | RawMultiplexResponseContinuation = false;
+        let ticketContinuation = false;
+        let friendStep: ReferenceFriendStep | undefined;
+        let packetOperation: ReferencePacketOperation | undefined;
 
-        if (wt && (operation === 'fetch' || operation === 'poll') && keyState === 'empty') {
+        if (
+            !restored &&
+            wt &&
+            (operation === 'fetch' || operation === 'poll') &&
+            keyState === 'empty'
+        ) {
             uin = profileUin;
-            command = qrCommand;
+            command = qrCommand!;
             encryption = 'zero';
             hold = operation === 'poll';
-        } else if (wt && operation === 'login-register' && keyState === 'empty') {
+        } else if (!restored && wt && operation === 'login-register' && keyState === 'empty') {
             uin = confirmed;
-            command = loginCommand;
+            command = loginCommand!;
             encryption = 'zero';
             hold = true;
-        } else if (!wt && operation === 'login-register' && keyState === 'tentative') {
+        } else if (
+            !wt &&
+            operation === (restored ? 'restore-register' : 'login-register') &&
+            keyState === 'tentative'
+        ) {
             uin = confirmed;
             command = SSO_INFO_SYNC_COMMAND;
         } else if (!wt && operation === 'heartbeat' && keyState === 'active') {
             uin = confirmed;
             command = SSO_HEARTBEAT_COMMAND;
+        } else if (!wt && operation === 'refresh-tickets' && keyState === 'active') {
+            if (!sendGate) {
+                throw new Error('invalid ticket refresh gate');
+            }
+
+            if (
+                input.command === NATIVE_KEY_EXCHANGE_COMMAND &&
+                expected === undefined &&
+                refreshVerifiedStage === 0
+            ) {
+                command = NATIVE_KEY_EXCHANGE_COMMAND;
+            } else if (
+                input.command === NATIVE_TICKET_REFRESH_COMMAND &&
+                expected?.command === NATIVE_KEY_EXCHANGE_COMMAND &&
+                refreshVerifiedStage === 1
+            ) {
+                command = NATIVE_TICKET_REFRESH_COMMAND;
+                ticketContinuation = true;
+            } else {
+                throw new Error('invalid ticket refresh transition');
+            }
+
+            uin = confirmed;
         } else if (!wt && operation === 'send-text' && keyState === 'active') {
             uin = confirmed;
             command = 'MessageSvc.PbSendMsg';
+        } else if (!wt && operation === 'friend-request' && keyState === 'active') {
+            if (!owner || !lease || !runId || !sendGate) {
+                throw new Error('invalid friend owner');
+            }
+
+            friendStep = referenceActiveFriendStep(token, owner, lease, runId);
+
+            if (
+                expected &&
+                (friendVerified !== expected ||
+                    expected.friendStep?.stepId !== 'settings' ||
+                    friendStep.stepId !== 'application' ||
+                    expected.friendStep.workflowRun !== friendStep.workflowRun ||
+                    expected.friendStep.childRun === friendStep.childRun)
+            ) {
+                throw new Error('invalid friend step transition');
+            }
+
+            uin = confirmed;
+            command = referenceFriendStepCommand(friendStep.stepId);
+            sendVerified = false;
+            friendVerified = undefined;
+        } else if (!wt && operation === 'request-packet' && keyState === 'active') {
+            if (!owner || !lease || !runId || !sendGate || expected) {
+                throw new Error('invalid packet owner');
+            }
+
+            packetOperation = referenceActivePacketOperation(token, owner, lease, runId);
+            uin = confirmed;
+            command = packetOperation.command;
+            sendVerified = false;
         } else if (!wt && operation === 'alive' && keyState === 'active') {
             uin = confirmed;
             command = SSO_REFERENCE_ALIVE_COMMAND;
@@ -442,7 +798,29 @@ export function createWtMultiplexReference(
             throw new Error('invalid request binding');
         }
 
-        const next = { uin, sequence: input.sequence, command, protocol, encryption, hold };
+        if (ticketContinuation) {
+            if (!owner || !lease) {
+                throw new Error('invalid ticket refresh continuation owner');
+            }
+
+            let release!: () => void;
+            const untilReleased = new Promise<void>((resolve) => {
+                release = resolve;
+            });
+            armReferenceTicketRefreshContinuation(token, owner, lease, release);
+            hold = Object.freeze({ untilReleased });
+        }
+
+        const next = {
+            uin,
+            sequence: input.sequence,
+            command,
+            protocol,
+            encryption,
+            hold,
+            friendStep,
+            packetOperation,
+        };
         expected = next;
         return next;
     };
@@ -498,13 +876,16 @@ export function createWtMultiplexReference(
                             let bodyMeta: Readonly<PushMeta & { retCode: number }> | undefined;
 
                             if (onPushBody) {
-                                const decoded = decodeReferencePushBody(
-                                    token,
-                                    item.frame,
-                                    transportUin,
-                                    item.meta,
-                                    maxPushBodyBytes!,
-                                );
+                                const decoded =
+                                    item.decoded ??
+                                    decodeReferencePushBody(
+                                        token,
+                                        item.frame,
+                                        transportUin,
+                                        item.meta,
+                                        maxPushBodyBytes!,
+                                    );
+                                item.decoded = undefined;
                                 activeBody = decoded.body;
                                 bodyMeta = Object.freeze({
                                     ...item.meta,
@@ -531,6 +912,8 @@ export function createWtMultiplexReference(
                             inCallback = false;
                             wipe(activeBody);
                             activeBody = undefined;
+                            wipe(item.decoded?.body);
+                            item.decoded = undefined;
                             wipe(item.frame);
                             activeCopy = undefined;
 
@@ -578,30 +961,70 @@ export function createWtMultiplexReference(
                     const protocol = decoded.protocol;
                     const confirmed = referenceExpectedUin(token);
 
-                    if (decoded.command === PUSH_COMMAND) {
+                    if (isWtReferencePushCommand(decoded.command)) {
                         if (
                             !confirmed ||
                             decoded.uin !== confirmed ||
-                            protocol !== 12 ||
+                            !isWtReferencePushProtocol(decoded.command, protocol) ||
                             decoded.encryption !== 'd2'
                         ) {
+                            log.warn(
+                                'rejected direct WT push envelope: command=%s protocol=%s encryption=%s accountMatch=%s registered=%s',
+                                decoded.command,
+                                protocol,
+                                decoded.encryption,
+                                confirmed !== undefined && decoded.uin === confirmed,
+                                confirmed !== undefined,
+                            );
                             return { kind: 'reject' };
                         }
 
-                        return { kind: 'push', name: PUSH_COMMAND, id: decoded.sequence };
+                        return { kind: 'push', name: decoded.command, id: decoded.sequence };
                     }
 
                     const request = expected;
-                    return request !== undefined &&
+                    // Linux SsoInfoSync may use the fixed zero key for its response even
+                    // though the associated request used D2. Keep the exception confined to
+                    // this registration command; every push and other response stays exact.
+                    const encryptionMatches =
+                        request !== undefined &&
+                        (decoded.encryption === request.encryption ||
+                            (request.command === SSO_INFO_SYNC_COMMAND &&
+                                request.encryption === 'd2' &&
+                                decoded.encryption === 'zero'));
+                    const accepted =
+                        request !== undefined &&
                         identity.sequence === request.sequence &&
                         decoded.sequence === request.sequence &&
                         decoded.uin === request.uin &&
                         decoded.command === request.command &&
-                        decoded.encryption === request.encryption &&
-                        protocol === request.protocol
+                        encryptionMatches &&
+                        protocol === request.protocol;
+
+                    if (!accepted) {
+                        log.warn(
+                            'rejected direct WT response envelope: expectedCommand=%s actualCommand=%s expectedProtocol=%s actualProtocol=%s expectedEncryption=%s actualEncryption=%s sequenceMatch=%s accountMatch=%s',
+                            request?.command ?? 'none',
+                            decoded.command,
+                            request?.protocol ?? 'none',
+                            protocol,
+                            request?.encryption ?? 'none',
+                            decoded.encryption,
+                            request !== undefined &&
+                                identity.sequence === request.sequence &&
+                                decoded.sequence === request.sequence,
+                            request !== undefined && decoded.uin === request.uin,
+                        );
+                    }
+
+                    return accepted
                         ? { kind: 'response', sequence: decoded.sequence }
                         : { kind: 'reject' };
-                } catch {
+                } catch (error) {
+                    log.warn(
+                        'rejected undecodable direct WT frame: %s',
+                        error instanceof Error ? error.message : String(error),
+                    );
                     return { kind: 'reject' };
                 }
             },
@@ -620,7 +1043,7 @@ export function createWtMultiplexReference(
                 return (
                     live() &&
                     referenceExpectedUin(token) !== undefined &&
-                    route.name === PUSH_COMMAND &&
+                    isWtReferencePushCommand(route.name) &&
                     referenceKeyState(token) !== 'empty'
                 );
             },
@@ -630,7 +1053,7 @@ export function createWtMultiplexReference(
                 if (
                     !live() ||
                     !uin ||
-                    route.name !== PUSH_COMMAND ||
+                    !isWtReferencePushCommand(route.name) ||
                     queue.length + (activeCopy ? 1 : 0) >= maxPushFrames ||
                     queuedBytes + frame.length > maxPushBytes
                 ) {
@@ -638,12 +1061,34 @@ export function createWtMultiplexReference(
                 }
 
                 const copy = Uint8Array.from(frame);
-                queuedBytes += copy.length;
-                queue.push({
-                    frame: copy,
-                    size: copy.length,
-                    meta: Object.freeze({ uin, sequence: route.id, command: route.name }),
-                });
+                const meta = Object.freeze({ uin, sequence: route.id, command: route.name });
+                let decoded: { body: Uint8Array; retCode: number } | undefined;
+
+                try {
+                    if (sendGate && operation === 'refresh-tickets' && onPushBody) {
+                        decoded = decodeReferencePushBody(
+                            token,
+                            frame,
+                            transportUin,
+                            meta,
+                            maxPushBodyBytes!,
+                        );
+                    }
+
+                    const size = copy.length + (decoded?.body.length ?? 0);
+
+                    if (queuedBytes + size > maxPushBytes) {
+                        throw new Error('push capacity or stopped');
+                    }
+
+                    queuedBytes += size;
+                    queue.push({ frame: copy, size, meta, decoded });
+                } catch (error) {
+                    wipe(copy);
+                    wipe(decoded?.body);
+                    throw error;
+                }
+
                 drain();
             },
         });
@@ -749,60 +1194,115 @@ export function createWtMultiplexReference(
             throw new TypeError('invalid register verifier');
         }
 
-        owner = createWtReferenceSessionWithCapability(
-            lease,
-            {
-                ...sessionOptions,
-                signal,
-                buildWtReserved: async (input) => {
-                    const current = generation;
-                    const request = makeExpected(input, true);
-                    const result = await wtSigner(input);
+        const bindings: Pick<
+            WtReferenceSessionOptions,
+            'buildRegisterReserved' | 'verifyRegisterRaw'
+        > = {
+            buildRegisterReserved: async (input) => {
+                const current = generation;
+                const request = makeExpected(input, false);
+                const result = await registerSigner(input);
 
-                    if (!live(current) || expected !== request) {
-                        throw new Error('signer stopped');
-                    }
+                if (
+                    !live(current) ||
+                    expected !== request ||
+                    (request.friendStep &&
+                        (!owner ||
+                            !lease ||
+                            !runId ||
+                            referenceActiveFriendStep(token, owner, lease, runId) !==
+                                request.friendStep)) ||
+                    (request.packetOperation &&
+                        (!owner ||
+                            !lease ||
+                            !runId ||
+                            referenceActivePacketOperation(token, owner, lease, runId) !==
+                                request.packetOperation))
+                ) {
+                    throw new Error('signer stopped');
+                }
 
-                    return result;
-                },
-                buildRegisterReserved: async (input) => {
-                    const current = generation;
-                    const request = makeExpected(input, false);
-                    const result = await registerSigner(input);
-
-                    if (!live(current) || expected !== request) {
-                        throw new Error('signer stopped');
-                    }
-
-                    return result;
-                },
-                verifyRegisterRaw: (input) => {
-                    if (operation !== 'send-text') {
-                        return registerVerifier(input);
-                    }
-
+                return result;
+            },
+            verifyRegisterRaw: (input) => {
+                if (operation === 'refresh-tickets') {
                     return (async () => {
                         const current = generation;
                         const request = expected;
+                        const expectedStage =
+                            request?.command === NATIVE_KEY_EXCHANGE_COMMAND
+                                ? 0
+                                : request?.command === NATIVE_TICKET_REFRESH_COMMAND
+                                  ? 1
+                                  : undefined;
 
-                        if (
-                            !sendGate ||
-                            !request ||
-                            request.command !== 'MessageSvc.PbSendMsg' ||
-                            input.uin !== request.uin ||
-                            input.sequence !== request.sequence ||
-                            input.command !== request.command ||
-                            !live(current) ||
-                            expected !== request
-                        ) {
-                            throw new Error('invalid send verifier binding');
-                        }
+                        const check = (): void => {
+                            if (
+                                !sendGate ||
+                                !busy ||
+                                !request ||
+                                expectedStage === undefined ||
+                                refreshVerifiedStage !== expectedStage ||
+                                !owner ||
+                                !lease ||
+                                !runId ||
+                                operation !== 'refresh-tickets' ||
+                                input.uin !== request.uin ||
+                                input.sequence !== request.sequence ||
+                                input.command !== request.command ||
+                                !live(current) ||
+                                expected !== request ||
+                                referenceKeyState(token) !== 'active'
+                            ) {
+                                throw new Error('invalid ticket refresh verifier binding');
+                            }
+                        };
 
+                        check();
                         const result = await registerVerifier(input);
+                        check();
 
-                        if (!live(current) || expected !== request || !sendGate) {
-                            throw new Error('send verifier stopped');
+                        if (result === true) {
+                            refreshVerifiedStage = ((expectedStage as 0 | 1) + 1) as 1 | 2;
                         }
+
+                        return result;
+                    })();
+                }
+
+                if (operation === 'request-packet') {
+                    return (async () => {
+                        const current = generation;
+                        const request = expected;
+                        const packet = request?.packetOperation;
+
+                        const check = (): void => {
+                            if (
+                                !sendGate ||
+                                !busy ||
+                                !request ||
+                                !packet ||
+                                !owner ||
+                                !lease ||
+                                !runId ||
+                                operation !== 'request-packet' ||
+                                packet.run !== runId ||
+                                input.uin !== request.uin ||
+                                input.sequence !== request.sequence ||
+                                input.command !== packet.command ||
+                                request.command !== input.command ||
+                                !live(current) ||
+                                expected !== request ||
+                                referenceActivePacketOperation(token, owner, lease, runId) !==
+                                    packet
+                            ) {
+                                throw new Error('invalid packet verifier binding');
+                            }
+                        };
+
+                        check();
+                        const result = await registerVerifier(input);
+                        check();
 
                         if (result === true) {
                             sendVerified = true;
@@ -810,12 +1310,117 @@ export function createWtMultiplexReference(
 
                         return result;
                     })();
-                },
+                }
+
+                if (operation === 'friend-request') {
+                    return (async () => {
+                        const current = generation;
+                        const request = expected;
+                        const stage = request?.friendStep;
+
+                        const check = (): void => {
+                            if (
+                                !sendGate ||
+                                !busy ||
+                                !request ||
+                                !stage ||
+                                !owner ||
+                                !lease ||
+                                !runId ||
+                                operation !== 'friend-request' ||
+                                stage.workflowRun !== runId ||
+                                input.uin !== request.uin ||
+                                input.sequence !== request.sequence ||
+                                input.command !== referenceFriendStepCommand(stage.stepId) ||
+                                request.command !== input.command ||
+                                !live(current) ||
+                                expected !== request ||
+                                referenceActiveFriendStep(token, owner, lease, runId) !== stage
+                            ) {
+                                throw new Error('invalid friend verifier binding');
+                            }
+                        };
+
+                        check();
+                        const result = await registerVerifier(input);
+                        check();
+
+                        if (result === true) {
+                            sendVerified = true;
+                            friendVerified = request;
+                        }
+
+                        return result;
+                    })();
+                }
+
+                if (operation !== 'send-text') {
+                    return registerVerifier(input);
+                }
+
+                return (async () => {
+                    const current = generation;
+                    const request = expected;
+
+                    if (
+                        !sendGate ||
+                        !request ||
+                        request.command !== 'MessageSvc.PbSendMsg' ||
+                        input.uin !== request.uin ||
+                        input.sequence !== request.sequence ||
+                        input.command !== request.command ||
+                        !live(current) ||
+                        expected !== request
+                    ) {
+                        throw new Error('invalid send verifier binding');
+                    }
+
+                    const result = await registerVerifier(input);
+
+                    if (!live(current) || expected !== request || !sendGate) {
+                        throw new Error('send verifier stopped');
+                    }
+
+                    if (result === true) {
+                        sendVerified = true;
+                    }
+
+                    return result;
+                })();
             },
-            token,
-            terminal,
-            fence,
-        );
+        };
+
+        if (restoredSessionOptions) {
+            owner = createWtRestoredSessionWithCapability(
+                lease,
+                { ...restoredSessionOptions, ...bindings, signal },
+                token,
+            );
+        } else {
+            owner = createWtReferenceSessionWithCapability(
+                lease,
+                {
+                    ...qrSessionOptions!,
+                    ...bindings,
+                    signal,
+                    buildWtReserved: async (input) => {
+                        const current = generation;
+                        const request = makeExpected(input, true);
+                        const result = await wtSigner!(input);
+
+                        if (!live(current) || expected !== request) {
+                            throw new Error('signer stopped');
+                        }
+
+                        return result;
+                    },
+                },
+                token,
+                terminal,
+                fence,
+            );
+        }
+
         sendHandle = takeReferenceSessionSend(token, owner, lease);
 
         if (!sendHandle) {
@@ -844,12 +1449,24 @@ export function createWtMultiplexReference(
         }
 
         const run = async <T>(next: Operation, action: () => Promise<T>): Promise<T> => {
-            if (!live() || busy || inCallback) {
+            if (
+                !live() ||
+                busy ||
+                sendGate ||
+                inCallback ||
+                (next === 'refresh-tickets' && queue.length > 0)
+            ) {
                 throw new Error('multiplex session busy or stopped');
             }
 
             busy = true;
             operation = next;
+
+            if (next === 'refresh-tickets') {
+                sendGate = true;
+                refreshVerifiedStage = 0;
+            }
+
             const current = generation;
             const currentRun = {};
             let pendingExactDelivery: { deadline: number; externalEpoch: number } | undefined;
@@ -866,13 +1483,42 @@ export function createWtMultiplexReference(
 
                 const descriptor = Object.getOwnPropertyDescriptor(result, 'status');
                 const status = descriptor && 'value' in descriptor ? descriptor.value : undefined;
+
+                if (next === 'refresh-tickets') {
+                    const networkResult =
+                        expected?.command === NATIVE_TICKET_REFRESH_COMMAND &&
+                        refreshVerifiedStage === 2;
+                    const localDisabled =
+                        status === 'disabled' &&
+                        expected === undefined &&
+                        refreshVerifiedStage === 0;
+                    const committedNeedsLogin =
+                        status === 'needs-login' &&
+                        stopped &&
+                        expected === undefined &&
+                        refreshVerifiedStage === 0;
+
+                    if (
+                        ![
+                            'refreshed',
+                            'protocol-error',
+                            'empty-a1',
+                            'needs-login',
+                            'disabled',
+                        ].includes(status as string) ||
+                        (!networkResult && !localDisabled && !committedNeedsLogin)
+                    ) {
+                        throw new Error('invalid ticket refresh result');
+                    }
+                }
+
                 const businessFailure =
                     (next === 'poll' &&
                         (status === 'expired' ||
                             status === 'canceled' ||
                             status === 'invalid' ||
                             status === 'unknown')) ||
-                    (next === 'login-register' &&
+                    ((next === 'login-register' || next === 'restore-register') &&
                         (status === 'verification-required' ||
                             status === 'nonzero' ||
                             status === 'incomplete' ||
@@ -880,7 +1526,8 @@ export function createWtMultiplexReference(
                             status === 'rejected' ||
                             status === 'missing-result' ||
                             status === 'sso-error')) ||
-                    ((next === 'heartbeat' || next === 'alive') && status === 'sso-error');
+                    ((next === 'heartbeat' || next === 'alive') && status === 'sso-error') ||
+                    (next === 'refresh-tickets' && status === 'needs-login');
 
                 if (businessFailure && typeof status === 'string') {
                     const exactReceipt =
@@ -1028,7 +1675,7 @@ export function createWtMultiplexReference(
                     throw new Error('session stopped');
                 }
 
-                if (next === 'login-register') {
+                if (next === 'login-register' || next === 'restore-register') {
                     if (status === 'success') {
                         if (referenceKeyState(token) !== 'active') {
                             throw new Error('key not committed');
@@ -1054,6 +1701,11 @@ export function createWtMultiplexReference(
                 runId = undefined;
                 claim = undefined;
                 busy = false;
+
+                if (next === 'refresh-tickets') {
+                    sendGate = false;
+                    refreshVerifiedStage = 0;
+                }
 
                 if (stopped) {
                     disposeAbortListener();
@@ -1232,21 +1884,372 @@ export function createWtMultiplexReference(
             }
         };
 
-        return Object.freeze({
+        const friendRequest = async (
+            input: WtReferenceFriendInput | undefined,
+        ): Promise<WtReferenceFriendResult> => {
+            if (busy || sendGate || inCallback) {
+                throw new Error('multiplex session busy');
+            }
+
+            busy = true;
+            sendGate = true;
+            operation = 'friend-request';
+            const currentRun = {};
+            runId = currentRun;
+            const current = generation;
+            const startExternalEpoch = externalEpoch;
+            const progress: ReferenceFriendProgress = {
+                stage: 'settings',
+                applicationAttempted: false,
+                applicationWriteState: 'not-written',
+            };
+            let prepared: PreparedReferenceFriendInput | undefined;
+            let entered = false;
+            let succeeded = false;
+            let deadline = 0;
+
+            try {
+                // The fallback identity exists only for validation before registration;
+                // an unregistered operation never reaches a signer or transport.
+                prepared = prepareReferenceFriendInput(
+                    input,
+                    BigInt(referenceExpectedUin(token) ?? '1'),
+                );
+                input = undefined;
+
+                if (!registered && !stopped) {
+                    throw new Error('multiplex session not registered');
+                }
+
+                entered = true;
+                const handle = sendHandle;
+                deadline = Math.min(leaseDeadline, performance.now() + prepared.timeoutMs);
+
+                if (
+                    !handle ||
+                    !registered ||
+                    expected !== undefined ||
+                    claim !== undefined ||
+                    !live(current) ||
+                    !busy ||
+                    !sendGate ||
+                    runId !== currentRun ||
+                    operation !== 'friend-request' ||
+                    sendHandle !== handle ||
+                    owner!.getState() !== 'success' ||
+                    referenceKeyState(token) !== 'active'
+                ) {
+                    throw new WtReferenceFriendError(progress, 'workflow-stopped');
+                }
+
+                sendVerified = false;
+                friendVerified = undefined;
+                const result = await handle.friendRequest(prepared, currentRun, deadline, progress);
+                const responseExpected = currentExpected();
+                const stage = responseExpected?.friendStep;
+                const finalStep =
+                    result.status === 'application-response' ? 'application' : 'settings';
+
+                if (
+                    !sendVerified ||
+                    !responseExpected ||
+                    currentFriendVerified() !== responseExpected ||
+                    !stage ||
+                    stage.workflowRun !== currentRun ||
+                    stage.stepId !== finalStep ||
+                    responseExpected.command !== referenceFriendStepCommand(finalStep) ||
+                    !live(current) ||
+                    currentExpected() !== responseExpected ||
+                    !busy ||
+                    !sendGate ||
+                    runId !== currentRun ||
+                    operation !== 'friend-request' ||
+                    sendHandle !== handle ||
+                    referenceKeyState(token) !== 'active' ||
+                    owner!.getState() !== 'success' ||
+                    performance.now() >= deadline
+                ) {
+                    throw new WtReferenceFriendError(progress, 'workflow-stopped');
+                }
+
+                succeeded = true;
+                return result;
+            } catch (error) {
+                if (entered) {
+                    closeAll();
+                    throw error instanceof WtReferenceFriendError
+                        ? error
+                        : new WtReferenceFriendError(progress, 'workflow-stopped');
+                }
+
+                throw error;
+            } finally {
+                disposePreparedReferenceFriendInput(prepared);
+                const owned = runId === currentRun;
+
+                if (owned) {
+                    expected = undefined;
+                    operation = undefined;
+                    runId = undefined;
+                    sendVerified = false;
+                    friendVerified = undefined;
+                    busy = false;
+                    sendGate = false;
+                }
+
+                if (stopped) {
+                    disposeAbortListener();
+                }
+
+                if (succeeded) {
+                    let failed = false;
+
+                    try {
+                        if (owned && registered && queue.length && live(current)) {
+                            drain();
+                        }
+
+                        const now = performance.now();
+
+                        if (
+                            !owned ||
+                            now >= deadline ||
+                            now >= leaseDeadline ||
+                            signal?.aborted ||
+                            stopped ||
+                            generation !== current ||
+                            externallyStopped ||
+                            externalEpoch !== startExternalEpoch ||
+                            streamClient.closed ||
+                            referenceKeyState(token) !== 'active'
+                        ) {
+                            failed = true;
+                        }
+                    } catch {
+                        failed = true;
+                    }
+
+                    if (failed) {
+                        closeAll();
+                        // eslint-disable-next-line no-unsafe-finally -- Fence pending friend results after cleanup and push wakeup.
+                        throw new WtReferenceFriendError(progress, 'workflow-stopped');
+                    }
+                }
+            }
+        };
+
+        const requestPacket = async (
+            input: WtReferencePacketInput | undefined,
+        ): Promise<WtReferencePacketResult> => {
+            if (busy || sendGate || inCallback) {
+                throw new Error('multiplex session busy');
+            }
+
+            busy = true;
+            sendGate = true;
+            operation = 'request-packet';
+            const currentRun = {};
+            runId = currentRun;
+            const current = generation;
+            const startExternalEpoch = externalEpoch;
+            const progress: ReferencePacketProgress = { writeState: 'not-written' };
+            let prepared: WtReferencePacketInput | undefined;
+            let response: WtReferencePacketResult | undefined;
+            let entered = false;
+            let deadline = 0;
+
+            try {
+                prepared = prepareReferencePacketInput(input);
+                input = undefined;
+
+                if (!registered && !stopped) {
+                    throw new Error('multiplex session not registered');
+                }
+
+                entered = true;
+                const handle = sendHandle;
+                deadline = Math.min(leaseDeadline, performance.now() + prepared.timeoutMs);
+
+                if (
+                    !handle ||
+                    typeof handle.requestPacket !== 'function' ||
+                    !registered ||
+                    expected !== undefined ||
+                    claim !== undefined ||
+                    !live(current) ||
+                    !busy ||
+                    !sendGate ||
+                    runId !== currentRun ||
+                    operation !== 'request-packet' ||
+                    sendHandle !== handle ||
+                    owner!.getState() !== 'success' ||
+                    referenceKeyState(token) !== 'active'
+                ) {
+                    throw new WtReferencePacketError(
+                        prepared.command,
+                        progress,
+                        'operation-stopped',
+                    );
+                }
+
+                sendVerified = false;
+                response = await handle.requestPacket(prepared, currentRun, deadline, progress);
+                const fields = sendRecord(response, [
+                    'status',
+                    'command',
+                    'sequence',
+                    'retCode',
+                    'body',
+                    'writeState',
+                ]);
+                const responseExpected = currentExpected();
+
+                if (
+                    fields.status !== 'response' ||
+                    fields.command !== prepared.command ||
+                    fields.retCode !== 0 ||
+                    fields.writeState !== 'written' ||
+                    isProxy(fields.body) ||
+                    !isUint8Array(fields.body) ||
+                    !sendVerified ||
+                    !responseExpected ||
+                    responseExpected.command !== prepared.command ||
+                    responseExpected.sequence !== fields.sequence ||
+                    responseExpected.packetOperation?.run !== currentRun ||
+                    responseExpected.packetOperation.command !== prepared.command ||
+                    !live(current) ||
+                    currentExpected() !== responseExpected ||
+                    !busy ||
+                    !sendGate ||
+                    runId !== currentRun ||
+                    operation !== 'request-packet' ||
+                    sendHandle !== handle ||
+                    referenceKeyState(token) !== 'active' ||
+                    owner!.getState() !== 'success' ||
+                    performance.now() >= deadline
+                ) {
+                    throw new WtReferencePacketError(
+                        prepared.command,
+                        progress,
+                        'operation-stopped',
+                    );
+                }
+
+                return response;
+            } catch (error) {
+                disposeReferencePacketResult(response);
+                response = undefined;
+
+                if (entered) {
+                    closeAll();
+                    throw error instanceof WtReferencePacketError
+                        ? error
+                        : new WtReferencePacketError(
+                              prepared!.command,
+                              progress,
+                              'operation-stopped',
+                          );
+                }
+
+                throw error;
+            } finally {
+                disposePreparedReferencePacket(prepared);
+                const owned = runId === currentRun;
+
+                if (owned) {
+                    expected = undefined;
+                    operation = undefined;
+                    runId = undefined;
+                    sendVerified = false;
+                    busy = false;
+                    sendGate = false;
+                }
+
+                if (stopped) {
+                    disposeAbortListener();
+                }
+
+                if (response) {
+                    let failed = false;
+
+                    try {
+                        if (owned && registered && queue.length && live(current)) {
+                            drain();
+                        }
+
+                        const now = performance.now();
+
+                        if (
+                            !owned ||
+                            now >= deadline ||
+                            now >= leaseDeadline ||
+                            signal?.aborted ||
+                            stopped ||
+                            generation !== current ||
+                            externallyStopped ||
+                            externalEpoch !== startExternalEpoch ||
+                            streamClient.closed ||
+                            referenceKeyState(token) !== 'active'
+                        ) {
+                            failed = true;
+                        }
+                    } catch {
+                        failed = true;
+                    }
+
+                    if (failed) {
+                        disposeReferencePacketResult(response);
+                        closeAll();
+                        // eslint-disable-next-line no-unsafe-finally -- Raw body ownership transfers only after the final delivery fence.
+                        throw new WtReferencePacketError(
+                            prepared!.command,
+                            progress,
+                            'operation-stopped',
+                        );
+                    }
+                }
+            }
+        };
+
+        const common = {
             whenClosed: streamClient.whenClosed,
             sendText,
-            getState: () => {
-                live();
-                return owner!.getState();
-            },
-            fetch: (fields: Parameters<WtReferenceSession['fetch']>[0]) =>
-                run('fetch', () => owner!.fetch(fields)),
-            poll: () => run('poll', () => owner!.poll()),
-            loginAndRegister: (fields: Parameters<WtReferenceSession['loginAndRegister']>[0]) =>
-                run('login-register', () => owner!.loginAndRegister(fields)),
+            friendRequest,
+            requestPacket,
             heartbeat: () => run('heartbeat', () => owner!.heartbeat()),
             alive: () => run('alive', () => owner!.alive()),
+            refreshTickets: async (options?: WtRefreshTicketsOptions) => {
+                const snapshot = snapshotRefreshOptions(options);
+                return run('refresh-tickets', () => owner!.refreshTickets(snapshot));
+            },
             close: stopExternally,
+        };
+
+        if (restored) {
+            const restoredOwner = owner as WtRestoredSession;
+            return Object.freeze({
+                ...common,
+                getState: () => {
+                    live();
+                    return restoredOwner.getState();
+                },
+                restoreAndRegister: () =>
+                    run('restore-register', () => restoredOwner.restoreAndRegister()),
+            });
+        }
+
+        const qrOwner = owner as WtReferenceSession;
+        return Object.freeze({
+            ...common,
+            getState: () => {
+                live();
+                return qrOwner.getState();
+            },
+            fetch: (fields: Parameters<WtReferenceSession['fetch']>[0]) =>
+                run('fetch', () => qrOwner.fetch(fields)),
+            poll: () => run('poll', () => qrOwner.poll()),
+            loginAndRegister: (fields: Parameters<WtReferenceSession['loginAndRegister']>[0]) =>
+                run('login-register', () => qrOwner.loginAndRegister(fields)),
         });
     } catch (error) {
         closeAll();

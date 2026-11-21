@@ -30,6 +30,10 @@
     "./apis": {
       "types": "./src/bridge/apis/index.ts",
       "default": "./src/bridge/apis/index.ts"
+    },
+    "./direct/*": {
+      "types": "./src/direct/*.ts",
+      "default": "./src/direct/*.ts"
     }
   },
   "scripts": {

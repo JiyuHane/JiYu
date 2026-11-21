@@ -19,9 +19,36 @@ type HealthCandidate = {
     revision: object;
 };
 
+type DirectSession = {
+    bridge: Bridge;
+    /** True once 'started' was handed to observers; only then is 'closed' owed. */
+    activated: boolean;
+    closing: Promise<void> | null;
+};
+
+/**
+ * @internal Experimental owner handle for one direct (non-hook) account session.
+ * It has no QQ process: session observers see `activePid === null` and a `closed`
+ * PID of `null`. Opening it claims the account; no hook login can bind to it.
+ */
+export interface DirectSessionHandle {
+    /** Available before activation so the owner can claim a push port and buffer. */
+    readonly bridge: Bridge;
+    /** Single use. Attaches the logged-in sender, then announces the session. */
+    activate(sender: PacketSender): void;
+    /** Throws unless the session is active, like a health report for an unbound PID. */
+    setReceiveHealthy(healthy: boolean): void;
+    /** Idempotent. Rejects if observers or Bridge disposal fail. */
+    close(): Promise<void>;
+}
+
 export class BridgeManager implements BridgeSessionSource {
     private readonly bridges = new Map<string, Bridge>();
     private readonly pidToUin_ = new Map<number, string>();
+    private readonly directSessions_ = new Map<string, DirectSession>();
+    /** Hook PIDs whose login was refused by a direct session, with the refusing UIN.
+     *  They stay unbound until the hook layer reports a disconnect or another login. */
+    private readonly refusedHookPids_ = new Map<number, string>();
     private readonly closingSessions_ = new Map<string, Set<Promise<void>>>();
     private readonly sessionSubscriptions = new Set<{ listener: BridgeSessionListener }>();
     private readonly healthRevisions = new WeakMap<Bridge, object>();
@@ -40,6 +67,8 @@ export class BridgeManager implements BridgeSessionSource {
         this.sessionSubscriptions.clear();
         this.pendingHealth.clear();
         this.healthBaselines.clear();
+        this.directSessions_.clear();
+        this.refusedHookPids_.clear();
 
         if (this.healthImmediate) {
             clearImmediate(this.healthImmediate);
@@ -385,7 +414,7 @@ export class BridgeManager implements BridgeSessionSource {
         }
     }
 
-    private fireSessionClosed(uin: string, bridge: Bridge, pid: number): void {
+    private fireSessionClosed(uin: string, bridge: Bridge, pid: number | null): void {
         for (const { listener } of [...this.sessionSubscriptions]) {
             try {
                 listener.closed?.(uin, bridge, pid);
@@ -403,6 +432,7 @@ export class BridgeManager implements BridgeSessionSource {
             return;
         }
 
+        this.refusedHookPids_.delete(pid);
         const uin = this.pidToUin_.get(pid);
 
         if (!uin) {
@@ -462,6 +492,11 @@ export class BridgeManager implements BridgeSessionSource {
             return;
         }
 
+        if (this.refusedHookPids_.has(pid)) {
+            // This process is not a transport of any session; its health is not ours.
+            return;
+        }
+
         const uin = this.pidToUin_.get(pid);
 
         if (!uin) {
@@ -500,6 +535,16 @@ export class BridgeManager implements BridgeSessionSource {
                 );
 
                 try {
+                    if (this.refuseHookPid(pid, uin, 'login')) {
+                        runtimeLog.trace(
+                            'bridge_binding_terminal pid=%d uin=%j source=login outcome=refused reason=direct_session_owner elapsedMs=%d',
+                            pid,
+                            uin,
+                            Date.now() - startedAt,
+                        );
+                        return;
+                    }
+
                     const { session, created } = this.bindPid(pid, uin, packetClient, 'login');
 
                     if (previousUin && previousUin !== uin) {
@@ -599,6 +644,16 @@ export class BridgeManager implements BridgeSessionSource {
         let handedToPipeline = false;
 
         try {
+            if (this.refuseHookPid(pkt.pid, uin, 'packet')) {
+                packetLog.trace(() => [
+                    'packet_terminal serviceCmd=%j seqId=%d outcome=dropped reason=direct_session_owner events=0 dispatched=0 elapsedMs=%d',
+                    pkt.serviceCmd,
+                    pkt.seqId,
+                    Date.now() - startedAt,
+                ]);
+                return;
+            }
+
             // A packet may be the first trustworthy observation that a live PID moved
             // to another UIN. Apply the exact same ownership transition as login so a
             // PID can never remain attached to two Bridges.
@@ -658,6 +713,170 @@ export class BridgeManager implements BridgeSessionSource {
             pkt.serviceCmd,
             error instanceof Error ? (error.stack ?? error.message) : String(error),
         );
+    }
+
+    /**
+     * A direct session is the only owner of its Bridge. A hook process reporting
+     * that account is released from its previous account (it no longer speaks for
+     * it) and left unbound; its packets are dropped so the direct session's own
+     * pushes are not duplicated. The refusal outlives the direct session: the hook
+     * layer still considers the process logged in and will not repeat the login.
+     */
+    private refuseHookPid(pid: number, uin: string, source: 'login' | 'packet'): boolean {
+        const refusedUin = this.refusedHookPids_.get(pid);
+
+        if (!this.directSessions_.has(uin)) {
+            if (source === 'packet' && refusedUin === uin) {
+                return true;
+            }
+
+            this.refusedHookPids_.delete(pid);
+            return false;
+        }
+
+        const previousUin = this.pidToUin_.get(pid);
+
+        if (previousUin) {
+            log.warn(
+                'PID ownership changed: PID=%d UIN=%s -> UIN=%s source=%s',
+                pid,
+                previousUin,
+                uin,
+                source,
+            );
+            this.detachPidFromSession(pid, previousUin);
+        }
+
+        if (pid > 0) {
+            this.refusedHookPids_.set(pid, uin);
+        }
+
+        if (source === 'login' || (pid > 0 && refusedUin !== uin)) {
+            log.warn(
+                'hook %s refused: UIN=%s is owned by a direct session; PID=%d stays unbound',
+                source,
+                uin,
+                pid,
+            );
+        }
+
+        return true;
+    }
+
+    /**
+     * @internal Experimental, explicit composition only. Two-phase open of a session
+     * that has no QQ process: the Bridge exists at once, so the owner can claim a
+     * push port and buffer, but observers learn of the session only on `activate`.
+     */
+    openDirectSession(uin: string): DirectSessionHandle {
+        if (this.disposal_) {
+            throw new Error('BridgeManager is disposed');
+        }
+
+        if (!isRealUin(uin)) {
+            throw new Error(`Direct session requires a real UIN: ${JSON.stringify(uin)}`);
+        }
+
+        if (this.bridges.has(uin)) {
+            throw new Error(`Bridge session already exists: UIN=${uin}`);
+        }
+
+        const bridge = this.ensureSession(uin).session;
+        const record: DirectSession = { bridge, activated: false, closing: null };
+        this.directSessions_.set(uin, record);
+
+        return Object.freeze({
+            bridge,
+            activate: (sender: PacketSender) => this.activateDirectSession(uin, record, sender),
+            setReceiveHealthy: (healthy: boolean) =>
+                this.setDirectReceiveHealth(uin, record, healthy),
+            close: () => this.closeDirectSession(uin, record),
+        });
+    }
+
+    private activateDirectSession(uin: string, record: DirectSession, sender: PacketSender): void {
+        if (this.disposal_ || record.closing) {
+            throw new Error(`Direct session is closed: UIN=${uin}`);
+        }
+
+        if (record.activated) {
+            throw new Error(`Direct session is already activated: UIN=${uin}`);
+        }
+
+        const { bridge } = record;
+        this.withHealthRouting(() =>
+            runWithTraceRequest(() => {
+                const { before, revision } = this.captureHealth(bridge);
+                // Observers send packets as soon as they start, so attach first.
+                bridge.attachDirectSender(sender);
+                this.recordHealthChange(uin, bridge, before, revision);
+                log.debug('session started: UIN=%s', uin);
+                this.markStartedHealthBoundary(bridge);
+                record.activated = true;
+                this.fireSessionStarted(uin, bridge);
+            }),
+        );
+    }
+
+    private setDirectReceiveHealth(uin: string, record: DirectSession, healthy: boolean): void {
+        if (this.disposal_) {
+            return;
+        }
+
+        if (!record.activated || record.closing) {
+            const message = `BridgeManager invariant violated: receive health for inactive direct session UIN=${uin}`;
+            log.error(message);
+            throw new Error(message);
+        }
+
+        const { bridge } = record;
+        this.withHealthRouting(() => {
+            const { before, revision } = this.captureHealth(bridge);
+            bridge.setDirectReceiveHealthy(healthy);
+            this.recordHealthChange(uin, bridge, before, revision);
+        });
+    }
+
+    private closeDirectSession(uin: string, record: DirectSession): Promise<void> {
+        if (record.closing) {
+            return record.closing;
+        }
+
+        const { bridge } = record;
+        let resolveClosing!: () => void;
+        let rejectClosing!: (error: unknown) => void;
+        // Publish the gate before observers run: a closed observer may reenter close().
+        record.closing = new Promise<void>((resolve, reject) => {
+            resolveClosing = resolve;
+            rejectClosing = reject;
+        });
+
+        try {
+            // Manager shutdown clears the registry and disposes every Bridge itself.
+            if (!this.disposal_) {
+                this.withHealthRouting(() => {
+                    // Same order as a final PID detach: the sender is gone before
+                    // observers run, and they can still read the account identity.
+                    bridge.detachDirectSender();
+                    this.pendingHealth.delete(bridge);
+                    this.closeSession(uin, bridge, () => {
+                        this.bridges.delete(uin);
+                        this.directSessions_.delete(uin);
+
+                        if (record.activated) {
+                            log.debug('session closed: UIN=%s', uin);
+                            this.fireSessionClosed(uin, bridge, null);
+                        }
+                    });
+                });
+            }
+
+            void bridge.dispose().then(resolveClosing, rejectClosing);
+        } catch (error) {
+            rejectClosing(error);
+        }
+
+        return record.closing;
     }
 
     /** Bind PID + sender as one state transition. If the PID changed accounts,

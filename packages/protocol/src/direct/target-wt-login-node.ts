@@ -99,3 +99,49 @@ export function encodeTargetWtLoginNode016a(value: Uint8Array): Uint8Array {
 export function encodeTargetWtLoginNode0318(value: Uint8Array): Uint8Array {
     return encodeNode(0x0318, value);
 }
+
+/**
+ * Local normal-success model of the inspected 0x0106 node. The constructor at
+ * 0x346912e–0x346919f uses vptr 0x8e7f808, stores tag 0x0106 and copies its
+ * supplied byte span into the object. Its relocated +0x10 writer is 0x35051e0,
+ * the same writer as the 0x0144 node. Under stable pointers and successful
+ * writes, it emits the tag, BE16 appended length and the appended bytes. This
+ * function neither supplies the target's session vector nor establishes peer
+ * acceptance. Lengths above 65535 are rejected locally, unlike the target's
+ * low-16-bit backfill. Ownership and cleanup match the 0x016a helper above.
+ */
+export function encodeTargetWtLoginNode0106(value: Uint8Array): Uint8Array {
+    return encodeNode(0x0106, value);
+}
+
+/**
+ * Local model of the 0x0144 node writer on the inspected normal-success path.
+ * The target constructs a 0x0144-tagged object, moves the output vector of
+ * 0x3468790 into it, and its relocated +0x10 slot resolves to 0x35051e0.
+ * Under the documented stable-object and successful-stream assumptions that
+ * writer emits BE16(tag), BE16(actual appended byte count) and the appended
+ * bytes. The target truncates the length to 16 bits and ignores some helper
+ * results; this local model instead rejects inputs above 65535 and reports
+ * failures. The input is caller-provided and is not proven to be target
+ * ciphertext. This does not create or validate a complete QQ login request.
+ * Ownership and best-effort snapshot cleanup match the 0x016a helper above.
+ */
+export function encodeTargetWtLoginNode0144(value: Uint8Array): Uint8Array {
+    return encodeNode(0x0144, value);
+}
+
+/**
+ * Local normal-success model of the target's 0x016e string node writer.
+ * The inspected construction sets the tag to 0x016e and stores a 24-byte
+ * string representation in the node; the relocated +0x10 slot selects
+ * 0x35053c0. Under stable, valid string storage and successful stream writes,
+ * the writer emits BE16(tag), BE16(appended byte count), then the raw string
+ * bytes. This helper takes those bytes directly; it does not infer their text
+ * encoding, determine the target's global-string value, or establish that the
+ * node is used in a real login. Oversized inputs are rejected locally rather
+ * than reproducing the target's low-16-bit length truncation. Ownership and
+ * best-effort cleanup match the 0x016a helper above.
+ */
+export function encodeTargetWtLoginNode016e(value: Uint8Array): Uint8Array {
+    return encodeNode(0x016e, value);
+}

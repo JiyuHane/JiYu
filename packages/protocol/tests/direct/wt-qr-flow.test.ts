@@ -67,8 +67,8 @@ function parse(frame: Uint8Array) {
     readField();
     const guid = Buffer.from(readField());
     const oicq = sso.subarray(end + 4);
-    const shared = peerKey.deriveTeaKey(oicq.subarray(48, 73));
-    const plain = Buffer.from(qqTeaDecrypt(oicq.subarray(73, -1), shared));
+    const shared = peerKey.deriveTeaKey(oicq.subarray(50, 75));
+    const plain = Buffer.from(qqTeaDecrypt(oicq.subarray(75, -1), shared));
     return {
         uin,
         command,
@@ -410,7 +410,7 @@ describe('isolated QR coordinator', () => {
             d1: 0,
             unusualSig: 0,
         };
-        const fields = Object.fromEntries(
+        const fields: PropertyDescriptorMap = Object.fromEntries(
             Object.entries(fetchFields).map(([key, value]) => [
                 key,
                 {

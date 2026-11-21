@@ -6,10 +6,11 @@ import { createHash } from 'node:crypto';
  * The MD5 path is conditional on a nonzero byte at offset +1 of the pointer
  * from 0x684bd56 and a dword equal to 1 at +0xa0 of another object. Those
  * gates are statically indicated, not observed here; other branches are unknown.
- * Indirect branches, gating at runtime, aliasing, errors, dynamic PLT binding
- * and downstream result flow remain unproven. Neither target output nor any
- * slot, ZIP association or SSO use is established. This calculation assumes
- * the supplied bits are the value formatted with %d, not target reachability.
+ * Indirect branches, gating at runtime, aliasing, errors and dynamic PLT binding
+ * remain unproven. A later bounded trace connects the candidate conditionally to
+ * output +0x200, but neither actual target output, ZIP association nor SSO use
+ * is established. This calculation assumes the supplied bits are the value
+ * formatted with %d, not target reachability.
  *
  * The input must be a primitive uint32 bit pattern. Negative zero is rejected
  * rather than treated as the zero pattern. MD5 provider failures produce a

@@ -16,6 +16,13 @@ export type RawMultiplexRoute =
     | Readonly<{ kind: 'defer' }>;
 export type RawMultiplexIdentity = Readonly<{ uin: string; sequence?: number }>;
 
+/** An explicit response continuation. The transaction may settle while following frames
+ * remain bounded and unclassified; resolve only after the caller has staged the state
+ * required to classify them. Rejection fails the client closed. */
+export interface RawMultiplexResponseContinuation {
+    readonly untilReleased: Promise<void>;
+}
+
 export interface RawMultiplexClientOptions {
     uin: string;
     initialSequence?: number;
@@ -57,11 +64,12 @@ export interface RawMultiplexClientOptions {
     /**
      * Synchronously select transactions whose following frames must wait for response
      * verification and consumption. This is caller policy, not authentication; a
-     * misclassified response can activate it. A held writer must finish independently
-     * of following frame processing. Stage any required state before consume resolves;
-     * business-delivery gating and final commit of provisional state belong to the caller.
+     * misclassified response can activate it. `true` releases after consume. An explicit
+     * continuation lets the transaction settle first and releases only when its native
+     * promise resolves, so the caller can stage state derived after transaction return.
+     * The continuation must settle independently of following frame processing.
      */
-    holdFollowingFrames?(identity: Sso12RawIdentity): boolean;
+    holdFollowingFrames?(identity: Sso12RawIdentity): boolean | RawMultiplexResponseContinuation;
     verifyPush(frame: Uint8Array, route: RawMultiplexPushRoute): boolean | Promise<boolean>;
     onPush(frame: Uint8Array, route: RawMultiplexPushRoute): void | Promise<void>;
 }
@@ -151,6 +159,31 @@ function uint(value: unknown, min: number, max: number): value is number {
     return typeof value === 'number' && Number.isSafeInteger(value) && value >= min && value <= max;
 }
 
+function responseContinuation(value: unknown): Promise<void> | undefined {
+    if (typeof value !== 'object' || value === null || utilTypes.isProxy(value)) {
+        return undefined;
+    }
+
+    const prototype = Object.getPrototypeOf(value);
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const keys = Reflect.ownKeys(descriptors);
+    const candidate = descriptors.untilReleased?.value;
+
+    if (
+        (prototype !== Object.prototype && prototype !== null) ||
+        keys.length !== 1 ||
+        keys[0] !== 'untilReleased' ||
+        !utilTypes.isPromise(candidate) ||
+        Object.getPrototypeOf(candidate) !== Promise.prototype ||
+        Object.hasOwn(candidate, 'constructor') ||
+        Object.hasOwn(candidate, 'then')
+    ) {
+        return undefined;
+    }
+
+    return candidate as Promise<void>;
+}
+
 function routeSnapshot(value: unknown, allowDeferredFrames: boolean): RawMultiplexRoute {
     const r = dataRecord(value, ['kind', 'sequence', 'name', 'id']);
     const keys = Object.keys(r);
@@ -188,6 +221,9 @@ type Pending = {
     writeDone: boolean;
     responseSeen: boolean;
     holdFollowingFrames: boolean;
+    responseContinuation?: Promise<void>;
+    responseContinuationReleased: boolean;
+    resultDelivered: boolean;
     candidate?: Uint8Array;
     responseWorker: boolean;
     hasValue: boolean;
@@ -304,6 +340,7 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
     let pushBytes = 0;
     let delivering = false;
     let pushTurns = 0;
+    let pump!: () => void;
     const callbackCopies = new Set<Uint8Array>();
 
     const copyForCallback = (source: Uint8Array): Uint8Array => {
@@ -317,9 +354,11 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
         callbackCopies.delete(copy);
     };
 
-    const finishPending = (p: Pending): void => {
-        clearTimeout(p.timer);
-        p.timer = undefined;
+    const finishPending = (p: Pending, keepContinuation = false): void => {
+        if (!keepContinuation) {
+            clearTimeout(p.timer);
+            p.timer = undefined;
+        }
 
         try {
             p.abort?.[Symbol.dispose]();
@@ -331,6 +370,10 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
         p.context = undefined;
         p.verify = undefined;
         p.consume = undefined;
+
+        if (!keepContinuation) {
+            p.responseContinuation = undefined;
+        }
     };
 
     const clearAssembly = (): void => {
@@ -472,31 +515,15 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
     const currentAlive = (): boolean => assemblyAlive() && (!pending || live(pending));
     const yieldTurn = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
-    const tryCommit = (): void => {
-        if (!assemblyAlive()) {
-            return;
+    const deliverResponse = (p: Pending, keepContinuation: boolean): void => {
+        if (keepContinuation) {
+            p.resultDelivered = true;
+            finishPending(p, true);
+        } else {
+            pending = undefined;
+            finishPending(p);
         }
 
-        const p = pending;
-
-        if (
-            !p ||
-            !p.hasValue ||
-            !p.writeDone ||
-            p.responseWorker ||
-            p.candidate ||
-            processing ||
-            incoming.length ||
-            parked.length ||
-            deferred ||
-            (!config.allowIncompleteFollowingFrame && (partial || prefixUsed)) ||
-            !live(p)
-        ) {
-            return;
-        }
-
-        pending = undefined;
-        finishPending(p);
         const value = p.value;
         p.value = undefined;
         const resolve = p.resolve;
@@ -507,6 +534,74 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
             value,
             writeState: 'written',
         });
+    };
+
+    const releaseResponseContinuation = (p: Pending): void => {
+        if (closed || pending !== p) {
+            return;
+        }
+
+        p.responseContinuationReleased = true;
+        p.responseContinuation = undefined;
+
+        if (!p.resultDelivered) {
+            return;
+        }
+
+        pending = undefined;
+        finishPending(p);
+        p.holdFollowingFrames = false;
+        pump();
+    };
+
+    const tryCommit = (): void => {
+        if (!assemblyAlive()) {
+            return;
+        }
+
+        const p = pending;
+
+        if (
+            !p ||
+            p.resultDelivered ||
+            !p.hasValue ||
+            !p.writeDone ||
+            p.responseWorker ||
+            p.candidate ||
+            processing ||
+            !live(p)
+        ) {
+            return;
+        }
+
+        if (
+            p.responseContinuation !== undefined &&
+            parked.length === 0 &&
+            deferred === undefined &&
+            (config.allowIncompleteFollowingFrame || (!partial && prefixUsed === 0))
+        ) {
+            if (p.responseContinuationReleased) {
+                p.responseContinuation = undefined;
+                p.holdFollowingFrames = false;
+                deliverResponse(p, false);
+                pump();
+            } else {
+                deliverResponse(p, true);
+            }
+
+            return;
+        }
+
+        if (
+            incoming.length ||
+            parked.length ||
+            deferred ||
+            (!config.allowIncompleteFollowingFrame && (partial || prefixUsed))
+        ) {
+            return;
+        }
+
+        deliverResponse(p, false);
     };
 
     // Budget remains charged to the candidate until this worker completes or shutdown wipes it.
@@ -574,7 +669,12 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
 
                 p.responseWorker = false;
 
-                if (p.holdFollowingFrames && p.hasValue && live(p)) {
+                if (
+                    p.holdFollowingFrames &&
+                    p.hasValue &&
+                    live(p) &&
+                    p.responseContinuation === undefined
+                ) {
                     if (deferred?.owner === p && deferred.phase === 'scanning') {
                         deferred.phase = 'replay';
                     }
@@ -650,7 +750,7 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
         })();
     };
 
-    const pump = (): void => {
+    pump = (): void => {
         if (processing || closed || pending?.holdFollowingFrames) {
             return;
         }
@@ -859,11 +959,27 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
                                 break;
                             }
 
-                            if (typeof hold !== 'boolean') {
-                                throw new Error('invalid response barrier result');
-                            }
+                            if (typeof hold === 'boolean') {
+                                p.holdFollowingFrames = forcedHold || hold;
+                            } else {
+                                const continuation = responseContinuation(hold);
 
-                            p.holdFollowingFrames = forcedHold || hold;
+                                if (!continuation || forcedHold) {
+                                    throw new Error('invalid response barrier result');
+                                }
+
+                                p.responseContinuation = continuation;
+                                p.holdFollowingFrames = true;
+                                void nativeThen.call(
+                                    continuation,
+                                    () => releaseResponseContinuation(p),
+                                    () => {
+                                        if (!closed && pending === p) {
+                                            shutdown('handler-error', 'response-barrier-failed');
+                                        }
+                                    },
+                                );
+                            }
                         }
 
                         runResponse(p);
@@ -1085,6 +1201,8 @@ export function createRawMultiplexClient(options: RawMultiplexClientOptions): Ra
                     writeDone: false,
                     responseSeen: false,
                     holdFollowingFrames: false,
+                    responseContinuationReleased: false,
+                    resultDelivered: false,
                     responseWorker: false,
                     hasValue: false,
                     value: undefined,

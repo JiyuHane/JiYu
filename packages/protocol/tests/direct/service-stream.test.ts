@@ -80,6 +80,54 @@ describe('service TCP stream framing', () => {
         }
     });
 
+    it('validates narrower frame limits without raising the global maximum', () => {
+        for (const limit of [0, 13, -1, 24.5, NaN, Infinity, 16 * 1024 * 1024 + 1]) {
+            expect(() => new ServiceFrameDecoder(limit)).toThrow(/limit/);
+        }
+
+        expect(() => new ServiceFrameDecoder(14)).not.toThrow();
+        expect(() => new ServiceFrameDecoder(16 * 1024 * 1024)).not.toThrow();
+    });
+
+    it('accepts exactly the configured limit at every split point', () => {
+        for (let split = 0; split <= wire.length; split++) {
+            const decoder = new ServiceFrameDecoder(wire.length);
+            expect([
+                ...decoder.push(wire.subarray(0, split)),
+                ...decoder.push(wire.subarray(split)),
+            ]).toEqual([Uint8Array.from(wire)]);
+            decoder.finish();
+        }
+
+        const minimum = Buffer.alloc(14);
+        minimum.writeUInt32BE(14);
+        expect(new ServiceFrameDecoder(14).push(minimum)).toEqual([Uint8Array.from(minimum)]);
+    });
+
+    it('rejects an oversized prefix immediately, before its body arrives', () => {
+        const prefix = Buffer.alloc(4);
+        prefix.writeUInt32BE(wire.length + 1);
+
+        for (let split = 0; split < prefix.length; split++) {
+            const decoder = new ServiceFrameDecoder(wire.length);
+            expect(decoder.push(prefix.subarray(0, split))).toEqual([]);
+            expect(() => decoder.push(prefix.subarray(split))).toThrow(/length/);
+            expect(() => decoder.push(wire)).toThrow(/closed/);
+        }
+    });
+
+    it('enforces the configured limit after pushFirst separates a preceding frame', () => {
+        const oversized = Buffer.alloc(4);
+        oversized.writeUInt32BE(wire.length + 1);
+        const joined = Buffer.concat([wire, oversized]);
+        const decoder = new ServiceFrameDecoder(wire.length);
+        expect(decoder.pushFirst(joined)).toEqual({
+            frame: Uint8Array.from(wire),
+            consumed: wire.length,
+        });
+        expect(() => decoder.pushFirst(joined.subarray(wire.length))).toThrow(/length/);
+    });
+
     it('reports a partial prefix or incomplete frame on end-of-stream', () => {
         for (let length = 1; length < wire.length; length++) {
             const decoder = new ServiceFrameDecoder();

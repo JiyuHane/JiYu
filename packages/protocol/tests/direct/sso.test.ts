@@ -59,6 +59,15 @@ describe('inner SSO codec', () => {
         expect(parsed.body).toEqual(Uint8Array.of(0xde, 0xad));
     });
 
+    it('accepts exactly one canonical empty trailing field from Linux SsoInfoSync', () => {
+        const parsed = decodeSsoResponse(Buffer.concat([response, Buffer.from([0, 0, 0, 4])]));
+        expect(parsed.command).toBe('A');
+        expect(parsed.body).toEqual(Uint8Array.of(0xde, 0xad));
+        expect(() =>
+            decodeSsoResponse(Buffer.concat([response, Buffer.from([0, 0, 0, 5])])),
+        ).toThrow(/trailing/);
+    });
+
     it('handles compressed responses and retains error codes', () => {
         const body = deflateSync(Buffer.from('hello'));
         const header = Buffer.from(response.subarray(0, 33));

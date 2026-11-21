@@ -254,7 +254,12 @@ export interface WtReferenceLoginAttemptOptions {
         businessAppId?: number;
     }) => boolean | Promise<boolean>;
     /** Exact half-open business range inside decoded code2d or login OICQ body. */
-    sliceBusiness: (input: { operation: Operation; bodyLength: number }) => {
+    sliceBusiness: (input: {
+        operation: Operation;
+        bodyLength: number;
+        /** Last decoded byte, when present; permits validating a profile's framing terminator. */
+        trailingByte?: number;
+    }) => {
         start: number;
         end: number;
     };
@@ -1265,7 +1270,11 @@ export class WtReferenceLoginAttempt implements BorrowedWtReferenceLoginAttempt 
 
                     const body = code?.body ?? wt.body;
                     const selection = snapshotRecord(
-                        this.slicer({ operation, bodyLength: body.length }),
+                        this.slicer({
+                            operation,
+                            bodyLength: body.length,
+                            trailingByte: body[body.length - 1],
+                        }),
                     ) as { start: number; end: number };
                     this.active();
                     const { start, end } = selection;
